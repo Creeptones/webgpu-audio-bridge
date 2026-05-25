@@ -202,9 +202,11 @@ Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 1
 
 | Operation | Median | p99 | Mean |
 |---|---|---|---|
-| `push` | 1.00 μs | 1.60 μs | 1.34 μs |
-| `pull` | 1.10 μs | 2.20 μs | 1.55 μs |
-| `pullLatest` | 1.10 μs | 11.00 μs | 2.47 μs |
+| `push` | 1.00 μs | 1.40 μs | 1.15 μs |
+| `pull` | 1.00 μs | 1.40 μs | 1.13 μs |
+| `pullLatest` | 1.10 μs | 2.10 μs | 1.22 μs |
+
+(Pull cost dropped ~10% in 0.1.1 vs 0.1.0 with the torn-check removed — see CHANGELOG.)
 
 At a control-rate 60 Hz cadence, the ring consumes ~0.006% of one core (≈60 μs of CPU per wall-clock second on the producer side). The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices and reach Adenot's original ~200 ns push/pull at the cost of a phase-bit complication and bounded session length.
 
@@ -226,12 +228,9 @@ The ring uses the standard release/acquire pattern for SPSC over SAB. A note for
 2. `Atomics.load(write_index)` — acquire.
 3. If equal → empty, return false.
 4. Read payload (non-atomic loads from the slot).
-5. `Atomics.load(write_index)` again — verify producer did not lap us during the copy. If `write_index − read_index > capacity`, payload may be torn; return false and do *not* advance `read_index`.
-6. `Atomics.store(read_index, read_index + 1n)` — release.
+5. `Atomics.store(read_index, read_index + 1n)` — release.
 
-The torn-frame re-check is the standard SPSC "verify tail after copy" idiom. **Under this library's strict push contract it is dead code** — `push()` rejects at exactly `writeIdx − readIdx ≥ capacity`, so a conforming producer never laps an in-flight reader. The check is retained as defense-in-depth: it documents the protocol shape and is the path that would fire under a non-conforming custom producer.
-
-The asymmetric boundary is deliberate. `writeIdx − readIdx == capacity` means "buffer exactly full, producer idle, oldest slot intact": the producer's `≥ capacity` push-check stops the next push, and the consumer's `> capacity` torn-check correctly **accepts** the read. Flipping the consumer side to `≥ capacity` falsely rejects every full-buffer read and deadlocks the ring — `testFullPush` regresses under that change. Under a non-conforming producer that overwrites mid-flight, neither `>` nor `≥` reliably catches mid-overwrite from `writeIdx` alone, since "idle and exactly full" is indistinguishable from "producer mid-overwrite with the release-store not yet visible" via the index. Robust detection there would need a different protocol (e.g., a head/tail seq match per slot).
+No torn-frame re-check is needed. The producer cannot be writing the slot the consumer is reading: `push()` refuses when `write_index − read_index ≥ capacity`, so the producer's `write_index` cannot advance past `read_index + capacity`, and the two slot offsets `(write_index & mask)` and `(read_index & mask)` cannot collide while there is an unread frame. The release-store on `write_index` establishes happens-before for the payload writes; the consumer's acquire-load observes them. That is the full synchronization the protocol needs. (Earlier versions performed a `Atomics.load(write_index)` re-check after the copy; under this push contract it was always dead code — see CHANGELOG 0.1.1.)
 
 `pullLatest` follows the same pattern but reads from `slot = (write_index − 1) & mask` and advances `read_index` all the way to `write_index`.
 
@@ -241,7 +240,7 @@ The asymmetric boundary is deliberate. `writeIdx − readIdx == capacity` means 
 
 - A small, tested, MIT-licensed reference primitive for the WebGPU → AudioWorklet streaming pattern.
 - The first published library, to our knowledge, that names and packages this bridge.
-- A correct implementation with a 12-test property net (including 10k mulberry32-seeded fuzz against an oracle queue) and a microbench.
+- A correct implementation with an 11-test property net (including 10k mulberry32-seeded fuzz against an oracle queue) and a microbench. Single-threaded — the SPSC memory-ordering protocol is verified by inspection and by reference to ringbuf.js (Adenot, 2018), not by concurrent stress.
 
 **This is not:**
 

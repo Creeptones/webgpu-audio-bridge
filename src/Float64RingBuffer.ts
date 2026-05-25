@@ -52,20 +52,17 @@
  *   1. Plain-read own read_index (single-consumer guarantee).
  *   2. Acquire-load write_index. If equal → empty.
  *   3. Read payload (non-atomic loads).
- *   4. Re-acquire write_index. If producer lapped us (delta > CAPACITY)
- *      payload may be torn → return false; do not advance read_index.
- *   5. Release-store read_index + 1.
+ *   4. Release-store read_index + 1.
  *
- * The torn-frame re-check is the standard SPSC "verify tail after copy"
- * idiom. Under this library's strict push contract (`push()` rejects at
- * `delta >= CAPACITY`) the re-check is unreachable: a conforming producer
- * never laps an in-flight reader. It is retained as defense-in-depth and
- * to document the protocol. The strict `> CAPACITY` boundary (not `>=`)
- * is the correct dual of the producer's `>= CAPACITY` push-check —
- * at `delta == CAPACITY` the buffer is exactly full with the oldest slot
- * still intact, so the consumer must accept. Flipping to `>=` regresses
- * testFullPush. See README "Memory ordering" for the full boundary
- * analysis.
+ * No torn-frame re-check is needed. The strict push contract guarantees
+ * the producer cannot be writing the slot the consumer is reading: push()
+ * rejects when `write_index - read_index >= CAPACITY`, so the producer's
+ * write_index cannot advance past read_index + CAPACITY, and the slot
+ * indices `(write_index & mask)` and `(read_index & mask)` cannot collide
+ * while there is an unread frame. The producer's release-store on
+ * write_index establishes happens-before for the payload writes; the
+ * consumer's acquire-load on write_index observes them. That is the full
+ * synchronization the protocol needs.
  *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
@@ -194,9 +191,8 @@ export class Float64RingBuffer {
   }
 
   /**
-   * Consumer side. Returns false on empty or on torn-frame detection (caller
-   * uses last-known-good or zeros).
-   * `outV` / `outJ` must each have length === `n`.
+   * Consumer side. Returns false on empty (caller uses last-known-good or
+   * zeros). `outV` / `outJ` must each have length === `n`.
    */
   pull(
     outV: Float64Array,
@@ -236,15 +232,6 @@ export class Float64RingBuffer {
         base + RING_FRAME_PRELUDE + 2 * this.n,
       ),
     );
-    // Torn-frame check: did producer lap us between the initial load and now?
-    // `>` (not `>=`) is the correct dual of push()'s `>= capacityBig` check —
-    // delta == capacity means "exactly full, oldest slot still intact" → accept.
-    // Flipping to `>=` deadlocks the ring (regresses testFullPush). Under the
-    // strict push contract this branch is unreachable; defense-in-depth only.
-    const writeIdxAfter = Atomics.load(this.indices, 0);
-    if (writeIdxAfter - readIdx > this.capacityBig) {
-      return false; // payload may be torn; do not advance read_index
-    }
     Atomics.store(this.indices, 1, readIdx + 1n); // release
     return true;
   }
@@ -252,7 +239,7 @@ export class Float64RingBuffer {
   /**
    * Drain to the newest available frame. Skipped older frames are discarded.
    * Returns the number of frames skipped (0 if a single frame was waiting,
-   * N if N+1 frames were buffered), or -1 if the ring was empty or torn.
+   * N if N+1 frames were buffered), or -1 if the ring was empty.
    *
    * This is the AudioWorklet's expected per-quantum call: take the freshest
    * macro-rate frame, drop staleness, minimize control→audio lag.
@@ -295,13 +282,6 @@ export class Float64RingBuffer {
         base + RING_FRAME_PRELUDE + 2 * this.n,
       ),
     );
-    // Torn-frame check on the newest slot — same boundary logic as pull():
-    // `>` (not `>=`) is the correct dual of push()'s `>= capacityBig` check.
-    // Unreachable under the strict push contract; defense-in-depth only.
-    const writeIdxAfter = Atomics.load(this.indices, 0);
-    if (writeIdxAfter - newestIdx > this.capacityBig) {
-      return -1; // torn / lapped; do not advance
-    }
     Atomics.store(this.indices, 1, writeIdx); // consume everything up to writeIdx
     return skipped;
   }

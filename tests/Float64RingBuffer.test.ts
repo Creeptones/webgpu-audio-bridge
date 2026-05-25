@@ -12,9 +12,8 @@
  *   5. FIFO ordering across many push/pull cycles
  *   6. Wrap correctness past capacity (slot reuse)
  *   7. pullLatest drain semantics + skipped count
- *   8. Torn-frame detection (simulated producer-lap mid-pull)
- *   9. available() counter
- *  10. 10k mulberry32-seeded fuzz vs an oracle queue
+ *   8. available() counter
+ *   9. 10k mulberry32-seeded fuzz vs an oracle queue
  *
  * Every pin uses assertEq (===) not assertNear — these are bit-exact contracts.
  */
@@ -279,59 +278,7 @@ function testPullLatest(): void {
   ok("pull-latest");
 }
 
-// ── 9. Torn-frame detection ────────────────────────────────────────────────
-//
-// Two distinct hazards, two different checks:
-//
-//   pull() torn-check fires when the producer's write_index has lapped the
-//   CONSUMER'S read_index by more than capacity (the slot the consumer is
-//   reading has been overwritten). This is single-thread-testable: bumping
-//   write_index before pull() runs makes the FIRST load see the lapped value.
-//
-//   pullLatest() torn-check fires when the producer laps the NEWEST frame
-//   BETWEEN the consumer's two atomic loads. In a single-threaded test we
-//   cannot interleave between those two loads, so the trigger condition is
-//   unobservable here. We document the asymmetry and assert the consistent
-//   outcome: under a pre-bump, pullLatest succeeds with skipped > 0 (the
-//   slot data is stale but not detected as torn, which is the documented
-//   "fresh-slot-only" semantic of pullLatest).
-function testTornFrameDetection(): void {
-  const capacity = 4;
-  const n = 2;
-  const { sab } = Float64RingBuffer.allocate(capacity, n);
-  const ring = new Float64RingBuffer(sab, capacity, n);
-  for (let i = 0; i < capacity; i++) {
-    const f = makeFrame(i, n);
-    ring.push(f.vEff, f.jEff, f.header);
-  }
-  const indices = new BigInt64Array(sab, 0, 2);
-  const writeIdxBefore = Atomics.load(indices, 0);
-  const readIdxBefore = Atomics.load(indices, 1);
-  Atomics.store(indices, 0, writeIdxBefore + 2n); // simulated producer-lap
-  const outV = new Float64Array(n);
-  const outJ = new Float64Array(n);
-  const outH = emptyHeader();
-  assertEq(ring.pull(outV, outJ, outH), false, "torn pull returns false");
-  assertEq(
-    Atomics.load(indices, 1),
-    readIdxBefore,
-    "torn pull did not advance read_index",
-  );
-  const skipped = ring.pullLatest(outV, outJ, outH);
-  assertEq(
-    skipped,
-    Number(writeIdxBefore + 2n - readIdxBefore - 1n),
-    "pullLatest after pre-bump succeeds with expected skipped count",
-  );
-  assertEq(
-    Atomics.load(indices, 1),
-    writeIdxBefore + 2n,
-    "pullLatest after pre-bump drained to writeIdx",
-  );
-  ok("torn-frame-detection");
-}
-
-// ── 10. available() counter under push/pull mix ────────────────────────────
+// ── 9. available() counter under push/pull mix ────────────────────────────
 function testAvailableCounter(): void {
   const capacity = 4;
   const n = 2;
@@ -354,7 +301,7 @@ function testAvailableCounter(): void {
   ok("available-counter");
 }
 
-// ── 11. 10k mulberry32-seeded fuzz vs oracle queue ─────────────────────────
+// ── 10. 10k mulberry32-seeded fuzz vs oracle queue ─────────────────────────
 function testFuzzVsOracle(): void {
   const capacity = 8;
   const n = 4;
@@ -418,7 +365,7 @@ function testFuzzVsOracle(): void {
   );
 }
 
-// ── 12. SAB header layout sanity ───────────────────────────────────────────
+// ── 11. SAB header layout sanity ───────────────────────────────────────────
 function testSabLayoutSanity(): void {
   assertEq(RING_HEADER_BYTES, 32, "header is 32 bytes");
   assertEq(RING_FRAME_PRELUDE, 4, "frame prelude is 4 floats");
@@ -435,7 +382,6 @@ function main(): void {
   testFifoOrdering();
   testWrapAcrossCapacity();
   testPullLatest();
-  testTornFrameDetection();
   testAvailableCounter();
   testSabLayoutSanity();
   testFuzzVsOracle();
