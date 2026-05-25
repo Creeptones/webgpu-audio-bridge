@@ -21,7 +21,9 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsx tests/Float64RingBuffer.test.ts",
+    "test": "tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
+    "test:unit": "tsx tests/Float64RingBuffer.test.ts",
+    "test:concurrent": "tsx tests/Float64RingBuffer.concurrent.test.ts",
     "bench": "tsx bench/Float64RingBuffer.bench.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"

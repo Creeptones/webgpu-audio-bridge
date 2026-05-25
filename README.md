@@ -251,7 +251,11 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 - A small, tested, MIT-licensed reference primitive for the WebGPU → AudioWorklet streaming pattern.
 - The first published library, to our knowledge, that names and packages this bridge.
-- A correct implementation with an 11-test property net (including 10k mulberry32-seeded fuzz against an oracle queue) and a microbench. Single-threaded — the SPSC memory-ordering protocol is verified by inspection and by reference to ringbuf.js (Adenot, 2018), not by concurrent stress.
+- A correct implementation with two test layers:
+  - **Single-threaded API contract** (11 pins, including a 10k mulberry32-seeded fuzz against an in-process oracle queue) — `npm run test:unit`.
+  - **Cross-thread SPSC memory-ordering stress** (1,000,000 frames over Node `worker_threads`, bit-exact `===` assertions on every header field and every payload `f64`, ~300 ms on a dev laptop) — `npm run test:concurrent`.
+  - `npm test` runs both. CI runs both on Ubuntu/macOS/Windows × Node 20/22.
+- A microbench (`npm run bench`).
 
 **This is not:**
 

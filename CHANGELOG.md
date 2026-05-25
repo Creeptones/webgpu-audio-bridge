@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `tests/Float64RingBuffer.concurrent.test.ts` — Node `worker_threads` SPSC stress test. Main thread is the consumer using the production `Float64RingBuffer.pull`; the worker thread is an inline-JS producer that mirrors `Float64RingBuffer.push` verbatim. Both share one `SharedArrayBuffer`. Validates 1,000,000 frames with `assertEq` (===) on every header field and every payload `f64` against a deterministic generator — any memory-ordering hazard (e.g. release-store downgraded to plain store, acquire-load elided) would manifest as non-monotonic `seq` or off-recipe payload. Local run: 1M frames in ~300 ms with ~2.5M empty polls and ~2M producer-full spins — both sides actually contend; the release/acquire protocol holds bit-exact across threads.
+- `npm test` now chains the single-thread suite (`test:unit`) and the cross-thread stress (`test:concurrent`). New `test:unit` and `test:concurrent` scripts run them independently.
+
+### Documentation
+- `Float64RingBuffer.test.ts` header now explicitly marks the file as single-threaded API correctness and points at `Float64RingBuffer.concurrent.test.ts` for the actual cross-thread memory-ordering coverage.
+- README "What this is" section updated to describe the two test layers honestly.
+
 ## [0.1.1] — 2026-05-25
 
 ### Changed

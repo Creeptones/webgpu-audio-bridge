@@ -16,6 +16,26 @@
  *   9. 10k mulberry32-seeded fuzz vs an oracle queue
  *
  * Every pin uses assertEq (===) not assertNear — these are bit-exact contracts.
+ *
+ * ─── Scope of this file: SINGLE-THREADED API correctness ──────────────────
+ *
+ * These pins (including the 10k mulberry32 fuzz at pin #9) run on one thread
+ * against an in-process oracle queue. They verify the queue's algebraic
+ * contract — push/pull/pullLatest outcomes, FIFO, wrap, header+payload bit-
+ * stability, available() — but they do NOT exercise real producer/consumer
+ * concurrent memory ordering. A reader who skims "10k iter fuzz" without
+ * this note would reasonably (and wrongly) take it as concurrency stress.
+ *
+ * The SPSC release/acquire memory-ordering protocol (the actual lock-free
+ * guarantee) is covered by:
+ *   1. The release-store / acquire-load protocol documented at the top of
+ *      ../src/Float64RingBuffer.ts.
+ *   2. The companion file Float64RingBuffer.concurrent.test.ts which spawns
+ *      a Node worker_threads producer against the same SharedArrayBuffer and
+ *      pins 1,000,000 frames bit-exact on every header field and every
+ *      payload f64 across real threads.
+ *   3. Adenot's ringbuf.js (2018) is the canonical SPSC-over-SAB lineage
+ *      this library extends; see README's Acknowledgments.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
