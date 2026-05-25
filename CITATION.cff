@@ -7,9 +7,17 @@ authors:
   - name: "Ephemera contributors"
 repository-code: "https://github.com/Creeptones/webgpu-audio-bridge"
 url: "https://github.com/Creeptones/webgpu-audio-bridge"
+doi: "10.5281/zenodo.20380886"
 version: "0.1.0"
 date-released: "2026-05-25"
 license: MIT
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.20380886"
+    description: "Concept DOI — resolves to the latest release."
+  - type: doi
+    value: "10.5281/zenodo.20380887"
+    description: "Version DOI — v0.1.0 specifically."
 keywords:
   - WebGPU
   - AudioWorklet

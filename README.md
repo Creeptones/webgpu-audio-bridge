@@ -1,6 +1,7 @@
 # webgpu-audio-bridge
 
 [![test](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml)
+[![DOI](https://zenodo.org/badge/1249253281.svg)](https://doi.org/10.5281/zenodo.20380886)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 > Lock-free SPSC SharedArrayBuffer ring for streaming WebGPU compute output into AudioWorklets — the control-rate-GPU / audio-rate-CPU pattern.
@@ -269,6 +270,7 @@ If you use this library in academic work, please cite:
   author = {Creeptone and Ephemera contributors},
   year   = {2026},
   url    = {https://github.com/Creeptones/webgpu-audio-bridge},
+  doi    = {10.5281/zenodo.20380886},
 }
 ```
 
