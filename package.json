@@ -1,0 +1,60 @@
+{
+  "name": "webgpu-audio-bridge",
+  "version": "0.1.0",
+  "description": "Lock-free SPSC SharedArrayBuffer ring for streaming WebGPU compute output into AudioWorklets — the control-rate-GPU / audio-rate-CPU pattern.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "CITATION.cff",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsx tests/Float64RingBuffer.test.ts",
+    "bench": "tsx bench/Float64RingBuffer.bench.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [
+    "webgpu",
+    "audioworklet",
+    "audio",
+    "ring-buffer",
+    "sharedarraybuffer",
+    "spsc",
+    "lock-free",
+    "atomics",
+    "control-rate",
+    "streaming",
+    "web-audio"
+  ],
+  "author": "Creeptone",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Creeptone/webgpu-audio-bridge.git"
+  },
+  "homepage": "https://github.com/Creeptone/webgpu-audio-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/Creeptone/webgpu-audio-bridge/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0"
+  }
+}

@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+title: "webgpu-audio-bridge: A streaming bridge from WebGPU compute to AudioWorklet via SharedArrayBuffer"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: "Creeptone"
+  - name: "Ephemera contributors"
+repository-code: "https://github.com/Creeptone/webgpu-audio-bridge"
+url: "https://github.com/Creeptone/webgpu-audio-bridge"
+version: "0.1.0"
+date-released: "2026-05-25"
+license: MIT
+keywords:
+  - WebGPU
+  - AudioWorklet
+  - SharedArrayBuffer
+  - lock-free
+  - SPSC
+  - ring-buffer
+  - web-audio
+  - control-rate
+references:
+  - type: software
+    title: "ringbuf.js: a wait-free single-producer single-consumer ringbuffer for the Web"
+    authors:
+      - family-names: Adenot
+        given-names: Paul
+    url: "https://github.com/padenot/ringbuf.js"
+    year: 2018
+    notes: "Direct precedent. The underlying SPSC-over-SharedArrayBuffer technique is established by ringbuf.js; this library extends the pattern to a different data shape and read semantic appropriate for WebGPU control-rate buses."
