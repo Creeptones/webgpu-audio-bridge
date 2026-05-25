@@ -57,9 +57,15 @@
  *   5. Release-store read_index + 1.
  *
  * The torn-frame re-check is the standard SPSC "verify tail after copy"
- * idiom. At a control-rate 60Hz cadence with CAPACITY = 16 (≈266 ms of
- * buffering) producer-lap-mid-copy is effectively impossible in practice,
- * but the check is cheap and catches misuse (consumer parked too long).
+ * idiom. Under this library's strict push contract (`push()` rejects at
+ * `delta >= CAPACITY`) the re-check is unreachable: a conforming producer
+ * never laps an in-flight reader. It is retained as defense-in-depth and
+ * to document the protocol. The strict `> CAPACITY` boundary (not `>=`)
+ * is the correct dual of the producer's `>= CAPACITY` push-check —
+ * at `delta == CAPACITY` the buffer is exactly full with the oldest slot
+ * still intact, so the consumer must accept. Flipping to `>=` regresses
+ * testFullPush. See README "Memory ordering" for the full boundary
+ * analysis.
  *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
@@ -231,6 +237,10 @@ export class Float64RingBuffer {
       ),
     );
     // Torn-frame check: did producer lap us between the initial load and now?
+    // `>` (not `>=`) is the correct dual of push()'s `>= capacityBig` check —
+    // delta == capacity means "exactly full, oldest slot still intact" → accept.
+    // Flipping to `>=` deadlocks the ring (regresses testFullPush). Under the
+    // strict push contract this branch is unreachable; defense-in-depth only.
     const writeIdxAfter = Atomics.load(this.indices, 0);
     if (writeIdxAfter - readIdx > this.capacityBig) {
       return false; // payload may be torn; do not advance read_index
@@ -285,6 +295,9 @@ export class Float64RingBuffer {
         base + RING_FRAME_PRELUDE + 2 * this.n,
       ),
     );
+    // Torn-frame check on the newest slot — same boundary logic as pull():
+    // `>` (not `>=`) is the correct dual of push()'s `>= capacityBig` check.
+    // Unreachable under the strict push contract; defense-in-depth only.
     const writeIdxAfter = Atomics.load(this.indices, 0);
     if (writeIdxAfter - newestIdx > this.capacityBig) {
       return -1; // torn / lapped; do not advance

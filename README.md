@@ -229,7 +229,9 @@ The ring uses the standard release/acquire pattern for SPSC over SAB. A note for
 5. `Atomics.load(write_index)` again — verify producer did not lap us during the copy. If `write_index − read_index > capacity`, payload may be torn; return false and do *not* advance `read_index`.
 6. `Atomics.store(read_index, read_index + 1n)` — release.
 
-The torn-frame re-check is the standard SPSC "verify tail after copy" idiom. At a 60 Hz control rate with `capacity = 16` (~266 ms of buffering), genuine producer-lap-mid-copy is effectively impossible in practice; the check is cheap insurance against consumer stalls.
+The torn-frame re-check is the standard SPSC "verify tail after copy" idiom. **Under this library's strict push contract it is dead code** — `push()` rejects at exactly `writeIdx − readIdx ≥ capacity`, so a conforming producer never laps an in-flight reader. The check is retained as defense-in-depth: it documents the protocol shape and is the path that would fire under a non-conforming custom producer.
+
+The asymmetric boundary is deliberate. `writeIdx − readIdx == capacity` means "buffer exactly full, producer idle, oldest slot intact": the producer's `≥ capacity` push-check stops the next push, and the consumer's `> capacity` torn-check correctly **accepts** the read. Flipping the consumer side to `≥ capacity` falsely rejects every full-buffer read and deadlocks the ring — `testFullPush` regresses under that change. Under a non-conforming producer that overwrites mid-flight, neither `>` nor `≥` reliably catches mid-overwrite from `writeIdx` alone, since "idle and exactly full" is indistinguishable from "producer mid-overwrite with the release-store not yet visible" via the index. Robust detection there would need a different protocol (e.g., a head/tail seq match per slot).
 
 `pullLatest` follows the same pattern but reads from `slot = (write_index − 1) & mask` and advances `read_index` all the way to `write_index`.
 
