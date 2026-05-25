@@ -35,15 +35,51 @@
  * The load-bearing fact is the contention pattern, NOT the wall-clock or the
  * frame count by themselves. With CAPACITY=16 and TOTAL_FRAMES=1,000,000 the
  * producer fills the ring in microseconds and then has to wait for the
- * consumer (full spins); the consumer drains in microseconds and then has to
- * wait for the producer (empty polls). Each run's `ok()` line reports both
- * counts, and they're typically millions each — meaning the threads spend
- * more time waiting on each other than running, so the release-store /
- * acquire-load protocol is genuinely interleaved rather than accidentally
- * serialized. A test where one side ran to completion before the other
- * started would validate the same payload but exercise no real cross-thread
- * ordering. That's why the contention numbers in the `ok()` output, not the
- * wall-clock, are the evidence this test was meaningful.
+ * consumer (full-waits); the consumer drains in microseconds and then has to
+ * wait for the producer (empty-waits). Each run's `ok()` line reports both
+ * counts, and they're typically hundreds of thousands each — meaning the
+ * threads spend more time waiting on each other than running, so the
+ * release-store / acquire-load protocol is genuinely interleaved rather
+ * than accidentally serialized. A test where one side ran to completion
+ * before the other started would validate the same payload but exercise
+ * no real cross-thread ordering. That's why the contention numbers in the
+ * `ok()` output, not the wall-clock, are the evidence this test was
+ * meaningful.
+ *
+ * ─── Park / wake protocol (Atomics.wait / Atomics.notify) ─────────────────
+ *
+ * Both sides park in the kernel instead of busy-spinning when blocked:
+ *   - Producer (inline JS): on full, Atomics.wait on indices[1] (read_index)
+ *     using the just-loaded readIdx as the expected value. Wakes when the
+ *     consumer's pull() unconditionally Atomics.notify(1)s on lane 1 (see
+ *     Float64RingBuffer.pull always-notify).
+ *   - Consumer (main thread): on empty, ring.waitForData(...) with a short
+ *     timeout so we periodically re-check the producer-error state and the
+ *     stall watchdog. Wakes when the producer's push unconditionally
+ *     Atomics.notify(1)s on lane 0 (see Float64RingBuffer.push always-notify,
+ *     mirrored verbatim by the inline producer below).
+ *
+ * Earlier iteration (kept here as a warning): the notifies were originally
+ * edge-triggered — only fired on empty→non-empty / full→non-full transitions.
+ * Under 2-thread contention the producer's wasEmpty load almost always read
+ * false (writeIdx > readIdx while the consumer was mid-drain), so notifies
+ * were never sent and the consumer ground forward at ~110 frames/sec entirely
+ * via Atomics.wait timeouts. Always-notify is correct by construction; the
+ * syscall cost when no peer is parked is dominated by the write itself and
+ * is dwarfed by the actual contention work. See the "Wall-clock vs CPU-shape
+ * tradeoff" section in src/Float64RingBuffer.ts for the full rationale.
+ *
+ * Atomics.wait blocks the calling thread for up to `timeoutMs` — that's
+ * fine on the test main thread (no audio rendering deadline) but would be
+ * catastrophic in an AudioWorklet. The library's pullLatest path the
+ * AudioWorklet uses does NOT call waitForData; it just polls and tolerates
+ * misses.
+ *
+ * `fullWaitTimeouts` and `emptyWaitTimeouts` are asserted === 0 at the end
+ * of the run. A non-zero value means an Atomics.wait reached its timeout
+ * without a notify — the protocol recovers (we loop and re-check the
+ * counter) but it's a real bug signal worth surfacing hard. Any future
+ * regression that re-introduces the lost-wakeup hole will fire here.
  *
  * ─── Why the producer source is inlined (eval: true) ──────────────────────
  *
@@ -102,12 +138,28 @@ const SAB_BYTES = RING_HEADER_BYTES + CAPACITY * FRAME_LEN * 8;
 
 // Consumer-side stall watchdog. If the consumer goes more than this many ms
 // without any successful pull, assume the producer has crashed or deadlocked.
-// This is the only timeout in the test — there are no heuristic delays.
+// This is the only timeout-as-failure in the test — there are no heuristic
+// delays.
 const STALL_TIMEOUT_MS = 30_000;
 // Chunk size for the consumer's inner pull loop between event-loop yields.
 // Big enough to stay tight, small enough that the worker 'done' message and
 // the watchdog tick can fire in reasonable time.
 const PULL_CHUNK = 8192;
+// Consumer-side Atomics.wait timeout — short enough that worker 'message'
+// / 'error' events are processed within ~1 watchdog tick even if no notify
+// arrives (defensive against any future producer-side notify bug).
+const CONSUMER_WAIT_TIMEOUT_MS = 100;
+// Producer-side Atomics.wait timeout — covers the same "lost notify" class
+// of bugs from the producer's POV. 1s is generous; under a healthy consumer
+// the wait wakes well under 1ms via the always-notify in pull().
+const PRODUCER_WAIT_TIMEOUT_MS = 1_000;
+// Heartbeat cadence. The whole point of the heartbeat is to make a stuck
+// run distinguishable from a slow run at a glance — if the output file
+// stops growing for more than this interval the test is definitively wedged.
+const HEARTBEAT_INTERVAL_MS = 1_000;
+// Producer worker emits a "heartbeat" message every this-many pushes. 100k
+// over a 1M-frame run is 10 messages → negligible postMessage overhead.
+const PRODUCER_HEARTBEAT_EVERY_N = 100_000;
 
 // ─── Producer source (runs in the worker via eval: true) ──────────────────
 // Plain JS (not TS). Mirrors Float64RingBuffer.push verbatim — if push
@@ -122,6 +174,8 @@ const PRODUCER_SOURCE = `
     totalFrames,
     headerBytes,
     framePrelude,
+    waitTimeoutMs,
+    heartbeatEveryN,
   } = workerData;
 
   const frameLen = framePrelude + 2 * n;
@@ -131,7 +185,16 @@ const PRODUCER_SOURCE = `
   const capacityBig = BigInt(capacity);
 
   let pushed = 0;
-  let fullSpins = 0;
+  // Wait/notify protocol counters. fullWaits is the number of kernel parks
+  // the producer did when the ring was full (analogous to the old fullSpins
+  // count but measuring real Atomics.wait calls instead of busy-spin iters).
+  // fullWaitTimeouts is the subset that reached waitTimeoutMs without a
+  // notify — should be 0 under a healthy consumer; non-zero indicates a
+  // notify path bug. notifyCalls is the number of Atomics.notify(0, 1) we
+  // issued — equals the number of successful pushes since we always-notify.
+  let fullWaits = 0;
+  let fullWaitTimeouts = 0;
+  let notifyCalls = 0;
   let nextSeq = 0n;
 
   while (pushed < totalFrames) {
@@ -140,11 +203,22 @@ const PRODUCER_SOURCE = `
     const writeIdx = indices[0];
     const readIdx = Atomics.load(indices, 1);
     if (writeIdx - readIdx >= capacityBig) {
-      // Ring is full — yield briefly so the consumer can drain. Light spin
-      // instead of Atomics.wait to keep the producer responsive (the consumer
-      // drains in microseconds; a notify/wait round-trip would be overkill).
-      fullSpins++;
-      for (let i = 0; i < 64; i++) { /* spin */ }
+      // Ring is full — park in the kernel until the consumer advances
+      // read_index. The consumer's pull() unconditionally Atomics.notify(1)s
+      // on lane 1 after its release-store of read_index + 1 (see
+      // Float64RingBuffer.pull always-notify), which wakes us.
+      //
+      // Atomics.wait performs an atomic compare-and-park against the value
+      // at indices[1]: if the consumer already advanced readIdx between our
+      // load and this wait call, it returns "not-equal" immediately rather
+      // than parking forever — load-then-park race is closed by the spec.
+      fullWaits++;
+      const status = Atomics.wait(indices, 1, readIdx, waitTimeoutMs);
+      if (status === "timed-out") {
+        // No notify within the budget. Loop and re-check; the bit-exact
+        // consumer pin downstream will fail loudly if this hides a stall.
+        fullWaitTimeouts++;
+      }
       continue;
     }
     const slot = Number(writeIdx & mask);
@@ -167,20 +241,57 @@ const PRODUCER_SOURCE = `
       data[base + framePrelude + n + k] = -seq + k * 0.001;
     }
     // Release-store: publishes the payload writes above to any subsequent
-    // acquire-load on the consumer. Mirrors Float64RingBuffer.push step 5.
+    // acquire-load on the consumer. Mirrors Float64RingBuffer.push step 4.
     Atomics.store(indices, 0, writeIdx + 1n);
+    // Unconditional notify mirrors Float64RingBuffer.push. An earlier
+    // edge-triggered version (notify only on wasEmpty) lost wakeups under
+    // genuine contention because the producer's wasEmpty load almost always
+    // read false while the consumer was mid-drain; see the always-notify
+    // rationale in src/Float64RingBuffer.ts.
+    notifyCalls++;
+    Atomics.notify(indices, 0, 1);
     nextSeq++;
     pushed++;
+    if (heartbeatEveryN > 0 && pushed % heartbeatEveryN === 0) {
+      // Liveness ping for the consumer's watchdog log. Cheap (≤10 calls
+      // for a 1M-frame run at heartbeatEveryN=100k) and gives us per-side
+      // forward-progress visibility — without this, a worker stuck in
+      // Atomics.wait is indistinguishable from a deadlocked one.
+      parentPort.postMessage({ type: "heartbeat", pushed, fullWaits, notifyCalls });
+    }
   }
 
-  parentPort.postMessage({ type: "done", fullSpins, totalPushed: pushed });
+  parentPort.postMessage({
+    type: "done",
+    fullWaits,
+    fullWaitTimeouts,
+    notifyCalls,
+    totalPushed: pushed,
+  });
 `;
 
 interface ProducerDoneMessage {
   type: "done";
-  fullSpins: number;
+  /** Number of times the producer parked on Atomics.wait (full ring). */
+  fullWaits: number;
+  /** Subset of fullWaits that hit waitTimeoutMs without a notify. Should be 0
+   *  under a healthy consumer; non-zero indicates a notify path bug or a
+   *  consumer stall and is therefore load-bearing telemetry. */
+  fullWaitTimeouts: number;
+  /** Number of Atomics.notify(lane=0, 1) issued by the producer — equals the
+   *  number of successful pushes over the run with always-notify. */
+  notifyCalls: number;
   totalPushed: number;
 }
+
+interface ProducerHeartbeatMessage {
+  type: "heartbeat";
+  pushed: number;
+  fullWaits: number;
+  notifyCalls: number;
+}
+
+type ProducerMessage = ProducerDoneMessage | ProducerHeartbeatMessage;
 
 function newHeader(): RingFrameHeader {
   return { seq: 0, tMacroNs: 0, vMax: 0, jMax: 0 };
@@ -198,10 +309,16 @@ async function runConcurrentStress(): Promise<void> {
     producerDone: boolean;
     producerStats: ProducerDoneMessage | null;
     producerError: Error | null;
+    /** Last heartbeat we received from the producer worker — the watchdog
+     *  prints this so a stuck worker is visible (heartbeat stops advancing
+     *  even though the main thread is still ticking). null until the first
+     *  heartbeat lands. */
+    lastProducerHeartbeat: ProducerHeartbeatMessage | null;
   } = {
     producerDone: false,
     producerStats: null,
     producerError: null,
+    lastProducerHeartbeat: null,
   };
 
   const worker = new Worker(PRODUCER_SOURCE, {
@@ -213,13 +330,18 @@ async function runConcurrentStress(): Promise<void> {
       totalFrames: TOTAL_FRAMES,
       headerBytes: RING_HEADER_BYTES,
       framePrelude: RING_FRAME_PRELUDE,
+      waitTimeoutMs: PRODUCER_WAIT_TIMEOUT_MS,
+      heartbeatEveryN: PRODUCER_HEARTBEAT_EVERY_N,
     },
   });
 
-  worker.on("message", (msg: ProducerDoneMessage) => {
-    if (msg && msg.type === "done") {
+  worker.on("message", (msg: ProducerMessage) => {
+    if (!msg) return;
+    if (msg.type === "done") {
       state.producerDone = true;
       state.producerStats = msg;
+    } else if (msg.type === "heartbeat") {
+      state.lastProducerHeartbeat = msg;
     }
   });
   worker.on("error", (err: Error) => {
@@ -232,8 +354,21 @@ async function runConcurrentStress(): Promise<void> {
   let consumed = 0;
   let lastSeq = -1;
   let emptyPolls = 0;
+  // Consumer-side park telemetry — analogous to the producer's fullWaits.
+  let emptyWaits = 0;
+  let emptyWaitTimeouts = 0;
   let lastProgressAt = Date.now();
   const startedAt = Date.now();
+  let lastHeartbeatAt = startedAt;
+  let lastHeartbeatConsumed = 0;
+  // stderr (not stdout) so the heartbeat shows up immediately even when the
+  // harness pipes stdout to a file — Node's stdout can full-buffer on a pipe
+  // on some Windows builds; stderr is always line-buffered/synchronous.
+  process.stderr.write(
+    `[watchdog] t=0.0s starting concurrent-spsc-stress ` +
+      `TOTAL_FRAMES=${TOTAL_FRAMES.toLocaleString()} CAPACITY=${CAPACITY} N=${N} ` +
+      `PULL_CHUNK=${PULL_CHUNK.toLocaleString()}\n`,
+  );
 
   while (consumed < TOTAL_FRAMES) {
     if (state.producerError !== null) {
@@ -243,8 +378,13 @@ async function runConcurrentStress(): Promise<void> {
     for (let i = 0; i < PULL_CHUNK && consumed < TOTAL_FRAMES; i++) {
       const got = ring.pull(outV, outJ, outH);
       if (!got) {
+        // Ring drained — break out and park via waitForData instead of
+        // burning the chunk budget spinning. The earlier `continue` form
+        // turned PULL_CHUNK iterations into ~8K Atomics.load syscalls per
+        // chunk and dominated the consumer's wall-clock when the producer
+        // was park-locked.
         emptyPolls++;
-        continue;
+        break;
       }
       const expectedSeq = consumed;
 
@@ -296,9 +436,36 @@ async function runConcurrentStress(): Promise<void> {
       consumed++;
       progressedThisChunk = true;
     }
+    const nowMs = Date.now();
+    // Always-on heartbeat. Prints once per HEARTBEAT_INTERVAL_MS regardless
+    // of whether the chunk made progress — that asymmetry is the whole
+    // point: a watcher tailing the output file can tell "advancing slowly"
+    // (consumed climbs) from "wedged" (consumed flat across heartbeats).
+    if (nowMs - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      const elapsed = (nowMs - startedAt) / 1000;
+      const intervalSec = (nowMs - lastHeartbeatAt) / 1000;
+      const rate = (consumed - lastHeartbeatConsumed) / Math.max(intervalSec, 1e-9);
+      const hb = state.lastProducerHeartbeat;
+      const producerLine = hb !== null
+        ? `producer.pushed=${hb.pushed.toLocaleString()} fullWaits=${hb.fullWaits.toLocaleString()}`
+        : state.producerDone
+          ? "producer=done"
+          : "producer=<no-heartbeat-yet>";
+      process.stderr.write(
+        `[watchdog] t=${elapsed.toFixed(1)}s ` +
+          `consumed=${consumed.toLocaleString()}/${TOTAL_FRAMES.toLocaleString()} ` +
+          `rate=${rate.toFixed(0)}f/s ` +
+          `emptyPolls=${emptyPolls.toLocaleString()} ` +
+          `emptyWaits=${emptyWaits.toLocaleString()} ` +
+          producerLine +
+          "\n",
+      );
+      lastHeartbeatAt = nowMs;
+      lastHeartbeatConsumed = consumed;
+    }
     if (progressedThisChunk) {
-      lastProgressAt = Date.now();
-    } else if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
+      lastProgressAt = nowMs;
+    } else if (nowMs - lastProgressAt > STALL_TIMEOUT_MS) {
       // `state.producerError` was narrowed to `null` by the chunk-start
       // `!== null` check; cast back to widen so we can stringify whichever
       // value is current here (a producer error landing between chunks
@@ -309,10 +476,25 @@ async function runConcurrentStress(): Promise<void> {
         `consumer stalled: ${consumed}/${TOTAL_FRAMES} frames after ${STALL_TIMEOUT_MS}ms with no progress (producerDone=${state.producerDone}, producerError=${errMsg})`,
       );
     }
-    // Yield to the event loop so the worker 'message' handler can fire and
-    // (more importantly) so we don't pin a single core if the producer is
-    // briefly idle. setImmediate is the cheapest possible yield.
+    // Yield to the event loop so the worker's 'message' / 'error' handlers
+    // can fire — Atomics.wait below would block them, so always drain the
+    // microtask queue first.
     await new Promise<void>((r) => setImmediate(r));
+    if (consumed < TOTAL_FRAMES) {
+      // If we drained the ring (or never had any data), park in the kernel
+      // until the producer pushes again. The producer's always-notify
+      // (mirroring Float64RingBuffer.push) wakes us on every push, parked
+      // or not. CONSUMER_WAIT_TIMEOUT_MS gives the outer loop a chance to
+      // re-check producerError / the stall watchdog even if a notify is
+      // somehow lost — if emptyWaitTimeouts climbs above 0 we've regressed.
+      const status = ring.waitForData(CONSUMER_WAIT_TIMEOUT_MS);
+      if (status === "ok" || status === "timed-out") {
+        emptyWaits++;
+        if (status === "timed-out") emptyWaitTimeouts++;
+      }
+      // "not-equal" means data was already available — no actual park
+      // happened, so we don't count it as a wait.
+    }
   }
 
   // Drain anything left, then make sure the producer signaled done. At
@@ -337,9 +519,27 @@ async function runConcurrentStress(): Promise<void> {
   );
   assertEq(ring.available(), 0, "ring fully drained at end of run");
 
+  const fullWaits = state.producerStats?.fullWaits ?? 0;
+  const fullWaitTimeouts = state.producerStats?.fullWaitTimeouts ?? 0;
+  const producerNotifies = state.producerStats?.notifyCalls ?? 0;
+  // A timeout on either side means a notify was lost — the loop recovers
+  // (we re-check the index), but it's a real bug signal worth surfacing
+  // hard rather than burying in the log line. Any future regression that
+  // re-introduces the edge-trigger-style lost-wakeup hole fires here.
+  assertEq(
+    fullWaitTimeouts,
+    0,
+    `producer Atomics.wait never times out under a healthy consumer (got ${fullWaitTimeouts})`,
+  );
+  assertEq(
+    emptyWaitTimeouts,
+    0,
+    `consumer Atomics.wait never times out under a healthy producer (got ${emptyWaitTimeouts})`,
+  );
   ok(
     `concurrent-spsc-stress (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +
-      `${emptyPolls.toLocaleString()} empty polls, ${state.producerStats?.fullSpins.toLocaleString() ?? "?"} producer-full spins)`,
+      `producer ${fullWaits.toLocaleString()} full-waits / ${producerNotifies.toLocaleString()} push-notifies; ` +
+      `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyPolls.toLocaleString()} empty polls)`,
   );
 }
 

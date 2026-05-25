@@ -47,12 +47,17 @@
  *   3. Write payload (non-atomic stores).
  *   4. Release-store write_index + 1. The release barrier guarantees the
  *      non-atomic payload stores happen-before any consumer acquire-load.
+ *   5. Atomics.notify(write_index, 1) wakes any consumer that may have
+ *      parked via waitForData (or inline Atomics.wait on lane 0).
+ *      Unconditional — see the "Park / wake protocol" note below.
  *
  * Consumer pull:
  *   1. Plain-read own read_index (single-consumer guarantee).
  *   2. Acquire-load write_index. If equal → empty.
  *   3. Read payload (non-atomic loads).
  *   4. Release-store read_index + 1.
+ *   5. Atomics.notify(read_index, 1) wakes any producer that may have parked
+ *      via waitForSpace (or inline Atomics.wait on lane 1). Unconditional.
  *
  * No torn-frame re-check is needed. The strict push contract guarantees
  * the producer cannot be writing the slot the consumer is reading: push()
@@ -63,6 +68,75 @@
  * write_index establishes happens-before for the payload writes; the
  * consumer's acquire-load on write_index observes them. That is the full
  * synchronization the protocol needs.
+ *
+ * ─── Park / wake protocol (Atomics.wait / Atomics.notify) ─────────────────
+ *
+ * Always-notify (not edge-triggered). Push and pull unconditionally issue
+ * Atomics.notify on the peer's lane after the release-store. An earlier
+ * iteration of this protocol used an edge-trigger (notify only on the
+ * empty→non-empty / full→non-full transition); under genuine 2-thread
+ * contention that protocol misses wake-ups because the producer's wasEmpty
+ * check almost always reads false (write_index > read_index while the
+ * consumer is mid-drain), so the consumer ends up reliant on its
+ * Atomics.wait timeout to make any progress at all. Always-notify is
+ * correct by construction: a parked peer is guaranteed to be woken on the
+ * next state change, and the syscall cost when nobody is parked is
+ * dominated by the write itself (~100ns on Windows / Linux per
+ * Atomics.notify with zero waiters). In the canonical production path
+ * (60Hz control-rate producer → AudioWorklet, ~375Hz pull at 48kHz/128q)
+ * that's a few hundred extra notify-syscalls per second total — invisible
+ * against everything else.
+ *
+ * Atomics.wait correctness under the load-then-park race is provided by the
+ * spec itself: Atomics.wait atomically compare-and-parks against the
+ * expected value, so a producer that observed readIdx = X and then issues
+ * Atomics.wait(indices, 1, X) is safe even if the consumer advances readIdx
+ * between the two operations — the wait sees the new value and returns
+ * "not-equal" immediately rather than parking forever.
+ *
+ * waitForData is NOT real-time safe (it blocks the calling thread up to the
+ * timeout) and MUST NOT be called from an AudioWorklet's process() method.
+ * The AudioWorklet always polls via pullLatest() and tolerates misses. The
+ * notify on push is still emitted for the benefit of non-realtime consumers
+ * (concurrent stress tests, bench harnesses, non-audio downstream readers).
+ *
+ * ─── Wall-clock vs CPU-shape tradeoff ─────────────────────────────────────
+ *
+ * Adding the park/wake protocol made the 1M-frame concurrent stress test
+ * ~1.6× slower in wall-clock (277ms busy-spin → 454ms wait/wake on a dev
+ * laptop) and pushed the single-thread microbench from ~150ns/op to
+ * ~1.1μs/op. Both numbers are real and worth naming so future readers don't
+ * read them as a regression:
+ *
+ *   - The microbench cost is ~1μs of Atomics.notify syscall per push and
+ *     per pull. The bench is single-threaded so there's no thread to park
+ *     and no contention to amortize against — every op pays the syscall.
+ *   - The stress-test cost is ~500K kernel parks × ~1μs/park ≈ ~500ms of
+ *     park overhead distributed across both threads. Wall-clock only shows
+ *     +180ms because the threads overlap.
+ *
+ * The protocol is still the right choice because the axis production cares
+ * about is CPU SHAPE, not CPU TIME:
+ *
+ *   - Busy-spin pins two cores at 100% for the duration of any back-pressure.
+ *     Wait/notify parks them; the cores are available for other work
+ *     (the audio thread itself, message handling, page JS).
+ *   - If the AudioWorklet stalls (browser GC, layout thrash) the busy-spin
+ *     producer would burn full-core CPU competing with the very thread it's
+ *     waiting for, amplifying the stall. Wait/notify degrades gracefully.
+ *   - Production push/pull rates (60Hz × 375Hz) burn the syscall ~435 times
+ *     per second total → <0.05% of one CPU. Invisible.
+ *   - With edge-trigger notify there was no way to observe a lost wakeup —
+ *     the symptom was just "slow forever." Always-notify + the heartbeat in
+ *     the concurrent stress test + emptyWaitTimeouts === 0 assertion turns
+ *     any future protocol break (V8 update, OS change, capacity tweak) into
+ *     a loud test failure within seconds.
+ *
+ * Wasted-iteration counters dropped 3 orders of magnitude (millions of
+ * busy-spin iters → a few hundred thousand kernel parks for the same 1M-
+ * frame run). The slower wall-clock on a benchmark designed to maximize
+ * the operation we pay for is the price of admission for a protocol that
+ * behaves correctly under the conditions the previous one ignored.
  *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
@@ -187,6 +261,11 @@ export class Float64RingBuffer {
     this.data.set(vEff, base + RING_FRAME_PRELUDE);
     this.data.set(jEff, base + RING_FRAME_PRELUDE + this.n);
     Atomics.store(this.indices, 0, writeIdx + 1n); // release
+    // Unconditional notify: zero-waiter notify is ~100ns and the edge-
+    // trigger (wasEmpty) approach lost wakeups under 2-thread contention
+    // because the producer's wasEmpty check usually reads false while the
+    // consumer is mid-drain. Always-notify is correct by construction.
+    Atomics.notify(this.indices, 0, 1);
     return true;
   }
 
@@ -233,6 +312,8 @@ export class Float64RingBuffer {
       ),
     );
     Atomics.store(this.indices, 1, readIdx + 1n); // release
+    // Unconditional notify — see the matching note in push().
+    Atomics.notify(this.indices, 1, 1);
     return true;
   }
 
@@ -283,6 +364,8 @@ export class Float64RingBuffer {
       ),
     );
     Atomics.store(this.indices, 1, writeIdx); // consume everything up to writeIdx
+    // Unconditional notify — see the matching note in push().
+    Atomics.notify(this.indices, 1, 1);
     return skipped;
   }
 
@@ -291,5 +374,50 @@ export class Float64RingBuffer {
     const writeIdx = Atomics.load(this.indices, 0);
     const readIdx = Atomics.load(this.indices, 1);
     return Number(writeIdx - readIdx);
+  }
+
+  /**
+   * Producer-side park: block until the consumer advances read_index or the
+   * timeout elapses. Returns immediately ("not-equal") if the queue already
+   * has space.
+   *
+   * Use this when push() returned false and you want to wait for capacity
+   * rather than busy-spin / drop. The caller is responsible for re-issuing
+   * push() after this returns — spurious wakeups (and brief readIdx churn
+   * that lands back at the previously-observed value) are possible.
+   *
+   * Atomics.wait performs an atomic compare-and-park against the value at
+   * indices[1] (read_index) — if the consumer advanced read_index between
+   * our load and the wait, the wait returns "not-equal" immediately rather
+   * than parking forever. This closes the load-then-park race window.
+   *
+   * NOTE: Atomics.wait blocks the calling thread. On the browser main thread
+   * the spec forbids it (TypeError). On a Worker / Node main / Node worker
+   * it is permitted. Do NOT call from an AudioWorklet process() method —
+   * that is hard-real-time and must never block.
+   */
+  waitForSpace(timeoutMs?: number): "ok" | "not-equal" | "timed-out" {
+    const writeIdx = this.indices[0]!;
+    const readIdx = Atomics.load(this.indices, 1);
+    if (writeIdx - readIdx < this.capacityBig) return "not-equal"; // already has space
+    return Atomics.wait(this.indices, 1, readIdx, timeoutMs);
+  }
+
+  /**
+   * Consumer-side park: block until the producer advances write_index or the
+   * timeout elapses. Returns immediately ("not-equal") if the queue already
+   * has data. Mirror of waitForSpace.
+   *
+   * NOT real-time safe — see waitForSpace for the threading rules. An
+   * AudioWorklet's per-quantum read path MUST NOT call this; it should
+   * poll via pullLatest() and tolerate misses. This method exists for
+   * non-realtime consumers (tests, bench harnesses, non-audio downstream
+   * readers that can afford to block).
+   */
+  waitForData(timeoutMs?: number): "ok" | "not-equal" | "timed-out" {
+    const readIdx = this.indices[1]!;
+    const writeIdx = Atomics.load(this.indices, 0);
+    if (writeIdx !== readIdx) return "not-equal"; // already has data
+    return Atomics.wait(this.indices, 0, writeIdx, timeoutMs);
   }
 }

@@ -179,6 +179,14 @@ Consumer side. Drains to the newest available frame, discarding older ones. Retu
 
 Returns the number of frames currently buffered.
 
+#### `waitForSpace(timeoutMs?) → "ok" | "not-equal" | "timed-out"`
+
+Producer-side park. Block until the consumer advances `read_index` or the timeout elapses. Returns immediately (`"not-equal"`) if the ring already has space. Use when `push()` returned `false` and you want to wait for capacity rather than busy-spin or drop. **Not real-time safe** — blocks the calling thread. Permitted on Workers / Node threads; the browser main thread forbids it (`TypeError`). See [Back-pressure](#back-pressure).
+
+#### `waitForData(timeoutMs?) → "ok" | "not-equal" | "timed-out"`
+
+Consumer-side park. Mirror of `waitForSpace`. Block until the producer advances `write_index` or the timeout elapses. Returns immediately (`"not-equal"`) if data is already available. **Not real-time safe** — must NOT be called from `AudioWorklet.process()`. AudioWorklets should continue to poll via `pullLatest()` and tolerate misses. This method exists for non-realtime consumers (tests, bench harnesses, non-audio downstream readers).
+
 ### Frame layout
 
 Each ring slot holds `4 + 2*n` Float64 values:
@@ -213,15 +221,39 @@ Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 1
 
 | Operation | Median | p99 | Mean |
 |---|---|---|---|
-| `push` | 1.00 μs | 1.40 μs | 1.15 μs |
-| `pull` | 1.00 μs | 1.40 μs | 1.13 μs |
-| `pullLatest` | 1.10 μs | 2.10 μs | 1.22 μs |
+| `push` | 1.10 μs | 1.40 μs | 1.15 μs |
+| `pull` | 1.10 μs | 1.90 μs | 1.42 μs |
+| `pullLatest` | 1.10 μs | 8.10 μs | 2.40 μs |
 
-(Pull cost dropped ~10% in 0.1.1 vs 0.1.0 with the torn-check removed — see CHANGELOG.) Outliers above the p99 (max values not shown above can reach hundreds of microseconds or low milliseconds) are dominated by V8 GC pauses, not ring-buffer pathology — medians and p99s are the load-bearing numbers.
+Outliers above the p99 (max values not shown above can reach hundreds of microseconds or low milliseconds) are dominated by V8 GC pauses, not ring-buffer pathology — medians and p99s are the load-bearing numbers.
 
-At a control-rate 60 Hz cadence, the ring consumes ~0.006% of one core (≈60 μs of CPU per wall-clock second on the producer side). The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices for lower push/pull overhead (closer to ringbuf.js's reported numbers, though direct comparison isn't apples-to-apples — ringbuf.js measures `Float32` audio-sample-shaped payloads, this library measures `Float64` × 1000-element control-rate frames) at the cost of a phase-bit complication and bounded session length.
+**0.2.0 added an unconditional `Atomics.notify` to every `push` / `pull` / `pullLatest`** (see [Back-pressure](#back-pressure) below). On Windows + V8 that's ~1 μs / call even when nobody is parked, so the floor moved from ~150–200 ns / op (0.1.x) to ~1.1 μs / op. The cost is the price of correct back-pressure under genuine 2-thread contention — see the "Wall-clock vs CPU-shape tradeoff" section in `src/Float64RingBuffer.ts` for the full rationale. In production it's invisible (435 syscalls/sec for ~0.05 % CPU); on a synthetic 1M-frame stress test it's a ~1.6× wall-clock slowdown, but the same run drops wasted busy-spin iterations by 3 orders of magnitude, which is the axis that actually matters.
 
-Run `npm run bench` to measure on your hardware.
+A future variant could drop to `Int32` wrapping indices for lower push/pull overhead (closer to ringbuf.js's reported numbers, though direct comparison isn't apples-to-apples — ringbuf.js measures `Float32` audio-sample-shaped payloads, this library measures `Float64` × 1000-element control-rate frames) at the cost of a phase-bit complication and bounded session length.
+
+Run `npm run bench` to measure on your hardware. Run `npm run test:concurrent` to validate the protocol across `worker_threads` against a deterministic 1M-frame bit-exact recipe.
+
+## Back-pressure
+
+The ring's `push()` returns `false` when full and `pull()` / `pullLatest()` return `false` / `-1` when empty. For the control-rate / audio-rate pattern this library is shaped for (slow GPU producer, fast audio consumer, ring almost always near-empty) you can ignore back-pressure entirely — the AudioWorklet polls `pullLatest()` per quantum and tolerates the rare miss via whatever smoothing it already does.
+
+If you're using the ring outside that canonical shape — slower consumer, deliberately small capacity for tight latency, or any case where the producer can genuinely outrun the consumer — `waitForSpace()` / `waitForData()` let you park in the kernel instead of busy-spinning:
+
+```ts
+// Producer side, NOT in real-time path:
+while (!ring.push(vEff, jEff, header)) {
+  // Park until the consumer drains at least one slot, with a 1s budget.
+  const status = ring.waitForSpace(1_000);
+  if (status === "timed-out") {
+    // Consumer hasn't drained anything in a full second — log, drop, or
+    // re-check whatever liveness signal makes sense for your app.
+  }
+}
+```
+
+**Do NOT call `waitForData()` from `AudioWorklet.process()`** — that method is hard-real-time and must never block. AudioWorklets should keep polling via `pullLatest()` and rely on the consumer-side smoothing they already have. `waitForSpace` / `waitForData` are for Workers, the main thread, Node tests, and any non-realtime downstream reader that can afford to block.
+
+Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic, so the load-then-park race is closed: if the peer advances its index between your load and your wait, the wait returns `"not-equal"` immediately rather than parking forever. The matching `Atomics.notify` is **unconditional** on every `push` / `pull` / `pullLatest` — a parked peer is guaranteed to be woken on the next state change. This is deliberately not edge-triggered; an earlier iteration tried "notify only on empty→non-empty / full→non-full" and lost wake-ups under genuine 2-thread contention. See the "Park / wake protocol" section in `src/Float64RingBuffer.ts` for the full story.
 
 ## Memory ordering (for serious readers)
 
@@ -233,6 +265,7 @@ The ring uses the standard release/acquire pattern for SPSC over SAB. A note for
 3. If `write_index − read_index ≥ capacity` → ring full, return false.
 4. Write payload (non-atomic stores into the slot).
 5. `Atomics.store(write_index, write_index + 1n)` — release. This barrier publishes the payload writes to any thread that subsequently acquires `write_index`.
+6. `Atomics.notify(write_index, 1)` — wake any consumer parked on `waitForData`. Unconditional; see [back-pressure](#back-pressure).
 
 **Consumer `pull`:**
 1. Plain-read own `read_index` (single-consumer guarantee).
@@ -240,6 +273,7 @@ The ring uses the standard release/acquire pattern for SPSC over SAB. A note for
 3. If equal → empty, return false.
 4. Read payload (non-atomic loads from the slot).
 5. `Atomics.store(read_index, read_index + 1n)` — release.
+6. `Atomics.notify(read_index, 1)` — wake any producer parked on `waitForSpace`. Unconditional.
 
 No torn-frame re-check is needed. The producer cannot be writing the slot the consumer is reading: `push()` refuses when `write_index − read_index ≥ capacity`, so the producer's `write_index` cannot advance past `read_index + capacity`, and the two slot offsets `(write_index & mask)` and `(read_index & mask)` cannot collide while there is an unread frame. The release-store on `write_index` establishes happens-before for the payload writes; the consumer's acquire-load observes them. That is the full synchronization the protocol needs. (Earlier versions performed a `Atomics.load(write_index)` re-check after the copy; under this push contract it was always dead code — see CHANGELOG 0.1.1.)
 
@@ -253,7 +287,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - The first published library, to our knowledge, that names and packages this bridge.
 - A correct implementation with two test layers:
   - **Single-threaded API contract** (11 pins, including a 10k mulberry32-seeded fuzz against an in-process oracle queue) — `npm run test:unit`.
-  - **Cross-thread SPSC memory-ordering stress** — `npm run test:concurrent`. Spawns a Node `worker_threads` producer against a main-thread consumer over one `SharedArrayBuffer` and pins 1,000,000 frames with bit-exact `===` assertions on every header field and every payload `f64`. **The load-bearing fact is the contention pattern, not throughput**: a typical run reports millions of empty polls (consumer waiting on producer) plus millions of producer-full spins (producer waiting on consumer) — both sides spend more time waiting on the other than running, so the threads genuinely interleave and the release-store / acquire-load protocol is actually exercised rather than accidentally serialized. A test where one side ran to completion before the other started would validate the same payload but prove little about cross-thread memory ordering. (Wall clock is ~300 ms on a dev laptop; that just means CI stays snappy.)
+  - **Cross-thread SPSC memory-ordering stress** — `npm run test:concurrent`. Spawns a Node `worker_threads` producer against a main-thread consumer over one `SharedArrayBuffer` and pins 1,000,000 frames with bit-exact `===` assertions on every header field and every payload `f64`. **The load-bearing fact is the contention pattern, not throughput**: under the 0.2.0 always-notify protocol both sides park in the kernel when blocked, so the contention shows up as hundreds of thousands of `fullWaits` (producer parked) plus thousands of `emptyWaits` (consumer parked) — same proof as before, three orders of magnitude less wasted CPU. The test also asserts `fullWaitTimeouts === 0` and `emptyWaitTimeouts === 0` — any future regression that re-introduces the lost-wakeup hole flips these red within seconds. (Wall clock ~660 ms on a dev laptop.)
   - `npm test` runs both. CI runs both on Ubuntu/macOS/Windows × Node 20/22.
 - A microbench (`npm run bench`).
 

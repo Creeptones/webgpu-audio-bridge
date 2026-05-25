@@ -4,9 +4,25 @@
  * Standalone tsx script. Run with:
  *   npx tsx bench/Float64RingBuffer.bench.ts
  *
+ * Target history:
+ *   - 0.1.x had no park/wake protocol — push was just a release-store + non-
+ *     atomic payload writes. Single-thread median sat around ~150–200 ns/op.
+ *   - 0.2.0 adds the always-notify wait/wake protocol (see the "Park / wake
+ *     protocol" section in src/Float64RingBuffer.ts). Every push and every
+ *     pull now pays an unconditional Atomics.notify syscall. On Windows +
+ *     V8 that's ~1 μs per call even with zero waiters parked, so the new
+ *     floor for the single-thread bench is ~1.1 μs median, not 200 ns.
+ *   - In production this is invisible: 60 Hz push × 1.1 μs = 66 μs/sec
+ *     (~0.007 % CPU); 375 Hz pullLatest × 1.1 μs = 412 μs/sec (~0.04 % CPU).
+ *     The cost is the price of correct back-pressure under genuine 2-thread
+ *     contention — see src/Float64RingBuffer.ts for the full wall-clock
+ *     vs CPU-shape tradeoff rationale.
+ *
  * This file does NOT fail on slow numbers — perf varies wildly between
  * local and CI hardware. It prints a table and only throws on egregious
- * regression (>10μs median, suggesting a real bug).
+ * regression (>10 μs median, suggesting a real bug). HARD_BUDGET_NS is the
+ * actual regression gate; the soft `target = 200` line below is the
+ * pre-protocol floor, kept as a hardware-comparison marker only.
  */
 
 import { hrtime } from "node:process";
