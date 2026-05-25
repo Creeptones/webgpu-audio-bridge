@@ -29,7 +29,7 @@
 
 ## The problem this solves
 
-You want to use WebGPU compute for heavy audio-adjacent work in the browser — physics simulation, neural model inference, dynamic IR computation, spatial audio scene updates — and you want the audio to come out of an `AudioWorklet` deterministically. The obvious pattern (GPU compute → `mapAsync` → AudioWorklet) doesn't work: `mapAsync` readback latency is **5–15 ms** on real hardware ([Chromium 41487454](https://issues.chromium.org/issues/41487454)), which is 2–6 audio render quanta. Your audio thread can't wait for that, and you can't `await` inside `AudioWorkletProcessor.process()`.
+You want to use WebGPU compute for heavy audio-adjacent work in the browser — physics simulation, neural model inference, dynamic IR computation, spatial audio scene updates — and you want the audio to come out of an `AudioWorklet` deterministically. The obvious pattern (GPU compute → `mapAsync` → AudioWorklet) doesn't work: `mapAsync` readback latency is **5–15 ms** on real hardware ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)), which is 2–6 audio render quanta. Your audio thread can't wait for that, and you can't `await` inside `AudioWorkletProcessor.process()`.
 
 The solution is to **stop trying to run audio rate on the GPU**. Instead:
 
@@ -212,7 +212,7 @@ Run `npm run bench` to measure on your hardware.
 
 ## Memory ordering (for serious readers)
 
-The ring uses the standard release/acquire pattern for SPSC over SAB:
+The ring uses the standard release/acquire pattern for SPSC over SAB. A note for systems readers: ECMA-262 only defines sequentially-consistent atomics — there is no `memory_order_acquire` in JS. `Atomics.load` and `Atomics.store` are seq-cst, which is strictly stronger than release/acquire, so the protocol below is sound; we describe it in R/A terms because that's the load-bearing structure.
 
 **Producer `push`:**
 1. Plain-read own `write_index` (single-producer guarantee).
