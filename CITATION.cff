@@ -5,8 +5,8 @@ type: software
 authors:
   - name: "Creeptone"
   - name: "Ephemera contributors"
-repository-code: "https://github.com/Creeptone/webgpu-audio-bridge"
-url: "https://github.com/Creeptone/webgpu-audio-bridge"
+repository-code: "https://github.com/Creeptones/webgpu-audio-bridge"
+url: "https://github.com/Creeptones/webgpu-audio-bridge"
 version: "0.1.0"
 date-released: "2026-05-25"
 license: MIT

@@ -43,11 +43,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Creeptone/webgpu-audio-bridge.git"
+    "url": "git+https://github.com/Creeptones/webgpu-audio-bridge.git"
   },
-  "homepage": "https://github.com/Creeptone/webgpu-audio-bridge#readme",
+  "homepage": "https://github.com/Creeptones/webgpu-audio-bridge#readme",
   "bugs": {
-    "url": "https://github.com/Creeptone/webgpu-audio-bridge/issues"
+    "url": "https://github.com/Creeptones/webgpu-audio-bridge/issues"
   },
   "engines": {
     "node": ">=18"
