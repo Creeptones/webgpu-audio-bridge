@@ -30,8 +30,20 @@
  * If the release/acquire protocol on either side were broken — e.g. the
  * producer's release-store on `write_index` was downgraded to a plain store,
  * or the consumer's acquire-load was elided — the inner payload reads would
- * observe stale or torn data and the bit-exact pin would fail. With 1M frames
- * over the wire that's a meaningful concurrency soak.
+ * observe stale or torn data and the bit-exact pin would fail.
+ *
+ * The load-bearing fact is the contention pattern, NOT the wall-clock or the
+ * frame count by themselves. With CAPACITY=16 and TOTAL_FRAMES=1,000,000 the
+ * producer fills the ring in microseconds and then has to wait for the
+ * consumer (full spins); the consumer drains in microseconds and then has to
+ * wait for the producer (empty polls). Each run's `ok()` line reports both
+ * counts, and they're typically millions each — meaning the threads spend
+ * more time waiting on each other than running, so the release-store /
+ * acquire-load protocol is genuinely interleaved rather than accidentally
+ * serialized. A test where one side ran to completion before the other
+ * started would validate the same payload but exercise no real cross-thread
+ * ordering. That's why the contention numbers in the `ok()` output, not the
+ * wall-clock, are the evidence this test was meaningful.
  *
  * ─── Why the producer source is inlined (eval: true) ──────────────────────
  *

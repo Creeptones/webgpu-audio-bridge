@@ -253,7 +253,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - The first published library, to our knowledge, that names and packages this bridge.
 - A correct implementation with two test layers:
   - **Single-threaded API contract** (11 pins, including a 10k mulberry32-seeded fuzz against an in-process oracle queue) — `npm run test:unit`.
-  - **Cross-thread SPSC memory-ordering stress** (1,000,000 frames over Node `worker_threads`, bit-exact `===` assertions on every header field and every payload `f64`, ~300 ms on a dev laptop) — `npm run test:concurrent`.
+  - **Cross-thread SPSC memory-ordering stress** — `npm run test:concurrent`. Spawns a Node `worker_threads` producer against a main-thread consumer over one `SharedArrayBuffer` and pins 1,000,000 frames with bit-exact `===` assertions on every header field and every payload `f64`. **The load-bearing fact is the contention pattern, not throughput**: a typical run reports millions of empty polls (consumer waiting on producer) plus millions of producer-full spins (producer waiting on consumer) — both sides spend more time waiting on the other than running, so the threads genuinely interleave and the release-store / acquire-load protocol is actually exercised rather than accidentally serialized. A test where one side ran to completion before the other started would validate the same payload but prove little about cross-thread memory ordering. (Wall clock is ~300 ms on a dev laptop; that just means CI stays snappy.)
   - `npm test` runs both. CI runs both on Ubuntu/macOS/Windows × Node 20/22.
 - A microbench (`npm run bench`).
 
