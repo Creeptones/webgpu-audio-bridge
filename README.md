@@ -206,7 +206,7 @@ Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 1
 | `pull` | 1.10 μs | 2.20 μs | 1.55 μs |
 | `pullLatest` | 1.10 μs | 11.00 μs | 2.47 μs |
 
-At a control-rate 60 Hz cadence with this overhead, the ring consumes ~0.000006% CPU. The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices and reach Adenot's original ~200 ns push/pull at the cost of a phase-bit complication and bounded session length.
+At a control-rate 60 Hz cadence, the ring consumes ~0.006% of one core (≈60 μs of CPU per wall-clock second on the producer side). The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices and reach Adenot's original ~200 ns push/pull at the cost of a phase-bit complication and bounded session length.
 
 Run `npm run bench` to measure on your hardware.
 
