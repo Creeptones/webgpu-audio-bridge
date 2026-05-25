@@ -4,7 +4,7 @@
 [![DOI](https://zenodo.org/badge/1249253281.svg)](https://doi.org/10.5281/zenodo.20380886)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-> Lock-free SPSC SharedArrayBuffer ring for streaming WebGPU compute output into AudioWorklets — the control-rate-GPU / audio-rate-CPU pattern.
+> Schema-driven lock-free SPSC SharedArrayBuffer ring for streaming structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet — the control-rate / audio-rate bridge pattern.
 
 ```
                 ┌──────────────────────────┐
@@ -15,8 +15,8 @@
                              │
                              ▼ Atomics-released SAB frames
                   ┌──────────────────────┐
-                  │  Float64RingBuffer   │ ◄── this library
-                  │  SPSC, f64, framed   │
+                  │  Bridge<Schema>      │ ◄── this library
+                  │  SPSC, typed frames  │
                   └──────────┬───────────┘
                              │
                              ▼ pullLatest() per audio quantum
@@ -46,93 +46,126 @@ The architectural framing this library encodes:
 | Layer | Rate | Where | Job |
 |---|---|---|---|
 | **Macro-surface** | Control rate (60 Hz typical) | GPU compute in a DedicatedWorker | Heavy, slowly-varying state (large simulations, neural inference, IR computation) |
-| **Bridge** | Async, single-frame latency | `Float64RingBuffer` over SAB | Cross-thread transfer without postMessage, without locks |
+| **Bridge** | Async, single-frame latency | `Bridge<Schema>` over SAB | Cross-thread transfer without postMessage, without locks; schema describes the frame |
 | **Micro-string** | Audio rate (48 kHz / 128-sample quanta) | AudioWorklet on CPU | Deterministic synthesis using the latest macro frame as input |
 
-The pattern is *named* here because, to our knowledge, it has not been named or documented in the web-audio literature before. Variants exist informally in native audio engines (control-rate vs audio-rate modulation in CSound, Reaktor, modular synthesizers) and in robotics telemetry. This library adapts the idea for the browser, where the `mapAsync` latency wall is what forces the split.
+The pattern is *named* here to make it citable for the web-audio case; it is not new in the broader DSP world. Informal variants are long-established: control-rate vs audio-rate modulation in CSound and Reaktor, the `k-rate` / `a-rate` distinction in modular synthesizers, and the high-rate-state / low-rate-command split in robotics telemetry. Public WebGPU-audio experiments — `blechdom/webgpuaudio`'s WebGPU/AudioWorklet passthrough demos, the WebGPU-PCM-in-compute-shader gist, and `NeoVand/games-of-life`'s GPU-spectrum → AudioWorklet path — already explore adjacent shapes. What this library contributes is a small, tested, packaged reference primitive for the bridge specifically, where the `mapAsync` latency wall is what forces the split.
+
+## See it running
+
+A working end-to-end demo lives at [`examples/minimal/`](./examples/minimal/) — `DedicatedWorker` running a WebGPU compute pass at ~60Hz (with CPU fallback), `AudioWorklet` consuming via `pullLatest()`, slider driving a GPU uniform that audibly shifts the chord. From the repo root:
+
+```bash
+npm install
+npm run build
+npm run dev:demo          # http://localhost:5173
+```
+
+For end-to-end latency measurements (push → audio-thread consume, percentiles under load), see [`bench/e2e-latency/`](./bench/e2e-latency/) — `npm run bench:e2e`.
+
+For headless browser smoke tests against the demo, `npm run test:browser` (Playwright; Chromium only for now).
 
 ## Quick start
 
-This library is a single-file reference primitive (~300 lines of TypeScript, no runtime dependencies). Not on the npm registry — **vendor it** directly into your project:
+This library has no runtime dependencies. Not on the npm registry — **vendor it** directly into your project:
 
 ```bash
-# Option A: copy the file (recommended for tiny self-contained use)
-curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts
-# place under src/lib/ in your project and import locally
-
-# Option B: clone, build, and link
-git clone --branch v0.1.1 --depth 1 https://github.com/Creeptones/webgpu-audio-bridge.git
+# Clone, build, and link from this repo.
+git clone --branch v0.3.0 --depth 1 https://github.com/Creeptones/webgpu-audio-bridge.git
 cd webgpu-audio-bridge && npm install && npm run build && npm link
 # then in your project: npm link webgpu-audio-bridge
 ```
 
-The Zenodo-archived [v0.1.1 tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact.
+If you specifically want a single-file copy and can live with the v0.1.x API, the legacy `Float64RingBuffer` is still vendorable as one self-contained file:
+
+```bash
+curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts
+```
+
+The Zenodo-archived [v0.1.1 tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact for that frozen single-file form. New code should prefer the `Bridge<Schema>` API below.
+
+### Define a schema
+
+A schema describes the byte layout of a single frame. Fields are typed (`f64`/`f32`/`u64`/`i64`/`u32`/`i32`/`u16`/`i16`/`u8`/`i8`) as scalars or fixed-length arrays. The library ships `physicsControlFrameSchema(n)` as a ready-made example matching the historical V/J shape:
+
+```ts
+import { defineSchema, u64, f64, f64Array } from "webgpu-audio-bridge";
+
+const MyControlFrame = defineSchema({
+  seq:      u64(),               // bigint
+  tMacroNs: u64(),               // bigint
+  vMax:     f64(),               // number
+  jMax:     f64(),               // number
+  vEff:     f64Array(1000),      // Float64Array(1000)
+  jEff:     f64Array(1000),      // Float64Array(1000)
+});
+```
+
+Field-name autocomplete and per-field type inference work in TypeScript via `FrameFor<typeof MyControlFrame>` — no `as const` or other gymnastics required.
 
 ### Producer (DedicatedWorker, GPU side)
 
 ```ts
-import { Float64RingBuffer, type RingFrameHeader } from "webgpu-audio-bridge";
+import { Bridge } from "webgpu-audio-bridge";
 
 // Allocate once; receive the SAB from your manager.
-const { sab, capacity, n } = Float64RingBuffer.allocate(/* capacity */ 16, /* n */ 1000);
-const ring = new Float64RingBuffer(sab, capacity, n);
+const { sab, capacity } = Bridge.allocate(/* capacity */ 16, MyControlFrame);
+const ring = new Bridge(sab, capacity, MyControlFrame);
 
-// Hand `sab` to your AudioWorklet via the main thread.
+// Hand `sab` to your AudioWorklet via the main thread. (And hand
+// `ring.describeLayout()` to the worklet too — see consumer below.)
+
+// Allocate a reusable scratch frame once; mutate in place each tick.
+const frame = ring.scratchFrame();
 
 // Per macro-frame (e.g. driven by setTimeout self-reschedule at 60Hz):
-const vEff = new Float64Array(n); // your control-rate output, e.g. column projection
-const jEff = new Float64Array(n);
-const header: RingFrameHeader = {
-  seq: frameCounter++,
-  tMacroNs: Math.floor(performance.now() * 1e6),
-  vMax: maxAbs(vEff),
-  jMax: maxAbs(jEff),
-};
+frame.seq      = nextSeqBigInt++;
+frame.tMacroNs = BigInt(Math.floor(performance.now() * 1e6));
+frame.vMax     = maxAbs(frame.vEff);
+frame.jMax     = maxAbs(frame.jEff);
+// (fill frame.vEff / frame.jEff in place from your compute output)
 
-const ok = ring.push(vEff, jEff, header);
+const ok = ring.push(frame);
 if (!ok) {
   // Ring full — consumer has fallen ~266ms behind at capacity=16, 60Hz.
   // Caller decides: drop frame, or pop oldest and re-push.
 }
 ```
 
+For a zero-copy producer path (write payload bytes directly into the slot, no intermediate scratch frame), see `ring.beginPush()` / `commitPush()` in the API reference below.
+
 ### Consumer (AudioWorklet, audio side)
 
+The recommended pattern: pass `bridge.describeLayout()` (a JSON-safe byte-offset table) through `processorOptions` so the worklet can read frames without importing the library on the audio thread.
+
 ```ts
-import { Float64RingBuffer, type RingFrameHeader } from "webgpu-audio-bridge";
+import { Bridge } from "webgpu-audio-bridge";
 
 class MyProcessor extends AudioWorkletProcessor {
-  private ring: Float64RingBuffer | null = null;
-  private readonly vEff = new Float64Array(1000);
-  private readonly jEff = new Float64Array(1000);
-  private readonly header: RingFrameHeader = { seq: 0, tMacroNs: 0, vMax: 0, jMax: 0 };
-  private misses = 0;
+  private ring: Bridge<typeof MyControlFrame> | null = null;
+  private frame = MyControlFrame ? null : null; // see below — typed by schema
 
   constructor(options: AudioWorkletNodeOptions) {
     super();
-    this.port.onmessage = (e) => {
-      if (e.data.type === "setMacroSurfaceSAB") {
-        this.ring = new Float64RingBuffer(e.data.sab, e.data.capacity, e.data.n);
-      }
-    };
+    const { sab, capacity } = options.processorOptions as { sab: SharedArrayBuffer; capacity: number };
+    this.ring = new Bridge(sab, capacity, MyControlFrame);
+    this.frame = this.ring.scratchFrame();
   }
 
   process(_inputs: Float32Array[][], outputs: Float32Array[][]) {
-    if (this.ring) {
-      const skipped = this.ring.pullLatest(this.vEff, this.jEff, this.header);
+    if (this.ring && this.frame) {
+      const skipped = this.ring.pullLatest(this.frame);
       if (skipped >= 0) {
-        // Got a fresh frame. `skipped` tells you how many older frames you discarded.
-        this.misses = 0;
-      } else {
-        // Empty (no fresh frame yet). Hold last value for ~12 misses (~32ms), then drift to zero.
-        this.misses++;
+        // this.frame.seq, this.frame.vEff, etc. now hold the freshest macro state.
       }
     }
-    // ... synthesize audio using this.vEff / this.jEff ...
+    // ... synthesize audio using this.frame.vEff / this.frame.jEff ...
     return true;
   }
 }
 ```
+
+If you'd rather keep the audio thread free of the library import — the recommended pattern for production worklets — see [`examples/minimal/worklet.js`](./examples/minimal/worklet.js): the main thread sends `bridge.describeLayout()` via `processorOptions.layout`, and the worklet reconstructs typed-array views from byte offsets inline (~30 lines, zero imports).
 
 ### Setting up SAB (cross-origin isolation required)
 
@@ -147,60 +180,112 @@ Check `crossOriginIsolated === true` at runtime before using this library.
 
 ## API reference
 
-### `Float64RingBuffer`
+### `Bridge<Schema>`
 
-#### `static allocate(capacity, n) → { sab, capacity, n }`
+#### `static allocate(capacity, schema) → { sab, capacity, schema }`
 
-Allocate a `SharedArrayBuffer` sized for a ring with the given `capacity` slots and frame size `n` (length of `vEff` / `jEff` arrays per frame). `capacity` must be a power of two.
+Allocate a `SharedArrayBuffer` sized for a ring with the given `capacity` slots and the schema's `frameByteSize`. `capacity` must be a power of two.
 
-#### `static byteLength(capacity, n) → number`
+#### `static byteLength(capacity, schema) → number`
 
 Compute the SAB byte size without allocating.
 
-#### `constructor(sab, capacity, n)`
+#### `constructor(sab, capacity, schema)`
 
-Construct a view over an existing SAB. Producer and consumer each construct their own instance over the *same* SAB. Capacity and `n` must match what was allocated.
+Construct a view over an existing SAB. Producer and consumer each construct their own instance over the *same* SAB with the *same* schema.
 
-#### `push(vEff, jEff, header) → boolean`
+#### `scratchFrame() → FrameFor<Schema>`
 
-Producer side. Writes the frame and advances `write_index`. Returns `false` if the ring is full. `vEff.length` and `jEff.length` must equal `n`.
+Allocate a reusable frame view. Array fields are pre-allocated heap typed arrays of the right kind and length; scalar fields are initialized to `0` / `0n`. Use this once outside hot loops and reuse the returned object on every push/pull call — zero GC pressure in steady state.
 
-#### `pull(outV, outJ, outHeader) → boolean`
+#### `push(frame) → boolean`
 
-Consumer side. Reads the oldest frame in FIFO order. Returns `false` on empty. On `false`, `read_index` is *not* advanced — caller can retry next quantum.
+Producer side. Writes `frame`'s fields into the next free slot and advances `write_index`. Returns `false` if the ring is full.
 
-#### `pullLatest(outV, outJ, outHeader) → number`
+#### `beginPush() → FrameFor<Schema> | null`, `commitPush()`, `abortPush()`
 
-Consumer side. Drains to the newest available frame, discarding older ones. Returns the count of skipped frames, or `-1` if the ring was empty.
+Two-step zero-copy producer path. `beginPush()` returns a frame view whose array fields point directly at the next free slot — mutate the typed-array fields in place via `.set(...)` and assign scalar fields normally, then `commitPush()` publishes (advances `write_index` + notifies). Use when the producer wants to compute payload values directly into the slot to skip the one `.set()` copy that `push(frame)` would do. Only one begin/commit pair can be in flight per Bridge instance; call `abortPush()` to discard without publishing.
+
+#### `pull(out) → boolean`
+
+Consumer side. Reads the oldest frame in FIFO order into `out`. Returns `false` on empty.
+
+#### `pullLatest(out) → number`
+
+Consumer side. Drains to the newest available frame into `out`, discarding older ones. Returns the count of skipped frames, or `-1` if the ring was empty.
 
 **This is the typical AudioWorklet read path:** the worklet wants the freshest macro state per quantum, not a queue.
 
+#### `pushChecked(frame) → boolean`
+
+Same as `push` but validates `frame`'s scalar field types and typed-array lengths against the schema first. Use in tests / debug builds; the production hot path should call `push` and trust caller-side construction (typically via `scratchFrame()` reuse).
+
 #### `available() → number`
 
-Returns the number of frames currently buffered.
+Number of frames currently buffered.
 
 #### `waitForSpace(timeoutMs?) → "ok" | "not-equal" | "timed-out"`
 
-Producer-side park. Block until the consumer advances `read_index` or the timeout elapses. Returns immediately (`"not-equal"`) if the ring already has space. Use when `push()` returned `false` and you want to wait for capacity rather than busy-spin or drop. **Not real-time safe** — blocks the calling thread. Permitted on Workers / Node threads; the browser main thread forbids it (`TypeError`). See [Back-pressure](#back-pressure).
+Producer-side park. Block until the consumer advances `read_index` or the timeout elapses. Returns immediately (`"not-equal"`) if the ring already has space. **Not real-time safe** — blocks the calling thread. Permitted on Workers / Node threads; the browser main thread forbids it (`TypeError`). See [Back-pressure](#back-pressure).
 
 #### `waitForData(timeoutMs?) → "ok" | "not-equal" | "timed-out"`
 
-Consumer-side park. Mirror of `waitForSpace`. Block until the producer advances `write_index` or the timeout elapses. Returns immediately (`"not-equal"`) if data is already available. **Not real-time safe** — must NOT be called from `AudioWorklet.process()`. AudioWorklets should continue to poll via `pullLatest()` and tolerate misses. This method exists for non-realtime consumers (tests, bench harnesses, non-audio downstream readers).
+Consumer-side park. Mirror of `waitForSpace`. **Not real-time safe** — must NOT be called from `AudioWorklet.process()`. AudioWorklets should continue to poll via `pullLatest()` and tolerate misses.
 
-### Frame layout
+#### `describeLayout() → SchemaLayoutDescription`
 
-Each ring slot holds `4 + 2*n` Float64 values:
+Returns a JSON-safe byte-offset table for the schema's frame layout — pass this through `postMessage` / `processorOptions` to a worklet that wants to inline the read protocol without importing the library on the audio thread.
+
+### Canonical schemas
+
+The library ships ready-made schemas for the historical V/J control-rate physics shape:
+
+- **`physicsControlFrameSchema(n)`** — recommended for new code. `seq` and `tMacroNs` are `u64` (bigint) for proper 64-bit semantics — no `≤ 2^53` precision caveat. Bytes are NOT compatible with v0.1.x `Float64RingBuffer` (which stores those fields as `f64`-via-`Number`).
+- **`legacyPhysicsControlFrameSchema(n)`** — wire-compatible with v0.1.x `Float64RingBuffer` bytes. All fields stored as `f64`. Use this if you're porting line-by-line from `Float64RingBuffer`, want number-typed `seq`/`tMacroNs` reads, or need fractional sub-microsecond precision in `tMacroNs` (as the latency bench does).
+
+Both schemas describe the same six fields:
 
 ```
-[0]   seq         monotonic frame number (equals producer write_index at push time)
-[1]   tMacroNs    producer timestamp in nanoseconds (best-effort, ≤ 2^53)
-[2]   vMax        precomputed max(|V_eff|) — surfaces to HUD without scanning
-[3]   jMax        precomputed max(|J_eff|) — same
-[4..4+n)         V_eff[n]
-[4+n..4+2n)      J_eff[n]
+seq         monotonic frame counter
+tMacroNs    producer timestamp in nanoseconds
+vMax        precomputed max(|V_eff|) — surfaces to HUD without scanning
+jMax        precomputed max(|J_eff|)
+V_eff[n]    effective potential / parameter envelope
+J_eff[n]    effective driving / gain envelope
 ```
 
 The `vMax` / `jMax` lanes exist because consumers often want a scalar magnitude (for a HUD meter or audio-side gain compensation) without re-scanning the full payload. If you don't use them, set them to 0.
+
+### Schema DSL
+
+The full set of field constructors:
+
+| Scalar | TS type | Array | TS type |
+|---|---|---|---|
+| `u64()` / `i64()` | `bigint` | `u64Array(n)` / `i64Array(n)` | `BigUint64Array` / `BigInt64Array` |
+| `u32()` / `i32()` | `number` | `u32Array(n)` / `i32Array(n)` | `Uint32Array` / `Int32Array` |
+| `u16()` / `i16()` | `number` | `u16Array(n)` / `i16Array(n)` | `Uint16Array` / `Int16Array` |
+| `u8()`  / `i8()`  | `number` | `u8Array(n)`  / `i8Array(n)`  | `Uint8Array`  / `Int8Array`  |
+| `f64()` / `f32()` | `number` | `f64Array(n)` / `f32Array(n)` | `Float64Array` / `Float32Array` |
+
+`defineSchema({ ... })` validates field names (must be valid JS identifiers, no duplicates), groups fields internally by alignment class (8-aligned first, then 4, then 2, then 1; stable within class) so SAB-backed typed-array views land at legal byte offsets, and pads the frame size up to 8.
+
+### Legacy API — `Float64RingBuffer`
+
+> **Deprecated 0.3.0.** Use `Bridge` + `physicsControlFrameSchema(n)` for new code. The legacy class is preserved unchanged for v0.1.x byte-compat and will be removed no earlier than 2.0.
+
+The original hard-coded API survives unchanged:
+
+```ts
+import { Float64RingBuffer, type RingFrameHeader } from "webgpu-audio-bridge";
+
+const ring = new Float64RingBuffer(sab, /*capacity*/ 16, /*n*/ 1000);
+ring.push(vEff, jEff, { seq, tMacroNs, vMax, jMax });
+ring.pull(outV, outJ, outHeader);
+ring.pullLatest(outV, outJ, outHeader);
+```
+
+The wire bytes match the schema produced by `legacyPhysicsControlFrameSchema(n)`. If you need to migrate incrementally — keep your existing v0.1.x SAB layout, swap to `Bridge<Schema>` — start there.
 
 ## Use cases
 
@@ -216,6 +301,8 @@ The pattern this library implements unblocks browser projects that previously ha
 - **Educational physics demos with deterministic audio.** Wave equations, EM fields, quantum wells — anywhere the visualization is GPU-heavy and the sonification needs not to glitch.
 
 ## Performance
+
+**Caveat:** these are Node V8 microbench numbers measuring ring-primitive overhead only. End-to-end browser latency from push to audio-thread consume — the number that actually matters for an audio pipeline — is reported by the separate harness at [`bench/e2e-latency/`](./bench/e2e-latency/) (run with `npm run bench:e2e`). Trust the numbers below for "the ring itself is cheap" and the e2e harness for "the worklet won't glitch under load."
 
 Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 100,000 iterations:
 
@@ -284,7 +371,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 **This is:**
 
 - A small, tested, MIT-licensed reference primitive for the WebGPU → AudioWorklet streaming pattern.
-- The first published library, to our knowledge, that names and packages this bridge.
+- A focused, packaged reference implementation of the control-rate-GPU / audio-rate-CPU bridge. The broader idea is not new — informal variants exist in native audio engines (k-rate / a-rate, CSound, Reaktor) and in robotics telemetry, and public WebGPU-audio experiments already exist (see [Prior art](#prior-art)). This library's contribution is the small, tested, citable primitive itself.
 - A correct implementation with two test layers:
   - **Single-threaded API contract** (11 pins, including a 10k mulberry32-seeded fuzz against an in-process oracle queue) — `npm run test:unit`.
   - **Cross-thread SPSC memory-ordering stress** — `npm run test:concurrent`. Spawns a Node `worker_threads` producer against a main-thread consumer over one `SharedArrayBuffer` and pins 1,000,000 frames with bit-exact `===` assertions on every header field and every payload `f64`. **The load-bearing fact is the contention pattern, not throughput**: under the 0.2.0 always-notify protocol both sides park in the kernel when blocked, so the contention shows up as hundreds of thousands of `fullWaits` (producer parked) plus thousands of `emptyWaits` (consumer parked) — same proof as before, three orders of magnitude less wasted CPU. The test also asserts `fullWaitTimeouts === 0` and `emptyWaitTimeouts === 0` — any future regression that re-introduces the lost-wakeup hole flips these red within seconds. (Wall clock ~660 ms on a dev laptop.)
@@ -294,19 +381,29 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 **This is not:**
 
 - The first SPSC ring over SharedArrayBuffer. That is **[Paul Adenot's `ringbuf.js`](https://github.com/padenot/ringbuf.js/)** (2018), described in [*A wait-free SPSC ringbuffer for the Web*](https://blog.paul.cx/post/a-wait-free-spsc-ringbuffer-for-the-web/). `ringbuf.js` is the canonical primitive and the direct precedent for this library. If your use case is audio samples (Float32, FIFO, audio-bus shape), use `ringbuf.js`.
-- An optimal version. BigInt indices cost ~1 μs/push; `Int32` wrapping indices would be ~5× faster but require a phase bit. The frame layout is hard-coded for the (V_eff, J_eff) physics shape; a generic library would accept a schema.
+- An optimal version. BigInt indices cost ~1 μs/push; `Int32` wrapping indices would be ~5× faster but require a phase bit.
 - A multi-producer / multi-consumer variant. SPSC only.
 - A solution for audio-rate GPU compute. The whole point is that audio-rate-on-GPU does not work today; this library exists to make that not matter.
 
 ## Roadmap
 
-Likely future work, in rough priority order:
+### Shipped in 0.3.0
 
-1. **Generic frame schema** — accept a user-defined frame descriptor instead of the hard-coded (header, V_eff, J_eff) layout.
-2. **Int32 wrapping-index variant** for use cases that want Adenot-grade push/pull speed and can tolerate a bounded session length.
-3. **Zero-copy producer path** — let the GPU write directly into the SAB-backed buffer via `mappedAtCreation` semantics, avoiding the CPU memcpy.
-4. **f16 / quantized lanes** for bandwidth-sensitive control data.
-5. **Apple Silicon optimization** — the unified-memory `mapAsync` behavior may differ from Intel/NVIDIA and merits a measured platform-specific path.
+- ✅ **Schema-driven frames** — `Bridge<Schema>` + `defineSchema({ ... })` with mixed primitive types as scalars or fixed-length arrays. Replaces the hard-coded `(seq, tMacroNs, vMax, jMax) + V_eff + J_eff` layout that the v0.1.x / v0.2.x `Float64RingBuffer` baked into its method signatures. Old class kept around (deprecated) for byte-compat.
+
+### Remaining 1.0 work
+
+1. **Backpressure policies** — `policy: 'reject' | 'drop-oldest' | 'drop-newest' | 'block'` constructor option. Today only `reject` (the historical contract) is implemented; the other three are useful for telemetry-style and critical-data streams respectively.
+2. **Observability snapshot** — `ring.snapshot()` returning pushed/pulled/dropped counters, current/max depth, and last-wait durations. Lets consumers build DevTools panels, load shedding, and dashboards without instrumenting both ends by hand.
+
+These are sequenced after #3 because all three change the constructor / class surface and should land before 1.0 freezes the API.
+
+### Beyond 1.0
+
+- **Topology variants** — MPSC (multiple producers → one consumer) and SPMC (one producer → multiple consumers). SPSC stays the canonical case.
+- **Lane-width variants** — `f16` / quantized lanes for control buses where `f64` is overkill; ~4× bandwidth savings on mobile / Apple Silicon.
+- **`Int32` wrapping-index variant** for use cases that want Adenot-grade push/pull speed and can tolerate a bounded session length.
+- **Zero-copy producer path** — let the GPU write directly into the SAB-backed buffer via `mappedAtCreation` semantics, avoiding the CPU memcpy.
 
 Issues and contributions welcome.
 
@@ -326,12 +423,28 @@ If you use this library in academic work, please cite:
 
 A `CITATION.cff` file is included in the repository for automated citation tools.
 
+## Prior art
+
+This library is a packaged primitive for one specific shape of the WebGPU-audio problem; it stands on a body of public work that should be acknowledged directly.
+
+**SPSC ring over SharedArrayBuffer:**
+- **Paul Adenot** (Mozilla) — [`ringbuf.js`](https://github.com/padenot/ringbuf.js/) (2018) and the [foundational blog post](https://blog.paul.cx/post/a-wait-free-spsc-ringbuffer-for-the-web/). The underlying SPSC-over-SAB technique is his work; this library extends it for framed `Float64` control-state payloads.
+
+**Worker / SAB / AudioWorklet three-thread architecture:**
+- **Hongchan Choi** (Google) — [Audio Worklet design pattern](https://developer.chrome.com/blog/audio-worklet-design-pattern/), the canonical browser low-latency audio plumbing pattern.
+- **GoogleChromeLabs** — [web-audio-samples](https://googlechromelabs.github.io/web-audio-samples/audio-worklet/design-pattern/shared-buffer/), reference SAB / AudioWorklet integration.
+
+**Public WebGPU-audio integration experiments (closest adjacent work):**
+- **`blechdom/webgpuaudio`** / [WebGPUSound.com](https://webgpusound.com) — a collection of WebGPU-audio experiments including an "AudioWorklet WebWorker WebGPU Passthrough" demo. Demonstrates the WebGPU → AudioWorklet plumbing in working (if exploratory) form.
+- **Public WebGPU-PCM-in-compute-shader gists** (community demos, multiple authors) — generate audio samples directly in a compute shader, read back via `mapAsync`, play through `AudioBufferSourceNode`. Useful contrast: this is *audio-rate-on-GPU* via buffered readback, the failure mode that motivates our control-rate split.
+- **`NeoVand/games-of-life`** [`@games-of-life/audio`](https://github.com/NeoVand/games-of-life) — GPU-accelerated spectral synthesis with a "Spectrum Buffer" transferred to an `AudioWorklet`. Embeds the bridge inside a larger simulation engine rather than packaging it as a standalone primitive.
+
+**Standards and platform context:**
+- The **WebGPU working group** for the spec, and the Chromium / Firefox / WebKit teams for the implementations. GPUWeb meeting minutes from 2023–2024 record the audio-deadline preemption concern and the user demand for WebGPU-in-AudioWorklet that motivate this library's split.
+
 ## Acknowledgments
 
-- **Paul Adenot** (Mozilla) for [`ringbuf.js`](https://github.com/padenot/ringbuf.js/) and the [foundational blog post](https://blog.paul.cx/post/a-wait-free-spsc-ringbuffer-for-the-web/). The underlying SPSC-over-SAB technique is his work; this library extends it.
-- **Hongchan Choi** (Google) for the [Audio Worklet design pattern](https://developer.chrome.com/blog/audio-worklet-design-pattern/) — the canonical Worker / SAB / AudioWorklet three-thread architecture this builds on.
-- **GoogleChromeLabs** [web-audio-samples](https://googlechromelabs.github.io/web-audio-samples/audio-worklet/design-pattern/shared-buffer/) for the canonical SAB / AudioWorklet integration patterns.
-- The **WebGPU working group** for the spec, and the Chromium / Firefox / WebKit teams for the implementations.
+See [Prior art](#prior-art) above. Particular thanks to Paul Adenot, whose `ringbuf.js` is the direct precedent this library extends, and to Hongchan Choi, whose Audio Worklet design pattern is the three-thread architecture this fits into.
 
 ## License
 

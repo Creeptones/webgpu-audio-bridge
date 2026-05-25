@@ -10,3 +10,8 @@ coverage/
 .env
 .env.local
 *.tgz
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/

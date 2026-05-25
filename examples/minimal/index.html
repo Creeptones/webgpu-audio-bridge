@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — minimal demo</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 720px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      label { display: block; margin: 8px 0 6px; color: #9aa3ad; font-size: 12px; }
+      input[type=range] { width: 100%; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k { color: #9aa3ad; }
+      .status .v { color: #d4d7dc; }
+      .status .err { color: #ff7a7a; }
+      .status .ok { color: #6ee69b; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — minimal demo</h1>
+    <p>
+      A <code>DedicatedWorker</code> runs a GPU compute pass (or a CPU fallback when WebGPU
+      isn't available) at ~60Hz, publishes the result into a <code>SharedArrayBuffer</code>
+      via the bridge, and an <code>AudioWorklet</code> reads the freshest frame each
+      render quantum and synthesizes audio.
+    </p>
+    <p>
+      The whole point: nothing in <code>AudioWorkletProcessor.process()</code> blocks
+      or waits on the GPU.
+    </p>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+
+    <h2>Control</h2>
+    <label for="ctrl">Slider drives a uniform read by the worker. Slide it; the chord shifts.</label>
+    <input id="ctrl" type="range" min="0" max="1" step="0.001" value="0.3" />
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

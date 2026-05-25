@@ -1,7 +1,7 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.2.0",
-  "description": "Lock-free SPSC SharedArrayBuffer ring for streaming WebGPU compute output into AudioWorklets — the control-rate-GPU / audio-rate-CPU pattern.",
+  "version": "0.3.0",
+  "description": "Schema-driven lock-free SPSC SharedArrayBuffer ring for streaming structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet — the control-rate / audio-rate bridge pattern.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -21,10 +21,13 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
-    "test:unit": "tsx tests/Float64RingBuffer.test.ts",
-    "test:concurrent": "tsx tests/Float64RingBuffer.concurrent.test.ts",
-    "bench": "tsx bench/Float64RingBuffer.bench.ts",
+    "test": "tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
+    "test:unit": "tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/Float64RingBuffer.test.ts",
+    "test:concurrent": "tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
+    "test:browser": "playwright test --config tests/browser/playwright.config.ts",
+    "bench": "tsx bench/Bridge.bench.ts && tsx bench/Float64RingBuffer.bench.ts",
+    "bench:e2e": "node bench/e2e-latency/serve.mjs",
+    "dev:demo": "node examples/minimal/serve.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
@@ -55,6 +58,7 @@
     "node": ">=18"
   },
   "devDependencies": {
+    "@playwright/test": "^1.48.0",
     "@types/node": "^20.19.41",
     "tsx": "^4.0.0",
     "typescript": "^5.3.0"

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>webgpu-audio-bridge — e2e latency bench</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.4; max-width: 900px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 12px; margin: 20px 0 6px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 8px 14px; font: inherit; font-size: 12px; border-radius: 4px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      pre { background: #15171c; border: 1px solid #21252d; border-radius: 4px; padding: 12px 14px; font-size: 11px; margin: 0; overflow-x: auto; }
+      .controls { margin-bottom: 12px; }
+      .controls label { font-size: 12px; color: #9aa3ad; margin-right: 14px; }
+      .controls input { background: #15171c; color: #d4d7dc; border: 1px solid #21252d; padding: 4px 8px; font: inherit; font-size: 12px; width: 80px; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — end-to-end latency bench</h1>
+    <p>
+      Measures the time between the producer's <code>performance.now()</code> at <code>push</code>
+      and the audio thread's <code>currentTime</code> when the frame is consumed by
+      <code>pullLatest()</code>. Reports median / p50 / p95 / p99 / max over a sliding
+      window.
+    </p>
+    <p>
+      The headline number for a real audio pipeline is <strong>p99 under load</strong> —
+      that's what controls glitching. Idle numbers are reassuring but unrepresentative.
+    </p>
+
+    <div class="controls">
+      <label>backend
+        <select id="backend">
+          <option value="auto">auto (GPU if available)</option>
+          <option value="cpu">CPU stub only</option>
+        </select>
+      </label>
+      <label>n
+        <input id="n" type="number" value="1000" min="1" max="4096" step="1" />
+      </label>
+      <label>capacity
+        <select id="capacity">
+          <option>4</option><option selected>16</option><option>64</option><option>256</option>
+        </select>
+      </label>
+      <label>load
+        <select id="load">
+          <option value="idle">idle</option>
+          <option value="gpu">extra GPU work (~10 ms/tick)</option>
+          <option value="main">layout thrash on main thread</option>
+        </select>
+      </label>
+    </div>
+
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="copy">Copy report to clipboard</button>
+
+    <h2>Live report</h2>
+    <pre id="report">(not running)</pre>
+
+    <h2>Notes for CI</h2>
+    <p>
+      The Playwright spec at <code>tests/browser/latency.spec.ts</code> runs a fixed-duration
+      version of this bench (CPU stub, no audio output) and asserts the p99 stays below a
+      budget. The page itself is for interactive measurement, especially across browsers
+      and hardware where headless CI doesn't help.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

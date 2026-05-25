@@ -175,6 +175,19 @@ function isPowerOfTwo(x: number): boolean {
   return x > 0 && (x & (x - 1)) === 0;
 }
 
+/**
+ * @deprecated 0.3.0 — replaced by `Bridge<Schema>` with
+ * `physicsControlFrameSchema(n)`. This class is preserved unchanged for
+ * v0.1.x byte-compat (existing SAB layouts continue to work) and will be
+ * removed no earlier than 2.0. New code should import:
+ *
+ *   import { Bridge, physicsControlFrameSchema } from "webgpu-audio-bridge";
+ *
+ * If you specifically need byte-compatibility with a v0.1.x SAB produced
+ * elsewhere, use `legacyPhysicsControlFrameSchema(n)` — its `seq`/`tMacroNs`
+ * are stored as f64 lanes (matching this class's wire format) rather than
+ * the cleaner u64 lanes of `physicsControlFrameSchema(n)`.
+ */
 export class Float64RingBuffer {
   public readonly capacity: number;
   public readonly n: number;
