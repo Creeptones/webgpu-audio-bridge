@@ -53,9 +53,20 @@ The pattern is *named* here because, to our knowledge, it has not been named or 
 
 ## Quick start
 
+This library is a single-file reference primitive (~300 lines of TypeScript, no runtime dependencies). Not on the npm registry — **vendor it** directly into your project:
+
 ```bash
-npm install webgpu-audio-bridge
+# Option A: copy the file (recommended for tiny self-contained use)
+curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts
+# place under src/lib/ in your project and import locally
+
+# Option B: clone, build, and link
+git clone --branch v0.1.1 --depth 1 https://github.com/Creeptones/webgpu-audio-bridge.git
+cd webgpu-audio-bridge && npm install && npm run build && npm link
+# then in your project: npm link webgpu-audio-bridge
 ```
+
+The Zenodo-archived [v0.1.1 tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact.
 
 ### Producer (DedicatedWorker, GPU side)
 
@@ -113,7 +124,7 @@ class MyProcessor extends AudioWorkletProcessor {
         // Got a fresh frame. `skipped` tells you how many older frames you discarded.
         this.misses = 0;
       } else {
-        // Empty or torn. Hold last value for ~12 misses (~32ms), then drift to zero.
+        // Empty (no fresh frame yet). Hold last value for ~12 misses (~32ms), then drift to zero.
         this.misses++;
       }
     }
@@ -156,11 +167,11 @@ Producer side. Writes the frame and advances `write_index`. Returns `false` if t
 
 #### `pull(outV, outJ, outHeader) → boolean`
 
-Consumer side. Reads the oldest frame in FIFO order. Returns `false` on empty or on torn-frame detection (producer lapped mid-read). On `false`, `read_index` is *not* advanced — caller can retry next quantum.
+Consumer side. Reads the oldest frame in FIFO order. Returns `false` on empty. On `false`, `read_index` is *not* advanced — caller can retry next quantum.
 
 #### `pullLatest(outV, outJ, outHeader) → number`
 
-Consumer side. Drains to the newest available frame, discarding older ones. Returns the count of skipped frames, or `-1` if the ring was empty or torn.
+Consumer side. Drains to the newest available frame, discarding older ones. Returns the count of skipped frames, or `-1` if the ring was empty.
 
 **This is the typical AudioWorklet read path:** the worklet wants the freshest macro state per quantum, not a queue.
 
@@ -206,9 +217,9 @@ Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 1
 | `pull` | 1.00 μs | 1.40 μs | 1.13 μs |
 | `pullLatest` | 1.10 μs | 2.10 μs | 1.22 μs |
 
-(Pull cost dropped ~10% in 0.1.1 vs 0.1.0 with the torn-check removed — see CHANGELOG.)
+(Pull cost dropped ~10% in 0.1.1 vs 0.1.0 with the torn-check removed — see CHANGELOG.) Outliers above the p99 (max values not shown above can reach hundreds of microseconds or low milliseconds) are dominated by V8 GC pauses, not ring-buffer pathology — medians and p99s are the load-bearing numbers.
 
-At a control-rate 60 Hz cadence, the ring consumes ~0.006% of one core (≈60 μs of CPU per wall-clock second on the producer side). The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices and reach Adenot's original ~200 ns push/pull at the cost of a phase-bit complication and bounded session length.
+At a control-rate 60 Hz cadence, the ring consumes ~0.006% of one core (≈60 μs of CPU per wall-clock second on the producer side). The cost is well below where it matters; the design prioritizes correctness and ergonomics over micro-optimization. A future variant could drop to `Int32` wrapping indices for lower push/pull overhead (closer to ringbuf.js's reported numbers, though direct comparison isn't apples-to-apples — ringbuf.js measures `Float32` audio-sample-shaped payloads, this library measures `Float64` × 1000-element control-rate frames) at the cost of a phase-bit complication and bounded session length.
 
 Run `npm run bench` to measure on your hardware.
 
