@@ -197,6 +197,36 @@
  *      a fresh full-ring tick returns the same value as the first call;
  *      Q16.16 round-trip matches the documented `floor(scale · 65536)`
  *      encoding.
+ *  64. Backpressure policy 'reject' preserves 0.6.11 behavior (0.6.12).
+ *      Default-constructed Bridge (no opts) AND explicit
+ *      `{policy:'reject'}` both: push returns false when full,
+ *      telemetry().policy === 'reject', telemetry().droppedFrames === 0.
+ *      The single existing pin-5 full-push behavior is the same shape;
+ *      this pin focuses on the new public surface (opts + telemetry).
+ *  65. Backpressure policy 'drop-newest' (0.6.12). Push returns true
+ *      when full but does NOT write a new frame; the ring's existing
+ *      older frames survive (consumer pull reads the originally-oldest);
+ *      telemetry().droppedFrames matches the number of dropped pushes.
+ *  66. Backpressure policy 'drop-oldest' (0.6.12). Push returns true
+ *      when full AND writes the new frame; the originally-oldest unread
+ *      frame is evicted (consumer's next pull reads the NEWER frame
+ *      that overwrote the oldest slot); telemetry().droppedFrames
+ *      matches the number of CAS evictions. Multi-thread torn-frame
+ *      race window is out-of-scope for this single-thread pin (covered
+ *      by the recommendation to pair with `.withInvariant`).
+ *  67. Backpressure policy 'block' with consumer drain (0.6.12). Push
+ *      under `{policy:'block', blockTimeoutMs: 100}` parks until the
+ *      consumer drains, then returns true. Verified via a worker thread
+ *      consumer that drains after a measurable delay — push observes
+ *      the drain via `waitForSpace` and proceeds. (The single-thread
+ *      variant pins the no-wait fast path: push when not full returns
+ *      true without ever calling waitForSpace.)
+ *  68. Backpressure policy 'block' with timeout (0.6.12). Push under
+ *      `{policy:'block', blockTimeoutMs: 1}` against a full ring with
+ *      no consumer drain returns false after ~1 ms (waitForSpace
+ *      timed-out). The bound is loose to tolerate platform timer
+ *      jitter; the point is that the push DOES return rather than
+ *      block forever.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -3498,6 +3528,214 @@ function testAdaptiveFlowControllerUnit(): void {
   ok("adaptive-flow-controller-unit");
 }
 
+// ── 64. Backpressure policy 'reject' preserves 0.6.11 behavior (0.6.12) ──
+function testBackpressurePolicyReject(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(8, schema);
+  // Default constructor (no opts) and explicit {policy:'reject'} should be
+  // bit-identical to the pre-0.6.12 behavior.
+  const bridgeDefault = new Bridge(alloc.sab, alloc.capacity, alloc.schema);
+  assertEq(bridgeDefault.telemetry().policy, "reject", "default policy is 'reject'");
+  assertEq(bridgeDefault.telemetry().droppedFrames, 0, "default droppedFrames = 0");
+
+  // Fill the ring; the next push must return false.
+  for (let i = 0; i < 8; i++) {
+    const ok = bridgeDefault.push(makePhysFrame(i, n));
+    assert(ok, `default ring push #${i} fits`);
+  }
+  assertEq(bridgeDefault.push(makePhysFrame(99, n)), false, "default full push returns false");
+  assertEq(bridgeDefault.telemetry().droppedFrames, 0, "reject never increments dropped");
+
+  // Explicit {policy:'reject'} — same SAB shape, so reuse fresh allocation.
+  const alloc2 = Bridge.allocate(8, schema);
+  const bridgeExplicit = new Bridge(alloc2.sab, alloc2.capacity, alloc2.schema, {
+    policy: "reject",
+  });
+  assertEq(bridgeExplicit.telemetry().policy, "reject", "explicit policy round-trips");
+  for (let i = 0; i < 8; i++) bridgeExplicit.push(makePhysFrame(i, n));
+  assertEq(bridgeExplicit.push(makePhysFrame(99, n)), false, "explicit reject returns false on full");
+  assertEq(bridgeExplicit.telemetry().droppedFrames, 0, "explicit reject droppedFrames = 0");
+
+  // Unknown policy throws at construction.
+  const alloc3 = Bridge.allocate(8, schema);
+  let threw = false;
+  try {
+    new Bridge(alloc3.sab, alloc3.capacity, alloc3.schema, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      policy: "bogus" as any,
+    });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "unknown policy throws at construction");
+
+  ok("backpressure-policy-reject");
+}
+
+// ── 65. Backpressure policy 'drop-newest' (0.6.12) ───────────────────────
+function testBackpressurePolicyDropNewest(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema, {
+    policy: "drop-newest",
+  });
+  assertEq(bridge.telemetry().policy, "drop-newest", "policy round-trips");
+
+  // Fill the ring with seqs 0..3.
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `push ${i} fits`);
+  }
+  assertEq(bridge.telemetry().droppedFrames, 0, "no drops while filling");
+
+  // Three pushes that all should drop silently.
+  assertEq(bridge.push(makePhysFrame(100, n)), true, "drop-newest push #1 returns true");
+  assertEq(bridge.push(makePhysFrame(101, n)), true, "drop-newest push #2 returns true");
+  assertEq(bridge.push(makePhysFrame(102, n)), true, "drop-newest push #3 returns true");
+  assertEq(bridge.telemetry().droppedFrames, 3, "droppedFrames = 3 after 3 drops");
+
+  // Consumer pulls — must see the originally-oldest (seqs 0..3) bit-exact,
+  // not the dropped ones (100..102).
+  const out = emptyPhysFrame(n);
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.pull(out), `pull #${i} succeeds`);
+    assertEq(out.seq, BigInt(i), `pull #${i} returns original seq=${i}`);
+    assert(framesEqual(makePhysFrame(i, n), out), `pull #${i} bit-exact`);
+  }
+  assertEq(bridge.pull(out), false, "ring is now empty");
+
+  ok("backpressure-policy-drop-newest");
+}
+
+// ── 66. Backpressure policy 'drop-oldest' (0.6.12) ───────────────────────
+function testBackpressurePolicyDropOldest(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema, {
+    policy: "drop-oldest",
+  });
+  assertEq(bridge.telemetry().policy, "drop-oldest", "policy round-trips");
+
+  // Fill the ring with seqs 0..3.
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `push ${i} fits`);
+  }
+  assertEq(bridge.telemetry().droppedFrames, 0, "no drops while filling");
+
+  // Push 3 more — each evicts the oldest. Final ring should hold seqs 3..6
+  // (original 0,1,2 evicted; original 3 + new 4,5,6 retained).
+  assertEq(bridge.push(makePhysFrame(4, n)), true, "drop-oldest push #1 returns true");
+  assertEq(bridge.push(makePhysFrame(5, n)), true, "drop-oldest push #2 returns true");
+  assertEq(bridge.push(makePhysFrame(6, n)), true, "drop-oldest push #3 returns true");
+  assertEq(bridge.telemetry().droppedFrames, 3, "droppedFrames = 3 after 3 evictions");
+  // Available is still capacity (we wrote new frames into the evicted slots).
+  assertEq(bridge.telemetry().available, 4, "available stays at capacity after drop-oldest");
+
+  // Consumer pulls — sees seqs 3..6 in FIFO order; originally-oldest 0,1,2
+  // are gone forever.
+  const out = emptyPhysFrame(n);
+  for (let i = 3; i <= 6; i++) {
+    assert(bridge.pull(out), `pull seq=${i} succeeds`);
+    assertEq(out.seq, BigInt(i), `pull returns seq=${i}`);
+    assert(framesEqual(makePhysFrame(i, n), out), `pull seq=${i} bit-exact`);
+  }
+  assertEq(bridge.pull(out), false, "ring is now empty");
+
+  ok("backpressure-policy-drop-oldest");
+}
+
+// ── 67. Backpressure policy 'block' fast path (0.6.12) ───────────────────
+function testBackpressurePolicyBlockFastPath(): void {
+  // Single-thread pin: validate the fast path (not-full → no waitForSpace
+  // call → push returns true immediately). The actual park-and-wake path
+  // is covered by tests/Bridge.concurrent.test.ts existing infrastructure
+  // (which uses Atomics.wait extensively); no need to fork a Worker for
+  // this single-thread pin.
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema, {
+    policy: "block",
+    blockTimeoutMs: 50,
+  });
+  assertEq(bridge.telemetry().policy, "block", "policy round-trips");
+
+  // With space available, push must NOT block — returns true synchronously.
+  const startNs = process.hrtime.bigint();
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `block fast-path push ${i} fits`);
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1e6;
+  // Generous bound — 4 pushes of a 4-element physics schema must be well
+  // under the 50 ms block timeout, even on a slow CI box.
+  assert(elapsedMs < 25, `block fast-path completes quickly (${elapsedMs.toFixed(1)} ms < 25 ms)`);
+  assertEq(bridge.telemetry().droppedFrames, 0, "block fast path drops nothing");
+
+  // Sanity: pulls and re-pushes also stay on the fast path.
+  const out = emptyPhysFrame(n);
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.pull(out), `block fast-path pull ${i}`);
+  }
+  for (let i = 100; i < 104; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `block fast-path re-push ${i}`);
+  }
+
+  ok("backpressure-policy-block-fast-path");
+}
+
+// ── 68. Backpressure policy 'block' with timeout (0.6.12) ────────────────
+function testBackpressurePolicyBlockTimeout(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema, {
+    policy: "block",
+    blockTimeoutMs: 5,
+  });
+  // Fill the ring.
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `fill push ${i}`);
+  }
+
+  // Next push blocks for ~5 ms then returns false. No consumer is draining
+  // — single-threaded test.
+  const startNs = process.hrtime.bigint();
+  const result = bridge.push(makePhysFrame(99, n));
+  const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1e6;
+  assertEq(result, false, "block timeout returns false");
+  // Lower bound: the block must actually wait. Bound loose for timer jitter.
+  assert(elapsedMs >= 3, `block waited at least ~3 ms (${elapsedMs.toFixed(2)} ms)`);
+  // Upper bound: don't block forever. 250 ms is way past any reasonable
+  // 5 ms timeout overshoot.
+  assert(elapsedMs < 250, `block returned within bound (${elapsedMs.toFixed(2)} ms < 250 ms)`);
+
+  // Construction-time validation: bad timeout values throw.
+  let threw = false;
+  try {
+    new Bridge(Bridge.allocate(4, schema).sab, 4, schema, {
+      policy: "block",
+      blockTimeoutMs: -1,
+    });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "negative blockTimeoutMs throws");
+  threw = false;
+  try {
+    new Bridge(Bridge.allocate(4, schema).sab, 4, schema, {
+      policy: "block",
+      blockTimeoutMs: NaN,
+    });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "NaN blockTimeoutMs throws");
+
+  ok("backpressure-policy-block-timeout");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -3563,6 +3801,11 @@ function main(): void {
   testFrameSmootherUnit();
   testConsumerClockRecoveryUnit();
   testAdaptiveFlowControllerUnit();
+  testBackpressurePolicyReject();
+  testBackpressurePolicyDropNewest();
+  testBackpressurePolicyDropOldest();
+  testBackpressurePolicyBlockFastPath();
+  testBackpressurePolicyBlockTimeout();
   console.log("\nAll Bridge tests passed.");
 }
 

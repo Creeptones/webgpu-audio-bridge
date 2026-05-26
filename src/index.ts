@@ -34,6 +34,7 @@
 export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
 export type {
   BridgeAllocation,
+  BridgeOptions,
   SmoothedPullOptions,
   SmootherSkipPolicy,
 } from "./Bridge.js";
@@ -47,7 +48,11 @@ export type {
 // of each module for the per-primitive contract.
 
 export { SpscRing } from "./SpscRing.js";
-export type { SpscPullResult } from "./SpscRing.js";
+export type {
+  SpscPullResult,
+  SpscRingOptions,
+  BackpressurePolicy,
+} from "./SpscRing.js";
 export { FrameSmoother } from "./FrameSmoother.js";
 export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 export { AdaptiveFlowController } from "./AdaptiveFlowController.js";

@@ -216,6 +216,8 @@ import {
   RING_HEADER_INT32_LANES as SPSC_RING_HEADER_INT32_LANES,
   SpscRing,
   type BridgeAllocation as SpscBridgeAllocation,
+  type BackpressurePolicy,
+  type SpscRingOptions,
 } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
@@ -270,6 +272,12 @@ export type SmootherSkipPolicy = "stall-smooth" | "catch-up";
 export interface SmoothedPullOptions {
   readonly skipPolicy?: SmootherSkipPolicy;
 }
+
+/** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
+ *  Forwards directly to the inner `SpscRing` — see `SpscRingOptions` for the
+ *  per-field contract. Forward-compatible shape; future patches can add
+ *  fields here without breaking the constructor signature. */
+export interface BridgeOptions extends SpscRingOptions {}
 
 type AnyTypedArray =
   | Float64Array
@@ -377,8 +385,13 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   static readonly INVARIANT_SOFT_THRESHOLD = INVARIANT_SOFT_THRESHOLD;
   static readonly INVARIANT_SOFT_ALPHA_BASE = INVARIANT_SOFT_ALPHA_BASE;
 
-  constructor(sab: SharedArrayBuffer, capacity: number, schema: S) {
-    this.ring = new SpscRing<S>(sab, capacity, schema);
+  constructor(
+    sab: SharedArrayBuffer,
+    capacity: number,
+    schema: S,
+    opts: BridgeOptions = {},
+  ) {
+    this.ring = new SpscRing<S>(sab, capacity, schema, opts);
     this.capacity = this.ring.capacity;
     this.schema = this.ring.schema;
     this.frameByteSize = this.ring.frameByteSize;
@@ -1030,6 +1043,8 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     readonly readIndex: number;
     readonly pllLocked: boolean;
     readonly pllOffsetNs: number;
+    readonly policy: BackpressurePolicy;
+    readonly droppedFrames: number;
   } {
     return Object.freeze({
       tornFrames: this.ring.tornFrameCount(),
@@ -1044,6 +1059,11 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       // are still reserved; cross-process observability lands in a follow-up.
       pllLocked: this.pll.locked,
       pllOffsetNs: this.pll.offsetNs,
+      // 0.6.12 — backpressure policy + heap-side drop counter. The full
+      // pushed / pulled / wait-duration / high-water-mark suite is the
+      // 0.6.13 observability dashboards patch.
+      policy: this.ring.policy,
+      droppedFrames: this.ring.droppedCount(),
     });
   }
 

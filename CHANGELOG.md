@@ -4,6 +4,121 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.12] — 2026-05-26
+
+### Added — backpressure policies (1.0 must-have, item 1 of 2)
+
+The first of the two README-named "Remaining 1.0 work" items. `Bridge<S>` and
+`SpscRing<S>` constructors gain an optional `opts` bag whose first field is
+`policy: 'reject' | 'drop-newest' | 'drop-oldest' | 'block'` (default
+`'reject'` — preserves 0.4.0..0.6.11 behavior bit-exact). Selects what happens
+when `push` would overflow.
+
+- **`policy: 'reject'`** (default). Push returns false; the caller decides
+  what to do (typically retry, drop, or `waitForSpace`). Same contract as
+  every prior 0.x. No behavior change for any existing caller.
+
+- **`policy: 'drop-newest'`**. Push returns true but does NOT write the new
+  frame. The ring's existing older frames survive — `pull` continues to read
+  the FIFO sequence the consumer was already mid-way through. Use for
+  audit-style streams where state transitions matter more than the freshest
+  tick. Drop counter increments per dropped push.
+
+- **`policy: 'drop-oldest'`**. Push CAS-advances `read_index` to evict the
+  oldest unread frame, then writes the new frame into the freed slot.
+  Returns true. Use for freshness-wins streams where the newest update
+  matters most. Multi-thread torn-frame race window documented on
+  `BackpressurePolicy` and the `_dropOldest` body comment — pair with
+  `.withInvariant(...)` for safe multi-thread use (the existing torn-frame
+  classifier catches the race).
+
+- **`policy: 'block'`** (with optional `blockTimeoutMs?: number`). Push
+  parks the producer via the existing `waitForSpace` machinery until the
+  consumer drains, then retries once. On timeout, push returns false (same
+  surface as `'reject'`). Producer thread must be one where `Atomics.wait`
+  is permitted (not the browser main thread, never an AudioWorklet's
+  `process()`).
+
+`Bridge<S>.telemetry()` gains two new fields: `policy: BackpressurePolicy`
+and `droppedFrames: number`. The full `pushed` / `pulled` / wait-duration /
+high-water-mark observability suite lands in the 0.6.13 companion patch
+(README §Remaining 1.0 work item 2 of 2). `droppedFrames` is heap-side per
+producer instance — drops are a producer-side fact, not a wire-format fact.
+
+### Why
+
+The README explicitly carves out backpressure policies as one of the two
+remaining 1.0-blocking items. With 0.5.0's soft `flowScaleHint` already in
+place, hard reject is rare in practice — but the policies cover the cases
+where the producer cannot honor the hint at all (`'block'` is the explicit
+"wait for consumer" surface; `'drop-newest'` / `'drop-oldest'` are the
+freshness/audit-style streams where the producer keeps producing under
+overload). Implementing them now lets us also exercise the docs-pattern
+for the 0.6.13 observability patch on the same constructor surface before
+1.0 freezes the API shape.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding, torn-frame counter, header / payload boundary — all
+  bit-for-bit identical to 0.6.11. A 0.6.11 peer and a 0.6.12 peer share
+  a SAB transparently. Policies are a per-instance producer-side concern;
+  the consumer never observes the policy directly.
+- **No public-API break.** All existing constructors continue to compile
+  and behave bit-identically (the new `opts` parameter defaults to `{}`
+  which resolves to `policy: 'reject'`). `telemetry()` adds two fields,
+  no removed fields; existing destructures continue to work.
+- **No `Bridge<S>` orchestration change.** Push / pull / pullSmoothed /
+  pullEvaluated / observeConsumerTime / phaseLockedTime are all
+  unaffected. The only push-path change is a single forward-predicted
+  branch in the full-detection block that V8 inlines well — bench medians
+  are unchanged at 1.20 μs.
+- **`'drop-oldest'` SPSC caveat.** Documented on `BackpressurePolicy`:
+  the producer CAS-writes `read_index` on overflow, which under SPSC is
+  normally consumer-only. The CAS guarantees atomicity but does not
+  prevent a concurrent consumer pull from reading torn bytes on the
+  just-evicted slot. Pair with `.withInvariant(...)` for multi-thread
+  use; single-thread use has no race.
+- **Lanes 4–7 still reserved** for future wire-format extensions.
+
+### Tests
+
+Five new test pins (#64–68) in `tests/Bridge.test.ts`:
+
+- **#64** — `'reject'` policy preserves 0.6.11 behavior (default and
+  explicit construction); `telemetry().policy` round-trips; unknown
+  policy throws at construction.
+- **#65** — `'drop-newest'` returns true when full, the new frame is
+  dropped, consumer reads the originally-oldest survivors,
+  `droppedFrames` matches drop count.
+- **#66** — `'drop-oldest'` returns true when full, the originally-
+  oldest is evicted, consumer reads the newer frames that overwrote it,
+  `available` stays at capacity, `droppedFrames` matches eviction count.
+- **#67** — `'block'` fast path: with space available, push completes
+  synchronously without invoking the parking machinery; sub-25 ms bound
+  for 4 pushes on a 4-element physics schema.
+- **#68** — `'block'` timeout: with no consumer draining, push returns
+  false after ~5 ms; construction validates `blockTimeoutMs` is a
+  non-negative finite number.
+
+All 7 existing suites green; bench medians match the 0.6.11 baseline at
+1.20 μs for push / pull / pullLatest (the new policy dispatch is a single
+forward-predicted branch on the not-full path and never executes in
+steady state).
+
+### Documentation
+
+- `src/SpscRing.ts` gains a `BackpressurePolicy` doc block covering the
+  per-policy contract, the `'drop-oldest'` SPSC torn-frame caveat, and
+  the recommended `.withInvariant(...)` pairing.
+- `src/Bridge.ts` exports a new `BridgeOptions` interface (extends
+  `SpscRingOptions`).
+- `README.md` `Remaining 1.0 work` section is updated to reflect that
+  item 1 has shipped; the §Back-pressure section gains a paragraph
+  documenting the new policies and the multi-thread caveat. The full
+  policy table will be added when item 2 (observability) lands in
+  0.6.13.
+
 ## [0.6.11] — 2026-05-26
 
 ### Added — bench cells for downstream decisions

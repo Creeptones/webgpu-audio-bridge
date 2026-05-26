@@ -270,6 +270,92 @@ export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
   schema: S;
 }
 
+/**
+ * Producer-side overflow disposition (0.6.12). Selects what `push` does when
+ * the ring is full.
+ *
+ *  - `'reject'` (default, preserves 0.4.0..0.6.11 behavior bit-exact): push
+ *    returns false; the caller decides. With 0.5.0's soft `flowScaleHint`
+ *    already driving the producer's cadence, hard reject is rare in practice
+ *    — it covers only the cases where the producer cannot honor the hint at
+ *    all.
+ *
+ *  - `'drop-newest'`: push returns true but does NOT write. The frame the
+ *    producer was about to send is silently dropped; the ring's existing
+ *    older frames survive. Useful for telemetry-style streams where the
+ *    older context is more valuable than the newest update, e.g. an audit
+ *    log that must not lose state transitions even if the latest tick is
+ *    skipped. The drop counter increments; no SAB mutation; no race with
+ *    the consumer.
+ *
+ *  - `'drop-oldest'`: push CAS-advances `read_index` by one (atomically
+ *    kicking out the oldest unread frame), then writes the new frame into
+ *    the freed slot, advances `write_index`, and notifies. Returns true.
+ *    Useful for freshness-wins streams where the newest update matters
+ *    most.
+ *
+ *    Multi-thread safety note. SPSC's normal invariant — only the consumer
+ *    writes `read_index` — is relaxed: under drop-oldest the producer
+ *    also CAS-writes `read_index` on overflow. The CAS guarantees atomicity
+ *    of the index advance, but there is still a narrow window where a
+ *    concurrent consumer pull on the just-stolen slot can read torn
+ *    payload bytes (the producer writes the new payload at the same slot).
+ *    Pair drop-oldest with `.withInvariant(...)` to detect + recover
+ *    these via the existing torn-frame classifier: the slot's `__invariant`
+ *    lane is overwritten by the new producer's write, so a consumer
+ *    reading torn bytes computes a mismatched invariant and falls back to
+ *    the previous frame via the existing soft/hard error pathway. Without
+ *    an invariant schema, the race is theoretically observable as a single
+ *    torn frame per drop event under simultaneous pull; with an invariant
+ *    schema, it is caught and surfaces in `tornFrames` telemetry instead
+ *    of corrupt output.
+ *
+ *    Single-thread use (test code, sequential producer/consumer alternation)
+ *    has no race at all; drop-oldest behaves exactly as documented with
+ *    the new frame replacing the oldest unread one.
+ *
+ *  - `'block'`: push parks the producer via `waitForSpace(blockTimeoutMs)`
+ *    when full, then retries once. If `waitForSpace` returns `'ok'` or
+ *    `'not-equal'` (consumer drained), push proceeds and returns true. If
+ *    `waitForSpace` returns `'timed-out'`, push returns false — same
+ *    failure surface as `'reject'` but only after exhausting the wait.
+ *
+ *    Producer MUST be on a thread where `Atomics.wait` is permitted (not
+ *    the browser main thread, not the AudioWorklet's `process()`). The
+ *    'block' policy is a convenience over the existing `flowScaleHint` +
+ *    manual `waitForSpace` loop the README documents for critical-data
+ *    streams; bake it in once at construction time and the per-push
+ *    decision goes away.
+ *
+ * Picked at SpscRing / Bridge / BridgeConsumer construction time. The
+ * choice is immutable for the lifetime of the ring — the SAB protocol
+ * cannot safely change mid-flight (a producer half-way through a
+ * drop-oldest CAS sequence cannot coordinate with a peer that thinks the
+ * policy is `'reject'`).
+ */
+export type BackpressurePolicy =
+  | "reject"
+  | "drop-newest"
+  | "drop-oldest"
+  | "block";
+
+/** Optional opts bag for the `SpscRing` constructor (0.6.12). All fields
+ *  optional; omitted fields default as documented per-field.
+ *
+ *  Forward-compatible shape — future patches can add fields here without
+ *  breaking the constructor signature. */
+export interface SpscRingOptions {
+  /** Producer-side overflow disposition. See `BackpressurePolicy` for the
+   *  full per-policy contract. Default: `'reject'` (preserves
+   *  0.4.0..0.6.11 behavior bit-exact). */
+  readonly policy?: BackpressurePolicy;
+  /** Timeout (milliseconds) for the `'block'` policy's internal
+   *  `waitForSpace` call. `undefined` means "wait indefinitely" (matches
+   *  `Atomics.wait`'s default). Ignored for non-`'block'` policies.
+   *  Default: `undefined`. */
+  readonly blockTimeoutMs?: number;
+}
+
 type AnyTypedArray =
   | Float64Array
   | Float32Array
@@ -384,6 +470,30 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  for the controller contract. */
   private readonly flowController: AdaptiveFlowController = new AdaptiveFlowController();
 
+  /** Producer-side overflow disposition (0.6.12). See `BackpressurePolicy`
+   *  for the per-policy contract. Frozen at construction; baking it in
+   *  once avoids a per-push policy dispatch on the fast path (the
+   *  `'reject'` default takes a single `if (full) return false` branch
+   *  that V8 inlines well). */
+  public readonly policy: BackpressurePolicy;
+
+  /** Timeout for the `'block'` policy's internal `waitForSpace` call.
+   *  Captured at construction; immutable. `undefined` = wait forever
+   *  (matches `Atomics.wait` default). */
+  private readonly blockTimeoutMs: number | undefined;
+
+  /** Heap-side counter of frames the policy dropped at the producer
+   *  (`'drop-newest'` increments on every overflow; `'drop-oldest'`
+   *  increments on every successful CAS advance of `read_index`). Read
+   *  via `droppedCount()` for `telemetry().droppedFrames`. Heap-only —
+   *  not a SAB lane — because it tracks a producer-side decision and
+   *  cross-process observability is not in scope for 0.6.12. The
+   *  per-thread counter is exact for the producer that owns this ring;
+   *  a consumer's separate `SpscRing` instance over the same SAB sees
+   *  its own (zero) counter, which is correct: drops are a producer
+   *  fact, not a wire-format fact. */
+  private droppedFrames: number = 0;
+
   /** Reused scratch for pull / pullLatest results. SpscRing mutates this in
    *  place each call; Bridge reads it immediately after the call returns.
    *  No external lifetime — do not retain references across pull calls. */
@@ -395,7 +505,12 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     preReadIdx: 0,
   };
 
-  constructor(sab: SharedArrayBuffer, capacity: number, schema: S) {
+  constructor(
+    sab: SharedArrayBuffer,
+    capacity: number,
+    schema: S,
+    opts: SpscRingOptions = {},
+  ) {
     if (!isPowerOfTwo(capacity)) {
       throw new Error(
         `SpscRing: capacity must be power of two, got ${capacity}`,
@@ -422,6 +537,29 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.frameByteSize = schema.frameByteSize;
     this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
     this.mask = capacity - 1;
+
+    // Policy + block-timeout from opts. Validated here so invalid configs
+    // surface at construction rather than as a confusing branch-miss later.
+    const policy = opts.policy ?? "reject";
+    if (
+      policy !== "reject" &&
+      policy !== "drop-newest" &&
+      policy !== "drop-oldest" &&
+      policy !== "block"
+    ) {
+      throw new Error(
+        `SpscRing: unknown backpressure policy '${String(policy)}'; ` +
+          `expected 'reject' | 'drop-newest' | 'drop-oldest' | 'block'`,
+      );
+    }
+    this.policy = policy;
+    const t = opts.blockTimeoutMs;
+    if (t !== undefined && !(Number.isFinite(t) && t >= 0)) {
+      throw new Error(
+        `SpscRing: blockTimeoutMs must be a non-negative finite number or undefined, got ${String(t)}`,
+      );
+    }
+    this.blockTimeoutMs = t;
     // Seed flow_scale = 1.0 so any producer that reads `flowScaleHint()`
     // before the consumer has issued a single pull sees "no scaling." Both
     // peers construct their own ring over the SAB; this CAS sets the lane
@@ -553,9 +691,42 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     // acquire-loaded. Both i32, wrap-mod-2^32; the signed-32 subtraction
     // `(a - b) | 0` gives the correct true diff for |true_diff| < 2^31.
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
-    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    let readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     if (((writeIdx - readIdx) | 0) >= this.capacity) {
-      return false; // full
+      // Full — dispatch on policy (0.6.12). The reject branch (default)
+      // is the common case and lands as a single forward-predicted branch
+      // for V8.
+      const p = this.policy;
+      if (p === "reject") {
+        return false;
+      }
+      if (p === "drop-newest") {
+        this.droppedFrames = (this.droppedFrames + 1) | 0;
+        return true;
+      }
+      if (p === "drop-oldest") {
+        readIdx = this._dropOldest(readIdx, writeIdx);
+        // Post-_dropOldest the ring has space (either we CAS-advanced or
+        // the consumer raced and drained). Fall through to the normal
+        // write path.
+      } else {
+        // 'block': park until consumer drains or timeout. On timeout,
+        // surface the same false-return that 'reject' would, so callers
+        // can distinguish "could not be enqueued" from "enqueued".
+        const status = this.waitForSpace(this.blockTimeoutMs);
+        if (status === "timed-out") {
+          return false;
+        }
+        // Re-load readIdx; the consumer advanced.
+        readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+        if (((writeIdx - readIdx) | 0) >= this.capacity) {
+          // Pathological: waitForSpace returned ok but the ring is somehow
+          // still full. Cannot happen in SPSC (consumer is the only one
+          // that decreases buffered) but defensive return surfaces it
+          // rather than corrupting state.
+          return false;
+        }
+      }
     }
     // Unsigned-then-mask: the low log2(capacity) bits don't depend on
     // signed-ness, so this is wrap-invariant.
@@ -595,6 +766,16 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * Use this when the producer wants to compute payload values directly into
    * the slot to skip the one .set() copy that `push(view)` would do. Only
    * one begin/commit pair can be in flight at a time per ring instance.
+   *
+   * Policy interaction (0.6.12). `beginPush` honors the same backpressure
+   * policy as `push`: under `'drop-newest'` it returns null (the producer
+   * can detect and increment its own counters); under `'drop-oldest'` it
+   * CAS-advances readIdx before opening the slot; under `'block'` it
+   * parks via `waitForSpace`. The `'drop-newest'` null-return is
+   * deliberate — the two-step path lets the caller do work between
+   * `beginPush` and `commitPush`, and silently swallowing the push as
+   * `push` does would be a surprise. Use `push` for the silent-drop
+   * semantics or check the `null` return + read `droppedCount()`.
    */
   beginPush(): FrameFor<S> | null {
     if (this.pendingPushFrame !== null) {
@@ -603,9 +784,26 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       );
     }
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
-    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    let readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     if (((writeIdx - readIdx) | 0) >= this.capacity) {
-      return null;
+      const p = this.policy;
+      if (p === "reject") {
+        return null;
+      }
+      if (p === "drop-newest") {
+        // Silent drop is not appropriate when the caller is about to
+        // build a frame; surface the rejection.
+        this.droppedFrames = (this.droppedFrames + 1) | 0;
+        return null;
+      }
+      if (p === "drop-oldest") {
+        readIdx = this._dropOldest(readIdx, writeIdx);
+      } else {
+        const status = this.waitForSpace(this.blockTimeoutMs);
+        if (status === "timed-out") return null;
+        readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+        if (((writeIdx - readIdx) | 0) >= this.capacity) return null;
+      }
     }
     const slot = (writeIdx >>> 0) & this.mask;
     const frame: Record<string, unknown> = {};
@@ -823,6 +1021,84 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const buffered = (writeIdx - readIdx) | 0;
     const encoded = this.flowController.tick(buffered, this.capacity);
     Atomics.store(this.indices, FLOW_SCALE_LANE, encoded);
+  }
+
+  /**
+   * Producer-side `'drop-oldest'` (0.6.12). CAS-advances `read_index` to
+   * kick out the oldest unread frame and open one slot for the new push.
+   *
+   * Loop semantics. Each iteration:
+   *   1. Compute the proposed new `read_index = observedRead + 1`.
+   *   2. `Atomics.compareExchange(readLane, observedRead, observedRead+1)`.
+   *      - On success: the producer "won" — slot at `observedRead & mask`
+   *        is now considered consumed; the producer can write at
+   *        `writeIdx & mask` (which aliases to the same slot in a
+   *        capacity-equals-buffered ring). Return the new readIdx.
+   *      - On failure: the consumer raced and advanced readIdx itself.
+   *        Re-load readIdx. If we now have space (buffered < capacity),
+   *        return without dropping — the consumer's drain already made
+   *        room. Otherwise loop and retry.
+   *
+   * Bounded iteration. Under SPSC, only the consumer can advance readIdx
+   * (other than us). Each consumer advance opens one slot of space. So
+   * the loop terminates in at most `capacity + 1` iterations even under
+   * adversarial racing — long before that the consumer has drained the
+   * ring entirely and we have free space without needing to drop.
+   *
+   * Multi-thread race window. Documented on `BackpressurePolicy` for
+   * `'drop-oldest'`. The CAS guarantees readIdx atomicity, but a
+   * consumer mid-pull on the just-stolen slot can observe torn bytes
+   * because the producer's subsequent payload write overlaps the
+   * consumer's read. With `.withInvariant(...)`, the slot's invariant
+   * lane is overwritten too, and the consumer's classifier surfaces the
+   * torn read as a hard error (fallback to prev + tornFrames++) rather
+   * than as corrupt output. Without an invariant schema, the torn frame
+   * is theoretically observable; in practice the race window is in the
+   * tens-to-hundreds of nanoseconds against control-rate cadences (16 ms
+   * at 60 Hz), so the per-push probability is tiny — but the schema
+   * pairing is the honest fix and is recommended in the README.
+   *
+   * Caller contract. Only invoked from the `push` / `beginPush` overflow
+   * branches under `policy === 'drop-oldest'`. Returns the post-CAS
+   * `readIdx` so the caller can confirm capacity headroom; the caller
+   * proceeds to write at `writeIdx & mask` knowing the slot is free
+   * (modulo the documented race).
+   */
+  private _dropOldest(observedRead: number, writeIdx: number): number {
+    let readIdx = observedRead;
+    // Bounded retry — see the loop semantics block above.
+    for (let attempt = 0; attempt <= this.capacity; attempt++) {
+      // Re-check capacity each iteration; the consumer may have drained
+      // since the caller observed readIdx.
+      if (((writeIdx - readIdx) | 0) < this.capacity) {
+        return readIdx;
+      }
+      const next = (readIdx + 1) | 0;
+      const prev = Atomics.compareExchange(
+        this.indices,
+        READ_IDX_LANE,
+        readIdx,
+        next,
+      );
+      if (prev === readIdx) {
+        // Won the CAS — we own the slot eviction. Update counter.
+        this.droppedFrames = (this.droppedFrames + 1) | 0;
+        return next;
+      }
+      // Lost the CAS — consumer raced. Re-load and retry.
+      readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    }
+    // Unreachable under SPSC (consumer can only advance readIdx; after
+    // `capacity` advances the ring is empty), but defensive return makes
+    // the type system happy and surfaces any future protocol change.
+    return readIdx;
+  }
+
+  /** Number of frames the policy has dropped at the producer side since
+   *  construction. Read for `telemetry().droppedFrames`. Heap-only
+   *  counter — per-instance, not synchronized across peers. (0.6.12) */
+  droppedCount(): number {
+    return this.droppedFrames;
   }
 
   /** Number of frames currently buffered (≤ capacity). */
