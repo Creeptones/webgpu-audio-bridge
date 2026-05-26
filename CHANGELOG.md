@@ -4,6 +4,52 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.4] — 2026-05-26
+
+### Fixed — trajectory × α-smoother: derivative lanes were being blended
+
+Pre-0.6.4, `pullSmoothed` / `pullLatestSmoothed` ran the one-pole blend across every element of every array field — including the velocity and acceleration lanes of `f{32,64}TrajectoryArray(n, { order: ≥2 })`. Blending a derivative across consecutive frames collapses the very signal the trajectory ships to preserve: under a perfectly linear position ramp the producer publishes a constant velocity, but the consumer's α-smoothed velocity would drift toward the previous-frame velocity at the smoother's time constant. Linear extrapolation built on the smoothed frame would then under- or over-shoot the true trajectory.
+
+Fix in `_applySmoother`:
+
+- **Plain arrays and order-1 trajectories**: unchanged (every element blends — order=1 is byte-identical to a positions-only array).
+- **order=2 trajectories**: blend only the position lanes (`j % 2 === 0`); copy velocity lanes (`j % 2 === 1`) verbatim from curr.
+- **order=3 trajectories**: blend only the position lanes (`j % 3 === 0`); copy velocity + acceleration lanes verbatim from curr.
+
+Precomputed per-array `arrayTrajectoryOrder` table drives the dispatch — no per-call branch on field metadata; the existing tight indexed walk over `arrayLayout` keeps its shape.
+
+This is the smallest correctness change in 0.6.4. It is technically a behavior change visible to existing callers that pulled a trajectory schema through `pullSmoothed`, so it ships alone as the headline fix of the patch.
+
+### Added — four test pins (one inline FFT)
+
+Four new pins make the 0.6.1 → 0.6.3 trajectory + PLL + per-frame-evaluator surface mechanically auditable:
+
+- **Pin #47 — trajectory × α-smoother interop** (`tests/Bridge.test.ts`). Schema with plain array + order=1 + order=2 + order=3 trajectory in one fixture. Push A; pullSmoothed (seed). Push B; pullSmoothed at `α=0.25` → positions blend per the existing contract; velocity / acceleration lanes pass through verbatim from B; a third pullSmoothed of B confirms derivatives don't drift across repeated calls. Regression pin for the fix above.
+
+- **Pin #48 — trajectory × invariant interop** (`tests/Bridge.test.ts`). Same trajectory schema with two different `.withInvariant(fn)` choices: positions-only and positions + velocities. SAB-mutation pattern from pins #35–#38 applied to a velocity lane post-push. Asserts classification differs by invariant choice: positions-only → ratio = 1 → OK pull, mutated velocity passes through; positions + velocities → ratio past SOFT threshold → hard error, last-known-good fallback, `tornFrames++`. Documents the recommended pattern for trajectory-aware invariants.
+
+- **Pin #49 — end-to-end pull-lag p95 < 3 ms** (`tests/Bridge.test.ts`). Faked-clock discrete-event scheduler: 60 Hz producer (period 16_666_667 ns) stamps `decisionTimeNs = now`; 375 Hz consumer (= 48 kHz / 128-sample quantum, period 2_666_667 ns) calls `pullLatest`. Each successful pull records `now − decisionTimeNs`. Assertion: p95 across 10 k pulls is < 3 ms. Measured: p50 = 1.33 ms, p95 = 2.01 ms, p99 = 2.02 ms, max = 2.02 ms — under the cadence's analytic bound (uniform on [0, 2.67 ms]). Pins the bridge's *own* contribution to control→audio latency; real-world AudioContext latency stays in `bench/e2e-latency/`.
+
+- **`tests/Bridge.phaseLock.test.ts` — phase-lock FFT spectrum** (the headline marketing pin). Producer (60 Hz, order=2 trajectory carrying `signal(t) = sin(2π·f·t)` + `signal'(t) = 2π·f·cos(2π·f·t)`) feeds a consumer that captures 16 384 audio samples (~0.34 s) under **two** reconstruction strategies side-by-side: step-and-hold and linear-Taylor (`evaluateInto`). Both buffers pass through an inline Cooley-Tukey radix-2 FFT (≈50 LOC, no dev-dep) under a Hann window. Pin asserts (a) the signal bin dominates both spectra within ±6 dB and (b) at every 60 Hz harmonic in `[60, 120, 180, 240, 300, 360, 420, 480]` Hz, the trajectory spectrum sits **at least 10 dB below** the step spectrum. Measured: 12–19 dB suppression at every harmonic, absolute trajectory floor −44 dB or quieter. This is the marketing claim "60 Hz GPU producer drives 48 kHz audio with collapsed staircase aliasing" made testable; the math (sinc² envelope of linear interp vs sinc of step+hold) gives the suppression for free at sub-Nyquist signal frequencies.
+
+Test suite count: 5 → 6 (the new `Bridge.phaseLock.test.ts` joins `schema` / `Bridge` / `Bridge.concurrent` / `Float64RingBuffer` / `Float64RingBuffer.concurrent`). Bridge pin count: 46 → 49.
+
+### Why — drain a correctness liability, then audit the new surface
+
+The handoff doc for this session (`WebsitePlans/WebAudioBridge Phase-Locked Extrapolation - Handoff Post 0.6.3.md`) flagged the trajectory × α-smoother bug as a real correctness issue introduced by 0.6.1's trajectory layout and not yet caught by tests. The recommended sequencing — fix it before adding new public surface — keeps the patch focused and avoids riding a behavior bug into later releases. The four pins then audit the entire 0.6.1–0.6.3 stack at the points the deferred-work plans (`pullEvaluated` sugar, EvalMode dispatch, per-quantum batch API) will compose against next.
+
+### Wire compatibility
+
+- **No SAB changes.** The smoother fix is heap-only consumer-side; the test pins are pure additions. Header lanes 0–3 unchanged from 0.6.0; lanes 4–7 still reserved. A 0.6.3 peer and a 0.6.4 peer share a SAB transparently.
+- **API additions only.** No removed or renamed members. The smoother fix changes the *output* of `pullSmoothed` / `pullLatestSmoothed` for order≥2 trajectory schemas (derivative lanes now reflect curr verbatim rather than the previous blended derivative); the *signatures* are unchanged. Schemas without trajectory fields are byte-identical to 0.6.3 behavior.
+
+### Documentation
+
+- New paragraph in the `Smoothed pulls` section of `src/Bridge.ts` header documenting the trajectory-aware rule (positions blend; velocity + acceleration pass through verbatim) and the precomputed `arrayTrajectoryOrder` dispatch.
+- JSDoc on the `arrayTrajectoryOrder` field explains the 0-vs-order encoding (0 = plain or order-1; ≥2 = strided-blend path).
+- `tests/Bridge.test.ts` header gains entries #47–#49 with the same numbered-template style as the rest of the file.
+- `tests/Bridge.phaseLock.test.ts` carries a substantial file-header walkthrough: test setup, expected spectrum derivation (sinc vs sinc²), assertion shape, and the rationale for the inline FFT over a dev-dep.
+
 ## [0.6.3] — 2026-05-25
 
 ### Added — per-frame trajectory evaluator (Pillar 3 of phase-locked extrapolation, first cut)

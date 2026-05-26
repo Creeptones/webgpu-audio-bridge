@@ -99,6 +99,28 @@
  *  46. evaluateInto validation: non-finite dt throws; outFrame too small
  *      for a trajectory field surfaces evaluateTrajectoryInto's error
  *      (consistent with calling the helper directly).
+ *  47. Trajectory × α-smoother interop (0.6.4): pullSmoothed blends
+ *      positions per the α-smoother contract and passes derivative lanes
+ *      (velocity, acceleration) through verbatim from curr. Covers plain
+ *      array, order=1 (positions only, byte-identical to plain), order=2
+ *      (p,v interleaved), and order=3 (p,v,a interleaved) in one fixture
+ *      so a regression in the strided-blend dispatch surfaces immediately.
+ *  48. Trajectory × invariant interop (0.6.4): the user-supplied
+ *      invariant closure decides which trajectory lanes contribute. A
+ *      positions-only invariant treats a velocity mutation as a no-op
+ *      (ratio = 1 → OK pull); a positions + velocities invariant
+ *      classifies the same mutation as a hard error (ratio past the soft
+ *      threshold → fallback + tornFrames++). Documents the recommended
+ *      pattern for trajectory-aware invariants.
+ *  49. End-to-end pull-lag p95 (0.6.4 — Pillar 3 latency budget). Simulate
+ *      a 60 Hz producer and a 375 Hz consumer (48 kHz / 128-sample
+ *      quantum). Each producer push stamps `decisionTimeNs`; each
+ *      successful pullLatest records `consumerNs - decisionTimeNs`.
+ *      Assert the 95th-percentile across 10k pulls is < 3 ms — the
+ *      bridge's contribution to the audio latency budget in the canonical
+ *      control-rate → audio-rate pattern.
+ *      Faked clocks; this is the bridge-only signal. Real-world
+ *      AudioContext latency is the existing bench/e2e-latency harness.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -2053,6 +2075,351 @@ function testEvaluateIntoValidation(): void {
   ok("evaluate-into-validation");
 }
 
+// ── 47. Trajectory × α-smoother interop (0.6.4) ────────────────────────────
+//
+// Verifies that `pullSmoothed` honors the trajectory layout:
+//   - plain (non-trajectory) arrays: every element blends (existing 0.4.1
+//     contract).
+//   - order=1 trajectory: positions-only; behaves identically to a plain
+//     array of the same length (no derivative lanes to special-case).
+//   - order=2 trajectory: position lanes (j % 2 === 0) blend; velocity
+//     lanes (j % 2 === 1) pass through verbatim from curr — blending a
+//     derivative across frames collapses the very signal the trajectory
+//     ships to preserve.
+//   - order=3 trajectory: position lanes (j % 3 === 0) blend; velocity
+//     and acceleration lanes pass through verbatim.
+//
+// A linear position ramp at constant velocity is the canonical regression
+// case: under the pre-0.6.4 every-element blend, a steady velocity reading
+// would drift toward zero across successive smoothed pulls (curr.v ≈
+// prev.v ≈ constant, but a 1-step lag from a position-derived signal
+// pollutes the blend). The pin asserts velocities are bit-exact across
+// successive blends so any reintroduction of derivative-blending surfaces
+// immediately.
+function testTrajectorySmoothedInterop(): void {
+  const N = 4;
+  const schema = defineSchema({
+    seq: u64(),
+    plain: f64Array(N),                            // every element blends
+    pos1: f64TrajectoryArray(N, { order: 1 }),     // positions only
+    pv2:  f64TrajectoryArray(N, { order: 2 }),     // [p,v] interleaved
+    pva3: f32TrajectoryArray(N, { order: 3 }),     // [p,v,a] interleaved
+  });
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  // Frame A — "previous" once seeded.
+  const A = ring.scratchFrame();
+  A.seq = 1n;
+  for (let k = 0; k < N; k++) {
+    A.plain[k] = 10 + k;
+    A.pos1[k]  = 100 + k;
+    A.pv2[k * 2]     = 1000 + k;       // p
+    A.pv2[k * 2 + 1] = 7;              // v
+    A.pva3[k * 3]     = 10_000 + k;    // p
+    A.pva3[k * 3 + 1] = 9;             // v
+    A.pva3[k * 3 + 2] = 11;            // a
+  }
+
+  // Frame B — "current" on the second smoothed call. Positions move by a
+  // recognizable delta; velocities + accelerations stay at distinct values
+  // so verbatim-vs-blend is unambiguous to read from the asserted output.
+  const B = ring.scratchFrame();
+  B.seq = 2n;
+  for (let k = 0; k < N; k++) {
+    B.plain[k] = 30 + k;
+    B.pos1[k]  = 200 + k;
+    B.pv2[k * 2]     = 2000 + k;       // p
+    B.pv2[k * 2 + 1] = 13;             // v   ≠ A.pv2 velocity (7)
+    B.pva3[k * 3]     = 20_000 + k;    // p
+    B.pva3[k * 3 + 1] = 17;            // v   ≠ A.pva3 velocity (9)
+    B.pva3[k * 3 + 2] = 19;            // a   ≠ A.pva3 accel (11)
+  }
+
+  // Seed: push A, pullSmoothed → out = A verbatim (no prev to blend with).
+  assertEq(ring.push(A), true, "push A");
+  const out = ring.scratchFrame();
+  assertEq(ring.pullSmoothed(out, 0.25), true, "first smoothed pull returns true");
+  for (let k = 0; k < N; k++) {
+    assertEq(out.plain[k], A.plain[k]!, `seed: plain[${k}] = A`);
+    assertEq(out.pos1[k],  A.pos1[k]!,  `seed: pos1[${k}] = A`);
+    assertEq(out.pv2[k * 2],     A.pv2[k * 2]!,     `seed: pv2.p[${k}] = A`);
+    assertEq(out.pv2[k * 2 + 1], A.pv2[k * 2 + 1]!, `seed: pv2.v[${k}] = A`);
+    assertEq(out.pva3[k * 3],     A.pva3[k * 3]!,     `seed: pva3.p[${k}] = A`);
+    assertEq(out.pva3[k * 3 + 1], A.pva3[k * 3 + 1]!, `seed: pva3.v[${k}] = A`);
+    assertEq(out.pva3[k * 3 + 2], A.pva3[k * 3 + 2]!, `seed: pva3.a[${k}] = A`);
+  }
+
+  // Blend: push B, pullSmoothed(α=0.25) → positions blend, derivatives pass.
+  const alpha = 0.25;
+  const oneMinusAlpha = 1 - alpha;
+  assertEq(ring.push(B), true, "push B");
+  assertEq(ring.pullSmoothed(out, alpha), true, "second smoothed pull returns true");
+
+  for (let k = 0; k < N; k++) {
+    // Plain array: every element blends.
+    const expectedPlain = alpha * B.plain[k]! + oneMinusAlpha * A.plain[k]!;
+    assertEq(out.plain[k], expectedPlain, `plain[${k}] blends elementwise`);
+
+    // order=1 trajectory: positions-only, behaves like plain array.
+    const expectedPos1 = alpha * B.pos1[k]! + oneMinusAlpha * A.pos1[k]!;
+    assertEq(out.pos1[k], expectedPos1, `pos1[${k}] blends (order=1 ≡ plain)`);
+
+    // order=2 trajectory: position blends, velocity verbatim from curr.
+    const expectedPv2P = alpha * B.pv2[k * 2]! + oneMinusAlpha * A.pv2[k * 2]!;
+    assertEq(out.pv2[k * 2], expectedPv2P, `pv2.p[${k}] blends`);
+    assertEq(out.pv2[k * 2 + 1], B.pv2[k * 2 + 1]!, `pv2.v[${k}] = curr verbatim (not blended)`);
+    // Cross-check: a blended velocity would have been 0.25·13 + 0.75·7 = 8.5.
+    // The pin's bite is that out.pv2.v === 13 (B's value), NOT 8.5.
+    assert(out.pv2[k * 2 + 1] !== 8.5, `pv2.v[${k}] is not the blended value`);
+
+    // order=3 trajectory: position blends, velocity + acceleration verbatim.
+    const expectedPva3P = alpha * B.pva3[k * 3]! + oneMinusAlpha * A.pva3[k * 3]!;
+    // f32 storage — compare via Math.fround to absorb the round-trip.
+    assertEq(out.pva3[k * 3], Math.fround(expectedPva3P), `pva3.p[${k}] blends (f32)`);
+    assertEq(out.pva3[k * 3 + 1], B.pva3[k * 3 + 1]!, `pva3.v[${k}] = curr verbatim`);
+    assertEq(out.pva3[k * 3 + 2], B.pva3[k * 3 + 2]!, `pva3.a[${k}] = curr verbatim`);
+  }
+
+  // Third blend: push B again, pullSmoothed once more. The velocity must
+  // STILL be exactly B's velocity — the smoother must not gradually drift
+  // a derivative lane across many calls under the new rule.
+  assertEq(ring.push(B), true, "push B again");
+  assertEq(ring.pullSmoothed(out, alpha), true, "third smoothed pull returns true");
+  for (let k = 0; k < N; k++) {
+    assertEq(out.pv2[k * 2 + 1], B.pv2[k * 2 + 1]!, `repeat: pv2.v[${k}] still verbatim`);
+    assertEq(out.pva3[k * 3 + 1], B.pva3[k * 3 + 1]!, `repeat: pva3.v[${k}] still verbatim`);
+    assertEq(out.pva3[k * 3 + 2], B.pva3[k * 3 + 2]!, `repeat: pva3.a[${k}] still verbatim`);
+  }
+
+  ok("trajectory-smoothed-interop");
+}
+
+// ── 48. Trajectory × invariant interop (0.6.4) ─────────────────────────────
+//
+// `.withInvariant(fn)` is a user-supplied closure — what counts as the
+// "invariant" of a trajectory frame is the caller's choice. The bridge
+// stores `fn(curr)` on push and verifies `fn(payload)` on pull.
+//
+// Two natural choices for an order=2 trajectory of `[p, v, p, v, ...]`:
+//
+//   (a) sum of squared positions:  Σ_k frame.vEff[2*k]²
+//       — velocities don't contribute. A velocity mutation in flight
+//         leaves stored == computed; classification = OK.
+//
+//   (b) sum of squared positions + velocities:  Σ_k frame.vEff[k]² over
+//       the flat element stream
+//       — velocities contribute equally. The same velocity mutation
+//         flips computed away from stored; classification = soft or hard
+//         per the ratio.
+//
+// The pin sets up the canonical fixture for both and asserts each
+// classification fires as expected via tornFrames. Same SAB-mutation
+// pattern as pins #35–#38; same per-slot f64 indexing.
+function testTrajectoryInvariantInterop(): void {
+  const N = 4;
+  // Schema A — positions-only invariant. A velocity mutation is invisible
+  // to the invariant, so the pull classifies as OK.
+  const schemaPosOnly = defineSchema({
+    seq: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  }).withInvariant((frame) => {
+    // Sum positions only: indices 0, 2, 4, ... of the flat array.
+    let s = 0;
+    for (let k = 0; k < N; k++) {
+      const p = frame.vEff[k * 2]!;
+      s += p * p;
+    }
+    return s;
+  });
+
+  // Schema B — positions + velocities invariant. A velocity mutation
+  // changes the computed sum; large enough to land past the soft band.
+  const schemaFull = defineSchema({
+    seq: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  }).withInvariant((frame) => {
+    let s = 0;
+    const L = frame.vEff.length;
+    for (let j = 0; j < L; j++) {
+      const x = frame.vEff[j]!;
+      s += x * x;
+    }
+    return s;
+  });
+
+  // Both schemas have identical byte layout (the invariant choice doesn't
+  // change the SAB shape). Frame layout: seq u64 at byteOffset 0, vEff
+  // (8 elements = 64B) at byteOffset 8, __invariant f64 at byteOffset 72.
+  // frameByteSize = 80, f64-stride = 10. v[k] sits at f64-element offset
+  // 1 + (k*2 + 1) = 2 + 2k within a slot.
+  assertEq(schemaPosOnly.frameByteSize, 80, "schema frame byte size");
+  assertEq(schemaFull.frameByteSize, 80, "schema frame byte size (full inv)");
+
+  function makeTrajFrame(
+    seq: number,
+    positions: number[],
+    velocities: number[],
+  ): { seq: bigint; vEff: Float64Array } {
+    assert(positions.length === N && velocities.length === N, "test helper sizes");
+    const vEff = new Float64Array(N * 2);
+    for (let k = 0; k < N; k++) {
+      vEff[k * 2]     = positions[k]!;
+      vEff[k * 2 + 1] = velocities[k]!;
+    }
+    return { seq: BigInt(seq), vEff };
+  }
+  const emptyOut = () => ({ seq: 0n, vEff: new Float64Array(N * 2) });
+
+  // ─── Case (a): positions-only invariant. ─────────────────────────────
+  // Push A (positions = [1,1,1,1], velocities = [1,1,1,1]). Pull (ok, seeds
+  // consumerPrev). Push B = A, mutate B's v[0] in the SAB from 1 → 5.
+  // Stored invariant = Σp² = 4 (computed pre-push from A). Computed at
+  // pull = Σp² = 4 (positions untouched). Ratio = 1 → OK. tornFrames = 0.
+  // The MUTATED v[0] = 5 must pass through to out unchanged (no recovery
+  // engaged).
+  {
+    const { sab, capacity } = Bridge.allocate(16, schemaPosOnly);
+    const ring = new Bridge(sab, capacity, schemaPosOnly);
+    const out = emptyOut();
+    const A = makeTrajFrame(1, [1, 1, 1, 1], [1, 1, 1, 1]);
+    assertEq(ring.push(A), true, "pos-only: push A");
+    assertEq(ring.pull(out), true, "pos-only: seed pull A");
+    assertEq(ring.telemetry().tornFrames, 0, "pos-only: no torn after seed");
+
+    const B = makeTrajFrame(2, [1, 1, 1, 1], [1, 1, 1, 1]);
+    assertEq(ring.push(B), true, "pos-only: push B");
+    // B lands at slot 1. v[0] at f64-element offset 10 + 2 = 12.
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 10);
+    f64View[12] = 5;
+    assertEq(ring.pull(out), true, "pos-only: pull mutated B");
+    assertEq(ring.telemetry().tornFrames, 0, "pos-only: velocity mutation is OK");
+    assertEq(out.seq, B.seq, "pos-only: B's seq, not A's (no fallback)");
+    assertEq(out.vEff[0], 1, "pos-only: position[0] unchanged");
+    assertEq(out.vEff[2], 1, "pos-only: position[1] unchanged");
+    assertEq(out.vEff[1], 5, "pos-only: mutated velocity passes through raw");
+  }
+
+  // ─── Case (b): full invariant (positions + velocities). ──────────────
+  // Same setup; same mutation. Stored invariant = 4 + 4 = 8 (A's full sum).
+  // Computed at pull = positions sum (4) + velocities sum with v[0]=5
+  //                  = 4 + (25 + 1 + 1 + 1) = 32.
+  // Ratio = 32 / 8 = 4 → |ratio − 1| = 3 > SOFT_THRESHOLD (1.0) → hard.
+  // tornFrames++; out is the last-known-good A (fallback), not corrupt B.
+  {
+    const { sab, capacity } = Bridge.allocate(16, schemaFull);
+    const ring = new Bridge(sab, capacity, schemaFull);
+    const out = emptyOut();
+    const A = makeTrajFrame(10, [1, 1, 1, 1], [1, 1, 1, 1]);
+    assertEq(ring.push(A), true, "full: push A");
+    assertEq(ring.pull(out), true, "full: seed pull A");
+    assertEq(ring.telemetry().tornFrames, 0, "full: no torn after seed");
+
+    const B = makeTrajFrame(11, [1, 1, 1, 1], [1, 1, 1, 1]);
+    assertEq(ring.push(B), true, "full: push B");
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 10);
+    f64View[12] = 5; // same mutation
+    assertEq(ring.pull(out), true, "full: pull mutated B");
+    assertEq(ring.telemetry().tornFrames, 1, "full: velocity mutation is HARD");
+    assertEq(out.seq, A.seq, "full: hard fallback returns A's seq");
+    for (let k = 0; k < N; k++) {
+      assertEq(out.vEff[k * 2],     A.vEff[k * 2]!,     `full: fallback p[${k}] = A`);
+      assertEq(out.vEff[k * 2 + 1], A.vEff[k * 2 + 1]!, `full: fallback v[${k}] = A`);
+    }
+  }
+
+  ok("trajectory-invariant-interop");
+}
+
+// ── 49. End-to-end pull-lag p95 < 3 ms (0.6.4) ─────────────────────────────
+//
+// Pins the bridge's *own* contribution to control→audio latency. Two
+// faked clocks at the canonical cadences:
+//
+//   producer: 60 Hz       (period 16_666_667 ns)
+//   consumer: 375 Hz      (= 48 kHz / 128 quantum; period 2_666_667 ns)
+//
+// Each producer push stamps `decisionTimeNs = now`. Each successful
+// `pullLatest` records `now - frame.decisionTimeNs` — the freshest-frame
+// pull lag from the producer's stamp to the consumer's evaluation moment.
+// Under this cadence (consumer polls 6.25× faster than producer pushes)
+// the lag is uniformly distributed in [0, consumer_period] ≈ [0, 2.67 ms],
+// so p95 lands around 2.5 ms. Budget asserted at 3 ms with margin.
+//
+// What this pin catches: a pull path that adds extra spin loops, a
+// pullLatest that doesn't drain newest, or a producer push that delays
+// the release-store past its current cost. Real-world AudioContext
+// latency lives in the existing bench/e2e-latency harness; this pin is
+// the synchronous-Node sanity-check that bridge mechanics aren't the
+// budget breaker.
+function testLatencyP95(): void {
+  const schema = defineSchema({
+    seq: u64(),
+    decisionTimeNs: u64(),
+  });
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const PRODUCER_PERIOD_NS = 16_666_667n; // 60 Hz
+  const CONSUMER_PERIOD_NS = 2_666_667n;  // 375 Hz
+  const TARGET_FRAMES = 10_000;
+  const BUDGET_NS = 3_000_000;            // 3 ms
+
+  const pushFrame = ring.scratchFrame();
+  const out = ring.scratchFrame();
+  const latencies: number[] = [];
+
+  let producerNext = 0n;
+  let consumerNext = 0n;
+  let seq = 0n;
+
+  // Discrete-event scheduler. Producer wins ties (push before pull at the
+  // same nanosecond), matching the real handoff: the consumer's poll at
+  // `t` sees a frame pushed at `t` rather than waiting one cycle.
+  let safety = 0;
+  while (latencies.length < TARGET_FRAMES) {
+    if (++safety > 1_000_000) {
+      throw new Error("latency pin: scheduler safety bound exceeded");
+    }
+    if (producerNext <= consumerNext) {
+      pushFrame.seq = seq++;
+      pushFrame.decisionTimeNs = producerNext;
+      assertEq(ring.push(pushFrame), true, "producer push must succeed");
+      producerNext = producerNext + PRODUCER_PERIOD_NS;
+    } else {
+      if (ring.pullLatest(out) >= 0) {
+        const lat = Number(consumerNext - out.decisionTimeNs);
+        latencies.push(lat);
+      }
+      consumerNext = consumerNext + CONSUMER_PERIOD_NS;
+    }
+  }
+
+  // Percentile aggregation. `Math.floor(N * q)` is the conventional
+  // nearest-rank pick for the q-th percentile of a sorted array.
+  latencies.sort((a, b) => a - b);
+  const pick = (q: number) => latencies[Math.floor(latencies.length * q)]!;
+  const p50 = pick(0.50);
+  const p95 = pick(0.95);
+  const p99 = pick(0.99);
+  const max = latencies[latencies.length - 1]!;
+
+  assert(
+    p95 < BUDGET_NS,
+    `latency p95 must be < 3 ms: got p95=${(p95 / 1e6).toFixed(3)} ms (p50=${(p50 / 1e6).toFixed(3)} ms, p99=${(p99 / 1e6).toFixed(3)} ms, max=${(max / 1e6).toFixed(3)} ms)`,
+  );
+  // Sanity: max latency is bounded by ~consumer_period under this cadence.
+  // 4 ms gives margin for any future controller jitter we add to pullLatest.
+  assert(
+    max < 4_000_000,
+    `latency max must be < 4 ms: got ${(max / 1e6).toFixed(3)} ms`,
+  );
+
+  ok(
+    `latency-p95 (n=${latencies.length}: p50=${(p50 / 1e6).toFixed(2)}ms p95=${(p95 / 1e6).toFixed(2)}ms p99=${(p99 / 1e6).toFixed(2)}ms max=${(max / 1e6).toFixed(2)}ms)`,
+  );
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -2101,6 +2468,9 @@ function main(): void {
   testEvaluateIntoMixedSchema();
   testEvaluateIntoNoTrajectorySchema();
   testEvaluateIntoValidation();
+  testTrajectorySmoothedInterop();
+  testTrajectoryInvariantInterop();
+  testLatencyP95();
   console.log("\nAll Bridge tests passed.");
 }
 

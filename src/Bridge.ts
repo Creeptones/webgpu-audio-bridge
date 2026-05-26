@@ -160,6 +160,18 @@
  * sequence counters or timestamps. Integer-typed numeric fields (u8…u32,
  * i8…i32) blend in floating-point then `Math.round` back to integer.
  *
+ * Trajectory fields (`f{32,64}TrajectoryArray(n, { order })`): the smoother
+ * blends ONLY the position lanes and copies derivative lanes (velocity,
+ * acceleration) verbatim from curr. Velocity is a derivative — time-
+ * averaging it across frames collapses the very signal the trajectory ships
+ * to preserve (a perfectly linear ramp would yield velocity → 0 under a
+ * naive elementwise blend). For order=1 the layout is positions-only and
+ * the rule reduces to plain array blending; for order=2 the smoother
+ * blends elements at indices 0, 2, 4, … and copies 1, 3, 5, …; for
+ * order=3 it blends 0, 3, 6, … and copies the other six per triple. The
+ * compiled `arrayTrajectoryOrder` table drives the dispatch — no per-call
+ * branch on field metadata.
+ *
  * The smoother's `prev` is held heap-side on the Bridge instance. It is
  * lazily allocated on the first smoothed call and persists across calls.
  * Any non-smoothed `pull` / `pullLatest` invalidates the prev (the next
@@ -607,6 +619,16 @@ export class Bridge<S extends Schema<FieldsObject>> {
   private readonly scalarIsInteger: ReadonlyArray<boolean>;
   private readonly arrayIsBigInt: ReadonlyArray<boolean>;
   private readonly arrayIsInteger: ReadonlyArray<boolean>;
+  /** Per-array-field trajectory order, in `arrayLayout` order. 0 for
+   *  non-trajectory arrays and order=1 trajectories (both blend every
+   *  element identically — order=1 is byte-compatible with a plain array
+   *  of positions). 2 / 3 for higher-order trajectories: the smoother
+   *  blends only the position lanes (every Nth element starting at 0) and
+   *  copies derivative lanes (velocity, acceleration) verbatim from curr.
+   *  Blending derivatives across frames is mathematically meaningless —
+   *  velocity is a snapshot, not a quantity to time-average. See file
+   *  header "Smoothed pulls" for the trajectory-aware rule. */
+  private readonly arrayTrajectoryOrder: ReadonlyArray<number>;
 
   /** PI controller integral state. Persists across pull calls; clamped to
    *  ±FLOW_SCALE_INT_LIMIT for anti-windup. Reset to 0 on construction (no
@@ -795,6 +817,16 @@ export class Bridge<S extends Schema<FieldsObject>> {
     );
     this.arrayIsInteger = Object.freeze(
       arrays.map((f) => f.kind !== "f64" && f.kind !== "f32" && kindTsType(f.kind) !== "bigint"),
+    );
+    // Trajectory order per array field. 0 means "blend every element" — used
+    // for non-trajectory arrays and for order=1 trajectories (positions only,
+    // byte-identical to a plain array). ≥2 selects the strided-blend path in
+    // `_applySmoother` so velocity / acceleration lanes pass through verbatim.
+    this.arrayTrajectoryOrder = Object.freeze(
+      arrays.map((f) => {
+        const order = f.trajectory?.order ?? 0;
+        return order >= 2 ? order : 0;
+      }),
     );
   }
 
@@ -1412,6 +1444,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
     const al = this.arrayLayout;
     const abi = this.arrayIsBigInt;
     const aii = this.arrayIsInteger;
+    const ato = this.arrayTrajectoryOrder;
     for (let i = 0; i < al.length; i++) {
       const name = al[i]!.name;
       if (abi[i]) {
@@ -1423,11 +1456,33 @@ export class Bridge<S extends Schema<FieldsObject>> {
         const pA = prev[name] as { length: number; [j: number]: number };
         const isInt = aii[i];
         const L = cA.length;
-        for (let j = 0; j < L; j++) {
-          let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
-          if (isInt) b = Math.round(b);
-          cA[j] = b;
-          pA[j] = b;
+        const order = ato[i]!;
+        if (order === 0) {
+          // Plain array (or order=1 trajectory): blend every element.
+          for (let j = 0; j < L; j++) {
+            let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+            if (isInt) b = Math.round(b);
+            cA[j] = b;
+            pA[j] = b;
+          }
+        } else {
+          // Trajectory order=2 or order=3. Layout is interleaved:
+          //   order=2 → [p, v, p, v, ...]; order=3 → [p, v, a, p, v, a, ...].
+          // Blend positions (`j % order === 0`) and copy derivative slots
+          // verbatim from curr. Velocity and acceleration are snapshots of
+          // the producer's instantaneous state — time-averaging them across
+          // frames corrupts the very signal the trajectory ships to preserve.
+          for (let j = 0; j < L; j++) {
+            if ((j % order) === 0) {
+              let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+              if (isInt) b = Math.round(b);
+              cA[j] = b;
+              pA[j] = b;
+            } else {
+              // Derivative slot: out already holds curr; sync prev to match.
+              pA[j] = cA[j]!;
+            }
+          }
         }
       }
     }
