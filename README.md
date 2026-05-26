@@ -339,6 +339,46 @@ The trajectory tag (`{ order, sampleCount }`) rides on `FieldSpec`, `CompiledFie
 
 This is the Pillar 1 release of the [Phase-Locked Extrapolation plan](https://github.com/Creeptones/webgpu-audio-bridge#roadmap) — the schema + evaluator half. Pillars 2 (nanosecond PLL for clock recovery between producer and consumer) and 3 (`bridge.pullEvaluated(out, sampleOffset)` that wraps pull + PLL + evaluate into one hot-path call) remain on the roadmap. Until they land, the consumer wires the dt by hand as shown above.
 
+#### Phase-locked loop — Pillar 2 of phase-locked extrapolation
+
+Track the offset between the producer's `tMacroNs` clock and the consumer's wall-clock so the trajectory evaluator gets sub-microsecond `dt` without manual epoch arithmetic (0.6.2, offset-only first cut):
+
+```ts
+// AudioWorklet — wired up against a trajectory schema (Pillar 1) + the PLL (Pillar 2).
+process(_inputs, outputs) {
+  const block = outputs[0][0]; // 128 samples
+
+  // 1. Pull the latest control frame (skip-tolerant).
+  const skipped = this.bridge.pullLatest(this.frame);
+  if (skipped < 0) {
+    // No frame available — extrapolate from the last one we have, or output silence.
+    return true;
+  }
+
+  // 2. Observe the consumer↔producer clock pairing once per quantum.
+  //    The PLL filters the per-observation jitter (mapAsync stalls, GC pauses)
+  //    so the per-sample dt below is sub-μs accurate.
+  const quantumStartNs = currentTime * 1e9;
+  this.bridge.observeConsumerTime(quantumStartNs, Number(this.frame.tMacroNs));
+
+  // 3. Evaluate the trajectory at every sample of the quantum.
+  for (let i = 0; i < block.length; i++) {
+    const consumerNs = quantumStartNs + (i / sampleRate) * 1e9;
+    const dtNs = this.bridge.phaseLockedTime(consumerNs) - Number(this.frame.tMacroNs);
+    evaluateTrajectoryInto(this.frame.vEff, this.trajSpec, dtNs * 1e-9, this.outBuf);
+    block[i] = this.synth.step(this.outBuf);
+  }
+
+  return true;
+}
+```
+
+The PLL is a 2nd-order PI controller (proportional + integral) over the residual `(producerNs - consumerNs) - currentEstimate`. With the default gains (`Kp = 0.2`, `Ki = 0.01`) a fresh constant offset converges to within 1 μs in ~30 observations; constant drift (e.g. 50 ppm between Worker `performance.now()` and `AudioContext.currentTime`) settles in a few seconds. The integral is anti-windup-clamped at ±1 ms in residual units, so any short-term stall drains in bounded time.
+
+State lives entirely on the consumer's `Bridge` instance — the SAB header is byte-for-byte unchanged from 0.6.1, so a 0.6.2 peer and a 0.6.1 peer share a SAB transparently. `bridge.telemetry()` exposes `pllLocked` and `pllOffsetNs` for diagnostics. Call `bridge.resetPll()` on AudioContext suspend/resume or whenever the producer's `tMacroNs` epoch jumps.
+
+This is the **first cut** of Pillar 2 — offset estimation only. Drift estimation, the Mahalanobis outlier gate for `mapAsync` stalls, and cross-process observability via header lanes 4-5 remain queued as future patches. Pillar 3 (`bridge.pullEvaluated(out, sampleOffset)` that wraps pull + observe + evaluate into one hot-path call) is also still ahead.
+
 ### Legacy API — `Float64RingBuffer`
 
 > **Deprecated 0.3.0.** Use `Bridge` + `physicsControlFrameSchema(n)` for new code. The legacy class is preserved unchanged for v0.1.x byte-compat and will be removed no earlier than 2.0.
@@ -533,6 +573,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
 - ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
 - ✅ **0.6.1 — Trajectory arrays (Pillar 1 of phase-locked extrapolation)** (`f64TrajectoryArray(n, { order })`, `f32TrajectoryArray(n, { order })`, and `evaluateTrajectoryInto(...)`). Producers pack interleaved `(p, v, [a])` samples into a frame field; consumers Taylor-extrapolate to a continuous-time signal at audio rate via the helper. Pillars 2 (nanosecond PLL) and 3 (`pullEvaluated`) remain ahead — see [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.6.2 — Phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut — offset only)** (`bridge.observeConsumerTime(consumerNs, producerNs)`, `bridge.phaseLockedTime(consumerNs)`, `bridge.resetPll()`, plus `pllLocked` / `pllOffsetNs` on `telemetry()`). Consumer-side PI loop tracks the producer↔consumer clock offset; sub-μs convergence in ~30 observations. Heap-only — SAB byte layout unchanged from 0.6.1. Drift estimator, outlier gate, and cross-process observability via lanes 4-5 are queued patches; Pillar 3 (`pullEvaluated`) remains ahead — see [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
 
 ### Remaining 1.0 work
 

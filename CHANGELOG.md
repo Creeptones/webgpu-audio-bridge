@@ -4,6 +4,69 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.2] — 2026-05-25
+
+### Added — consumer-side phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut: offset only)
+
+0.6.1 shipped the schema half of phase-locked extrapolation: producers can pack derivatives into a frame and consumers can Taylor-extrapolate via `evaluateTrajectoryInto`. The remaining gap was clock recovery — the consumer needs to know the elapsed time between a pulled frame's `tMacroNs` stamp and the audio-rate sample it's about to compute, sub-microsecond, against a producer clock that can jitter (`mapAsync` stalls) and drift (clock-domain crossings between Worker `performance.now()` and `AudioContext.currentTime`). 0.6.2 lands the consumer-side PLL that fills that gap.
+
+- **`bridge.observeConsumerTime(consumerNs, producerNs)`** — consumer-side observation point. Pair the producer-stamped timestamp from a recently-pulled frame with the consumer's wall-clock at the moment of observation; the bridge runs one PI cycle. First call seeds the offset exactly (`pllOffsetNs = producerNs - consumerNs`, `pllLocked = true`); subsequent calls update via:
+
+  ```
+  residual = (producerNs - consumerNs) - pllOffsetNs
+  integral = clamp(integral + residual, ±PLL_INT_LIMIT_NS)
+  pllOffsetNs += PLL_KP · residual + PLL_KI · integral
+  ```
+
+  ~5 arithmetic ops + 2 compares + 2 finite-checks per call. Allocation-free. Safe to call from an AudioWorklet's `process()` loop.
+
+- **`bridge.phaseLockedTime(consumerNs) → number`** — map a consumer-clock reading into the producer's frame of reference. Returns `consumerNs + pllOffsetNs` once locked, `consumerNs` unchanged before lock. One add + one boolean check. Safe at audio rate. Typical pattern (the canonical pre-Pillar-3 hand-rolled loop):
+
+  ```ts
+  for (let i = 0; i < 128; i++) {
+    const consumerNs = (currentTime + i / sampleRate) * 1e9;
+    const dtNs = bridge.phaseLockedTime(consumerNs) - Number(frame.tMacroNs);
+    evaluateTrajectoryInto(frame.vEff, spec, dtNs * 1e-9, out);
+    synth.step(out[i]);
+  }
+  ```
+
+- **`bridge.resetPll()`** — flip back to unlocked. Use on AudioContext suspend/resume, when the producer reconnects with a different `tMacroNs` epoch, or whenever the consumer's clock domain visibly jumps. Does not touch `consumerPrev` or `piIntegral` — the PLL, α-smoother, and flow-scale controller are independent state machines; pair with `resetSmoother()` if you want to drop both.
+
+- **`bridge.telemetry()` gains two fields:** `pllLocked: boolean` and `pllOffsetNs: number` — the heap snapshot of the consumer-side PLL state. The PLL is heap-only on the consumer's Bridge instance; the producer side reading its own `telemetry()` sees its own PLL state (which is permanently unlocked unless that side also runs observations).
+
+### Why — break the latency / phase tradeoff incrementally
+
+The full Pillar 2 design (in [`WebsitePlans/WebAudioBridge Beyond 1 and 4 - Phase-Locked Extrapolation Plan.md`](../NewProject/website/WebsitePlans/WebAudioBridge%20Beyond%201%20and%204%20-%20Phase-Locked%20Extrapolation%20Plan.md)) calls for a drift estimator, an outlier gate, and cross-process observability via lanes 4-5. 0.6.2 ships the *core PI loop on offset only* — the smallest piece that gives a measurable improvement over no clock recovery at all. With `PLL_KP = 0.2` a fresh constant offset converges to within 1 μs in ~30 observations (geometric residual decay at 80 % per cycle); with `PLL_KI = 0.01` constant drift settles in a few seconds. This is enough for the most common case — both peers on the same machine with sub-ppm clock drift between `performance.now()` and `AudioContext.currentTime`.
+
+What 0.6.2 does NOT do (still in the Pillar 2 plan, queued for follow-up patches):
+
+- **Drift estimator** — second integrator over residuals normalized by inter-observation dt, tracking ppm. Improves long-term lock under heavy clock-domain drift.
+- **Mahalanobis outlier gate** — reject `mapAsync` stalls so a single 30 ms residual spike doesn't poison the offset estimate.
+- **Cross-process observability** via lanes 4-5. Producer reads the consumer's offset estimate for unified telemetry / DevTools dashboards. The 0.6.2 cut keeps the wire format byte-for-byte identical to 0.6.1.
+
+### Wire compatibility
+
+- **No SAB changes.** All PLL state lives on the consumer's Bridge instance (heap). Header lanes 0-3 remain as in 0.6.0; lanes 4-7 stay reserved. A 0.6.1 peer and a 0.6.2 peer share a SAB transparently.
+- **API additions only.** `observeConsumerTime`, `phaseLockedTime`, `resetPll` are new public methods; the `telemetry()` return type gains two fields (`pllLocked`, `pllOffsetNs`). No removed or renamed members.
+
+### Tests
+
+`tests/Bridge.test.ts` grows from 40 to 43 pins:
+
+- **`testPllColdStart`** (pin #41) — fresh Bridge: `telemetry().pllLocked === false`, `pllOffsetNs === 0`, `phaseLockedTime(x) === x`. First `observeConsumerTime(c, p)` seeds: `pllOffsetNs === p - c` exactly, `pllLocked === true`, no PI math runs. `phaseLockedTime(c) === p` post-seed; any other consumer time gets the same offset applied.
+
+- **`testPllConvergence`** (pin #42) — seed at 10 ms below truth, feed 50 observations against a constant 50 ms true offset with ±100 μs of synthetic jitter per observation. Asserts the heap estimate converges to within 50 μs of truth (jitter-floor-respecting bound). The Kp=0.2 geometric decay alone closes a 10 ms residual in ~41 cycles, so 50 cycles has headroom.
+
+- **`testPllStepAndResetAndValidation`** (pin #43) — three behaviors. Step response: lock at offset=0, jump to 1 ms offset, drive 200 cycles, assert residual < 1000 ns. `resetPll()`: flips back to unlocked, zeros state, next observation re-seeds exactly. Argument validation: `NaN` / `±Infinity` for either argument throws.
+
+### Documentation
+
+- New `Phase-locked loop (0.6.2, Pillar 2 first cut — offset only)` section in `src/Bridge.ts` header documenting the PI derivation, the heap-only storage rationale, the lock state machine, convergence properties, and the deferred follow-up items.
+- JSDoc on `observeConsumerTime`, `phaseLockedTime`, `resetPll`, and the updated `telemetry()` covers the new contracts.
+- README gains a `#### Phase-locked loop` subsection under `Schema DSL` with a worked AudioWorklet-pattern example showing trajectory + PLL combined (the Pillar 1 + Pillar 2 stack as designed).
+- Roadmap `Shipped` adds the 0.6.2 entry; "phase-locked extrapolation" stays in the active roadmap with Pillars 2-extensions and Pillar 3 (`bridge.pullEvaluated`) still ahead.
+
 ## [0.6.1] — 2026-05-25
 
 ### Added — trajectory arrays (Pillar 1 of phase-locked extrapolation)

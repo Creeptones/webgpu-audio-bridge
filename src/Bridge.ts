@@ -281,6 +281,75 @@
  * over baseline. Tolerable for control-rate frames; not a fit for audio-
  * rate or high-Hz telemetry — those callers should leave invariants off.
  *
+ * ─── Phase-locked loop (0.6.2, Pillar 2 first cut — offset only) ────────
+ *
+ * Consumer-side PLL that tracks the offset between the producer's
+ * `tMacroNs` (the timestamp the producer writes into each frame) and the
+ * consumer's wall-clock (typically `AudioContext.currentTime * 1e9`).
+ * Once locked, the consumer knows the sub-microsecond elapsed time
+ * between a pulled frame's stamp and any audio-rate evaluation point —
+ * the prerequisite for Pillar 3's `pullEvaluated` and the FFT phase-lock
+ * marketing claim ("60 Hz GPU physics drives 48 kHz audio with no
+ * observable 60 Hz alias").
+ *
+ * Why a PLL and not a single subtraction:
+ * - `mapAsync`/postMessage latency between producer and consumer has
+ *   high variance (5–10 ms typical, 30 ms+ stalls under GPU load).
+ * - `AudioContext.currentTime` and the producer's clock can drift at
+ *   tens of ppm even on the same machine (NTP correction, thermal).
+ * - A single `(producerNs - consumerNs)` subtraction captures both the
+ *   true offset AND the per-observation jitter; the PLL low-pass
+ *   filters out the jitter while tracking the drift.
+ *
+ * Storage: heap-only on the consumer's Bridge instance — three numbers
+ * (`pllOffsetNs`, `pllIntegral`, `pllLocked`). The header lanes 4-7
+ * stay reserved. Cross-process observability of the PLL state (so the
+ * producer side can see the consumer's offset estimate for telemetry)
+ * is a deferred follow-up; the 0.6.2 cut keeps the wire format
+ * byte-for-byte identical to 0.6.1.
+ *
+ * API:
+ *   observeConsumerTime(consumerNs, producerNs) — run one PI cycle pairing
+ *     a producer-stamped time with the consumer's wall-clock at the
+ *     observation moment. Typical pattern: call once per pull. The first
+ *     call seeds the offset exactly (`pllOffsetNs = producerNs - consumerNs`,
+ *     `pllLocked = true`); subsequent calls run the PI math:
+ *       residual = (producerNs - consumerNs) - pllOffsetNs
+ *       integral = clamp(integral + residual, ±PLL_INT_LIMIT_NS)
+ *       pllOffsetNs += PLL_KP · residual + PLL_KI · integral
+ *
+ *   phaseLockedTime(consumerNs) — returns `consumerNs + pllOffsetNs` once
+ *     locked, else `consumerNs` unchanged. Safe at audio rate.
+ *
+ *   resetPll() — flip back to unlocked. Use after suspend/resume, an
+ *     AudioContext epoch change, or when the producer reconnects with
+ *     a different `tMacroNs` epoch.
+ *
+ *   telemetry().pllLocked / .pllOffsetNs — point-in-time snapshot.
+ *
+ * Convergence: with `PLL_KP = 0.2`, a fresh constant offset converges to
+ * within 1 μs in ~30 observations (geometric residual decay at 80 % per
+ * cycle, log-base-1.25 of (initial / 1μs)). With `PLL_KI = 0.01`, a
+ * constant drift (e.g. 50 ppm) settles within a few seconds — exactly
+ * the regime where Ki contributes more than Kp's decaying-residual term.
+ *
+ * Anti-windup: `pllIntegral` is clamped to ±`PLL_INT_LIMIT_NS` (1 ms in
+ * residual units). Past that, Ki·integral alone would dominate and any
+ * short-term residual spike (a stalled producer, a paused consumer)
+ * could take an arbitrarily long time to drain. Same shape as 0.5.0's
+ * `FLOW_SCALE_INT_LIMIT` (anti-windup is the same pattern in both
+ * controllers).
+ *
+ * Deferred to follow-ups (still in the Pillar 2 plan, not in 0.6.2):
+ *   - Drift estimator: second integrator over residuals normalized by
+ *     dt-between-observations, tracking ppm. Improves long-term lock
+ *     quality on drifting clocks.
+ *   - Mahalanobis outlier gate against recent residual variance. Rejects
+ *     `mapAsync` stalls so a single 30 ms residual spike doesn't poison
+ *     the offset estimate.
+ *   - Cross-process observability via lanes 4-5. Producer can read the
+ *     consumer's offset for unified telemetry / DevTools dashboards.
+ *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
  * Compared to the hand-rolled Float64RingBuffer code path, Bridge<S> pays a
@@ -356,6 +425,25 @@ const FLOW_SCALE_INT_LIMIT = 20; // = 1.0 / FLOW_SCALE_KI
 const INVARIANT_OK_THRESHOLD = 1e-3;
 const INVARIANT_SOFT_THRESHOLD = 1.0;
 const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
+
+// PLL controller gains. See file header "Phase-locked loop" for the
+// derivation; same shape as FLOW_SCALE_KP/KI but tuned for the offset
+// signal (residuals are nanoseconds-scale where flow-scale residuals are
+// occupancy-fraction-scale, so absolute gains differ).
+//
+// Kp dominates the transient response — at Kp=0.2 a single observation
+// closes 20 % of the residual gap, so a fresh constant offset converges
+// to within 1 μs in ~30 cycles. Ki removes residual bias from drift
+// (e.g. a producer clock running 50 ppm fast) over a few seconds.
+const PLL_KP = 0.2;
+const PLL_KI = 0.01;
+// Anti-windup: cap |integral| at 1 ms (= 1e6 ns) in residual-units.
+// Past this, Ki·integral alone would dominate the offset estimate and
+// any short-term residual spike would take an arbitrarily long time
+// to drain. 1 ms is large enough to handle multi-second drift error
+// accumulating before Ki notices, small enough that recovery from a
+// trapped integrator takes at most a few seconds.
+const PLL_INT_LIMIT_NS = 1e6;
 
 export interface BridgeAllocation<S extends Schema<FieldsObject>> {
   sab: SharedArrayBuffer;
@@ -474,6 +562,33 @@ export class Bridge<S extends Schema<FieldsObject>> {
    *  external invalidation path — the controller is a feedback loop that
    *  re-converges within a few cycles after any disturbance). */
   private piIntegral: number = 0;
+
+  /** PLL state — consumer-side phase-locked loop tracking the offset between
+   *  the producer's `tMacroNs` clock and the consumer's wall clock (typically
+   *  AudioContext.currentTime in ns). Heap-only; lanes 4-7 of the header
+   *  remain reserved in this release.
+   *
+   *  Lifecycle:
+   *   - Constructor sets `pllLocked=false`, `pllOffsetNs=0`, `pllIntegral=0`.
+   *   - First `observeConsumerTime(c, p)` seeds `pllOffsetNs = p - c` and flips
+   *     `pllLocked=true`. No PI math runs on the seeding call.
+   *   - Subsequent calls run one PI cycle each, updating `pllOffsetNs` and
+   *     `pllIntegral` (the latter clamped to ±PLL_INT_LIMIT_NS for anti-windup).
+   *   - `resetPll()` flips back to the unlocked state — re-call on suspend/resume
+   *     or whenever the consumer's clock epoch jumps.
+   *
+   *  The offset is consumer-clock → producer-clock: `producerNs ≈ consumerNs +
+   *  pllOffsetNs` once locked. `phaseLockedTime(consumerNs)` returns that sum.
+   *  Pre-lock, `phaseLockedTime` returns `consumerNs` unchanged (the caller's
+   *  best fallback is just trust the consumer clock until the first
+   *  observation arrives).
+   *
+   *  See file header "Phase-locked loop (0.6.2, Pillar 2 first cut)" for the
+   *  PI derivation and the deferred items (drift estimator, outlier gate,
+   *  cross-process observability lanes). */
+  private pllOffsetNs: number = 0;
+  private pllIntegral: number = 0;
+  private pllLocked: boolean = false;
 
   /** F64 umbrella view used to read/write the hidden `__invariant` lane on
    *  invariant-enabled schemas. Null when `schema.invariant === null`, in
@@ -998,6 +1113,96 @@ export class Bridge<S extends Schema<FieldsObject>> {
   }
 
   /**
+   * PLL observation — consumer-side. Pair the timestamp the producer wrote
+   * into a recently-pulled frame (`producerNs`, typically `Number(frame.tMacroNs)`
+   * or `Number(frame.tMacroNs - epochNs)` depending on the consumer's frame
+   * of reference) with the consumer's wall-clock reading at the moment
+   * that frame was pulled or evaluated (`consumerNs`, typically
+   * `AudioContext.currentTime * 1e9`).
+   *
+   * The first call seeds the offset estimate exactly (`pllOffsetNs =
+   * producerNs - consumerNs`) and flips `pllLocked=true`. Subsequent calls
+   * run one PI cycle each:
+   *
+   *     residual = (producerNs - consumerNs) - pllOffsetNs
+   *     pllIntegral = clamp(pllIntegral + residual, ±PLL_INT_LIMIT_NS)
+   *     pllOffsetNs += PLL_KP · residual + PLL_KI · pllIntegral
+   *
+   * `consumerNs` and `producerNs` are user-supplied scalars; the bridge has
+   * no opinion on which clocks they came from as long as the pairing is
+   * consistent (same observation event). Calling once per `pull` is the
+   * canonical pattern; calling more often is harmless (the PI converges
+   * faster); calling less often is fine (the PI is just slower to settle).
+   *
+   * Cost: ~5 arithmetic ops + 2 compares. Allocation-free. Safe to call
+   * from an AudioWorklet's `process()` loop.
+   *
+   * NOT exposed via the SAB header — the offset estimate lives only on the
+   * caller's Bridge instance. A second Bridge instance (e.g. the producer
+   * side observing PLL state) cannot read it. Cross-process observability
+   * is a deferred Pillar 2 follow-up (lanes 4-5 will publish the offset).
+   */
+  observeConsumerTime(consumerNs: number, producerNs: number): void {
+    if (!Number.isFinite(consumerNs) || !Number.isFinite(producerNs)) {
+      throw new Error(
+        `observeConsumerTime: arguments must be finite (consumerNs=${consumerNs}, producerNs=${producerNs})`,
+      );
+    }
+    if (!this.pllLocked) {
+      this.pllOffsetNs = producerNs - consumerNs;
+      this.pllIntegral = 0;
+      this.pllLocked = true;
+      return;
+    }
+    const residual = (producerNs - consumerNs) - this.pllOffsetNs;
+    let integral = this.pllIntegral + residual;
+    if (integral > PLL_INT_LIMIT_NS) integral = PLL_INT_LIMIT_NS;
+    else if (integral < -PLL_INT_LIMIT_NS) integral = -PLL_INT_LIMIT_NS;
+    this.pllIntegral = integral;
+    this.pllOffsetNs += PLL_KP * residual + PLL_KI * integral;
+  }
+
+  /**
+   * PLL evaluation — map a consumer-clock reading to the producer-clock
+   * frame of reference using the current offset estimate. Returns
+   * `consumerNs + pllOffsetNs` once `observeConsumerTime` has been called
+   * at least once; before that, returns `consumerNs` unchanged (the safest
+   * fallback: trust the consumer clock until the loop has any data).
+   *
+   * Typical use inside an AudioWorklet's per-sample loop:
+   *
+   *     for (let i = 0; i < 128; i++) {
+   *       const consumerNs = (currentTime + i / sampleRate) * 1e9;
+   *       const dtNs = bridge.phaseLockedTime(consumerNs) - Number(frame.tMacroNs);
+   *       evaluateTrajectoryInto(frame.vEff, spec, dtNs * 1e-9, out);
+   *       synth.step(out[i]);
+   *     }
+   *
+   * Cost: one add + one boolean check. Safe at audio rate.
+   */
+  phaseLockedTime(consumerNs: number): number {
+    if (!this.pllLocked) return consumerNs;
+    return consumerNs + this.pllOffsetNs;
+  }
+
+  /**
+   * Reset the PLL to the unlocked state. The next `observeConsumerTime`
+   * call seeds the offset from scratch. Call when the consumer's clock
+   * epoch jumps (suspend/resume, AudioContext close/reopen) or when the
+   * producer reconnects with a different `tMacroNs` epoch.
+   *
+   * Does not touch `consumerPrev` or `piIntegral` — the PLL, α-smoother,
+   * and flow-scale controller are independent state machines. Use
+   * `resetSmoother()` alongside this if you also want to drop the
+   * α-smoother's history.
+   */
+  resetPll(): void {
+    this.pllLocked = false;
+    this.pllOffsetNs = 0;
+    this.pllIntegral = 0;
+  }
+
+  /**
    * Apply the one-pole blend in-place on `out` and update `consumerPrev`.
    *
    * Called by `pullSmoothed` / `pullLatestSmoothed` after the SAB read +
@@ -1308,6 +1513,8 @@ export class Bridge<S extends Schema<FieldsObject>> {
     readonly capacity: number;
     readonly writeIndex: number;
     readonly readIndex: number;
+    readonly pllLocked: boolean;
+    readonly pllOffsetNs: number;
   } {
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
@@ -1322,6 +1529,11 @@ export class Bridge<S extends Schema<FieldsObject>> {
       capacity: this.capacity,
       writeIndex: writeIdx >>> 0,
       readIndex: readIdx >>> 0,
+      // PLL fields are heap-only on this Bridge instance — a peer reading
+      // their own Bridge's telemetry sees their own PLL state. Lanes 4-5
+      // are still reserved; cross-process observability lands in a follow-up.
+      pllLocked: this.pllLocked,
+      pllOffsetNs: this.pllOffsetNs,
     });
   }
 
