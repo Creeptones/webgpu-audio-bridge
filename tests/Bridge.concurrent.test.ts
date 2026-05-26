@@ -31,6 +31,12 @@
  *      indicate a sign-flip, clamp miss, or encoder overflow. This is the
  *      cross-thread pin for #1 (0.5.0); the single-threaded controller math
  *      is exhaustively covered by tests/Bridge.test.ts pins 28-33.
+ *   8. `telemetry().tornFrames === 0` over the full 1 M-frame run on a
+ *      no-invariant schema. The bridge's invariant-pathway short-circuits
+ *      when `schema.invariant === null`, so zero torn frames are expected;
+ *      any non-zero reading indicates a false-positive in the
+ *      classification logic or an SPSC-protocol regression. Cross-thread
+ *      pin for #4 (0.6.0).
  *
  * If the release/acquire protocol is broken on either side OR the schema-
  * driven offset math drifts from what the consumer reads, the inner payload
@@ -442,6 +448,18 @@ async function runConcurrentStress(): Promise<void> {
   assert(
     flowScaleMin >= 0.5 && flowScaleMax <= 2.0,
     `flow-scale envelope [${flowScaleMin}, ${flowScaleMax}] within [0.5, 2.0] (${flowScaleSamples} samples)`,
+  );
+  // Torn-frame counter. The schema in this test (physicsControlFrameSchema)
+  // has no `.withInvariant(...)` attached, so the invariant pathway is
+  // short-circuited in the bridge — tornFrames must stay at 0 over a 1 M-
+  // frame healthy run. Any non-zero reading would indicate either an
+  // incorrect classification (false positive) or a torn-frame regression
+  // in the SPSC protocol itself.
+  const tel = ring.telemetry();
+  assertEq(
+    tel.tornFrames,
+    0,
+    `tornFrames=0 over ${TOTAL_FRAMES.toLocaleString()} frames on a no-invariant schema (got ${tel.tornFrames})`,
   );
   ok(
     `bridge-concurrent-spsc-stress (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +

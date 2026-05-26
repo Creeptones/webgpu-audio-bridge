@@ -236,6 +236,10 @@ Consumer-side park. Mirror of `waitForSpace`. **Not real-time safe** — must NO
 
 Producer-side adaptive backpressure hint, in `[0.5, 2.0]`. Returns the consumer's most recent `flow_scale` reading: `1.0` means the consumer's controller sees rates matched; `< 1.0` means slow down (consumer overfull); `> 1.0` means speed up (consumer starved). Best-effort — the bridge does not enforce; the producer voluntarily honors. See [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style) for the contract and a worked example.
 
+#### `telemetry() → { tornFrames, flowScale, available, capacity, writeIndex, readIndex }`
+
+Frozen point-in-time observability snapshot. All fields are O(1) `Atomics.load` reads — safe to call from any thread. `tornFrames` is the count of hard-error invariant fallbacks (0 if the schema has no invariant). Individual reads are consistent; the whole snapshot is not mutually atomic (use for dashboards / diagnostics, not for synchronization). See [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection) for the invariant-driven path that increments `tornFrames`.
+
 #### `describeLayout() → SchemaLayoutDescription`
 
 Returns a JSON-safe byte-offset table for the schema's frame layout — pass this through `postMessage` / `processorOptions` to a worklet that wants to inline the read protocol without importing the library on the audio thread.
@@ -273,6 +277,27 @@ The full set of field constructors:
 | `f64()` / `f32()` | `number` | `f64Array(n)` / `f32Array(n)` | `Float64Array` / `Float32Array` |
 
 `defineSchema({ ... })` validates field names (must be valid JS identifiers, no duplicates), groups fields internally by alignment class (8-aligned first, then 4, then 2, then 1; stable within class) so SAB-backed typed-array views land at legal byte offsets, and pads the frame size up to 8.
+
+#### Schema invariants — `.withInvariant(fn)`
+
+Append a hidden integrity field to the schema (0.6.0):
+
+```ts
+const schema = defineSchema({
+  seq:  u64(),
+  vEff: f64Array(64),
+  jEff: f64Array(64),
+}).withInvariant((frame) => {
+  // Σ|f|² is the canonical choice for f64-dominant payloads. xxhash /
+  // CRC32 / any pure, O(payload size), allocation-free function works.
+  let s = 0;
+  for (const x of frame.vEff) s += x * x;
+  for (const x of frame.jEff) s += x * x;
+  return s;
+});
+```
+
+The bridge auto-computes the invariant at push and verifies at pull, falling back to the last-known-good frame on hard errors and engaging the α-smoother on soft errors. See [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection) for the protocol and recovery behavior.
 
 ### Legacy API — `Float64RingBuffer`
 
@@ -371,6 +396,50 @@ function tick() {
 
 The controller targets half-full occupancy with `Kp = 0.5, Ki = 0.05` (~10 ms settling time at the canonical 375 Hz consumer cadence). The integrator is bounded to `±20` for anti-windup so a long stall can't trap the controller in permanent over-correction. See the "Adaptive backpressure (CFL-style)" section in `src/Bridge.ts` for the full controller math and the CHANGELOG `[0.5.0]` entry for the design rationale.
 
+### Cross-IPC bit-rot detection
+
+0.6.0 adds opt-in payload integrity verification as a protocol concern. Build a schema with `.withInvariant(fn)` and the bridge auto-computes the invariant on push, verifies on pull, and recovers gracefully on mismatch:
+
+```ts
+import { defineSchema, f64Array, u64, Bridge } from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq:  u64(),
+  vEff: f64Array(64),
+  jEff: f64Array(64),
+}).withInvariant((frame) => {
+  // Σ|f|² is canonical for f64-dominant payloads. Use xxhash / CRC32 /
+  // anything pure + O(payload size) + allocation-free if you need
+  // bit-level (rather than energy-level) integrity.
+  let s = 0;
+  for (const x of frame.vEff) s += x * x;
+  for (const x of frame.jEff) s += x * x;
+  return s;
+});
+
+const { sab, capacity } = Bridge.allocate(16, schema);
+const ring = new Bridge(sab, capacity, schema);
+
+// ... push as usual; pull returns recovered frames on corruption ...
+
+const tel = ring.telemetry();
+if (tel.tornFrames > 0) {
+  console.warn(`bridge recovered ${tel.tornFrames} torn frames`);
+}
+```
+
+The classification:
+
+| Verdict | `\|ratio − 1\|` | Action |
+|---|---|---|
+| ok | `< 1e-3` | Pass through; seed `consumerPrev` (last-known-good). |
+| soft | `< 1.0` | Invoke α-smoother (from 0.4.1) with `α = clamp(0.1 / \|ratio−1\|, 0, 1)`. tornFrames stays 0. |
+| hard | `≥ 1.0` (or NaN/Inf) | Copy `consumerPrev` into `out`; increment `tornFrames`. On the first pull (no prev), the raw payload passes through and `tornFrames` still increments. |
+
+Hard errors are visible via `bridge.telemetry().tornFrames` — a monotonic counter you can scrape for dashboards, regression tests, or runtime alerting. Soft errors are recovered click-free with no counter bump.
+
+**Wire compatibility**: schemas with and without invariants have different wire formats (the invariant lane adds 8 bytes per slot). Producer and consumer must use the same schema. Schemas without `.withInvariant(...)` are wire-compatible with 0.5.x and 0.4.x peers; the invariant pathway is a single null-check on the hot path, with zero observable cost when not used (the 0.6.0 bench at N=1000 shows push/pull/pullLatest median unchanged from 0.5.0 at 1.20 μs).
+
 ## Memory ordering (for serious readers)
 
 The ring uses the standard release/acquire pattern for SPSC over SAB. A note for systems readers: ECMA-262 only defines sequentially-consistent atomics — there is no `memory_order_acquire` in JS. `Atomics.load` and `Atomics.store` are seq-cst, which is strictly stronger than release/acquire, so the protocol below is sound; we describe it in R/A terms because that's the load-bearing structure.
@@ -422,14 +491,14 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.4.0 — Int32 wrap counters** (ringbuf.js-class atomic floor). `write_index` / `read_index` lanes moved from BigInt64 to Int32 wrapping mod 2^32; isolated atomic load+store+notify drops from ~160 ns to ~100 ns on V8.
 - ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with skip-scaling (`α_eff = α_base · 2⁻ˢᵏⁱᵖᵖᵉᵈ`) on the latest variant.
 - ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
+- ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
 
 ### Remaining 1.0 work
 
-1. **Schema invariant header** — `defineSchema({ ... }).withInvariant(fn)` adds a per-frame integrity field (Σ|f|² / CRC / xxhash, caller's choice) that the bridge auto-computes at push and verifies at pull. Soft errors (small ratio deviation) engage the 0.4.1 smoother for inaudible recovery; hard errors fall back to the last-known-good frame and increment a `tornFrameCounter` on lane 3. Cross-IPC bit-rot detection as a protocol concern instead of a per-caller responsibility. Target: 0.6.0.
-2. **Backpressure policies** — `policy: 'reject' | 'drop-oldest' | 'drop-newest' | 'block'` constructor option. Today only `reject` (the historical contract) is implemented; the other three are useful for telemetry-style and critical-data streams. With #4 landed and the soft hint already running, `reject` is rarely needed in practice, but the policies cover the cases where the producer can't honor the hint at all.
-3. **Observability snapshot** — `ring.telemetry()` returning pushed/pulled/dropped counters, current/max depth, `flowScale`, `tornFrames`, and last-wait durations. Lets consumers build DevTools panels, load shedding, and dashboards without instrumenting both ends by hand. Mostly falls out of #1 once `tornFrameCounter` lands on lane 3.
+1. **Backpressure policies** — `policy: 'reject' | 'drop-oldest' | 'drop-newest' | 'block'` constructor option. Today only `reject` (the historical contract) is implemented; the other three are useful for telemetry-style and critical-data streams respectively. With 0.5.0's soft hint + 0.6.0's recovery already running, `reject` is rarely needed in practice, but the policies cover the cases where the producer can't honor the hint at all.
+2. **Observability dashboards on `telemetry()`** — the snapshot API landed in 0.6.0 with `tornFrames`, `flowScale`, `available`, `capacity`, `writeIndex`, `readIndex`. Adds `pushed` / `pulled` / `dropped` counters + last-wait durations + max-depth high-water-mark for full DevTools panel integration. Mostly an additive extension of the existing API surface.
 
-These are sequenced together because all three change the constructor / class surface and should land before 1.0 freezes the API.
+Both are scoped together because they share the constructor / class surface and should land before 1.0 freezes the API.
 
 ### Beyond 1.0
 

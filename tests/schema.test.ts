@@ -13,6 +13,10 @@
  *      field's element size (the SAB typed-array constructor contract).
  *   4. Frame size is padded up to 8 so consecutive slots stay 8-aligned.
  *   5. describeSchemaLayout serializes the compiled layout for postMessage.
+ *   9. withInvariant builder appends a hidden __invariant f64 lane: frame
+ *      size grows by 8, f64 joins typesPresent, invariantByteOffset is
+ *      set to the (8-aligned) userEnd. No invariant → invariantByteOffset
+ *      is null. Schema is still frozen.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -305,6 +309,94 @@ function testSchemaFrozen(): void {
   ok("schema-frozen");
 }
 
+// ── 9. withInvariant builder ───────────────────────────────────────────────
+//
+// Calling `.withInvariant(fn)` on a base schema produces a new schema with
+// the hidden `__invariant: f64` lane appended at the (8-aligned) end of the
+// user fields. Frame size grows by exactly 8; `f64` is in `typesPresent`
+// even if the base schema had no f64 fields; `invariantByteOffset` is set.
+// The original schema is unchanged (immutable builder).
+function testWithInvariant(): void {
+  // Base schema with no f64 (just u64) — verify f64 gets added to
+  // typesPresent purely from the invariant requirement.
+  const base = defineSchema({
+    seq: u64(),
+    label: u8Array(7), // odd-byte to force userEnd padding
+  });
+  // base layout: u64 at 0 (8B), u8Array(7) at 8 (7B), userEnd raw = 15,
+  // padded to 16. f64 NOT in typesPresent.
+  assertEq(base.frameByteSize, 16, "base frame size 16");
+  assertEq(base.invariant, null, "base has no invariant attached");
+  assertEq(base.compiled.invariantByteOffset, null, "base invariantByteOffset null");
+  assert(
+    !base.compiled.typesPresent.includes("f64"),
+    "base typesPresent does NOT include f64",
+  );
+
+  const withInv = base.withInvariant((frame) => {
+    // Trivial invariant — sum the label bytes interpreted as u8s.
+    let s = 0;
+    for (let k = 0; k < 7; k++) s += frame.label[k]!;
+    return s;
+  });
+
+  assertEq(
+    withInv.frameByteSize,
+    24,
+    "withInvariant frame size = base + 8 (hidden invariant lane)",
+  );
+  assertEq(
+    withInv.compiled.invariantByteOffset,
+    16,
+    "invariantByteOffset = padded userEnd (16)",
+  );
+  assert(
+    withInv.compiled.typesPresent.includes("f64"),
+    "withInvariant adds f64 to typesPresent",
+  );
+  assert(withInv.invariant !== null, "withInvariant.invariant is non-null");
+  assertEq(withInv.invariant?.byteOffset, 16, "invariant byteOffset matches");
+
+  // Original is unchanged.
+  assertEq(base.frameByteSize, 16, "base unchanged after withInvariant");
+  assertEq(base.invariant, null, "base invariant still null");
+
+  // Type validation.
+  let threw = false;
+  try {
+    (base as unknown as { withInvariant: (x: unknown) => unknown }).withInvariant("not-a-fn");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "withInvariant rejects non-function argument");
+
+  // Sanity: schemas with existing f64 also work — typesPresent stays correct.
+  const withF64 = defineSchema({ x: f64(), y: f64Array(3) }).withInvariant(
+    (frame) => {
+      let s = frame.x * frame.x;
+      for (let k = 0; k < 3; k++) s += frame.y[k]! * frame.y[k]!;
+      return s;
+    },
+  );
+  assertEq(withF64.frameByteSize, 8 + 24 + 8, "f64 schema + invariant = 40B");
+  assertEq(
+    withF64.compiled.typesPresent.filter((k) => k === "f64").length,
+    1,
+    "f64 listed exactly once in typesPresent",
+  );
+
+  // Frozen.
+  let threw2 = false;
+  try {
+    (withInv as { frameByteSize: number }).frameByteSize = 99;
+  } catch {
+    threw2 = true;
+  }
+  assert(threw2, "withInvariant schema is frozen");
+
+  ok("with-invariant");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -314,6 +406,7 @@ function main(): void {
   testDescribeLayout();
   testFrameForInference();
   testSchemaFrozen();
+  testWithInvariant();
   console.log("ALL PASS schema");
 }
 

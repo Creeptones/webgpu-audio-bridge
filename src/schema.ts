@@ -30,6 +30,26 @@
  * type that field carries on a frame (e.g. `u64()` returns `FieldSpec<bigint>`,
  * `f64Array(n)` returns `FieldSpec<Float64Array>`). The `FrameFor<S>` mapped
  * type extracts those `T`s into the shape `Bridge.push`/`pull` accept.
+ *
+ * ─── Schema invariants (0.6.0) ─────────────────────────────────────────────
+ *
+ * `defineSchema(...).withInvariant(fn)` builds a new schema with a hidden
+ * `__invariant: f64` lane appended at the end of each frame slot. The Bridge
+ * auto-computes the invariant on push (caller-supplied fn) and verifies on
+ * pull; mismatches are classified as soft (smoother recovery) or hard
+ * (last-known-good fallback + lane-3 tornFrameCounter increment). See the
+ * `Schema invariants` section of `src/Bridge.ts` for the runtime protocol
+ * and recovery thresholds.
+ *
+ * The invariant fn must be O(payload size), allocation-free, and pure (same
+ * input → same output bit-exactly). Sum-of-squares is the canonical choice
+ * for f64-dominant schemas; xxhash / CRC32 work for byte-oriented payloads.
+ * BigInt and integer fields can be coerced into the sum or run through a
+ * separate accumulator — the bridge doesn't constrain the choice.
+ *
+ * Type erasure: schemas with and without invariants share the `Schema<F>`
+ * type. `FrameFor<S>` does NOT include the hidden `__invariant` field — it's
+ * bridge-managed, never exposed to user-side reads/writes.
  */
 
 export type FieldKind =
@@ -129,6 +149,27 @@ export interface CompiledLayout {
   readonly frameByteSize: number;
   readonly typesPresent: ReadonlyArray<FieldKind>;
   readonly fields: ReadonlyArray<CompiledField>;
+  /** Byte offset of the hidden `__invariant: f64` field within a frame, or
+   *  null if the schema has no invariant attached. When non-null the
+   *  bridge writes the f64 invariant here on push and reads/verifies on
+   *  pull. Always 8-aligned. */
+  readonly invariantByteOffset: number | null;
+}
+
+/** Caller-supplied invariant function. Receives a user-shaped frame object
+ *  (no `__invariant` field exposed) and returns a finite f64 scalar that the
+ *  bridge stores per-frame for verification on pull. Must be O(payload size),
+ *  allocation-free, and pure. */
+export type InvariantFn<F extends FieldsObject> = (
+  frame: { -readonly [K in keyof F]: F[K] extends FieldSpec<infer T> ? T : never },
+) => number;
+
+/** Type-erased invariant spec consumed by Bridge. */
+export interface SchemaInvariantSpec {
+  /** Type-erased invariant compute fn (Bridge passes Record<string, unknown>). */
+  readonly compute: (frame: Record<string, unknown>) => number;
+  /** Byte offset of the hidden `__invariant: f64` field within a frame. */
+  readonly byteOffset: number;
 }
 
 export interface Schema<F extends FieldsObject = FieldsObject> {
@@ -136,9 +177,18 @@ export interface Schema<F extends FieldsObject = FieldsObject> {
   readonly frameByteSize: number;
   readonly compiled: CompiledLayout;
   readonly _brand: "wab/Schema";
+  /** Attached invariant spec, or null if none. */
+  readonly invariant: SchemaInvariantSpec | null;
+  /** Builder: returns a new Schema with the invariant attached. The frame
+   *  byte size grows by 8 to accommodate the hidden `__invariant: f64`
+   *  field; the f64 type-family is added to `compiled.typesPresent` if not
+   *  already present. */
+  withInvariant(fn: InvariantFn<F>): Schema<F>;
 }
 
-/** Map a Schema to the frame object shape used by Bridge push/pull. */
+/** Map a Schema to the frame object shape used by Bridge push/pull.
+ *  Does NOT include the hidden `__invariant` field — that's bridge-managed
+ *  and never exposed to user-side reads/writes. */
 export type FrameFor<S> = S extends Schema<infer F>
   ? { -readonly [K in keyof F]: F[K] extends FieldSpec<infer T> ? T : never }
   : never;
@@ -169,6 +219,106 @@ function isFieldKind(x: unknown): x is FieldKind {
     x === "u8"  || x === "i8"  ||
     x === "f64" || x === "f32"
   );
+}
+
+function compileLayout(
+  fields: FieldsObject,
+  options: { invariant: boolean },
+): CompiledLayout {
+  const names = Object.keys(fields);
+  // Stable sort by alignment class descending: 8-byte first, then 4, then 2, then 1.
+  // Within an alignment class preserve declared order. Dense packing within
+  // class then guarantees every field's byteOffset is a multiple of its
+  // element size — no SAB typed-array constructor will reject the alignment.
+  const decl = names.map((name, i) => {
+    const spec = fields[name]!;
+    return { name, spec, declOrder: i, align: kindByteSize(spec.kind) };
+  });
+  decl.sort((a, b) => {
+    if (a.align !== b.align) return b.align - a.align;
+    return a.declOrder - b.declOrder;
+  });
+
+  const compiledFields: CompiledField[] = [];
+  const typesPresentSet = new Set<FieldKind>();
+  let offset = 0;
+  for (const { name, spec } of decl) {
+    const length = spec.length ?? 1;
+    const isArray = spec.length !== undefined;
+    const align = kindByteSize(spec.kind);
+    if (offset % align !== 0) {
+      throw new Error(
+        `Schema: internal alignment error for field '${name}' (offset ${offset} not aligned to ${align})`,
+      );
+    }
+    compiledFields.push(
+      Object.freeze({
+        name,
+        kind: spec.kind,
+        length,
+        isArray,
+        byteOffset: offset,
+      }),
+    );
+    typesPresentSet.add(spec.kind);
+    offset += spec.byteSize;
+  }
+
+  // Pad user-fields end up to 8 so the next slot starts 8-aligned (matches
+  // the ring header which is also 32 = multiple of 8).
+  const userEnd = (offset + 7) & ~7;
+
+  if (!options.invariant) {
+    return Object.freeze({
+      frameByteSize: userEnd,
+      typesPresent: Object.freeze([...typesPresentSet]) as ReadonlyArray<FieldKind>,
+      fields: Object.freeze(compiledFields) as ReadonlyArray<CompiledField>,
+      invariantByteOffset: null,
+    });
+  }
+
+  // Append the hidden __invariant: f64 field at userEnd. userEnd is already
+  // 8-aligned. Frame size grows by 8. f64 must be in typesPresent so the
+  // Bridge has a Float64 umbrella view to read/write the lane through.
+  typesPresentSet.add("f64");
+  return Object.freeze({
+    frameByteSize: userEnd + 8,
+    typesPresent: Object.freeze([...typesPresentSet]) as ReadonlyArray<FieldKind>,
+    fields: Object.freeze(compiledFields) as ReadonlyArray<CompiledField>,
+    invariantByteOffset: userEnd,
+  });
+}
+
+function makeSchema<F extends FieldsObject>(
+  fields: F,
+  compiled: CompiledLayout,
+  invariantFn: InvariantFn<F> | null,
+): Schema<F> {
+  const invariant: SchemaInvariantSpec | null =
+    invariantFn === null || compiled.invariantByteOffset === null
+      ? null
+      : Object.freeze({
+          compute: invariantFn as unknown as (
+            frame: Record<string, unknown>,
+          ) => number,
+          byteOffset: compiled.invariantByteOffset,
+        });
+  return Object.freeze({
+    fields,
+    frameByteSize: compiled.frameByteSize,
+    compiled,
+    _brand: "wab/Schema" as const,
+    invariant,
+    withInvariant(fn: InvariantFn<F>): Schema<F> {
+      if (typeof fn !== "function") {
+        throw new TypeError(
+          "Schema.withInvariant: argument must be a function (frame → number)",
+        );
+      }
+      const newCompiled = compileLayout(fields, { invariant: true });
+      return makeSchema(fields, newCompiled, fn);
+    },
+  }) as Schema<F>;
 }
 
 export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
@@ -208,62 +358,8 @@ export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
     }
   }
 
-  // Stable sort by alignment class descending: 8-byte first, then 4, then 2, then 1.
-  // Within an alignment class preserve declared order. Dense packing within
-  // class then guarantees every field's byteOffset is a multiple of its
-  // element size — no SAB typed-array constructor will reject the alignment.
-  const decl = names.map((name, i) => {
-    const spec = fields[name]!;
-    return { name, spec, declOrder: i, align: kindByteSize(spec.kind) };
-  });
-  decl.sort((a, b) => {
-    if (a.align !== b.align) return b.align - a.align;
-    return a.declOrder - b.declOrder;
-  });
-
-  const compiledFields: CompiledField[] = [];
-  const typesPresentSet = new Set<FieldKind>();
-  let offset = 0;
-  for (const { name, spec } of decl) {
-    const length = spec.length ?? 1;
-    const isArray = spec.length !== undefined;
-    const align = kindByteSize(spec.kind);
-    // Sanity: dense packing within sorted-by-class order should already be aligned.
-    // If this ever throws it means the sort or pack invariant was broken.
-    if (offset % align !== 0) {
-      throw new Error(
-        `Schema: internal alignment error for field '${name}' (offset ${offset} not aligned to ${align})`,
-      );
-    }
-    compiledFields.push(
-      Object.freeze({
-        name,
-        kind: spec.kind,
-        length,
-        isArray,
-        byteOffset: offset,
-      }),
-    );
-    typesPresentSet.add(spec.kind);
-    offset += spec.byteSize;
-  }
-
-  // Pad frame size up to 8 so the next slot starts 8-aligned (matches the
-  // ring header which is also 32 = multiple of 8).
-  const frameByteSize = (offset + 7) & ~7;
-
-  const compiled: CompiledLayout = Object.freeze({
-    frameByteSize,
-    typesPresent: Object.freeze([...typesPresentSet]) as ReadonlyArray<FieldKind>,
-    fields: Object.freeze(compiledFields) as ReadonlyArray<CompiledField>,
-  });
-
-  return Object.freeze({
-    fields,
-    frameByteSize,
-    compiled,
-    _brand: "wab/Schema" as const,
-  }) as Schema<F>;
+  const compiled = compileLayout(fields, { invariant: false });
+  return makeSchema(fields, compiled, null);
 }
 
 /** Produce a postMessage-safe layout description for worklet inliners. */

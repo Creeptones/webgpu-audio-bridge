@@ -55,13 +55,37 @@
  *  33. Anti-windup: 200 saturating overfull cycles then a switch to
  *      starvation — the controller recovers to scale > 1 within a bounded
  *      number of cycles (not trapped at the low clamp).
+ *  34. Schema invariant round-trip: a `.withInvariant(fn)` schema pushes,
+ *      pulls, returns the frame bit-exact; `telemetry().tornFrames === 0`.
+ *  35. Hard-error fallback: direct SAB byte mutation between push and pull
+ *      drives `computed / stored` ratio past the soft threshold;
+ *      tornFrames increments by exactly 1 per corrupt pull, and the
+ *      consumer receives the last-known-good frame instead of the corrupt
+ *      payload.
+ *  36. First-pull hard error (no consumerPrev available) passes the raw
+ *      (corrupt) payload through, still increments tornFrames. No prev
+ *      seeded from the corrupt frame — next ok pull seeds normally.
+ *  37. Soft-error smoothing: a tiny payload-byte mutation that lands
+ *      between the OK and SOFT thresholds invokes `_applySmoother` against
+ *      consumerPrev; out lies strictly between corrupt and prev; tornFrames
+ *      stays 0.
+ *  38. Threshold boundary classification: invariants engineered to land at
+ *      ratios 0.9995 (ok), 1.005 (soft), and 2.0 (hard) classify as
+ *      expected, observable via the tornFrames counter and the
+ *      output-vs-prev relationship.
+ *  39. No-invariant schemas are unaffected: a `physicsControlFrameSchema`-
+ *      derived Bridge has `telemetry().tornFrames === 0` after 1k cycles
+ *      and behavior identical to 0.5.0 baseline.
+ *  40. `telemetry()` snapshot returns coherent {tornFrames, flowScale,
+ *      available, capacity, writeIndex, readIndex}; readings match
+ *      individual hint/available reads.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
-import { Bridge } from "../src/Bridge.js";
+import { Bridge, RING_HEADER_BYTES } from "../src/Bridge.js";
 import {
   defineSchema,
   f32,
@@ -1311,6 +1335,343 @@ function testFlowScaleAntiWindup(): void {
   ok(`flow-scale-anti-windup (recovered at cycle ${recoveryCycle})`);
 }
 
+// ─── Invariant test helpers ────────────────────────────────────────────────
+
+/**
+ * Small invariant schema for the pin block: seq:u64 + vEff:f64Array(4) +
+ * hidden __invariant:f64. The invariant is the sum-of-squares of vEff
+ * (canonical Σ|f|² norm). With this layout:
+ *   seq         at byteOffset 0      (8B)
+ *   vEff[0..4]  at byteOffset 8      (32B)   userEnd raw = 40
+ *   __invariant at byteOffset 40     (8B)
+ *   frameByteSize = 48 (= userEnd + 8)
+ * In Float64 element units (stride8 = 6): seq at f64-off 0, vEff[k] at
+ * f64-off 1+k, __invariant at f64-off 5. Used by the SAB-mutation pins.
+ */
+function makeInvariantSchema() {
+  return defineSchema({
+    seq: u64(),
+    vEff: f64Array(4),
+  }).withInvariant((frame) => {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += frame.vEff[k]! * frame.vEff[k]!;
+    return s;
+  });
+}
+
+type InvFrame = FrameFor<ReturnType<typeof makeInvariantSchema>>;
+
+function makeInvFrame(seq: number, vEff: number[]): InvFrame {
+  assert(vEff.length === 4, "invariant test helper: vEff must be length 4");
+  return { seq: BigInt(seq), vEff: new Float64Array(vEff) };
+}
+
+function emptyInvFrame(): InvFrame {
+  return { seq: 0n, vEff: new Float64Array(4) };
+}
+
+// ── 34. Schema invariant round-trip ────────────────────────────────────────
+//
+// Healthy push/pull cycle through a withInvariant schema. Payload
+// round-trips bit-exactly, tornFrames stays 0, telemetry() reflects the
+// final state.
+function testInvariantRoundTrip(): void {
+  const schema = makeInvariantSchema();
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyInvFrame();
+  for (let i = 0; i < 100; i++) {
+    const f = makeInvFrame(1000 + i, [1.5 + i, 2.5 - i * 0.1, 3.0, -0.5 + i]);
+    assertEq(ring.push(f), true, `inv round-trip push ${i}`);
+    assertEq(ring.pull(out), true, `inv round-trip pull ${i}`);
+    assertEq(out.seq, f.seq, `inv round-trip seq ${i}`);
+    for (let k = 0; k < 4; k++) {
+      assertEq(out.vEff[k], f.vEff[k]!, `inv round-trip vEff[${k}] ${i}`);
+    }
+  }
+  const tel = ring.telemetry();
+  assertEq(tel.tornFrames, 0, "no false-positive tornFrames over 100 ok cycles");
+  ok("invariant-round-trip");
+}
+
+// ── 35. Hard-error fallback via direct SAB mutation ────────────────────────
+//
+// Push frame A (ok pull seeds consumerPrev = A). Push frame B, mutate B's
+// vEff[0] in the SAB to a wildly different value, pull. Computed invariant
+// (sum of B's mutated vEff²) deviates far from stored (sum of B's original
+// vEff²) — ratio > soft threshold → hard error. tornFrames increments;
+// out is the last-known-good (A), not corrupt B.
+function testInvariantHardErrorFallback(): void {
+  const schema = makeInvariantSchema();
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyInvFrame();
+  // Step 1: push A, pull (ok). consumerPrev now holds A.
+  const A = makeInvFrame(1, [1, 2, 3, 4]);
+  ring.push(A);
+  assertEq(ring.pull(out), true, "ok pull A");
+  assertEq(out.seq, A.seq, "out is A after ok pull");
+  assertEq(ring.telemetry().tornFrames, 0, "no tornFrames after ok pull");
+
+  // Step 2: push B, mutate B's vEff[0] in SAB, pull. Hard error → fallback.
+  const B = makeInvFrame(2, [10, 20, 30, 40]);
+  ring.push(B);
+  // B sits at slot 1 (after A consumed slot 0). vEff[0] is f64-element
+  // offset 1 within the frame; frame stride is 48/8 = 6.
+  const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+  const slot = 1;
+  const stride = 6;
+  const vEff0Off = 1;
+  f64View[slot * stride + vEff0Off] = 99999; // wildly different
+  assertEq(ring.pull(out), true, "pull on corrupt B");
+  const tel = ring.telemetry();
+  assertEq(tel.tornFrames, 1, "hard error increments tornFrames");
+  // Out should be A (last-known-good), not corrupt B.
+  assertEq(out.seq, A.seq, "hard fallback returns A's seq, not B's");
+  for (let k = 0; k < 4; k++) {
+    assertEq(out.vEff[k], A.vEff[k]!, `hard fallback returns A's vEff[${k}]`);
+  }
+
+  // Step 3: push uncorrupted C, pull (ok). tornFrames doesn't bump.
+  const C = makeInvFrame(3, [0.1, 0.2, 0.3, 0.4]);
+  ring.push(C);
+  assertEq(ring.pull(out), true, "pull C ok");
+  assertEq(out.seq, C.seq, "ok pull returns C");
+  assertEq(ring.telemetry().tornFrames, 1, "tornFrames unchanged on ok pull");
+  ok("invariant-hard-error-fallback");
+}
+
+// ── 36. First-pull hard error passes raw, still increments ─────────────────
+//
+// On the very first pull there is no consumerPrev to fall back to. Push,
+// mutate slot 0's vEff in SAB to drive hard error, pull. Output should be
+// the raw (corrupt) payload (no fallback available); tornFrames still
+// increments so the failure is visible. consumerPrev is NOT seeded from
+// the corrupt frame (would propagate corruption). The next ok pull seeds
+// consumerPrev cleanly.
+function testInvariantFirstPullHardError(): void {
+  const schema = makeInvariantSchema();
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyInvFrame();
+  const X = makeInvFrame(50, [1, 1, 1, 1]);
+  ring.push(X);
+  const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+  // Corrupt slot 0's vEff[0] (was 1, becomes huge → hard error).
+  f64View[0 * 6 + 1] = 1e9;
+  assertEq(ring.pull(out), true, "first pull (corrupt) returns true");
+  assertEq(ring.telemetry().tornFrames, 1, "tornFrames=1 after first-pull hard");
+  // Out should be the raw corrupt payload (no fallback available).
+  assertEq(out.vEff[0], 1e9, "raw corrupt vEff[0] passes through (no prev)");
+  assertEq(out.seq, X.seq, "raw seq passes through (X)");
+
+  // Push Y (ok), pull. consumerPrev should re-seed from Y (NOT from the
+  // earlier corrupt frame). Then push Z + corrupt, pull → fallback to Y,
+  // not to the corrupt earlier frame.
+  const Y = makeInvFrame(51, [2, 2, 2, 2]);
+  ring.push(Y);
+  assertEq(ring.pull(out), true, "ok pull Y");
+  assertEq(out.seq, Y.seq, "Y returned ok");
+  assertEq(ring.telemetry().tornFrames, 1, "tornFrames unchanged on ok pull");
+
+  const Z = makeInvFrame(52, [5, 5, 5, 5]);
+  ring.push(Z);
+  // Z lands at slot 2 (after X at 0, Y at 1).
+  f64View[2 * 6 + 1] = 1e9;
+  assertEq(ring.pull(out), true, "pull corrupt Z");
+  assertEq(ring.telemetry().tornFrames, 2, "tornFrames=2");
+  assertEq(out.seq, Y.seq, "fallback is Y, not earlier corrupt frame");
+  ok("invariant-first-pull-hard-error");
+}
+
+// ── 37. Soft-error smoothing ───────────────────────────────────────────────
+//
+// Push A (ok pull seeds prev = A, vEff = [1,2,3,4], invariant = 30).
+// Push B (identical to A so stored invariant matches A's). Mutate B's
+// vEff[0] to 3 — computed invariant deviates from stored by
+// (9 − 1) / 30 ≈ 0.267, which lands in the soft band (between OK 1e-3 and
+// SOFT 1.0) with `α = INVARIANT_SOFT_ALPHA_BASE / delta = 0.1/0.267 ≈ 0.375`.
+// Blend: out = 0.375·3 + 0.625·1 = 1.75. The pin asserts the blended
+// output is strictly between prev (1) and corrupt (3) — the precise α
+// value is implementation-tunable, but the BLEND-MUST-FIRE property is
+// the invariant. tornFrames stays 0 (soft errors aren't torn).
+function testInvariantSoftErrorSmoothing(): void {
+  const schema = makeInvariantSchema();
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyInvFrame();
+  const A = makeInvFrame(1, [1, 2, 3, 4]); // invariant = 1+4+9+16 = 30
+  ring.push(A);
+  assertEq(ring.pull(out), true, "seed pull A");
+
+  const B = makeInvFrame(2, [1, 2, 3, 4]); // same vEff → same stored invariant
+  ring.push(B);
+  const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+  // Slot 1 is B; vEff[0] at f64 element 1*6 + 1 = 7.
+  f64View[7] = 3; // mutation 1 → 3, delta ≈ 0.267, lands mid-soft band
+  assertEq(ring.pull(out), true, "soft-error pull");
+  assert(
+    out.vEff[0]! > 1.0 && out.vEff[0]! < 3.0,
+    `soft error blends vEff[0]: expected (1.0, 3.0), got ${out.vEff[0]}`,
+  );
+  assertEq(ring.telemetry().tornFrames, 0, "soft errors don't bump tornFrames");
+  ok("invariant-soft-error-smoothing");
+}
+
+// ── 38. Threshold boundary classification ──────────────────────────────────
+//
+// Engineer three frames whose computed-invariant deviation lands in each
+// classification band, verify outcome via tornFrames + payload comparison.
+//
+//   ok    delta ≈ 1e-4 (well below OK threshold 1e-3): no fallback, no
+//         smoother, no tornFrames bump.
+//   soft  delta ≈ 0.05 (between thresholds): smoother engages, tornFrames
+//         stays 0.
+//   hard  delta ≈ 5.0 (well above SOFT threshold 1.0): tornFrames++,
+//         fallback to prev.
+//
+// Constructed by mutating one vEff element on a known A: delta in invariant
+// is approximately Δ(x_k²)/stored = (2·x_k·ε + ε²)/stored. With A's
+// vEff[0]=10, stored=10²+others=...:
+//   ε=0.001 → delta ≈ 0.02/stored ≈ 1.9e-4   (ok)
+//   ε=2     → delta ≈ 40/stored ≈ 0.038     (soft)
+//   ε=200   → delta ≈ (2·10·200 + 200²)/108 ≈ 407 (hard)
+//
+// Stored ≈ 100 + 4 + 1 + 9 = 114.
+function testInvariantThresholdBoundaries(): void {
+  const schema = makeInvariantSchema();
+
+  // ok band.
+  {
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyInvFrame();
+    const A = makeInvFrame(1, [10, 2, 1, 3]);
+    ring.push(A);
+    assertEq(ring.pull(out), true, "seed");
+    const B = makeInvFrame(2, [10, 2, 1, 3]);
+    ring.push(B);
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+    f64View[1 * 6 + 1] = 10 + 0.001; // ε=0.001, delta ≈ 1.75e-4 < 1e-3 = ok
+    assertEq(ring.pull(out), true, "ok-band pull");
+    assertEq(ring.telemetry().tornFrames, 0, "ok band: no tornFrames");
+    // Out should be the raw payload (no smoothing, no fallback).
+    assertEq(out.vEff[0], 10.001, "ok band: raw payload passes through");
+  }
+
+  // soft band.
+  {
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyInvFrame();
+    const A = makeInvFrame(1, [10, 2, 1, 3]);
+    ring.push(A);
+    assertEq(ring.pull(out), true, "seed");
+    const B = makeInvFrame(2, [10, 2, 1, 3]);
+    ring.push(B);
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+    f64View[1 * 6 + 1] = 10 + 2; // ε=2, delta ≈ 0.21 in soft band [1e-3, 1.0]
+    assertEq(ring.pull(out), true, "soft-band pull");
+    assertEq(ring.telemetry().tornFrames, 0, "soft band: no tornFrames");
+    // Smoothing engaged: out between 10 (prev) and 12 (corrupt).
+    assert(
+      out.vEff[0]! > 10 && out.vEff[0]! < 12,
+      `soft band blends vEff[0]: got ${out.vEff[0]}`,
+    );
+  }
+
+  // hard band.
+  {
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyInvFrame();
+    const A = makeInvFrame(1, [10, 2, 1, 3]);
+    ring.push(A);
+    assertEq(ring.pull(out), true, "seed");
+    const B = makeInvFrame(2, [10, 2, 1, 3]);
+    ring.push(B);
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+    f64View[1 * 6 + 1] = 10 + 200; // ε=200, delta huge → hard
+    assertEq(ring.pull(out), true, "hard-band pull");
+    assertEq(ring.telemetry().tornFrames, 1, "hard band: tornFrames=1");
+    assertEq(out.vEff[0], 10, "hard fallback: vEff[0] is A's value");
+    assertEq(out.seq, A.seq, "hard fallback: seq is A's");
+  }
+  ok("invariant-threshold-boundaries");
+}
+
+// ── 39. No-invariant schemas remain unaffected ─────────────────────────────
+//
+// Schemas built without `.withInvariant(...)` see identical behavior to
+// 0.5.0: no invariant lane, no consumerPrev tracking on raw pulls,
+// tornFrames stays at 0 across a long healthy run. The invariant block is
+// a single null-check on push/pull — no observable cost.
+function testNoInvariantSchemaUnchanged(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  for (let i = 0; i < 1000; i++) {
+    ring.push(makePhysFrame(i, n));
+    assertEq(ring.pull(out), true, `no-invariant cycle ${i}`);
+    assertEq(out.seq, BigInt(i), `no-invariant seq round-trip ${i}`);
+  }
+  assertEq(ring.telemetry().tornFrames, 0, "no-invariant: tornFrames stays 0");
+  // Sanity: schema actually has invariant === null.
+  assertEq(schema.invariant, null, "physicsControlFrameSchema has no invariant");
+  ok("no-invariant-schema-unchanged");
+}
+
+// ── 40. telemetry() snapshot coherence ─────────────────────────────────────
+//
+// telemetry() returns a frozen object whose fields match the individual
+// hint / available / index reads. Cross-check across push/pull cycles.
+function testTelemetrySnapshot(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  // Fresh.
+  const t0 = ring.telemetry();
+  assertEq(t0.tornFrames, 0, "fresh tornFrames=0");
+  assertEq(t0.flowScale, 1.0, "fresh flowScale=1.0");
+  assertEq(t0.available, 0, "fresh available=0");
+  assertEq(t0.capacity, capacity, "telemetry.capacity matches");
+  assertEq(t0.writeIndex, 0, "fresh writeIndex=0");
+  assertEq(t0.readIndex, 0, "fresh readIndex=0");
+  // Frozen.
+  let threw = false;
+  try {
+    (t0 as { tornFrames: number }).tornFrames = 99;
+  } catch {
+    threw = true;
+  }
+  assert(threw, "telemetry() result is frozen");
+
+  // After 5 pushes.
+  for (let i = 0; i < 5; i++) ring.push(makePhysFrame(i, n));
+  const t1 = ring.telemetry();
+  assertEq(t1.writeIndex, 5, "after 5 pushes writeIndex=5");
+  assertEq(t1.readIndex, 0, "after 5 pushes readIndex=0");
+  assertEq(t1.available, 5, "after 5 pushes available=5");
+  assertEq(t1.available, ring.available(), "telemetry.available matches available()");
+  assertEq(
+    t1.flowScale,
+    ring.flowScaleHint(),
+    "telemetry.flowScale matches flowScaleHint()",
+  );
+
+  // After 3 pulls.
+  for (let i = 0; i < 3; i++) ring.pull(out);
+  const t2 = ring.telemetry();
+  assertEq(t2.writeIndex, 5, "writeIndex unchanged after pulls");
+  assertEq(t2.readIndex, 3, "readIndex=3 after 3 pulls");
+  assertEq(t2.available, 2, "available=2");
+  ok("telemetry-snapshot");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -1346,6 +1707,13 @@ function main(): void {
   testFlowScaleIntegrationDirection();
   testFlowScaleStability();
   testFlowScaleAntiWindup();
+  testInvariantRoundTrip();
+  testInvariantHardErrorFallback();
+  testInvariantFirstPullHardError();
+  testInvariantSoftErrorSmoothing();
+  testInvariantThresholdBoundaries();
+  testNoInvariantSchemaUnchanged();
+  testTelemetrySnapshot();
   console.log("\nAll Bridge tests passed.");
 }
 

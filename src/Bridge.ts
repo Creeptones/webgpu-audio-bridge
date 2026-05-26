@@ -15,13 +15,18 @@
  *                                  default 65536 = 1.0 (no scaling). Independent
  *                                  atomic — best-effort, no ordering vs the
  *                                  counter lanes. See "Adaptive backpressure"
- *                                  section below. Reserved-lane table:
+ *                                  section below.
+ *     [byte 12..15]  torn_frame_counter  monotonic Int32 wrap-counter; consumer
+ *                                  increments on hard-error invariant failure.
+ *                                  Read via bridge.telemetry().tornFrames. See
+ *                                  "Schema invariants" section below.
+ *                                  Reserved-lane table:
  *                                    lane 0: write_index            (active, 0.4.0)
  *                                    lane 1: read_index             (active, 0.4.0)
  *                                    lane 2: flow_scale             (active, 0.5.0)
- *                                    lane 3: torn_frame_counter     (reserved)
+ *                                    lane 3: torn_frame_counter     (active, 0.6.0)
  *                                    lanes 4-7: reserved
- *     [byte 12..31]  reserved (20 bytes — earmarked for torn_frame_counter etc.)
+ *     [byte 16..31]  reserved (16 bytes — earmarked for soft-error counter etc.)
  *
  *   Payload region (typed-array umbrella views at SAB byte 32):
  *     For each FieldKind present in the schema, one umbrella view spanning
@@ -218,6 +223,64 @@
  * one `Math.floor`, one `Atomics.store`). Bench cell `flowScaleRecovery`
  * pins the settling-time signal as a separate measurement.
  *
+ * ─── Schema invariants (0.6.0, opt-in via `.withInvariant(fn)`) ───────────
+ *
+ * Cross-IPC bit-rot detection as a protocol concern. When a schema is built
+ * with `.withInvariant(fn)`, the schema layout grows by 8 bytes per slot
+ * for a hidden `__invariant: f64` field. The Bridge auto-computes the
+ * invariant via `fn(frame)` on every push (right before the release-store
+ * on write_index) and verifies on every pull (right after payload read,
+ * before recovery + release-store on read_index).
+ *
+ * Recovery classification, against `ratio = computed / stored`:
+ *
+ *   |ratio − 1| < INVARIANT_OK_THRESHOLD       (1e-3): ok, pass through
+ *   |ratio − 1| < INVARIANT_SOFT_THRESHOLD     (1.0):  soft error
+ *   otherwise:                                         hard error
+ *
+ * Soft errors invoke `_applySmoother` against the unified `consumerPrev`
+ * buffer with `α = clamp(INVARIANT_SOFT_ALPHA_BASE / |ratio−1|, 0, 1)`. The
+ * curve picks α near the OK boundary so tiny deviations pass through
+ * essentially raw, and α near 0 at the hard boundary so the smoother
+ * basically trusts prev when the corruption is severe. The smoother is the
+ * same primitive as for `pullSmoothed` (lifted from 0.4.1) — single field-
+ * type-dispatched blend loop, no extra surface.
+ *
+ * Hard errors copy `consumerPrev` into `out` (last-known-good fallback) and
+ * increment the torn_frame_counter on lane 3. The producer is unaffected;
+ * the consumer's downstream sees a stale-but-trusted frame instead of a
+ * corrupt one. If `consumerPrev` is not yet valid (first pull ever was a
+ * hard error), the raw payload passes through and tornFrames still
+ * increments so the failure is visible in telemetry.
+ *
+ * On smoothed pulls under an invariant-enabled schema, the smoother always
+ * fires with the user's α on ok / soft, and hard-error fallback returns
+ * `consumerPrev` (which itself is the most recent blended output, exactly
+ * what the consumer would have used).
+ *
+ * Lineage: wavefunction-synth's `wfNormGuard.js:46-80` (Σ|ψ|² invariant
+ * with ratio-band recovery). The bridge generalizes "norm guard" to any
+ * caller-supplied scalar — sum-of-squares for f64-dominant frames,
+ * xxhash/CRC32 for byte-oriented payloads, your choice. The invariant fn
+ * must be O(payload size) and allocation-free; it runs on every push AND
+ * every pull, so it sits on the hot path.
+ *
+ * Cost when not opted in. Zero. Schemas without `.withInvariant(...)` have
+ * `schema.invariant === null`; the push/pull paths short-circuit the
+ * invariant block in a single null-check. The unified `consumerPrev`
+ * buffer is also not allocated for no-invariant schemas (raw pulls keep
+ * the 0.4.1 "flip valid=false" behavior; the smoother allocates lazily on
+ * its own first call as before).
+ *
+ * Cost when opted in. One invariant fn call on push (caller's complexity),
+ * one f64 SAB store. One invariant fn call on pull, one f64 SAB load, one
+ * division, one classification branch, one `_copyFrameInto` (consumerPrev
+ * update on the ok / soft branches; on the hard branch the copy direction
+ * reverses but the cost is the same). For the canonical `Σ|f|²` invariant
+ * on `physicsControlFrameSchema(1000)`: ~5 μs/push and ~5 μs/pull added
+ * over baseline. Tolerable for control-rate frames; not a fit for audio-
+ * rate or high-Hz telemetry — those callers should leave invariants off.
+ *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
  * Compared to the hand-rolled Float64RingBuffer code path, Bridge<S> pays a
@@ -258,11 +321,12 @@ export const RING_HEADER_INT32_LANES = 8; // 32-byte header viewed as Int32 = 8 
 // Internal lane indices into the Int32 header view.
 //   lanes 0-1: SPSC counters (acquire/release ordering, wrap-mod-2^32)
 //   lane 2:    flow_scale — Q16.16 consumer→producer hint (0.5.0)
-//   lane 3:    reserved for torn_frame_counter
+//   lane 3:    torn_frame_counter — Int32 monotonic wrap-counter (0.6.0)
 //   lanes 4-7: reserved
 const WRITE_IDX_LANE = 0;
 const READ_IDX_LANE = 1;
 const FLOW_SCALE_LANE = 2;
+const TORN_FRAME_LANE = 3;
 
 // Flow-scale fixed-point + PI controller constants.
 //
@@ -283,6 +347,15 @@ const FLOW_SCALE_KI = 0.05;
 // of scale's range (1.0). Past this, the integrator would saturate the output
 // and recovery from a long stall would be unable to back off.
 const FLOW_SCALE_INT_LIMIT = 20; // = 1.0 / FLOW_SCALE_KI
+
+// Schema-invariant recovery thresholds. See the "Schema invariants" section
+// of the file header for the classification semantics and the smoother α
+// curve. All three are exported on the Bridge class as static readonly
+// constants so tests / callers can pin against them without reaching into
+// private state.
+const INVARIANT_OK_THRESHOLD = 1e-3;
+const INVARIANT_SOFT_THRESHOLD = 1.0;
+const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
 
 export interface BridgeAllocation<S extends Schema<FieldsObject>> {
   sab: SharedArrayBuffer;
@@ -370,13 +443,23 @@ export class Bridge<S extends Schema<FieldsObject>> {
   private pendingPushFrame: Record<string, unknown> | null = null;
   private pendingPushSlot: number = -1;
 
-  /** α-smoother previous-output cache (consumer-side). Lazily allocated by
-   *  the first call to `pullSmoothed` / `pullLatestSmoothed`; persists across
-   *  calls. `pull` / `pullLatest` flip the valid flag false (the buffer is
-   *  retained for reuse so the next smoothed call re-seeds without
-   *  allocation). See file header "Smoothed pulls". */
-  private smoothPrev: FrameFor<S> | null = null;
-  private smoothPrevValid: boolean = false;
+  /** Unified consumer-side cached prev frame, used by both the α-smoother
+   *  (pullSmoothed / pullLatestSmoothed) and the schema-invariant hard-
+   *  error recovery path (pull-family under `.withInvariant` schemas).
+   *  Lazily allocated on first use; persists across calls.
+   *
+   *  Lifecycle:
+   *   - Raw pull (no invariant): valid → false on every call. Buffer
+   *     retained for the next smoothed call to re-seed without allocation.
+   *   - Raw pull (with invariant): on ok, out is copied into consumerPrev
+   *     (valid=true). On soft error, smoother runs (consumerPrev gets the
+   *     blended output). On hard error, consumerPrev → out, valid unchanged.
+   *   - Smoothed pull: smoother runs every time, consumerPrev = blended
+   *     output. On invariant hard error, consumerPrev → out, valid unchanged.
+   *
+   *  See file headers "Smoothed pulls" + "Schema invariants". */
+  private consumerPrev: FrameFor<S> | null = null;
+  private consumerPrevValid: boolean = false;
   /** Precomputed per-scalar/per-array smoother classification. Computed in
    *  the constructor in `scalarLayout` / `arrayLayout` order so the blend
    *  loops are a tight indexed walk. `isBigInt` ⇒ verbatim pass-through;
@@ -391,6 +474,23 @@ export class Bridge<S extends Schema<FieldsObject>> {
    *  external invalidation path — the controller is a feedback loop that
    *  re-converges within a few cycles after any disturbance). */
   private piIntegral: number = 0;
+
+  /** F64 umbrella view used to read/write the hidden `__invariant` lane on
+   *  invariant-enabled schemas. Null when `schema.invariant === null`, in
+   *  which case the invariant block in push/pull is a single null-check. */
+  private readonly invariantView: Float64Array | null;
+  /** Per-slot stride in f64 elements (= `frameByteSize / 8`). Used only
+   *  when `invariantView` is non-null. */
+  private readonly invariantSlotStrideF64: number;
+  /** Element offset within a slot of the `__invariant` lane in f64 units.
+   *  Used only when `invariantView` is non-null. */
+  private readonly invariantElemOffsetF64: number;
+
+  /** Public, frozen recovery thresholds — exported for tests and callers
+   *  that want to pin against the exact boundaries. */
+  static readonly INVARIANT_OK_THRESHOLD = INVARIANT_OK_THRESHOLD;
+  static readonly INVARIANT_SOFT_THRESHOLD = INVARIANT_SOFT_THRESHOLD;
+  static readonly INVARIANT_SOFT_ALPHA_BASE = INVARIANT_SOFT_ALPHA_BASE;
 
   constructor(sab: SharedArrayBuffer, capacity: number, schema: S) {
     if (!isPowerOfTwo(capacity)) {
@@ -464,6 +564,21 @@ export class Bridge<S extends Schema<FieldsObject>> {
       return views;
     });
     this.arrayViews = arrayViews;
+
+    // Invariant umbrella + stride / offset. Schema's invariant spec guarantees
+    // byteOffset is 8-aligned and frameByteSize is a multiple of 8 (compile
+    // step pads userEnd up to 8 before appending the f64 invariant lane).
+    if (schema.invariant !== null) {
+      // F64 umbrella was added to typesPresent by compileLayout for invariant
+      // schemas, so umbrellas['f64'] is guaranteed populated.
+      this.invariantView = umbrellas.f64 as Float64Array;
+      this.invariantSlotStrideF64 = schema.frameByteSize / 8;
+      this.invariantElemOffsetF64 = schema.invariant.byteOffset / 8;
+    } else {
+      this.invariantView = null;
+      this.invariantSlotStrideF64 = 0;
+      this.invariantElemOffsetF64 = 0;
+    }
 
     // Build per-scalar-field writer / reader closures. Each closure captures
     // its umbrella view, stride, in-frame element offset, and field name.
@@ -587,6 +702,15 @@ export class Bridge<S extends Schema<FieldsObject>> {
       (av[i]![slot] as { set: (src: ArrayLike<number> | ArrayLike<bigint>) => void })
         .set(frame[al[i]!.name] as ArrayLike<number> | ArrayLike<bigint>);
     }
+    // Compute + store invariant BEFORE release-store so the consumer's
+    // acquire-load on writeIdx observes both the payload and the invariant
+    // bytes as a single happens-before unit. See "Schema invariants" in
+    // the file header for the protocol detail.
+    if (this.invariantView !== null && this.schema.invariant !== null) {
+      this.invariantView[
+        slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+      ] = this.schema.invariant.compute(frame);
+    }
     Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0); // release
     // Unconditional notify — see file header on the always-notify protocol.
     Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
@@ -649,6 +773,11 @@ export class Bridge<S extends Schema<FieldsObject>> {
     for (let i = 0; i < sw.length; i++) sw[i]!(slot, frame);
     // Array writes happened in place via the user's `.set(...)` calls into
     // the SAB-backed views handed out by beginPush. Nothing to copy here.
+    if (this.invariantView !== null && this.schema.invariant !== null) {
+      this.invariantView[
+        slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+      ] = this.schema.invariant.compute(frame);
+    }
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
     Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0);
     Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
@@ -682,11 +811,23 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
+    // Read stored invariant BEFORE release-store so the slot bytes are still
+    // ours. The classification/recovery math below only touches heap state
+    // so it can safely run AFTER release.
+    const invariantStored = this.invariantView !== null
+      ? this.invariantView[
+          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+        ]!
+      : 0;
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
-    // Non-smoothed pull invalidates the smoother's prev — next smoothed call
-    // re-seeds. Allocation-free; the prev buffer (if any) is retained.
-    this.smoothPrevValid = false;
+    if (this.schema.invariant !== null) {
+      this._invariantHandleRaw(frame, invariantStored);
+    } else {
+      // No invariant: raw pull invalidates the smoother's prev — next
+      // smoothed call re-seeds. Allocation-free; prev buffer retained.
+      this.consumerPrevValid = false;
+    }
     this._updateFlowScale(writeIdx, readIdx);
     return true;
   }
@@ -715,11 +856,20 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
+    const invariantStored = this.invariantView !== null
+      ? this.invariantView[
+          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+        ]!
+      : 0;
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
-    // Non-smoothed pullLatest invalidates the smoother's prev — next smoothed
-    // call re-seeds. Allocation-free; prev buffer is retained.
-    this.smoothPrevValid = false;
+    if (this.schema.invariant !== null) {
+      this._invariantHandleRaw(frame, invariantStored);
+    } else {
+      // No invariant: raw pullLatest invalidates the smoother's prev — next
+      // smoothed call re-seeds. Allocation-free; prev buffer is retained.
+      this.consumerPrevValid = false;
+    }
     this._updateFlowScale(writeIdx, readIdx);
     return skipped;
   }
@@ -759,9 +909,14 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
+    const invariantStored = this.invariantView !== null
+      ? this.invariantView[
+          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+        ]!
+      : 0;
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0);
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
-    this._applySmoother(frame, alphaBase);
+    this._invariantHandleSmoothed(frame, invariantStored, alphaBase);
     this._updateFlowScale(writeIdx, readIdx);
     return true;
   }
@@ -802,53 +957,68 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
+    // Read stored invariant BEFORE release so the slot bytes are still ours.
+    const invariantStored = this.invariantView !== null
+      ? this.invariantView[
+          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+        ]!
+      : 0;
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0);
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
     // 2^(-skipped) via ldexp-style exponent shift; for skipped=0 this is 1.0.
     // Math.pow(2, -skipped) is cheap (V8 special-cases integer exponents);
     // we accept the small JS-call overhead in exchange for clarity.
     const alphaEff = alphaBase * Math.pow(2, -skipped);
-    this._applySmoother(frame, alphaEff);
+    this._invariantHandleSmoothed(frame, invariantStored, alphaEff);
     this._updateFlowScale(writeIdx, readIdx);
     return skipped;
   }
 
   /**
-   * Forget the smoother's `prev`. The next `pullSmoothed` /
-   * `pullLatestSmoothed` will behave as a first-call: no blending, the fresh
-   * frame is returned verbatim and stored as the new prev.
+   * Forget the consumer-side cached prev frame. The buffer is used by both
+   * the α-smoother (`pullSmoothed` / `pullLatestSmoothed`) and the schema-
+   * invariant hard-error recovery path (under `.withInvariant` schemas):
    *
-   * Use this at quiescence boundaries (e.g., the producer just started, or
-   * the consumer just woke from suspend) to avoid blending with a possibly-
-   * stale prev. `pull` / `pullLatest` already invalidate prev implicitly;
-   * call this only if you need to invalidate without consuming a frame.
+   *   - Next `pullSmoothed` / `pullLatestSmoothed` behaves as a first-call:
+   *     no blending, fresh frame returned verbatim and stored as the new
+   *     prev.
+   *   - Next invariant hard-error has no last-known-good to fall back to,
+   *     so the raw (possibly corrupt) payload passes through. `tornFrames`
+   *     still increments so the failure is visible in `telemetry()`.
+   *
+   * Use this at quiescence boundaries (producer just started, consumer
+   * just woke from suspend) to avoid blending or fallback against a
+   * possibly-stale prev. Under a no-invariant schema, raw `pull` /
+   * `pullLatest` already invalidate implicitly; call this only if you need
+   * to invalidate without consuming a frame, or to wipe the invariant
+   * fallback buffer.
    */
   resetSmoother(): void {
-    this.smoothPrevValid = false;
+    this.consumerPrevValid = false;
   }
 
   /**
-   * Apply the one-pole blend in-place on `out` and update `smoothPrev`.
+   * Apply the one-pole blend in-place on `out` and update `consumerPrev`.
    *
    * Called by `pullSmoothed` / `pullLatestSmoothed` after the SAB read +
    * release-store have completed. `out` arrives holding the raw fresh frame
-   * (curr); on exit it holds the blended frame, and `this.smoothPrev` mirrors
+   * (curr); on exit it holds the blended frame, and `this.consumerPrev` mirrors
    * it. Allocation-free in steady state; the first call allocates the prev
    * buffer via `scratchFrame()` (heap typed arrays + scalar zeros), seeds it
-   * with curr, and flips `smoothPrevValid` true.
+   * with curr, and flips `consumerPrevValid` true.
    */
   private _applySmoother(out: Record<string, unknown>, alpha: number): void {
-    if (!this.smoothPrevValid) {
+    if (!this.consumerPrevValid) {
       // First smoothed call (or first after invalidation): no blend, just
       // seed prev with the current fresh frame. Allocate prev if needed.
-      if (this.smoothPrev === null) {
-        this.smoothPrev = this.scratchFrame();
+      if (this.consumerPrev === null) {
+        this.consumerPrev = this.scratchFrame();
       }
-      this._copyFrameInto(out, this.smoothPrev as unknown as Record<string, unknown>);
-      this.smoothPrevValid = true;
+      this._copyFrameInto(out, this.consumerPrev as unknown as Record<string, unknown>);
+      this.consumerPrevValid = true;
       return;
     }
-    const prev = this.smoothPrev as unknown as Record<string, unknown>;
+    const prev = this.consumerPrev as unknown as Record<string, unknown>;
     const oneMinusAlpha = 1 - alpha;
     // Scalars.
     const sl = this.scalarLayout;
@@ -933,10 +1103,137 @@ export class Bridge<S extends Schema<FieldsObject>> {
     );
   }
 
-  /** Copy `src` into `dst` field-by-field. Used to seed `smoothPrev` on the
-   *  first smoothed call. Scalars are plain assigns; arrays use typed-array
-   *  `.set()` so length / element-kind validation happens at the runtime
-   *  layer (`dst` is always a freshly-allocated `scratchFrame()`). */
+  /**
+   * Classify a stored vs computed invariant ratio into ok / soft / hard +
+   * the soft-recovery α. Numerical-safety: when `stored === 0` we treat any
+   * nonzero `computed` as a hard error (ratio is undefined). A literal
+   * zero-vs-zero invariant matches (ok).
+   *
+   *   ok:    |computed − stored| / max(|stored|, ε) < INVARIANT_OK_THRESHOLD
+   *   soft:  < INVARIANT_SOFT_THRESHOLD
+   *   hard:  ≥ INVARIANT_SOFT_THRESHOLD, or NaN/Infinity on either side
+   *
+   * For soft, α = clamp(INVARIANT_SOFT_ALPHA_BASE / delta, 0, 1) — small
+   * deviations get α≈1 (trust curr); deviations near the hard boundary get
+   * α near INVARIANT_SOFT_ALPHA_BASE (trust prev). See file header "Schema
+   * invariants" for the curve rationale.
+   */
+  private _classifyInvariant(
+    computed: number,
+    stored: number,
+  ): { kind: "ok" | "soft" | "hard"; alpha: number } {
+    if (!Number.isFinite(computed) || !Number.isFinite(stored)) {
+      return { kind: "hard", alpha: 0 };
+    }
+    if (stored === 0) {
+      // Exact 0/0 is treated as ok; nonzero computed vs 0 stored is hard
+      // (no meaningful ratio).
+      if (computed === 0) return { kind: "ok", alpha: 1 };
+      return { kind: "hard", alpha: 0 };
+    }
+    const delta = Math.abs(computed - stored) / Math.abs(stored);
+    if (delta < INVARIANT_OK_THRESHOLD) return { kind: "ok", alpha: 1 };
+    if (delta < INVARIANT_SOFT_THRESHOLD) {
+      const alpha = Math.min(
+        1,
+        Math.max(0, INVARIANT_SOFT_ALPHA_BASE / delta),
+      );
+      return { kind: "soft", alpha };
+    }
+    return { kind: "hard", alpha: 0 };
+  }
+
+  /**
+   * Invariant handler for raw pulls (`pull` / `pullLatest`) under an
+   * invariant-enabled schema. Called after release-store and notify. Only
+   * touches heap state (`consumerPrev`, `consumerPrevValid`, the
+   * tornFrameCounter lane).
+   *
+   * Branches:
+   *   ok   — seed/update consumerPrev with `out` (last-known-good).
+   *   soft — invoke smoother with computed α (blends out with consumerPrev,
+   *          updates consumerPrev to blended value).
+   *   hard — Atomics.add tornFrameCounter. If consumerPrev is valid, copy
+   *          it into out (graceful fallback). Otherwise leave out as the
+   *          raw payload (corruption visible on first-pull hard error) and
+   *          do NOT seed consumerPrev so corruption can't propagate.
+   */
+  private _invariantHandleRaw(
+    out: Record<string, unknown>,
+    invariantStored: number,
+  ): void {
+    const inv = this.schema.invariant;
+    if (inv === null) return; // defensive — caller already checked.
+    const computed = inv.compute(out);
+    const { kind, alpha } = this._classifyInvariant(computed, invariantStored);
+    if (kind === "ok") {
+      this._seedConsumerPrev(out);
+    } else if (kind === "soft") {
+      this._applySmoother(out, alpha);
+    } else {
+      // hard
+      Atomics.add(this.indices, TORN_FRAME_LANE, 1);
+      if (this.consumerPrevValid && this.consumerPrev !== null) {
+        this._copyFrameInto(
+          this.consumerPrev as unknown as Record<string, unknown>,
+          out,
+        );
+      }
+      // else: pass through. Don't update consumerPrev (would propagate
+      // corruption). Next ok pull will (re-)seed.
+    }
+  }
+
+  /**
+   * Invariant handler for smoothed pulls (`pullSmoothed` /
+   * `pullLatestSmoothed`). Always runs the smoother on ok / soft / no-
+   * invariant; on hard error, falls back to consumerPrev (or passes through
+   * with smoother seeding when no prev). Soft-error α is the USER's α — the
+   * smoother is already smoothing; layering recovery-α on top is
+   * unnecessary (the smoother's α gate handles minor deviations).
+   */
+  private _invariantHandleSmoothed(
+    out: Record<string, unknown>,
+    invariantStored: number,
+    alpha: number,
+  ): void {
+    if (this.schema.invariant === null) {
+      // No invariant: behavior identical to 0.5.0 smoothed pull.
+      this._applySmoother(out, alpha);
+      return;
+    }
+    const computed = this.schema.invariant.compute(out);
+    const { kind } = this._classifyInvariant(computed, invariantStored);
+    if (kind === "hard") {
+      Atomics.add(this.indices, TORN_FRAME_LANE, 1);
+      if (this.consumerPrevValid && this.consumerPrev !== null) {
+        this._copyFrameInto(
+          this.consumerPrev as unknown as Record<string, unknown>,
+          out,
+        );
+      }
+      // else: pass through; don't seed prev with corrupt data.
+      return;
+    }
+    // ok or soft: smoother handles both. Identical to no-invariant path.
+    this._applySmoother(out, alpha);
+  }
+
+  /** Allocate-on-demand seed of `consumerPrev` from `src`. */
+  private _seedConsumerPrev(src: Record<string, unknown>): void {
+    if (this.consumerPrev === null) this.consumerPrev = this.scratchFrame();
+    this._copyFrameInto(
+      src,
+      this.consumerPrev as unknown as Record<string, unknown>,
+    );
+    this.consumerPrevValid = true;
+  }
+
+  /** Copy `src` into `dst` field-by-field. Used to seed `consumerPrev` on
+   *  the first smoothed call or invariant ok-branch. Scalars are plain
+   *  assigns; arrays use typed-array `.set()` so length / element-kind
+   *  validation happens at the runtime layer (`dst` is always a freshly-
+   *  allocated `scratchFrame()`). */
   private _copyFrameInto(
     src: Record<string, unknown>,
     dst: Record<string, unknown>,
@@ -982,6 +1279,50 @@ export class Bridge<S extends Schema<FieldsObject>> {
    */
   flowScaleHint(): number {
     return (Atomics.load(this.indices, FLOW_SCALE_LANE) | 0) / FLOW_SCALE_Q;
+  }
+
+  /**
+   * Observability snapshot. Returns a frozen object with the current state
+   * of every bridge-managed counter / hint:
+   *
+   *   tornFrames  — monotonic count of hard-error invariant fallbacks since
+   *                 SAB allocation (0 if the schema has no invariant or if
+   *                 no hard error has ever occurred). Wraps mod 2^32 like
+   *                 the other Int32 lanes.
+   *   flowScale   — current consumer→producer adaptive backpressure hint,
+   *                 in [0.5, 2.0]. Same value `flowScaleHint()` returns.
+   *   available   — number of frames currently buffered.
+   *   capacity    — total ring capacity (constant per Bridge instance).
+   *   writeIndex  — current producer counter (Int32, wraps mod 2^32).
+   *   readIndex   — current consumer counter (Int32, wraps mod 2^32).
+   *
+   * All reads are O(1) and use Atomics.load — safe to call from any
+   * thread. The snapshot is a point-in-time sample; under live producer/
+   * consumer activity the values are individually consistent but not
+   * mutually atomic. For diagnostic / dashboard use only.
+   */
+  telemetry(): {
+    readonly tornFrames: number;
+    readonly flowScale: number;
+    readonly available: number;
+    readonly capacity: number;
+    readonly writeIndex: number;
+    readonly readIndex: number;
+  } {
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    return Object.freeze({
+      // Read as unsigned so the counter is exposed in [0, 2^32) regardless
+      // of i32 sign wrap. SPSC counters use signed-32 internally for the
+      // wrap-invariant subtraction trick; telemetry consumers want the raw
+      // monotonic count.
+      tornFrames: Atomics.load(this.indices, TORN_FRAME_LANE) >>> 0,
+      flowScale: (Atomics.load(this.indices, FLOW_SCALE_LANE) | 0) / FLOW_SCALE_Q,
+      available: ((writeIdx - readIdx) | 0),
+      capacity: this.capacity,
+      writeIndex: writeIdx >>> 0,
+      readIndex: readIdx >>> 0,
+    });
   }
 
   /**

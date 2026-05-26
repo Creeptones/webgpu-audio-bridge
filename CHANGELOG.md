@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented here. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-25
+
+### Added — `Bridge<Schema>` schema invariants (cross-IPC bit-rot detection)
+
+The bridge has historically trusted the SAB payload bytes byte-for-byte: a producer-side bug, a hardware ECC flip, or a (vanishingly-rare) V8/Chromium SAB-coherence bug would silently corrupt the consumer's frames, with the only symptom being downstream audio glitches. 0.6.0 lifts payload integrity from a per-caller responsibility into a protocol concern.
+
+- **`defineSchema({...}).withInvariant(fn)`** is a new schema builder that returns a schema with a hidden `__invariant: f64` lane appended at the (8-aligned) end of each frame slot. `fn` is a caller-supplied scalar function (`frame → number`) — typically Σ|f|² for f64-dominant payloads, but the bridge doesn't constrain the choice: xxhash, CRC32, hand-rolled product-of-primes, anything that's pure, O(payload size), and allocation-free works. The frame byte size grows by exactly 8; `f64` joins `typesPresent` if not already there.
+- **The bridge auto-computes the invariant on every push** (right before the release-store on `write_index`) and **verifies on every pull** (right after the payload read, before the recovery / release-store). Ratio = computed / stored; classification:
+  - **`|ratio − 1| < INVARIANT_OK_THRESHOLD` (1e-3)** — ok. Pass through; seed/update `consumerPrev`.
+  - **`|ratio − 1| < INVARIANT_SOFT_THRESHOLD` (1.0)** — soft error. Invoke the 0.4.1 α-smoother against `consumerPrev` with `α = clamp(INVARIANT_SOFT_ALPHA_BASE / |ratio − 1|, 0, 1)`. Small deviations get α≈1 (essentially pass through); deviations near the hard boundary get α≈0.1 (essentially trust prev). `tornFrames` does NOT increment.
+  - **otherwise** — hard error. Atomically increment `torn_frame_counter` on lane 3 (mod 2^32), copy `consumerPrev` into `out` (last-known-good fallback). If `consumerPrev` is not yet valid (first pull ever was a hard error), the raw payload passes through and `tornFrames` still increments so the failure is visible.
+- **Lane 3 of the Int32 header is now active.** `torn_frame_counter` (Int32 monotonic wrap-counter). Read via `bridge.telemetry().tornFrames`. The increment is `Atomics.add(..., 1)` so any thread can read a consistent count.
+- **`bridge.telemetry()`** is a new diagnostic snapshot returning a frozen `{ tornFrames, flowScale, available, capacity, writeIndex, readIndex }` object. All reads use `Atomics.load`; fields are individually consistent but not mutually atomic (point-in-time samples). Folds in the planned "observability snapshot" roadmap item as a side-effect of #4 since lane 3 needed a public read path anyway.
+
+### Why — first SPSC ring with payload integrity as a protocol concern
+
+Existing SPSC ring libraries (`ringbuf.js`, LMAX Disruptor, `jack-ringbuffer`, `crossbeam::channel`) treat payload bytes as opaque — the protocol's job ends at "deliver these bytes intact." If the consumer wants integrity, the caller wraps each payload in their own checksum. That works for batch / message-oriented protocols where the per-message checksum cost is amortized, but it leaves a gap for streaming protocols where the receiver wants to gracefully recover from a single bad frame without dropping the whole stream.
+
+The bridge's invariant lane closes that gap. With the same one-pole smoother that 0.4.1 added for click-free producer-stall masking, the bridge can now mask single-frame corruption click-free too — the soft-error path doesn't even tell the consumer something went wrong (`tornFrames` stays 0), it just blends curr with the last-known-good. Hard errors fall back to last-known-good outright and surface the failure as a numeric counter (`tornFrames`), so downstream alerting / dashboards / regression tests can pin against it.
+
+Lineage: wavefunction-synth's `wfNormGuard.js:46-80` — a Σ|ψ|² invariant with ratio-band recovery applied to a quantum-mechanics simulation's state vector. The bridge generalizes the pattern to any caller-supplied scalar invariant. Same control-theoretic shape (measure-and-recover against a known-good signal) as 0.5.0's adaptive backpressure (CFL analog), different failure mode (data corruption vs rate mismatch).
+
+### Unified `consumerPrev` cache
+
+Internally the smoother prev (from 0.4.1) and the invariant last-known-good buffer (from 0.6.0) are now a single `consumerPrev: FrameFor<S> | null` field with one `consumerPrevValid: boolean` gate. The semantics: `consumerPrev` always holds the most recent value the consumer trusted — for raw pulls under an invariant schema, that's the last verified-ok frame; for smoothed pulls, that's the most recent blended output; for raw pulls under a no-invariant schema, `consumerPrev` is treated as invalid (existing 0.4.1 behavior preserved). The buffer is lazily allocated on first use; one allocation per Bridge instance.
+
+`resetSmoother()` semantics extended: now also clears the invariant fallback. Use at quiescence boundaries (producer just started, consumer just woke from suspend).
+
+### Wire compatibility
+
+- **No-invariant schemas are wire-compatible across 0.5.x ↔ 0.6.0.** The invariant pathway is a single null-check on `schema.invariant` in push and pull; when null, behavior is identical to 0.5.0 (zero observable cost).
+- **`.withInvariant(fn)` schemas have a different wire format from the base schema** — the frame size grows by 8 bytes. A 0.5.x peer cannot share a SAB with a 0.6.0 invariant-enabled peer (frame stride mismatch). 0.6.0 invariant peers must use matching `.withInvariant(fn)` schemas with the same compute function on both sides (the invariant is computed at push by the producer's fn and verified at pull by the consumer's fn — they must agree).
+- Lane 3 (`torn_frame_counter`) was reserved in 0.5.x (stored as zero); 0.6.0 now writes to it via `Atomics.add` on hard errors. A 0.5.x consumer ignores the lane; a 0.6.0 consumer reads it via `telemetry()`. No SAB-layout conflict.
+
+### Added — invariant + telemetry test pins
+
+`tests/schema.test.ts` grows from 8 to 9 pins:
+
+- **`testWithInvariant`** — schema layer: `.withInvariant(fn)` appends the hidden `__invariant: f64` lane, frame size grows by 8, `f64` joins `typesPresent` (even on schemas without prior f64 fields), `invariantByteOffset` is set; non-function argument throws; original schema is unchanged (immutable builder); result is frozen.
+
+`tests/Bridge.test.ts` grows from 33 to 40 pins (7 new):
+
+- **`testInvariantRoundTrip`** — 100-cycle healthy push/pull through a `seq:u64 + vEff:f64Array(4)` invariant schema. Frame round-trips bit-exact; `tornFrames === 0` (no false positives).
+- **`testInvariantHardErrorFallback`** — push A, ok pull (seeds consumerPrev=A); push B, mutate B's `vEff[0]` to 99999 in the SAB via direct view, pull → hard classified, `tornFrames=1`, `out === A` (not corrupt B). Following ok pull doesn't bump tornFrames.
+- **`testInvariantFirstPullHardError`** — first pull is a hard error: raw corrupt payload passes through, `tornFrames=1`, consumerPrev is NOT seeded from corrupt frame. Next ok pull (re-)seeds cleanly; subsequent hard error falls back to that ok frame, not the earlier corrupt one. Pins the "no fallback available" edge.
+- **`testInvariantSoftErrorSmoothing`** — mutation of magnitude ≈ 0.27 in ratio space lands mid-soft-band (α ≈ 0.375). Output is visibly between corrupt (3) and prev (1); `tornFrames=0`.
+- **`testInvariantThresholdBoundaries`** — three engineered runs hit ok-band (`ε=0.001`, delta ≈ 1.75e-4), soft-band (`ε=2`, delta ≈ 0.38), and hard-band (`ε=200`). Outcome correct for each (raw pass-through / blended / fallback) and tornFrames count matches.
+- **`testNoInvariantSchemaUnchanged`** — 1k-cycle physicsControlFrameSchema run with no invariant: `schema.invariant === null`, `tornFrames=0`, full round-trip preserved. Verifies the opt-in design — zero observable cost when not used.
+- **`testTelemetrySnapshot`** — `telemetry()` returns frozen `{ tornFrames, flowScale, available, capacity, writeIndex, readIndex }`. Cross-check vs `available()` / `flowScaleHint()`; values update correctly across pushes/pulls.
+
+`tests/Bridge.concurrent.test.ts` cross-thread pin gets a new tornFrames assertion: 1 M frames of healthy SPSC traffic on the no-invariant `physicsControlFrameSchema(8)` must end with `telemetry().tornFrames === 0`. Any non-zero reading indicates either a false-positive classification or an SPSC-protocol regression — both worth catching loudly.
+
+### Documentation
+
+- New `Schema invariants (0.6.0, opt-in via .withInvariant(fn))` section in `src/Bridge.ts` header documenting the classification thresholds, the soft-error α curve, the consumer-side state machine, and the opt-in zero-cost guarantee.
+- `Layout` block updated: lane 3 documented as `torn_frame_counter`; the reserved-lane table now shows lanes 0-3 as active and lanes 4-7 reserved.
+- JSDoc on `withInvariant`, `telemetry`, and the updated `resetSmoother` semantics covers the new contracts.
+- README `API reference` gets `bridge.telemetry()` and the `Schema invariants` subsection under "Schema DSL"; a new "Cross-IPC bit-rot detection" subsection appears under Back-pressure / Adaptive backpressure, showing the worked `.withInvariant(...)` example with a Σ|f|² invariant.
+- Roadmap collapses: with #1 (adaptive backpressure) and #4 (schema invariants) both shipped, the remaining 1.0 work is two items (backpressure policies + observability dashboards on top of `telemetry()`). 1.0 freeze is in sight.
+
 ## [0.5.0] — 2026-05-25
 
 ### Added — `Bridge<Schema>` adaptive backpressure (CFL-style)
