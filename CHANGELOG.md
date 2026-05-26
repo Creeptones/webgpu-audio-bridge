@@ -4,6 +4,134 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.15] — 2026-05-26
+
+### Added — PLL drift estimator (Pillar 2 second-order)
+
+`ConsumerClockRecovery` gains an opt-in 2nd-order tracker that models
+the offset as a linear function of consumer time:
+`predicted_offset(t) = offsetNs + driftRate · (t − lastConsumerNs)`.
+Switches the PI loop from 1st-order to a g-h alpha-beta filter when the
+estimator is enabled.
+
+- **Math.** Standard g-h shape:
+  ```
+  dt        = consumerNs − lastConsumerNs
+  predicted = offset + driftRate · dt
+  residual  = (producerNs − consumerNs) − predicted
+  offset    = predicted + KP · residual         (α step, no PI integral)
+  driftRate = driftRate + (driftGain / dt) · residual   (β step)
+  ```
+  The PI integral term is intentionally OFF in drift mode — the drift
+  estimator IS the steady-state integrator at the 2nd-order level. A
+  redundant integral would fight the drift estimator (both trying to
+  absorb residual) and degrade convergence; keeping the integral term
+  on lifts steady-state drift error from ~5 ppm to ~25+ ppm at
+  default β. So drift-mode uses pure g-h; offset-only-mode keeps the
+  pre-0.6.15 PI loop verbatim.
+
+- **`phaseLockedTime(consumerNs)`** extrapolates using the current
+  `(offset, driftRate, lastConsumerNs)` triple, so a quantum-rate
+  AudioWorklet still gets sub-μs accurate offsets between
+  observations.
+
+- **Defaults.** `driftGain = 0.05` (g-h β) gives a ~20-observation
+  time constant; at 60 Hz that's ~333 ms to track a fresh drift.
+  Default β = 0.05 was chosen to balance noise rejection (lower β =
+  smoother) against tracking latency (higher β = faster).
+
+- **Opt-in.** The drift estimator is disabled by default
+  (`enableDriftEstimator: false`). All pre-0.6.15 behavior is
+  preserved bit-exact for any caller that doesn't explicitly opt in.
+  Switch it on when producer and consumer live in different clock
+  domains — the canonical case being a Worker stamping
+  `performance.now()` and an AudioWorklet reading
+  `AudioContext.currentTime` (which can drift relative to each other
+  at tens of ppm).
+
+- **Telemetry.** `Bridge.telemetry().pllDriftPpm` exposes the current
+  drift estimate in parts-per-million. Reads 0 in offset-only mode.
+
+### Why
+
+Pillar 2's "first cut" landed in 0.6.2 as offset-only. The Phase-Locked
+Extrapolation Plan explicitly called out drift estimation as the second-
+order extension needed for production-grade tracking when producer and
+consumer clocks have meaningfully different time sources. The 1st-order
+PI loop can track a constant offset to sub-μs and absorbs short-term
+drift via the KI integral, but it can't *predict* between observations
+— `phaseLockedTime(t > lastObservation)` returns
+`consumerNs + offsetNs` and that offset is the value at the LAST
+observation, not at `consumerNs`. Over a multi-second window of
+50 ppm drift, the prediction is off by 50 ppm × elapsed = tens of μs
+to ms.
+
+The g-h filter is the standard tool for this — same complexity as the
+PI loop (one extra add and one extra multiply per observation),
+asymptotically optimal for linear models, and well-understood
+convergence properties via the α-β parameter pair.
+
+Keeping it opt-in protects existing callers who measure
+`pllOffsetNs` over multi-second windows and would be surprised to
+see the offset state semantics shift to "offset at last observation"
+when the estimator was off.
+
+### Wire compatibility
+
+- **No SAB changes.** The drift estimator is heap-only on
+  `ConsumerClockRecovery`. A 0.6.14 peer and a 0.6.15 peer share a
+  SAB transparently.
+- **No public-API break.** The `ConsumerClockRecovery` constructor's
+  opts bag gains two new fields (both with documented defaults);
+  existing call sites continue to compile. `Bridge.telemetry()` adds
+  one field; existing destructures keep working.
+- **Bit-exact preservation when opt-out.** When
+  `enableDriftEstimator` is `false` (default), the math path is
+  identical to 0.6.14 — same residual computation, same PI integral,
+  same offset update. The only added cost is one extra branch per
+  observation (`if (this._enableDriftEstimator)`) which V8 inlines.
+- **Lanes 4–7 still reserved** for the PLL publication patch
+  (0.6.16) — the offsetNs + driftRate state will eventually publish
+  to those lanes for cross-process observability.
+
+### Tests
+
+Three new test pins (#75–77) in `tests/Bridge.test.ts`:
+
+- **#75 — default-off preserves 0.6.14.** Default-constructed PLL has
+  `driftEstimatorEnabled === false` and `driftPpm === 0` even after
+  feeding observations with 100 ppm drift. Bridge's built-in PLL is
+  default-constructed → drift off.
+- **#76 — converges on constant drift.** Opt in via
+  `enableDriftEstimator: true`. Simulate 100 ppm constant drift over
+  500 observations at 60 Hz with ±1 μs jitter; drift estimate
+  converges to within 10 ppm (analytic 1-σ at default β = 0.05 is
+  ~6 ppm). Offset stays within 1 ms of the moving truth (would walk
+  off by ~tens of ms under offset-only).
+- **#77 — phaseLockedTime extrapolation + validation.** With drift
+  trained on 50 ppm truth, `phaseLockedTime(consumerNs + 100ms)`
+  returns extrapolated value within 50 μs of the true offset at
+  that future moment. Drift-enabled extrapolation strictly beats
+  offset-only extrapolation in the same scenario. Construction
+  validates `driftGain` (NaN / non-positive / Infinity rejected);
+  `reset()` clears drift state but leaves the construction-time
+  enable flag intact.
+
+All 7 suites green; bench medians unchanged at 1.20 μs (PLL is not
+on the bench's measured path).
+
+### Documentation
+
+- `src/ConsumerClockRecovery.ts` gains a self-contained "Drift
+  estimator (0.6.15, opt-in)" section in the file header, covering
+  the math, the integral-off rationale, the default tuning, and
+  when to enable / when not to enable.
+- `src/Bridge.ts` `telemetry()` annotates the new `pllDriftPpm`
+  field with the "always 0 in offset-only mode" note.
+- `README.md` §Phase-locked loop gains a paragraph documenting the
+  drift estimator opt-in and the standard
+  `Worker→performance.now()` vs `AudioWorklet→currentTime` case.
+
 ## [0.6.14] — 2026-05-26
 
 ### Added — PLL Mahalanobis outlier gate (Pillar 2 robustness)

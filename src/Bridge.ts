@@ -1044,6 +1044,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     readonly pllLocked: boolean;
     readonly pllOffsetNs: number;
     readonly pllOutliersRejected: number;
+    readonly pllDriftPpm: number;
     readonly policy: BackpressurePolicy;
     readonly droppedFrames: number;
     readonly pushedFrames: number;
@@ -1070,6 +1071,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       // bridge's PLL was constructed; the field doc explains the gate
       // semantics and what counts as a rejection.
       pllOutliersRejected: this.pll.outliersRejected,
+      // 0.6.15 — drift estimator output, ppm. Always 0 when the
+      // estimator is opt-out (the default). Bridge<S>'s built-in PLL
+      // is constructed with default opts (offset-only); callers that
+      // want drift estimation should use the composable surface and
+      // construct ConsumerClockRecovery with `enableDriftEstimator: true`.
+      pllDriftPpm: this.pll.driftPpm,
       // 0.6.12 — backpressure policy + heap-side drop counter.
       policy: this.ring.policy,
       droppedFrames: this.ring.droppedCount(),

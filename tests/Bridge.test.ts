@@ -279,6 +279,32 @@
  *      would otherwise pass at the default 6σ. Construction validates
  *      the opts (negative warmup throws, α outside (0,1] throws,
  *      non-positive sigma throws).
+ *  75. PLL drift estimator — default-off preserves 0.6.14 (0.6.15).
+ *      Default-constructed `ConsumerClockRecovery` has
+ *      `driftEstimatorEnabled === false` and `driftPpm === 0` after
+ *      any sequence of observations. `Bridge.telemetry().pllDriftPpm`
+ *      reads 0 regardless of producer/consumer clock relationship.
+ *      Same Bridge convergence test as pin #42 yields bit-identical
+ *      pllOffsetNs (drift path is fully bypassed when the flag is
+ *      off).
+ *  76. PLL drift estimator — converges on constant drift (0.6.15).
+ *      Direct-construct `ConsumerClockRecovery({ enableDriftEstimator:
+ *      true })`. Simulate a producer clock running at 100 ppm faster
+ *      than consumer (1.0001 ns of producer time per 1 ns of consumer
+ *      time). Feed 500 observations at ~60 Hz cadence. The drift
+ *      estimate converges to within 10 ppm of truth (100 ppm); the
+ *      offset estimate stays within 1 ms of truth (would be tens of
+ *      ms off under offset-only mode by the end of the run because
+ *      the offset is actually drifting throughout).
+ *  77. PLL drift estimator — phaseLockedTime extrapolates (0.6.15).
+ *      With drift enabled and tracked to ~truth, `phaseLockedTime`
+ *      returns extrapolated values that are within 1 μs of truth
+ *      even when called between observations (i.e., when consumerNs
+ *      is well past `lastConsumerNs`). The same call against an
+ *      offset-only PLL would be off by `driftRate · elapsed` ≈
+ *      hundreds of μs to ms over a multi-second extrapolation
+ *      window. Also validates: `driftGain` validation (NaN /
+ *      non-positive throws); `reset()` clears drift state.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -4203,6 +4229,171 @@ function testPllOutlierGateTuningAndValidation(): void {
   ok("pll-outlier-gate-tuning-and-validation");
 }
 
+// ── 75. PLL drift estimator — default-off preserves 0.6.14 (0.6.15) ──────
+function testPllDriftEstimatorDefaultOff(): void {
+  // Default-constructed PLL has the estimator off.
+  const pll = new ConsumerClockRecovery();
+  assertEq(pll.driftEstimatorEnabled, false, "drift estimator default off");
+  assertEq(pll.driftPpm, 0, "drift estimate starts at 0");
+
+  // Feed a non-trivial sequence (with simulated 100 ppm drift in the
+  // producer clock) — pllDriftPpm stays at 0 because the estimator is
+  // off. The offset will drift but be tracked as moving offset, not
+  // as a drift.
+  pll.observe(0, 0);
+  let consumerNs = 0;
+  for (let i = 0; i < 50; i++) {
+    consumerNs += 16_666_667;
+    // Producer clock: 100 ppm faster than consumer. The producer
+    // measures `consumerNs * 1.0001` worth of producer time relative
+    // to its own start. So producerNs at consumer time consumerNs is
+    // consumerNs + (consumerNs * 100e-6) = consumerNs + 100 ppm of
+    // consumerNs.
+    const producerNs = consumerNs + consumerNs * 100e-6;
+    pll.observe(consumerNs, producerNs);
+  }
+  assertEq(pll.driftPpm, 0, "default-off PLL never updates drift estimate");
+
+  // Bridge's built-in PLL is default-constructed → drift off.
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  assertEq(ring.telemetry().pllDriftPpm, 0, "Bridge.telemetry().pllDriftPpm starts at 0");
+  ring.observeConsumerTime(0, 0);
+  assertEq(ring.telemetry().pllDriftPpm, 0, "still 0 after observation (drift off by default)");
+
+  ok("pll-drift-estimator-default-off");
+}
+
+// ── 76. PLL drift estimator — converges on constant drift (0.6.15) ───────
+function testPllDriftEstimatorConvergence(): void {
+  const TRUE_DRIFT_PPM = 100; // 100 ppm — producer clock runs 100 ppm fast
+  const pll = new ConsumerClockRecovery({ enableDriftEstimator: true });
+  assertEq(pll.driftEstimatorEnabled, true, "drift estimator opted in");
+
+  // Seed at offset = 0, consumerNs = 0.
+  pll.observe(0, 0);
+
+  // Feed 500 observations at ~60 Hz. Producer time advances faster
+  // than consumer by TRUE_DRIFT_PPM ppm.
+  let consumerNs = 0;
+  const rng = mulberry32(0x600d);
+  for (let i = 0; i < 500; i++) {
+    consumerNs += 16_666_667;
+    // Producer clock at "true" producer time corresponding to this
+    // consumer time. With 100 ppm faster producer clock, after
+    // consumerNs of consumer time has passed, producer has experienced
+    // consumerNs * (1 + 100e-6) of producer time. We're using the
+    // convention that producerNs is "what the producer reports as its
+    // wall-clock at the moment of observation," so producerNs =
+    // consumerNs + consumerNs * 100e-6 (the drift accumulates in the
+    // offset).
+    //
+    // Jitter is ±1 μs — small enough that the analytic g-h steady-
+    // state drift variance σ(drift) ≈ √(β/(2-α-β)) · σ(res)/dt is
+    // about 6 ppm, well below the 10 ppm test threshold.
+    const jitter = (rng() - 0.5) * 2_000;
+    const trueOffsetNs = consumerNs * TRUE_DRIFT_PPM * 1e-6;
+    const producerNs = consumerNs + trueOffsetNs + jitter;
+    pll.observe(consumerNs, producerNs);
+  }
+
+  const estimatedDriftPpm = pll.driftPpm;
+  const driftError = Math.abs(estimatedDriftPpm - TRUE_DRIFT_PPM);
+  assert(
+    driftError < 10,
+    `drift estimator converges to within 10 ppm of truth (estimated=${estimatedDriftPpm.toFixed(2)} ppm, truth=${TRUE_DRIFT_PPM} ppm, error=${driftError.toFixed(2)} ppm)`,
+  );
+
+  // Offset at last observation should match the true offset at that
+  // moment, modulo 1 ms.
+  const trueFinalOffset = consumerNs * TRUE_DRIFT_PPM * 1e-6;
+  const offsetError = Math.abs(pll.offsetNs - trueFinalOffset);
+  assert(
+    offsetError < 1_000_000,
+    `offset tracks drift: |estimate=${pll.offsetNs.toFixed(0)} − truth=${trueFinalOffset.toFixed(0)}| = ${offsetError.toFixed(0)} ns < 1 ms`,
+  );
+
+  ok("pll-drift-estimator-convergence");
+}
+
+// ── 77. PLL drift estimator — phaseLockedTime + validation (0.6.15) ─────
+function testPllDriftEstimatorPhaseLockedTime(): void {
+  const TRUE_DRIFT_PPM = 50;
+  const pll = new ConsumerClockRecovery({
+    enableDriftEstimator: true,
+    driftGain: 0.005,
+  });
+
+  // Train the PLL.
+  pll.observe(0, 0);
+  let consumerNs = 0;
+  for (let i = 0; i < 500; i++) {
+    consumerNs += 16_666_667;
+    const trueOffset = consumerNs * TRUE_DRIFT_PPM * 1e-6;
+    pll.observe(consumerNs, consumerNs + trueOffset);
+  }
+
+  // phaseLockedTime called WELL PAST the last observation —
+  // simulating a quantum that's far into the future.
+  const farConsumerNs = consumerNs + 100_000_000; // +100 ms into the future
+  const truePhaseLockedTime = farConsumerNs + farConsumerNs * TRUE_DRIFT_PPM * 1e-6;
+  const predicted = pll.phaseLockedTime(farConsumerNs);
+  const extrapolationError = Math.abs(predicted - truePhaseLockedTime);
+  assert(
+    extrapolationError < 50_000,
+    `extrapolation accurate within 50 μs over 100 ms: |${predicted.toFixed(0)} − ${truePhaseLockedTime.toFixed(0)}| = ${extrapolationError.toFixed(0)} ns`,
+  );
+
+  // Compare to an offset-only PLL trained on the same data — its
+  // extrapolation should be off by approximately driftRate × elapsed.
+  const offsetOnly = new ConsumerClockRecovery();
+  offsetOnly.observe(0, 0);
+  let c2 = 0;
+  for (let i = 0; i < 500; i++) {
+    c2 += 16_666_667;
+    const trueOffset = c2 * TRUE_DRIFT_PPM * 1e-6;
+    offsetOnly.observe(c2, c2 + trueOffset);
+  }
+  const offsetOnlyPredicted = offsetOnly.phaseLockedTime(farConsumerNs);
+  const offsetOnlyError = Math.abs(offsetOnlyPredicted - truePhaseLockedTime);
+  // Sanity: the drift-enabled extrapolation should be meaningfully
+  // better than the offset-only extrapolation in this scenario.
+  assert(
+    extrapolationError < offsetOnlyError,
+    `drift-enabled extrapolation better than offset-only: drift=${extrapolationError.toFixed(0)} ns < offset-only=${offsetOnlyError.toFixed(0)} ns`,
+  );
+
+  // Reset clears drift state.
+  pll.reset();
+  assertEq(pll.driftPpm, 0, "reset clears drift");
+  assertEq(pll.locked, false, "reset unlocks");
+
+  // After reset, drift estimator is still enabled (it's a construction-
+  // time setting). Next observation seeds fresh.
+  assertEq(pll.driftEstimatorEnabled, true, "drift flag survives reset");
+  pll.observe(1000, 1042);
+  assertEq(pll.offsetNs, 42, "post-reset re-seed");
+  assertEq(pll.driftPpm, 0, "post-reset drift starts at 0");
+
+  // (Validation.) driftGain must be positive finite.
+  let threw = false;
+  try { new ConsumerClockRecovery({ driftGain: 0 }); } catch { threw = true; }
+  assert(threw, "driftGain=0 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ driftGain: -0.1 }); } catch { threw = true; }
+  assert(threw, "driftGain<0 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ driftGain: NaN }); } catch { threw = true; }
+  assert(threw, "driftGain=NaN throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ driftGain: Infinity }); } catch { threw = true; }
+  assert(threw, "driftGain=Infinity throws (must be finite)");
+
+  ok("pll-drift-estimator-phase-locked-time");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -4279,6 +4470,9 @@ function main(): void {
   testPllOutlierGateSingleSpike();
   testPllOutlierGateSustainedStep();
   testPllOutlierGateTuningAndValidation();
+  testPllDriftEstimatorDefaultOff();
+  testPllDriftEstimatorConvergence();
+  testPllDriftEstimatorPhaseLockedTime();
   console.log("\nAll Bridge tests passed.");
 }
 

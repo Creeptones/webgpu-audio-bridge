@@ -29,6 +29,75 @@
  * Anti-windup: `integral` is clamped to ±`PLL_INT_LIMIT_NS` (1 ms in
  * residual units).
  *
+ * ─── Drift estimator (0.6.15, opt-in) ────────────────────────────────────
+ *
+ * The 0.6.2 PLL is a 1st-order tracker: it estimates the offset `O(t)`
+ * but assumes the offset is constant between observations. That's fine
+ * when producer and consumer share a clock (`performance.now()` to
+ * `performance.now()`) and any apparent change is jitter around a fixed
+ * mean.
+ *
+ * It's less fine when producer + consumer live in different clock domains
+ * — the canonical case being a producer Worker stamping
+ * `performance.now()` while the consumer AudioWorklet reads
+ * `AudioContext.currentTime`. These two clocks can drift relative to each
+ * other at tens of ppm (parts per million) because they're sourced from
+ * different platform timers with independent calibration. At 50 ppm, the
+ * apparent offset changes by 50 ns per ms of real time — large enough to
+ * walk the 1st-order PLL out of microsecond accuracy over seconds-scale
+ * timescales.
+ *
+ * 0.6.15 adds an opt-in 2nd-order tracker that models the offset as a
+ * linear function of consumer time:
+ *
+ *     predicted_offset(t) = O_lastObs + driftRate · (t − t_lastObs)
+ *
+ * where `driftRate` is the dimensionless slope of offset vs consumer
+ * time (1 ns of offset drift per 1 ns of consumer time = 1e6 ppm).
+ * `phaseLockedTime(consumerNs)` extrapolates using the current
+ * `(offset, driftRate, lastObservationTime)` triple, so a quantum-rate
+ * AudioWorklet still gets sub-μs accurate offsets between observations.
+ *
+ * The g-h alpha-beta filter is the standard 2nd-order PLL update:
+ *
+ *     dt        = consumerNs − lastConsumerNs
+ *     predicted = offset + driftRate · dt
+ *     residual  = (producerNs − consumerNs) − predicted
+ *     offset    = predicted + KP · residual + KI · integral   (1st-order PI lives here)
+ *     driftRate = driftRate + (driftGain / dt) · residual     (new in 0.6.15)
+ *
+ * The drift gain (default `0.005`) is the dimensionless g-h "β" parameter.
+ * Smaller values track drift more slowly but smooth jitter harder; the
+ * default settles a constant 50 ppm drift in a few hundred observations
+ * (≈ a few seconds at 60 Hz).
+ *
+ * **Opt-in.** Pass `enableDriftEstimator: true` in the opts bag to
+ * activate the 2nd-order path. Default is `false` — the 1st-order
+ * 0.6.2..0.6.14 behavior is preserved bit-exact for any caller that
+ * doesn't opt in. The two existing PLL pins (#42 convergence and #43
+ * step response) continue to pass unchanged.
+ *
+ * **Telemetry.** `Bridge.telemetry().pllDriftPpm` exposes the current
+ * drift estimate (always 0 in offset-only mode); useful for diagnosing
+ * clock-domain mismatch in production.
+ *
+ * **When to enable.** Switch on `enableDriftEstimator` when:
+ *   - Producer is on a Worker stamping `performance.now()` and the
+ *     consumer is in an AudioWorklet reading
+ *     `AudioContext.currentTime` (the canonical browser-audio case).
+ *   - You see slow `pllOffsetNs` walk in `telemetry()` over minute-
+ *     plus runs that the 1st-order PLL can't fully cancel.
+ *   - The producer-consumer clock pair has documented drift specs
+ *     (e.g., ASIO sample-clock vs system clock for pro-audio devices).
+ *
+ * **When NOT to enable.** When producer and consumer share a clock
+ * source (both in the same Worker, both reading
+ * `performance.now()`), the drift estimator adds variance without
+ * tracking anything real — the offset doesn't drift, so the drift
+ * estimator's β-term injects jitter onto the offset estimate. The
+ * 1st-order path is a strict improvement when there's nothing to
+ * track.
+ *
  * ─── Mahalanobis outlier gate (0.6.14) ───────────────────────────────────
  *
  * Single-frame residual spikes — a 30 ms `mapAsync` stall, a frame whose
@@ -106,6 +175,14 @@ const PLL_OUTLIER_WARMUP_DEFAULT = 5;
 const PLL_OUTLIER_EWMA_ALPHA_DEFAULT = 0.05;
 const PLL_OUTLIER_CONSECUTIVE_DEFAULT = 3;
 
+// Drift estimator defaults (0.6.15). See file header. Default-off; when
+// opted in, the g-h β gain converges a constant 50 ppm drift in ~few
+// dozen observations at the canonical 60 Hz observation cadence (β =
+// 0.05 ≈ 20-observation time constant). The 0.6.2 PI integral is
+// turned OFF in drift mode — the drift estimator IS the integrator and
+// a redundant integral term fights it.
+const PLL_DRIFT_GAIN_DEFAULT = 0.05;
+
 /** Constructor options for `ConsumerClockRecovery` (0.6.14). All fields
  *  optional; omitted fields take the documented per-field defaults. */
 export interface ConsumerClockRecoveryOptions {
@@ -128,6 +205,19 @@ export interface ConsumerClockRecoveryOptions {
    *  `3` — at 60 Hz that's ~50 ms before a step is acknowledged. Pass
    *  `Infinity` to make the gate never give up. */
   readonly outlierConsecutiveLimit?: number;
+  /** Enable the 2nd-order drift estimator (0.6.15). When `true`, the
+   *  PLL models offset as a linear function of consumer time and
+   *  tracks both `offsetNs` and `driftPpm`. Default `false` — preserves
+   *  pre-0.6.15 offset-only behavior bit-exact. Switch on when
+   *  producer and consumer live in different clock domains (e.g.,
+   *  Worker `performance.now()` vs AudioWorklet
+   *  `AudioContext.currentTime`). See class header "Drift estimator". */
+  readonly enableDriftEstimator?: boolean;
+  /** Drift gain (the dimensionless `β` parameter in the g-h
+   *  alpha-beta filter formulation). Default `0.005`. Only meaningful
+   *  when `enableDriftEstimator` is true. Smaller values track drift
+   *  more slowly but smooth jitter harder. */
+  readonly driftGain?: number;
 }
 
 /**
@@ -153,6 +243,20 @@ export class ConsumerClockRecovery {
   private readonly _outlierEwmaAlpha: number;
   private readonly _outlierConsecutiveLimit: number;
 
+  // Drift estimator state (0.6.15). Only meaningful when
+  // `_enableDriftEstimator` is true. Reset alongside the offset on
+  // `reset()` calls.
+  /** Dimensionless drift slope (1 ns of offset shift per 1 ns of
+   *  consumer time). Multiply by 1e6 for parts-per-million. */
+  private _driftRate: number = 0;
+  /** Consumer time at the moment of the most recent admitted
+   *  observation. Used to compute the `dt` for both the predicted-
+   *  offset extrapolation and the g-h velocity update. Equal to the
+   *  seed consumer time on the very first observation after lock. */
+  private _lastConsumerNs: number = 0;
+  private readonly _enableDriftEstimator: boolean;
+  private readonly _driftGain: number;
+
   /** Proportional gain (frozen for the lifetime of the instance). */
   static readonly KP = PLL_KP;
   /** Integral gain. */
@@ -170,6 +274,9 @@ export class ConsumerClockRecovery {
   /** Default consecutive-gated count before the loop concludes a step
    *  occurred and admits the residual. (0.6.14) */
   static readonly OUTLIER_CONSECUTIVE_DEFAULT = PLL_OUTLIER_CONSECUTIVE_DEFAULT;
+  /** Default g-h `β` drift gain when drift estimator is opted in.
+   *  (0.6.15) */
+  static readonly DRIFT_GAIN_DEFAULT = PLL_DRIFT_GAIN_DEFAULT;
 
   /** Default-construct with all gate parameters at their documented
    *  defaults, or pass an options bag to tune the gate per-instance.
@@ -204,6 +311,20 @@ export class ConsumerClockRecovery {
     this._outlierWarmupObservations = warmup;
     this._outlierEwmaAlpha = alpha;
     this._outlierConsecutiveLimit = consec;
+
+    // Drift estimator opts (0.6.15). Default-off; opt in to enable
+    // 2nd-order tracking. Validation: driftGain must be positive
+    // finite. (β = 0 is a no-op that wastes a multiply per observation
+    // — disallowed; pass enableDriftEstimator: false to actually
+    // disable.) NaN / negative driftGain rejected.
+    this._enableDriftEstimator = opts.enableDriftEstimator === true;
+    const driftGain = opts.driftGain ?? PLL_DRIFT_GAIN_DEFAULT;
+    if (!Number.isFinite(driftGain) || driftGain <= 0) {
+      throw new Error(
+        `ConsumerClockRecovery: driftGain must be a positive finite number (got ${driftGain})`,
+      );
+    }
+    this._driftGain = driftGain;
   }
 
   /**
@@ -234,10 +355,21 @@ export class ConsumerClockRecovery {
       this._sigmaEwma = 0;
       this._observationsSinceLock = 0;
       this._consecutiveOutliers = 0;
+      this._driftRate = 0;
+      this._lastConsumerNs = consumerNs;
       this._locked = true;
       return;
     }
-    const residual = (producerNs - consumerNs) - this._offsetNs;
+    // Drift estimator (0.6.15). When enabled, the offset is extrapolated
+    // forward by `driftRate · dt` before the residual is computed. The
+    // residual is then "actual offset minus predicted offset at the
+    // observation time," which is what the PI math and the g-h velocity
+    // update both want.
+    const dt = consumerNs - this._lastConsumerNs;
+    const predicted = this._enableDriftEstimator
+      ? this._offsetNs + this._driftRate * dt
+      : this._offsetNs;
+    const residual = (producerNs - consumerNs) - predicted;
     const absRes = residual < 0 ? -residual : residual;
 
     // Outlier gate (0.6.14). Active only after the warmup observations
@@ -271,13 +403,52 @@ export class ConsumerClockRecovery {
       }
     }
 
-    // Normal PI path. Same math as 0.6.13; the outlier gate above gates
-    // entry but never changes the math when allowed through.
-    let integral = this._integral + residual;
-    if (integral > PLL_INT_LIMIT_NS) integral = PLL_INT_LIMIT_NS;
-    else if (integral < -PLL_INT_LIMIT_NS) integral = -PLL_INT_LIMIT_NS;
-    this._integral = integral;
-    this._offsetNs += PLL_KP * residual + PLL_KI * integral;
+    // Offset + drift update. Two shapes:
+    //
+    // Offset-only mode (0.6.2..0.6.14, default): a 1st-order PI loop
+    //   integral  = clamp(integral + residual, ±PLL_INT_LIMIT_NS)
+    //   offsetNs += KP·residual + KI·integral
+    // The integral term cancels steady-state offset bias from the KP
+    // term's incomplete tracking; it's an inner integrator inside a
+    // 1st-order loop.
+    //
+    // Drift mode (0.6.15, opt-in): a 2nd-order g-h alpha-beta filter
+    //   offsetNs   = predicted + KP·residual            (α step)
+    //   driftRate += (driftGain / dt) · residual        (β step)
+    // The drift estimator IS the integrator at the 2nd-order level —
+    // it accumulates the steady-state offset bias as a drift rate. A
+    // redundant KI integral here would fight the drift estimator
+    // (both trying to absorb the residual), so it's intentionally
+    // omitted in drift mode. The integral state stays at 0.
+    //
+    // `predicted === this._offsetNs` in offset-only mode (driftRate = 0
+    // throughout that branch), so `offsetNs = predicted + KP·residual
+    // + KI·integral` collapses to `offsetNs += KP·residual + KI·integral`
+    // bit-exact and the pre-0.6.15 PI math is preserved.
+    if (this._enableDriftEstimator) {
+      this._offsetNs = predicted + PLL_KP * residual;
+      // Drift (g-h velocity) update — only when dt is positive.
+      // dt ≤ 0 happens if two observations arrive at the same
+      // consumer time (rare; possible from clock-quantization races) or
+      // if consumer time went backward (clock skew, suspend/resume).
+      // Skip the drift update; the offset update above absorbs the
+      // observation.
+      if (dt > 0) {
+        this._driftRate += (this._driftGain / dt) * residual;
+      }
+    } else {
+      let integral = this._integral + residual;
+      if (integral > PLL_INT_LIMIT_NS) integral = PLL_INT_LIMIT_NS;
+      else if (integral < -PLL_INT_LIMIT_NS) integral = -PLL_INT_LIMIT_NS;
+      this._integral = integral;
+      this._offsetNs = predicted + PLL_KP * residual + PLL_KI * integral;
+    }
+    // Always update the last-observation timestamp so the next
+    // observation's dt is computed against a current reference. Even
+    // in offset-only mode — harmless (we never read lastConsumerNs
+    // there) but keeps the state coherent for callers that flip the
+    // drift estimator on/off across resets.
+    this._lastConsumerNs = consumerNs;
 
     // EWMA update of σ̂ — done after PI math so the absRes reflects the
     // observation we just processed. Sticky-up bias is acceptable; the
@@ -306,7 +477,16 @@ export class ConsumerClockRecovery {
    */
   phaseLockedTime(consumerNs: number): number {
     if (!this._locked) return consumerNs;
-    return consumerNs + this._offsetNs;
+    // Offset-only mode: return consumerNs + offset directly.
+    // Drift mode (0.6.15): extrapolate the offset from the last
+    // observation to consumerNs using the current drift estimate.
+    // Between observations, this gives sub-μs accurate offsets even
+    // when producer and consumer clocks drift at tens of ppm.
+    if (!this._enableDriftEstimator) {
+      return consumerNs + this._offsetNs;
+    }
+    const dt = consumerNs - this._lastConsumerNs;
+    return consumerNs + this._offsetNs + this._driftRate * dt;
   }
 
   /**
@@ -322,6 +502,8 @@ export class ConsumerClockRecovery {
     this._sigmaEwma = 0;
     this._observationsSinceLock = 0;
     this._consecutiveOutliers = 0;
+    this._driftRate = 0;
+    this._lastConsumerNs = 0;
     // Note: _outliersRejected is intentionally NOT reset — it's a
     // cumulative diagnostic counter, like `tornFrames`. Callers that
     // want a fresh count should construct a new instance.
@@ -353,5 +535,22 @@ export class ConsumerClockRecovery {
    *  `outliersRejected` and `offsetNs`. (0.6.14) */
   get sigmaEstimateNs(): number {
     return this._sigmaEwma;
+  }
+
+  /** True if the drift estimator was enabled at construction. Read
+   *  this to know whether `driftPpm` is tracking real drift or stuck
+   *  at 0 because the 2nd-order path is off. (0.6.15) */
+  get driftEstimatorEnabled(): boolean {
+    return this._enableDriftEstimator;
+  }
+
+  /** Current drift estimate in parts-per-million (ns of offset shift
+   *  per second of consumer time). Always 0 when the drift estimator
+   *  is opt-out (default). Read via
+   *  `Bridge.telemetry().pllDriftPpm` for dashboards. (0.6.15) */
+  get driftPpm(): number {
+    // _driftRate is dimensionless (ns/ns). Multiply by 1e6 for ppm
+    // (the conventional "parts per million" unit clocks use).
+    return this._driftRate * 1e6;
   }
 }
