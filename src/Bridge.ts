@@ -125,6 +125,39 @@
  * notify on push is still emitted for the benefit of non-realtime consumers
  * (concurrent stress tests, bench harnesses, non-audio downstream readers).
  *
+ * ─── Smoothed pulls (α-smoother as first-class API) ─────────────────────
+ *
+ * `pullSmoothed` / `pullLatestSmoothed` are opt-in variants of `pull` /
+ * `pullLatest` that blend the freshly-read frame with the previous
+ * smoothed-call output using a one-pole low-pass:
+ *
+ *   out_i ← α_eff · curr_i + (1 − α_eff) · prev_i
+ *
+ * For `pullLatestSmoothed`, `α_eff = α_base · 2^(−skipped)` — a big jump
+ * (producer stalled then caught up) gets MORE smoothing, the steady-state
+ * case with no skips gets `α_eff = α_base`. For `pullSmoothed`, skipped is
+ * always 0, so `α_eff = α_base` always.
+ *
+ * Lineage: the wavefunction-synth project's 60 → 48 kHz boundary smoother
+ * (`wfEvolve.js:145-146,361-362`); same one-pole shape, lifted into the
+ * ring as a first-class consumer-side primitive. BigInt-typed fields are
+ * passed through verbatim — there is no meaningful blend on monotonic
+ * sequence counters or timestamps. Integer-typed numeric fields (u8…u32,
+ * i8…i32) blend in floating-point then `Math.round` back to integer.
+ *
+ * The smoother's `prev` is held heap-side on the Bridge instance. It is
+ * lazily allocated on the first smoothed call and persists across calls.
+ * Any non-smoothed `pull` / `pullLatest` invalidates the prev (the next
+ * smoothed call behaves as a first-call: no blending, seed prev with the
+ * fresh frame). `resetSmoother()` is the explicit equivalent.
+ *
+ * Memory ordering matches `pull` / `pullLatest`: acquire-load writeIdx,
+ * read payload, release-store readIdx, notify. The blend math runs AFTER
+ * the release-store — blend touches only heap-side `out` and `prev`, never
+ * the SAB, so the slot can be released back to the producer as early as
+ * possible (the smoother adds no critical-section length to the SPSC
+ * handoff).
+ *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
  * Compared to the hand-rolled Float64RingBuffer code path, Bridge<S> pays a
@@ -254,6 +287,22 @@ export class Bridge<S extends Schema<FieldsObject>> {
   private pendingPushFrame: Record<string, unknown> | null = null;
   private pendingPushSlot: number = -1;
 
+  /** α-smoother previous-output cache (consumer-side). Lazily allocated by
+   *  the first call to `pullSmoothed` / `pullLatestSmoothed`; persists across
+   *  calls. `pull` / `pullLatest` flip the valid flag false (the buffer is
+   *  retained for reuse so the next smoothed call re-seeds without
+   *  allocation). See file header "Smoothed pulls". */
+  private smoothPrev: FrameFor<S> | null = null;
+  private smoothPrevValid: boolean = false;
+  /** Precomputed per-scalar/per-array smoother classification. Computed in
+   *  the constructor in `scalarLayout` / `arrayLayout` order so the blend
+   *  loops are a tight indexed walk. `isBigInt` ⇒ verbatim pass-through;
+   *  `isInteger` ⇒ Math.round after blend; otherwise float-domain blend. */
+  private readonly scalarIsBigInt: ReadonlyArray<boolean>;
+  private readonly scalarIsInteger: ReadonlyArray<boolean>;
+  private readonly arrayIsBigInt: ReadonlyArray<boolean>;
+  private readonly arrayIsInteger: ReadonlyArray<boolean>;
+
   constructor(sab: SharedArrayBuffer, capacity: number, schema: S) {
     if (!isPowerOfTwo(capacity)) {
       throw new Error(
@@ -350,6 +399,22 @@ export class Bridge<S extends Schema<FieldsObject>> {
     }
     this.scalarWriters = Object.freeze(writers);
     this.scalarReaders = Object.freeze(readers);
+
+    // Precompute smoother classification flags. f64 / f32 ⇒ float-domain
+    // blend; integer-typed numeric kinds ⇒ blend in float then Math.round;
+    // BigInt kinds (u64 / i64) ⇒ skip blending, pass through verbatim.
+    this.scalarIsBigInt = Object.freeze(
+      scalars.map((f) => kindTsType(f.kind) === "bigint"),
+    );
+    this.scalarIsInteger = Object.freeze(
+      scalars.map((f) => f.kind !== "f64" && f.kind !== "f32" && kindTsType(f.kind) !== "bigint"),
+    );
+    this.arrayIsBigInt = Object.freeze(
+      arrays.map((f) => kindTsType(f.kind) === "bigint"),
+    );
+    this.arrayIsInteger = Object.freeze(
+      arrays.map((f) => f.kind !== "f64" && f.kind !== "f32" && kindTsType(f.kind) !== "bigint"),
+    );
   }
 
   /** Byte size needed for a ring of `(capacity, schema)`. */
@@ -519,6 +584,9 @@ export class Bridge<S extends Schema<FieldsObject>> {
     }
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    // Non-smoothed pull invalidates the smoother's prev — next smoothed call
+    // re-seeds. Allocation-free; the prev buffer (if any) is retained.
+    this.smoothPrevValid = false;
     return true;
   }
 
@@ -548,7 +616,195 @@ export class Bridge<S extends Schema<FieldsObject>> {
     }
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    // Non-smoothed pullLatest invalidates the smoother's prev — next smoothed
+    // call re-seeds. Allocation-free; prev buffer is retained.
+    this.smoothPrevValid = false;
     return skipped;
+  }
+
+  /**
+   * Consumer-side smoothed single-frame pull. Equivalent to `pull` but blends
+   * the freshly-read frame against the previously-returned smoothed frame
+   * using a one-pole low-pass:
+   *
+   *   out_i ← α_base · curr_i + (1 − α_base) · prev_i
+   *
+   * α_base ∈ [0, 1]: 1.0 = no smoothing (≡ raw pull); smaller = more inertia.
+   * On the first smoothed call (or the first after any non-smoothed pull /
+   * `resetSmoother()`) there is no prev — the fresh frame is returned
+   * verbatim and stored as the new prev.
+   *
+   * BigInt-typed fields (u64 / i64) are passed through verbatim regardless of
+   * α — there is no meaningful blend on monotonic sequence counters /
+   * timestamps. Integer-typed numeric fields are blended in float then
+   * `Math.round`-ed back. Float fields blend in float.
+   *
+   * Returns false on empty (no payload read; smoother state untouched).
+   *
+   * Memory ordering matches `pull`. See file header "Smoothed pulls".
+   */
+  pullSmoothed(out: FrameFor<S>, alphaBase: number): boolean {
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+    if (writeIdx === readIdx) return false;
+    const slot = (readIdx >>> 0) & this.mask;
+    const frame = out as unknown as Record<string, unknown>;
+    const sr = this.scalarReaders;
+    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+    const al = this.arrayLayout;
+    const av = this.arrayViews;
+    for (let i = 0; i < al.length; i++) {
+      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+      dst.set(av[i]![slot]!);
+    }
+    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0);
+    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    this._applySmoother(frame, alphaBase);
+    return true;
+  }
+
+  /**
+   * Consumer-side smoothed drain-to-latest. Equivalent to `pullLatest` but
+   * blends the freshly-read newest frame against the previously-returned
+   * smoothed frame using a skip-scaled one-pole low-pass:
+   *
+   *   α_eff = α_base · 2^(−skipped)
+   *   out_i ← α_eff · curr_i + (1 − α_eff) · prev_i
+   *
+   * The `2^(−skipped)` scaling means a single-frame catch-up uses
+   * `α_eff = α_base` (steady-state smoothing); a large drain (producer
+   * stalled, consumer caught a backlog) uses an exponentially smaller α_eff
+   * (mostly trust prev, drift slowly toward the catch-up state). This masks
+   * producer hiccups click-free at the cost of lag during big jumps —
+   * appropriate when the producer's recent post-stall values are correct but
+   * the jump itself would audibly click if applied raw.
+   *
+   * Returns -1 on empty, else the number of frames skipped (0 if a single
+   * frame was waiting). Same field-type rules as `pullSmoothed`. Memory
+   * ordering matches `pullLatest`. See file header "Smoothed pulls".
+   */
+  pullLatestSmoothed(out: FrameFor<S>, alphaBase: number): number {
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+    if (writeIdx === readIdx) return -1;
+    const newestIdx = (writeIdx - 1) | 0;
+    const skipped = ((newestIdx - readIdx) | 0);
+    const slot = (newestIdx >>> 0) & this.mask;
+    const frame = out as unknown as Record<string, unknown>;
+    const sr = this.scalarReaders;
+    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+    const al = this.arrayLayout;
+    const av = this.arrayViews;
+    for (let i = 0; i < al.length; i++) {
+      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+      dst.set(av[i]![slot]!);
+    }
+    Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0);
+    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    // 2^(-skipped) via ldexp-style exponent shift; for skipped=0 this is 1.0.
+    // Math.pow(2, -skipped) is cheap (V8 special-cases integer exponents);
+    // we accept the small JS-call overhead in exchange for clarity.
+    const alphaEff = alphaBase * Math.pow(2, -skipped);
+    this._applySmoother(frame, alphaEff);
+    return skipped;
+  }
+
+  /**
+   * Forget the smoother's `prev`. The next `pullSmoothed` /
+   * `pullLatestSmoothed` will behave as a first-call: no blending, the fresh
+   * frame is returned verbatim and stored as the new prev.
+   *
+   * Use this at quiescence boundaries (e.g., the producer just started, or
+   * the consumer just woke from suspend) to avoid blending with a possibly-
+   * stale prev. `pull` / `pullLatest` already invalidate prev implicitly;
+   * call this only if you need to invalidate without consuming a frame.
+   */
+  resetSmoother(): void {
+    this.smoothPrevValid = false;
+  }
+
+  /**
+   * Apply the one-pole blend in-place on `out` and update `smoothPrev`.
+   *
+   * Called by `pullSmoothed` / `pullLatestSmoothed` after the SAB read +
+   * release-store have completed. `out` arrives holding the raw fresh frame
+   * (curr); on exit it holds the blended frame, and `this.smoothPrev` mirrors
+   * it. Allocation-free in steady state; the first call allocates the prev
+   * buffer via `scratchFrame()` (heap typed arrays + scalar zeros), seeds it
+   * with curr, and flips `smoothPrevValid` true.
+   */
+  private _applySmoother(out: Record<string, unknown>, alpha: number): void {
+    if (!this.smoothPrevValid) {
+      // First smoothed call (or first after invalidation): no blend, just
+      // seed prev with the current fresh frame. Allocate prev if needed.
+      if (this.smoothPrev === null) {
+        this.smoothPrev = this.scratchFrame();
+      }
+      this._copyFrameInto(out, this.smoothPrev as unknown as Record<string, unknown>);
+      this.smoothPrevValid = true;
+      return;
+    }
+    const prev = this.smoothPrev as unknown as Record<string, unknown>;
+    const oneMinusAlpha = 1 - alpha;
+    // Scalars.
+    const sl = this.scalarLayout;
+    const sbi = this.scalarIsBigInt;
+    const sii = this.scalarIsInteger;
+    for (let i = 0; i < sl.length; i++) {
+      const name = sl[i]!.name;
+      if (sbi[i]) {
+        // BigInt — verbatim pass-through. `out` already holds curr; sync prev.
+        prev[name] = out[name];
+      } else {
+        const curr = out[name] as number;
+        const p = prev[name] as number;
+        let blended = alpha * curr + oneMinusAlpha * p;
+        if (sii[i]) blended = Math.round(blended);
+        out[name] = blended;
+        prev[name] = blended;
+      }
+    }
+    // Arrays.
+    const al = this.arrayLayout;
+    const abi = this.arrayIsBigInt;
+    const aii = this.arrayIsInteger;
+    for (let i = 0; i < al.length; i++) {
+      const name = al[i]!.name;
+      if (abi[i]) {
+        const currArr = out[name] as { set(s: ArrayLike<bigint>): void } & ArrayLike<bigint>;
+        const prevArr = prev[name] as { set(s: ArrayLike<bigint>): void };
+        prevArr.set(currArr);
+      } else {
+        const cA = out[name] as { length: number; [j: number]: number };
+        const pA = prev[name] as { length: number; [j: number]: number };
+        const isInt = aii[i];
+        const L = cA.length;
+        for (let j = 0; j < L; j++) {
+          let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+          if (isInt) b = Math.round(b);
+          cA[j] = b;
+          pA[j] = b;
+        }
+      }
+    }
+  }
+
+  /** Copy `src` into `dst` field-by-field. Used to seed `smoothPrev` on the
+   *  first smoothed call. Scalars are plain assigns; arrays use typed-array
+   *  `.set()` so length / element-kind validation happens at the runtime
+   *  layer (`dst` is always a freshly-allocated `scratchFrame()`). */
+  private _copyFrameInto(
+    src: Record<string, unknown>,
+    dst: Record<string, unknown>,
+  ): void {
+    for (const f of this.scalarLayout) {
+      dst[f.name] = src[f.name];
+    }
+    for (const f of this.arrayLayout) {
+      (dst[f.name] as { set: (s: ArrayLike<number> | ArrayLike<bigint>) => void }).set(
+        src[f.name] as ArrayLike<number> | ArrayLike<bigint>,
+      );
+    }
   }
 
   /** Number of frames currently buffered (≤ capacity). */

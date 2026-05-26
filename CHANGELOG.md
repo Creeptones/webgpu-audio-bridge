@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented here. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-25
+
+### Added — `Bridge<Schema>` smoothed-pull API
+
+Two new consumer-side methods plus a small helper:
+
+- **`bridge.pullSmoothed(out, alphaBase)`** — like `pull(out)` but blends the freshly-read frame against the previous smoothed-call output via a one-pole low-pass: `out_i ← α_base · curr_i + (1 − α_base) · prev_i`. Returns `false` on empty (no payload read; smoother state untouched). For per-quantum consumers that want click-free interpolation across the producer's irregular cadence.
+- **`bridge.pullLatestSmoothed(out, alphaBase)`** — like `pullLatest(out)` but with skip-scaled blending: `α_eff = α_base · 2^(−skipped)`. Steady-state (`skipped=0`) blends with `α_base`; a large drain (producer stalled, consumer caught a backlog) blends with an exponentially smaller `α_eff` so the consumer drifts slowly toward the catch-up state instead of jumping. Returns `−1` on empty, else the skipped count (same shape as `pullLatest`).
+- **`bridge.resetSmoother()`** — explicit prev-invalidation. Raw `pull` / `pullLatest` already invalidate prev implicitly (the next smoothed call re-seeds as a first-call: no blending, just seed with curr); call `resetSmoother()` to invalidate without consuming a frame.
+
+### Why — α-smoother as a first-class ring-buffer primitive
+
+Lineage: the wavefunction-synth project's 60 → 48 kHz boundary smoother (`wfEvolve.js:145-146,361-362`). The one-pole shape `y ← y + α·(x − y)` masks GPU hiccups click-free at the audio-rate consumer. Pre-0.4.1 the worklet had to implement it manually around `pullLatest`; lifting it into `Bridge` makes "temporally-coherent drain-to-newest" a single library primitive, with the skip-scaling automatic from the existing skipped-count diagnostic.
+
+Compared to other ring-buffer libraries (`ringbuf.js`, LMAX Disruptor, `jack-ringbuffer`, `crossbeam::channel`): all return "bytes since last read" — none return *temporally-coherent* bytes. For audio-rate consumers downstream of a control-rate producer, that's real value. Closes one of the two open 1.0-roadmap items from the README's improvements plan.
+
+### Field-type rules for the blend
+
+- **f64 / f32** (and their `*Array` variants): blended in float, stored as float. No rounding.
+- **u8 / i8 / u16 / i16 / u32 / i32** (and their `*Array` variants): blended in float, then `Math.round`-ed back to integer before storage. So a 0.5 blend between `10` and `11` stores `11` (JS `Math.round` rounds half away from zero for positives).
+- **u64 / i64** (BigInt-typed scalars and arrays): pass through verbatim as `curr` — there is no meaningful blend on monotonic sequence counters or timestamps. The previous prev value for these fields is overwritten with curr each call so the smoother's prev mirror stays consistent.
+
+### Memory ordering
+
+Identical to `pull` / `pullLatest`: acquire-load writeIdx, read payload, release-store readIdx, `Atomics.notify`. The blend math runs AFTER the release-store — blend touches only heap-side `out` and `prev`, never the SAB, so the producer's slot is released as early as possible. Smoother adds zero to the SPSC critical-section length.
+
+### Wire compatibility
+
+- **No SAB-layout change.** Header is still 32 bytes, counter lanes still i32 at bytes [0..3] and [4..7], reserved lanes 2-7 untouched. A 0.4.0 producer / consumer pair can interop with a 0.4.1 peer in either direction.
+- The smoother's prev frame lives heap-side on the consumer's `Bridge` instance, not in the SAB. No producer-side change.
+
+### Implementation notes
+
+- Smoother prev (`smoothPrev: FrameFor<S> | null`) is lazily allocated on the first smoothed call via `scratchFrame()`, then retained for reuse. Once allocated, smoothed calls are allocation-free.
+- `pull` / `pullLatest` flip a single boolean (`smoothPrevValid = false`) to invalidate the smoother. Cost is one store on the existing hot path — measured invisible in the bench (median push/pull/pullLatest all still ~1.10–1.20 μs at N=1000).
+- Field classification (`isBigInt` / `isInteger`) is precomputed at construction so the blend inner loop is a tight indexed walk over the schema's field arrays.
+
+### Added — smoothed-pull test pins
+
+`tests/Bridge.test.ts` grows from 17 to 27 pins (10 new):
+
+- **`testSmoothedEmpty`** — empty ring → `pullSmoothed` returns `false`, `pullLatestSmoothed` returns `−1`. Smoother state untouched on empty-return.
+- **`testSmoothedFirstCallNoBlend`** — first smoothed call returns curr verbatim regardless of α (no prev to blend with).
+- **`testSmoothedAlphaOneEqualsRawSteadyState`** — 10-cycle loop at α=1.0 with steady-state cadence (`skipped=0`) reproduces raw `pullLatest` values bit-exactly.
+- **`testSmoothedHandComputedBlend`** — two-step seed-then-blend matches hand-computed `0.5·B + 0.5·A` for every numeric field. BigInt fields pass through as `B` verbatim.
+- **`testSmoothedSkipScaling`** — push 5 frames then one `pullLatestSmoothed` sees `skipped=3`, `α_eff = α_base · 2⁻³`. Hand-computed blend matches.
+- **`testSmoothedPullSymmetricToPull`** — `pullSmoothed` (single-frame variant) blends with `α_eff = α_base` (no skip scaling).
+- **`testNonSmoothedPullInvalidatesSmoother`** — raw `pull` and `pullLatest` both invalidate prev; next smoothed call behaves as first-call.
+- **`testResetSmoother`** — explicit invalidation path, same observable behavior.
+- **`testSmoothedIntegerRounding`** — u8 scalar, u32 scalar, and u8Array elements all `Math.round` through to integer. Float field in the same schema is not rounded.
+- **`testSmoothedFloatArrayBlend`** — 16-element f64Array blends elementwise; cross-checks the array path.
+
+### Documentation
+
+- New `Smoothed pulls (α-smoother as first-class API)` section in `src/Bridge.ts` header documenting the blend, the field-type rules, the skip-scaling, and the prev-invalidation behavior.
+- JSDoc on `pullSmoothed`, `pullLatestSmoothed`, and `resetSmoother` covers semantics, return values, and the wavefunction-synth lineage.
+
 ## [0.4.0] — 2026-05-25
 
 ### Changed — `Bridge<Schema>` counter representation: BigInt64 → Int32 wrap

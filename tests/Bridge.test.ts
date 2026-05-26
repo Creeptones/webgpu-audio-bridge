@@ -24,6 +24,19 @@
  *  15. Wrap across the Int32 sign boundary (post-0.4 counter representation).
  *  16. Full-fill behavior straddling the Int32 sign boundary.
  *  17. Signed-32 counter algebra vs BigInt oracle across 10k randomized increments.
+ *  18. Smoothed pulls on an empty ring return false / -1; state untouched.
+ *  19. First smoothed call returns curr verbatim (no prev to blend with).
+ *  20. α_base=1.0 in steady state (skipped=0) reproduces raw pullLatest values.
+ *  21. Two-step seed-then-blend matches hand-computed α·B + (1-α)·A; BigInts
+ *      pass through verbatim.
+ *  22. Skipped-count exponentially scales α_eff via α_base · 2^(-skipped).
+ *  23. pullSmoothed (single-frame) blends with α_eff = α_base (no skip scale).
+ *  24. Raw pull / pullLatest invalidates the smoother's prev → next smoothed
+ *      call behaves as first-call (verbatim).
+ *  25. resetSmoother() — explicit invalidation path.
+ *  26. Integer-kind blends Math.round through to integer (u8 scalar, u32
+ *      scalar, u8Array elements); float fields are not rounded.
+ *  27. f64 array blends elementwise (cross-checks the array path).
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -34,8 +47,12 @@ import { Bridge } from "../src/Bridge.js";
 import {
   defineSchema,
   f32,
+  f64,
   u64,
+  u32,
+  u8,
   u8Array,
+  f64Array,
   type FrameFor,
 } from "../src/schema.js";
 import {
@@ -682,6 +699,323 @@ function testCounterArithmeticVsOracle(): void {
   ok(`counter-arithmetic-vs-oracle (10k iters, sign boundary crossed)`);
 }
 
+// ── 18. Smoothed pulls — empty-ring behavior ───────────────────────────────
+//
+// On an empty ring, pullSmoothed returns false and pullLatestSmoothed returns
+// -1 (matching pull / pullLatest). No payload is read; the smoother's prev
+// state is untouched.
+function testSmoothedEmpty(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  assertEq(ring.pullSmoothed(out, 0.5), false, "empty pullSmoothed returns false");
+  assertEq(ring.pullLatestSmoothed(out, 0.5), -1, "empty pullLatestSmoothed returns -1");
+  // Push, smoothed-pull, then drain to empty, then smoothed-pull empty again:
+  // the second smoothed empty must still return false / -1 (the prior state
+  // doesn't leak into an empty-pull return value).
+  ring.push(makePhysFrame(1, n));
+  assertEq(ring.pullLatestSmoothed(out, 0.5), 0, "post-empty pullLatestSmoothed succeeds");
+  assertEq(ring.pullSmoothed(out, 0.5), false, "back-to-empty pullSmoothed returns false");
+  ok("smoothed-empty");
+}
+
+// ── 19. First smoothed call returns curr verbatim (no prev to blend with) ──
+//
+// The first pullSmoothed / pullLatestSmoothed seeds the smoother's prev with
+// the fresh frame and returns it unchanged regardless of α. This is the
+// "warm-up" guarantee: callers don't have to special-case the first quantum.
+function testSmoothedFirstCallNoBlend(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  const F = makePhysFrame(42, n);
+  ring.push(F);
+  assertEq(ring.pullLatestSmoothed(out, 0.1), 0, "first pullLatestSmoothed returns 0 skipped");
+  // Even with a tiny α (would normally blend heavily with prev) — because
+  // there is no prev, the fresh value is returned verbatim.
+  assertEq(out.seq, F.seq, "first-call seq verbatim");
+  assertEq(out.vMax, F.vMax, "first-call vMax verbatim");
+  for (let k = 0; k < n; k++) {
+    assertEq(out.vEff[k], F.vEff[k], `first-call vEff[${k}] verbatim`);
+  }
+
+  // pullSmoothed first-call case on a separate Bridge instance.
+  const { sab: sab2, capacity: cap2 } = Bridge.allocate(8, schema);
+  const ring2 = new Bridge(sab2, cap2, schema);
+  const out2 = emptyPhysFrame(n);
+  const G = makePhysFrame(7, n);
+  ring2.push(G);
+  assertEq(ring2.pullSmoothed(out2, 0.05), true, "first pullSmoothed returns true");
+  assertEq(out2.seq, G.seq, "first pullSmoothed seq verbatim");
+  assertEq(out2.vMax, G.vMax, "first pullSmoothed vMax verbatim");
+  ok("smoothed-first-call-no-blend");
+}
+
+// ── 20. α=1.0 in steady state ⇒ equivalent to raw pullLatest ──────────────
+//
+// For pullLatestSmoothed, α_eff = α_base · 2^(-skipped). At α_base=1.0 with
+// skipped=0, α_eff = 1.0 and blend(curr, prev, 1) = curr. So a sequence of
+// α=1.0 pulls at steady-state cadence reproduces raw pullLatest values
+// bit-exactly. (At α_base=1.0 with skipped>0, α_eff < 1, which is the
+// expected skip-scaled blend — covered separately below.)
+function testSmoothedAlphaOneEqualsRawSteadyState(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  for (let i = 0; i < 10; i++) {
+    const F = makePhysFrame(100 + i, n);
+    ring.push(F);
+    assertEq(ring.pullLatestSmoothed(out, 1.0), 0, `α=1 cycle ${i} skipped=0`);
+    assertEq(out.seq, F.seq, `α=1 cycle ${i} seq verbatim`);
+    assertEq(out.vMax, F.vMax, `α=1 cycle ${i} vMax verbatim`);
+    for (let k = 0; k < n; k++) {
+      assertEq(out.vEff[k], F.vEff[k], `α=1 cycle ${i} vEff[${k}] verbatim`);
+    }
+  }
+  ok("smoothed-alpha-one-equals-raw-steady-state");
+}
+
+// ── 21. Two-step blend — hand-computed expected values ────────────────────
+//
+// Push frame A (vMax=10), pullLatestSmoothed(α=0.5) → out=A verbatim, prev=A.
+// Push frame B (vMax=20), pullLatestSmoothed(α=0.5) → expected blend:
+//   out_i = 0.5·B_i + 0.5·A_i
+// for each numeric field. BigInt fields (seq, tMacroNs) are NOT blended —
+// they pass through as B verbatim.
+function testSmoothedHandComputedBlend(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  const A = makePhysFrame(10, n);
+  ring.push(A);
+  assertEq(ring.pullLatestSmoothed(out, 0.5), 0, "seed call");
+  assertEq(out.vMax, A.vMax, "seed vMax = A.vMax");
+
+  const B = makePhysFrame(20, n);
+  ring.push(B);
+  assertEq(ring.pullLatestSmoothed(out, 0.5), 0, "blend call skipped=0");
+  // BigInt verbatim (no blend).
+  assertEq(out.seq, B.seq, "blend: seq passes through as B");
+  assertEq(out.tMacroNs, B.tMacroNs, "blend: tMacroNs passes through as B");
+  // Float fields: 0.5·B + 0.5·A.
+  assertEq(out.vMax, 0.5 * B.vMax + 0.5 * A.vMax, "blend: vMax = 0.5·B + 0.5·A");
+  assertEq(out.jMax, 0.5 * B.jMax + 0.5 * A.jMax, "blend: jMax = 0.5·B + 0.5·A");
+  for (let k = 0; k < n; k++) {
+    assertEq(out.vEff[k], 0.5 * B.vEff[k]! + 0.5 * A.vEff[k]!, `blend: vEff[${k}]`);
+    assertEq(out.jEff[k], 0.5 * B.jEff[k]! + 0.5 * A.jEff[k]!, `blend: jEff[${k}]`);
+  }
+  ok("smoothed-hand-computed-blend");
+}
+
+// ── 22. Skipped-count exponentially scales α_eff ──────────────────────────
+//
+// α_eff = α_base · 2^(-skipped). Seed with A; push frames B0..B3; one
+// pullLatestSmoothed sees skipped=3, α_eff = α_base / 8. The blended out
+// matches the hand-computed alpha-scaled blend with B3 as curr and A as prev.
+function testSmoothedSkipScaling(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  const A = makePhysFrame(0, n);
+  ring.push(A);
+  assertEq(ring.pullLatestSmoothed(out, 0.5), 0, "skip-scaling seed");
+
+  ring.push(makePhysFrame(1, n));
+  ring.push(makePhysFrame(2, n));
+  ring.push(makePhysFrame(3, n));
+  const Bnewest = makePhysFrame(4, n); // matches what producer #4 will push
+  ring.push(Bnewest);
+
+  const alphaBase = 0.5;
+  // 4 frames after seed: write_index = 5, read_index = 1 (we consumed A).
+  // newestIdx = 4, skipped = newestIdx - readIdx = 3.
+  assertEq(ring.pullLatestSmoothed(out, alphaBase), 3, "skip-scaling sees 3 skipped");
+  const alphaEff = alphaBase * Math.pow(2, -3); // 0.0625
+  assertEq(out.seq, Bnewest.seq, "skip-scaling seq verbatim");
+  // Hand-compute vMax: α·curr + (1-α)·prev where prev came from seed call (= A).
+  const expectedVMax = alphaEff * Bnewest.vMax + (1 - alphaEff) * A.vMax;
+  assertEq(out.vMax, expectedVMax, "skip-scaling vMax matches α_eff·B + (1-α_eff)·A");
+  for (let k = 0; k < n; k++) {
+    const want = alphaEff * Bnewest.vEff[k]! + (1 - alphaEff) * A.vEff[k]!;
+    assertEq(out.vEff[k], want, `skip-scaling vEff[${k}]`);
+  }
+  ok("smoothed-skip-scaling");
+}
+
+// ── 23. pullSmoothed (single-frame) blends with α_base (no skip scaling) ──
+//
+// pullSmoothed consumes one frame per call; skipped is always 0 conceptually,
+// so α_eff = α_base. Verify a two-step seed-then-blend matches the hand
+// computation.
+function testSmoothedPullSymmetricToPull(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  const A = makePhysFrame(5, n);
+  ring.push(A);
+  assertEq(ring.pullSmoothed(out, 0.25), true, "pullSmoothed seed");
+  assertEq(out.vMax, A.vMax, "pullSmoothed seed verbatim");
+
+  const B = makePhysFrame(15, n);
+  ring.push(B);
+  assertEq(ring.pullSmoothed(out, 0.25), true, "pullSmoothed blend");
+  // α_eff = α_base = 0.25 (no skip scaling for pullSmoothed).
+  assertEq(out.vMax, 0.25 * B.vMax + 0.75 * A.vMax, "pullSmoothed: vMax = 0.25·B + 0.75·A");
+  assertEq(out.seq, B.seq, "pullSmoothed: seq verbatim (BigInt)");
+  for (let k = 0; k < n; k++) {
+    assertEq(out.vEff[k], 0.25 * B.vEff[k]! + 0.75 * A.vEff[k]!, `pullSmoothed vEff[${k}]`);
+  }
+  ok("smoothed-pull-symmetric-to-pull");
+}
+
+// ── 24. Non-smoothed pull invalidates smoother state ──────────────────────
+//
+// pull / pullLatest set smoothPrevValid=false. The next pullSmoothed /
+// pullLatestSmoothed must behave as a first-call (no blending, just seed
+// prev with curr). Validates the file-header guarantee.
+function testNonSmoothedPullInvalidatesSmoother(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  // Seed the smoother.
+  ring.push(makePhysFrame(1, n));
+  assertEq(ring.pullSmoothed(out, 0.5), true, "seed pullSmoothed");
+  // Invalidate via raw pull.
+  ring.push(makePhysFrame(2, n));
+  assertEq(ring.pull(out), true, "raw pull invalidates smoother");
+  // Next smoothed must behave like first call (verbatim).
+  const F99 = makePhysFrame(99, n);
+  ring.push(F99);
+  assertEq(ring.pullSmoothed(out, 0.01), true, "post-invalidate pullSmoothed");
+  // With α=0.01 a blend would heavily favor prev; verbatim ⇒ value == F99.
+  assertEq(out.vMax, F99.vMax, "post-invalidate pullSmoothed returns curr verbatim");
+  assertEq(out.seq, F99.seq, "post-invalidate pullSmoothed seq verbatim");
+
+  // Same with pullLatest.
+  ring.push(makePhysFrame(100, n));
+  ring.push(makePhysFrame(101, n));
+  assertEq(ring.pullLatest(out), 1, "raw pullLatest invalidates smoother");
+  const F50 = makePhysFrame(50, n);
+  ring.push(F50);
+  assertEq(ring.pullLatestSmoothed(out, 0.01), 0, "post-invalidate pullLatestSmoothed");
+  assertEq(out.vMax, F50.vMax, "post-invalidate pullLatestSmoothed verbatim");
+  ok("non-smoothed-pull-invalidates-smoother");
+}
+
+// ── 25. resetSmoother() forgets prev ──────────────────────────────────────
+//
+// Explicit reset path. Same observable behavior as raw-pull invalidation
+// but without consuming a frame.
+function testResetSmoother(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  ring.push(makePhysFrame(1, n));
+  assertEq(ring.pullSmoothed(out, 0.5), true, "seed");
+  ring.resetSmoother();
+  const F99 = makePhysFrame(99, n);
+  ring.push(F99);
+  // With α=0.001 a blend would barely move from prev. Verbatim ⇒ vMax = F99.vMax.
+  assertEq(ring.pullSmoothed(out, 0.001), true, "post-reset pull");
+  assertEq(out.vMax, F99.vMax, "resetSmoother: next smoothed call is verbatim");
+  ok("reset-smoother");
+}
+
+// ── 26. Integer-kind smoothing rounds via Math.round ──────────────────────
+//
+// For numeric integer kinds (u8, u16, u32, i8, i16, i32 and their *Array
+// variants), the blend runs in float and the result is Math.round-ed back
+// before being stored. Use a u8 + u32 + u8Array schema with a 0.5 blend
+// between values that produce a half-integer raw blend; verify rounding.
+function testSmoothedIntegerRounding(): void {
+  const schema = defineSchema({
+    a8: u8(),
+    a32: u32(),
+    arr: u8Array(4),
+    fv: f64(), // float field for completeness — should not be rounded
+  });
+  type Frame = FrameFor<typeof schema>;
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const A: Frame = { a8: 10, a32: 100, arr: new Uint8Array([0, 10, 20, 30]), fv: 1.0 };
+  const B: Frame = { a8: 11, a32: 101, arr: new Uint8Array([1, 11, 21, 31]), fv: 2.0 };
+  const out: Frame = { a8: 0, a32: 0, arr: new Uint8Array(4), fv: 0 };
+
+  ring.push(A);
+  assertEq(ring.pullSmoothed(out, 0.5), true, "int seed");
+  assertEq(out.a8, A.a8, "int seed a8");
+
+  ring.push(B);
+  assertEq(ring.pullSmoothed(out, 0.5), true, "int blend");
+  // 0.5·11 + 0.5·10 = 10.5 → Math.round(10.5) = 11 (banker's? no — JS Math.round rounds half-away-from-zero positive = 11).
+  assertEq(out.a8, Math.round(0.5 * B.a8 + 0.5 * A.a8), "u8 scalar rounded");
+  assertEq(out.a32, Math.round(0.5 * B.a32 + 0.5 * A.a32), "u32 scalar rounded");
+  for (let k = 0; k < 4; k++) {
+    const want = Math.round(0.5 * B.arr[k]! + 0.5 * A.arr[k]!);
+    assertEq(out.arr[k], want, `u8Array[${k}] rounded`);
+  }
+  // Float field NOT rounded.
+  assertEq(out.fv, 0.5 * B.fv + 0.5 * A.fv, "f64 scalar not rounded");
+  ok("smoothed-integer-rounding");
+}
+
+// ── 27. Mixed scalar/array schema with float array round-trips a blend ────
+//
+// Cross-check that an array of f64 blends elementwise without any quirks
+// from the typed-array set() path interfering. Uses a 16-element f64 array.
+function testSmoothedFloatArrayBlend(): void {
+  const schema = defineSchema({
+    seq: u64(),
+    sig: f64Array(16),
+  });
+  type Frame = FrameFor<typeof schema>;
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const mk = (base: number): Frame => {
+    const sig = new Float64Array(16);
+    for (let k = 0; k < 16; k++) sig[k] = base + k * 0.1;
+    return { seq: BigInt(base), sig };
+  };
+  const out: Frame = { seq: 0n, sig: new Float64Array(16) };
+
+  const A = mk(1);
+  ring.push(A);
+  ring.pullSmoothed(out, 0.3); // seed
+
+  const B = mk(2);
+  ring.push(B);
+  assertEq(ring.pullSmoothed(out, 0.3), true, "float-array blend");
+  assertEq(out.seq, B.seq, "float-array seq verbatim");
+  for (let k = 0; k < 16; k++) {
+    const want = 0.3 * B.sig[k]! + 0.7 * A.sig[k]!;
+    assertEq(out.sig[k], want, `float-array sig[${k}]`);
+  }
+  ok("smoothed-float-array-blend");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -701,6 +1035,16 @@ function main(): void {
   testWrapAcrossInt32Boundary();
   testFullPushAtInt32Boundary();
   testCounterArithmeticVsOracle();
+  testSmoothedEmpty();
+  testSmoothedFirstCallNoBlend();
+  testSmoothedAlphaOneEqualsRawSteadyState();
+  testSmoothedHandComputedBlend();
+  testSmoothedSkipScaling();
+  testSmoothedPullSymmetricToPull();
+  testNonSmoothedPullInvalidatesSmoother();
+  testResetSmoother();
+  testSmoothedIntegerRounding();
+  testSmoothedFloatArrayBlend();
   console.log("\nAll Bridge tests passed.");
 }
 
