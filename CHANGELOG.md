@@ -4,6 +4,80 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.5] — 2026-05-26
+
+### Added — timestamp roles + `pullEvaluatedLatest` / `evaluateAtSampleOffset` sugar (Pillar 3 second cut)
+
+The hand-rolled pull + observe + per-sample-dt + evaluate loop from 0.6.3 collapses to two method calls per quantum. The canonical AudioWorklet pattern:
+
+```ts
+const skipped = bridge.pullEvaluatedLatest(evalFrame, currentTime * 1e9, sampleRate);
+for (let i = 1; i < 128; i++) {
+  bridge.evaluateAtSampleOffset(evalFrame, i);
+  block[i] = synth.step(evalFrame.vEff);
+}
+```
+
+Three building blocks make this work:
+
+- **`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`** — declares one or more named timestamp roles on the schema. Each role points at an existing numeric scalar field and labels its unit (`'ns' | 'us' | 'ms' | 's' | 'samples'`). A producer that ships multiple clocks (macro / GPU / audio-frame index) declares all of them; each consumer picks the role most natural for its math. The first declared role (or one flagged `default: true`) is the default; per-call `{ timestamp: 'roleName' }` overrides it. Role names are **compile-time-checked** at every call site via the new `TimestampRoleOf<S>` type helper — typos surface as TypeScript errors, not runtime "unknown field" exceptions.
+
+- **`bridge.pullEvaluatedLatest(out, baseConsumerNs, sampleRate?, opts?) → number`** — drain to newest, observe the PLL with the freshly-pulled timestamp, evaluate sample 0 of the quantum into `out`, and cache state for subsequent `evaluateAtSampleOffset` calls. Returns the skipped-frame count on fresh-pull; returns `-1` when the ring is empty (if the cache is valid from a prior pull, `out` is still populated from cache — the PLL is NOT re-observed, since a repeated stale stamp at advancing consumer times would poison the residual). The first-quantum-empty case leaves `out` untouched (zero-initialized silence via `scratchEvaluatedFrame()`).
+
+- **`bridge.evaluateAtSampleOffset(out, sampleOffset) → void`** — reads the cached raw frame, computes `consumerNs = base + sampleOffset / sampleRate · 1e9`, runs `phaseLockedTime(...)` to map into producer-clock space, computes `dt_s = (producerEstimate − cachedTimestampNs) · 1e−9`, and calls `evaluateInto`. Heap-only — never touches the SAB.
+
+- **`bridge.setSampleRate(rate)`** — registers a default so `pullEvaluatedLatest`'s `sampleRate` arg can be omitted. Per-call value wins precedence if both are set. Throws if neither is set when `pullEvaluatedLatest` runs.
+
+- **`bridge.resetEvalCache()`** — invalidates the cache shared by `pullEvaluatedLatest` / `evaluateAtSampleOffset`. Independent of `resetSmoother()` and `resetPll()` — three orthogonal caches. Use on `AudioContext` suspend/resume or producer-epoch changes.
+
+Internal: `_timestampToNs(value, unit, sampleRate)` converts each supported unit to nanoseconds (`samples` uses the per-call rate). A future `'custom'` escape hatch with a caller-supplied `toNs` multiplier is documented but deferred — the implementation site is a single switch case.
+
+### Why — three new heap-only consumer-side primitives, no wire-format change
+
+After 0.6.1 (trajectory schema), 0.6.2 (consumer PLL), and 0.6.3 (per-frame evaluator), every AudioWorklet that wanted Pillar 1+2+3 composed those primitives by hand:
+
+```ts
+// pre-0.6.5 manual pattern
+if (this.bridge.pullLatest(this.rawFrame) < 0) return true;
+this.bridge.observeConsumerTime(currentTime * 1e9, Number(this.rawFrame.tMacroNs));
+for (let i = 0; i < 128; i++) {
+  const cNs = currentTime * 1e9 + (i / sampleRate) * 1e9;
+  const dtNs = this.bridge.phaseLockedTime(cNs) - Number(this.rawFrame.tMacroNs);
+  this.bridge.evaluateInto(this.rawFrame, dtNs * 1e-9, this.evalFrame);
+  block[i] = this.synth.step(this.evalFrame.vEff);
+}
+```
+
+Five concerns mixed: empty-pull handling, clock observation, per-sample base-time math, unit conversion (`1e-9`), per-sample evaluation. Easy to get wrong. The 0.6.5 sugar bundles all five and pins the contract: the PLL is observed only on fresh-pulls; sample-offset arithmetic uses the cached quantum context; unit conversion is schema-driven. Identity tests verify the sugar produces bit-equivalent output to the hand-rolled loop.
+
+The role system is the type-safe layer above raw field names. A typed selector (`{ timestamp: 'gpu' }` checked against `TimestampRoleOf<S>`) lets every project name their timestamp fields differently — Wavefunction uses `tMacroNs`, a game engine might use `tick`, a physics sim uses `simulationTime`, an audio renderer uses `sampleFrame` — without forcing a global convention. Roles are declared once at schema-author time; callers consume by role, not by field name.
+
+### Wire compatibility
+
+- **No SAB changes.** All new state is heap-only on the consumer's Bridge instance. Header lanes 0–3 unchanged from 0.6.0; lanes 4–7 still reserved. A 0.6.4 peer and a 0.6.5 peer share a SAB transparently.
+- **`Schema<F>` gains a second optional generic parameter** (`Schema<F, T extends TimestampsConfig<F> | null = null>`) carrying compile-time role information. The default `T = null` keeps every existing `Schema<F>` usage backwards-compatible at the type level. `FrameFor<S>` was updated to extract `F` regardless of `T` (`S extends Schema<infer F, any>`).
+- **API additions only.** New methods on `Bridge`: `setSampleRate`, `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `resetEvalCache`. New schema method: `.withTimestamps(config)`. `describeSchemaLayout(...)` return shape gains a `timestamps: SchemaTimestampsSpec | null` field. No removed or renamed members.
+
+### Tests
+
+`tests/schema.test.ts` grows from 11 to 12 pins:
+
+- **`testWithTimestamps`** (pin #12) — declares two roles with one flagged default; default-flag and first-declared fallback both work; the spec propagates to `describeSchemaLayout`; composes with `.withInvariant(...)` in either order; rejects unknown field / array field / invalid unit / two defaults / empty config / bad role identifier / null config.
+
+`tests/Bridge.test.ts` grows from 49 to 53 pins:
+
+- **`testPullEvaluatedLatestRoundTrip`** (pin #50) — two Bridges with identical SAB streams driven side-by-side: one via the 0.6.5 sugar, one via the 0.6.3 manual loop. 100 quanta × 128 samples = 12 800 samples; every sample bit-exact across the two paths.
+- **`testTimestampRoleResolution`** (pin #51) — default role picked when `opts.timestamp` omitted; per-call override picks the alt role; unknown role throws; schema without `.withTimestamps()` throws on `pullEvaluatedLatest`; `resetEvalCache` invalidates so `evaluateAtSampleOffset` throws until next pull.
+- **`testSampleRateResolution`** (pin #52) — per-call sampleRate works without `setSampleRate`; registered default works with per-call omitted; per-call wins precedence over registered; both omitted → throws; `setSampleRate(rate)` rejects 0 / negative / NaN / ±Infinity.
+- **`testTimestampUnitConversion`** (pin #53) — same producer stamp expressed in `ns` / `us` / `ms` / `s` / `samples` units; bridge converts each correctly such that `dt = 0` at sample 0 when `baseConsumerNs` matches the ns-equivalent.
+
+### Documentation
+
+- New `Timestamp roles (0.6.5)` section in `src/schema.ts` header documenting the role concept, units, validation rules, and the wire-compat guarantee (descriptive only, no SAB layout change).
+- New `Per-frame evaluator sugar (0.6.5, Pillar 3 second cut)` section in `src/Bridge.ts` header documenting the three building blocks (roles, cache, unit conversion), the sample-rate handling, the cache-fallback semantics on empty pulls, and the `resetEvalCache` lifecycle.
+- JSDoc on `.withTimestamps`, `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `setSampleRate`, `resetEvalCache` covers each contract.
+- README gains a `#### Timestamp roles + pullEvaluatedLatest sugar` subsection under `Schema DSL` with the canonical worklet example collapsed from five lines to two. Roadmap `Shipped` adds the 0.6.5 entry.
+
 ## [0.6.4] — 2026-05-26
 
 ### Fixed — trajectory × α-smoother: derivative lanes were being blended

@@ -432,6 +432,58 @@ class WavefunctionWorklet extends AudioWorkletProcessor {
 
 This is the **first cut** of Pillar 3 — the heap-only per-frame evaluator and its scratch-buffer helper. The `bridge.pullEvaluated(out, sampleOffset, sampleRate)` sugar that collapses the entire `process()` loop into a single call, the `EvalMode` dispatch (step / alpha / trajectory / catmull), and the per-quantum batch API remain queued as follow-up patches.
 
+#### Timestamp roles + `pullEvaluatedLatest` sugar (0.6.5)
+
+`.withTimestamps({ roleName: { field, unit, default? } })` declares one or more named timestamp roles on the schema; `pullEvaluatedLatest` + `evaluateAtSampleOffset` collapse the canonical pull + observe + per-sample-dt + evaluate loop into two method calls per quantum:
+
+```ts
+import {
+  defineSchema, u64, f64TrajectoryArray,
+} from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq: u64(),
+  tMacroNs: u64(),
+  tGpuNs:   u64(),
+  vEff: f64TrajectoryArray(1000, { order: 2 }),
+}).withTimestamps({
+  macro: { field: "tMacroNs", unit: "ns", default: true },
+  gpu:   { field: "tGpuNs",   unit: "ns" },
+});
+
+class WavefunctionWorklet extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.bridge = new Bridge(opts.processorOptions.sab, 16, schema);
+    this.bridge.setSampleRate(sampleRate);              // register once
+    this.evalFrame = this.bridge.scratchEvaluatedFrame();
+  }
+
+  process(_inputs, outputs) {
+    const block = outputs[0][0]; // 128 samples
+    // Pull + observe + evaluate sample 0 in one call.
+    this.bridge.pullEvaluatedLatest(this.evalFrame, currentTime * 1e9);
+    block[0] = this.synth.step(this.evalFrame.vEff);
+    // Evaluate the remaining 127 samples from the cached frame.
+    for (let i = 1; i < block.length; i++) {
+      this.bridge.evaluateAtSampleOffset(this.evalFrame, i);
+      block[i] = this.synth.step(this.evalFrame.vEff);
+    }
+    return true;
+  }
+}
+```
+
+The bridge resolves the timestamp via the schema's default role (`macro` here). Per-call override: `pullEvaluatedLatest(out, baseNs, undefined, { timestamp: "gpu" })`. Role names are compile-time-checked via the `TimestampRoleOf<S>` type helper — a typo'd role name is a TypeScript error, not a runtime throw.
+
+Supported units: `'ns' | 'us' | 'ms' | 's' | 'samples'` (samples uses the per-call sample rate to convert). Producers stamping in any of those can be consumed without manual unit math at the consumer.
+
+Cache semantics on empty pulls: when `pullLatest` returns -1, `pullEvaluatedLatest` returns -1 too but still populates `out` from the previously-cached frame (the PLL is NOT re-observed — repeating a stale producer stamp at advancing consumer times would poison the residual). Only the first quantum with no producer push leaves `out` untouched; `scratchEvaluatedFrame()` zero-initializes, so that case plays silence safely.
+
+`bridge.resetEvalCache()` invalidates the cache (use on `AudioContext` suspend/resume or producer-epoch changes). Independent of `resetSmoother()` and `resetPll()`.
+
+This is the **second cut** of Pillar 3. The `EvalMode` dispatch (`step` / `alpha` / `trajectory` / `catmull`) and per-quantum batch API are still queued as follow-up patches.
+
 ### Legacy API — `Float64RingBuffer`
 
 > **Deprecated 0.3.0.** Use `Bridge` + `physicsControlFrameSchema(n)` for new code. The legacy class is preserved unchanged for v0.1.x byte-compat and will be removed no earlier than 2.0.
@@ -629,6 +681,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.2 — Phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut — offset only)** (`bridge.observeConsumerTime(consumerNs, producerNs)`, `bridge.phaseLockedTime(consumerNs)`, `bridge.resetPll()`, plus `pllLocked` / `pllOffsetNs` on `telemetry()`). Consumer-side PI loop tracks the producer↔consumer clock offset; sub-μs convergence in ~30 observations. Heap-only — SAB byte layout unchanged from 0.6.1. Drift estimator, outlier gate, and cross-process observability via lanes 4-5 are queued patches; Pillar 3 (`pullEvaluated`) remains ahead — see [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
 - ✅ **0.6.3 — Per-frame evaluator (Pillar 3 of phase-locked extrapolation, first cut)** (`bridge.evaluateInto(srcFrame, dt, outFrame)` + `bridge.scratchEvaluatedFrame()`). Bridge walks every field of the schema in one call, applying the Pillar 1 evaluator to trajectory fields and passing scalars + non-trajectory arrays through. Heap-only; the producer can be writing the next frame while the consumer re-evaluates the current one in private heap memory at audio rate. `pullEvaluated` sugar, `EvalMode` dispatch, and per-quantum batch API remain queued patches — see [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
+- ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 
 ### Remaining 1.0 work
 

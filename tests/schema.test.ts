@@ -26,6 +26,13 @@
  *      `p + v·dt`; order=3 is exact `p + v·dt + ½·a·dt²`. f64 and f32
  *      input variants. Bounds-checked. Allocation-free against caller's
  *      pre-allocated `out` buffer.
+ *  12. .withTimestamps(...) builder (0.6.5). Declares one or more named
+ *      timestamp roles pointing at numeric scalar fields with unit tags.
+ *      Builder validates field exists + numeric + scalar + unit valid;
+ *      enforces at-most-one-default flag; first declared role is default
+ *      if none flagged. Spec propagates onto Schema.timestamps and
+ *      through describeSchemaLayout for worklet inliners. Composes with
+ *      withInvariant in either order. Schema stays frozen.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -701,6 +708,135 @@ function testEvaluateTrajectory(): void {
   ok("evaluate-trajectory");
 }
 
+// ── 12. .withTimestamps builder (0.6.5) ────────────────────────────────────
+function testWithTimestamps(): void {
+  // Happy path: declare two roles, one flagged default.
+  const schema = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    tGpuNs: u64(),
+    tFrameMs: f64(),
+    vEff: f64Array(4),
+  }).withTimestamps({
+    macro: { field: "tMacroNs", unit: "ns", default: true },
+    gpu:   { field: "tGpuNs",   unit: "ns" },
+    frame: { field: "tFrameMs", unit: "ms" },
+  });
+
+  assert(schema.timestamps !== null, "timestamps spec attached");
+  const ts = schema.timestamps!;
+  assertEq(ts.defaultRole, "macro", "default role = macro (flagged)");
+  assertEq(Object.keys(ts.roles).length, 3, "three roles");
+  assertEq(ts.roles.macro!.field, "tMacroNs", "macro.field");
+  assertEq(ts.roles.macro!.unit, "ns", "macro.unit");
+  assertEq(ts.roles.macro!.isBigInt, true, "macro.isBigInt (u64)");
+  assertEq(ts.roles.frame!.isBigInt, false, "frame.isBigInt (f64) === false");
+  assertEq(ts.roles.frame!.unit, "ms", "frame.unit");
+  assert(Object.isFrozen(ts), "timestamps spec frozen");
+  assert(Object.isFrozen(ts.roles), "timestamps.roles frozen");
+  assert(Object.isFrozen(ts.roles.macro), "role descriptor frozen");
+
+  // Default-role fallback: no flag → first declared wins.
+  const schema2 = defineSchema({
+    seq: u64(),
+    a: u64(),
+    b: u64(),
+  }).withTimestamps({
+    aRole: { field: "a", unit: "ns" },
+    bRole: { field: "b", unit: "ns" },
+  });
+  assertEq(schema2.timestamps!.defaultRole, "aRole", "first declared = default");
+
+  // describeSchemaLayout propagates timestamps.
+  const layout = describeSchemaLayout(schema);
+  assert(layout.timestamps !== null, "layout.timestamps non-null");
+  assertEq(layout.timestamps!.defaultRole, "macro", "layout default = macro");
+  assertEq(layout.timestamps!.roles.gpu!.field, "tGpuNs", "layout role roundtrip");
+
+  // No-timestamps schema → layout.timestamps === null.
+  const bare = defineSchema({ seq: u64(), v: f64() });
+  assertEq(bare.timestamps, null, "bare.timestamps === null");
+  assertEq(describeSchemaLayout(bare).timestamps, null, "bare layout.timestamps null");
+
+  // Composition with withInvariant: either order works; timestamps spec
+  // survives a subsequent withInvariant call.
+  const withBoth = defineSchema({
+    seq: u64(),
+    tNs: u64(),
+    vEff: f64Array(2),
+  })
+    .withTimestamps({ macro: { field: "tNs", unit: "ns", default: true } })
+    .withInvariant((f) => f.vEff[0]! * f.vEff[0]!);
+  assert(withBoth.timestamps !== null, "timestamps survives withInvariant");
+  assert(withBoth.invariant !== null, "invariant attached");
+
+  const withBoth2 = defineSchema({
+    seq: u64(),
+    tNs: u64(),
+    vEff: f64Array(2),
+  })
+    .withInvariant((f) => f.vEff[0]! * f.vEff[0]!)
+    .withTimestamps({ macro: { field: "tNs", unit: "ns" } });
+  assert(withBoth2.timestamps !== null && withBoth2.invariant !== null,
+    "both orders compose");
+
+  // ─── Validation errors ─────────────────────────────────────────────────
+  const baseFields = {
+    seq: u64(),
+    tNs: u64(),
+    vEff: f64Array(4),
+    label: u8(),
+  };
+
+  function throws(label: string, fn: () => void): void {
+    let threw = false;
+    try { fn(); } catch { threw = true; }
+    assert(threw, `expected throw: ${label}`);
+  }
+
+  // Unknown field.
+  throws("unknown field", () =>
+    defineSchema(baseFields).withTimestamps({
+      bogus: { field: "nope" as keyof typeof baseFields & string, unit: "ns" },
+    }),
+  );
+  // Array field rejected.
+  throws("array field rejected", () =>
+    defineSchema(baseFields).withTimestamps({
+      bad: { field: "vEff", unit: "ns" },
+    }),
+  );
+  // Invalid unit.
+  throws("invalid unit", () =>
+    defineSchema(baseFields).withTimestamps({
+      bad: { field: "tNs", unit: "minutes" as unknown as "ns" },
+    }),
+  );
+  // Two defaults.
+  throws("two defaults", () =>
+    defineSchema(baseFields).withTimestamps({
+      a: { field: "tNs", unit: "ns", default: true },
+      b: { field: "seq", unit: "ns", default: true },
+    }),
+  );
+  // Empty config.
+  throws("empty config", () =>
+    defineSchema(baseFields).withTimestamps({}),
+  );
+  // Invalid identifier as role name.
+  throws("bad role name", () =>
+    defineSchema(baseFields).withTimestamps({
+      "bad-name": { field: "tNs", unit: "ns" },
+    }),
+  );
+  // Non-object arg.
+  throws("non-object arg", () =>
+    (defineSchema(baseFields).withTimestamps as unknown as (x: unknown) => unknown)(null),
+  );
+
+  ok("with-timestamps");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -713,6 +849,7 @@ function main(): void {
   testWithInvariant();
   testTrajectoryArrays();
   testEvaluateTrajectory();
+  testWithTimestamps();
   console.log("ALL PASS schema");
 }
 

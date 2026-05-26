@@ -88,6 +88,58 @@
  * equivalent plain array. A schema that swaps `f64Array(64)` for
  * `f64TrajectoryArray(64, { order: 1 })` produces identical SAB bytes;
  * only the field's compiled metadata changes.
+ *
+ * ─── Timestamp roles (0.6.5) ───────────────────────────────────────────────
+ *
+ * `defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`
+ * declares one or more named *timestamp roles* on the schema. Each role
+ * points at an existing numeric scalar field and labels its unit. The
+ * Bridge's `pullEvaluatedLatest` / `evaluateAtSampleOffset` sugar (0.6.5)
+ * reads the timestamp value from the role's `field` and converts to
+ * nanoseconds internally for the PLL + per-sample dt math.
+ *
+ *     const schema = defineSchema({
+ *       seq: u64(),
+ *       tMacroNs: u64(),
+ *       tGpuNs:   u64(),
+ *       vEff: f64TrajectoryArray(64, { order: 2 }),
+ *     }).withTimestamps({
+ *       macro: { field: "tMacroNs", unit: "ns", default: true },
+ *       gpu:   { field: "tGpuNs",   unit: "ns" },
+ *     });
+ *
+ *     bridge.pullEvaluatedLatest(out, baseNs, sampleRate);
+ *                                         // uses macro (the default)
+ *     bridge.pullEvaluatedLatest(out, baseNs, sampleRate, { timestamp: "gpu" });
+ *                                         // selects gpu instead
+ *
+ * Why roles rather than a raw field-name string: roles are declared once
+ * at schema-author time, type-checked at call sites (the `timestamp`
+ * option only accepts declared role names), and carry the unit alongside
+ * — callers never re-convert. A producer that ships several timestamp
+ * fields (a macro clock, a GPU clock, an audio-frame index) declares all
+ * three; each consumer picks the role most natural for its math.
+ *
+ * Supported units: `'ns' | 'us' | 'ms' | 's' | 'samples'`. The Bridge
+ * converts to ns via the obvious factor (samples uses the per-call
+ * `sampleRate`). A future `{ unit: 'custom', toNs: number }` escape
+ * hatch is anticipated but deferred — not shipped until a concrete
+ * caller asks for it. (When you do need it, the conversion is a single
+ * multiply inside `_resolveTimestampNs` in src/Bridge.ts.)
+ *
+ * Validation at builder time:
+ *   - Every `field` must exist on the schema and be a scalar numeric
+ *     kind (u64/i64/u32/i32/u16/i16/u8/i8/f64/f32). Array fields cannot
+ *     be timestamps; neither can BigInt-but-non-integer kinds (there
+ *     are none currently, but the kind whitelist is checked).
+ *   - Unit must be one of the supported strings.
+ *   - At most one role may set `default: true`. If none does, the first
+ *     declared role becomes the default.
+ *
+ * Wire compatibility: descriptive only. Timestamp roles do NOT change
+ * frame byte layout — they label existing fields. A 0.6.4 peer and a
+ * 0.6.5 peer share a SAB transparently; the timestamps spec lives on
+ * the consumer's `Schema` object (heap), never in the SAB header.
  */
 
 export type FieldKind =
@@ -281,24 +333,96 @@ export interface SchemaInvariantSpec {
   readonly byteOffset: number;
 }
 
-export interface Schema<F extends FieldsObject = FieldsObject> {
+// ─── Timestamp roles (0.6.5) ───────────────────────────────────────────────
+
+/** Supported timestamp units. The Bridge converts to nanoseconds internally
+ *  for PLL + per-sample dt math. `samples` is converted using the caller's
+ *  per-call `sampleRate`. A future `{ unit: 'custom', toNs }` escape hatch
+ *  is anticipated; until shipped, callers can multiply their value at the
+ *  producer side and use 'ns'. */
+export type TimestampUnit = "ns" | "us" | "ms" | "s" | "samples";
+
+/** Per-role spec on `.withTimestamps({ roleName: { ... } })`. */
+export interface TimestampRoleSpec<F extends FieldsObject = FieldsObject> {
+  /** Name of the scalar numeric field that carries this timestamp. Must
+   *  exist on the schema and not be an array. */
+  readonly field: keyof F & string;
+  /** Unit the producer stamps the field in. */
+  readonly unit: TimestampUnit;
+  /** Set on exactly one role to mark it as the default for
+   *  `pullEvaluatedLatest` when the caller omits `{ timestamp }`.
+   *  At most one role may set this. If none does, the first declared role
+   *  becomes the default. */
+  readonly default?: true;
+}
+
+/** The shape `.withTimestamps(...)` accepts: a record of role name → spec. */
+export type TimestampsConfig<F extends FieldsObject> =
+  Record<string, TimestampRoleSpec<F>>;
+
+/** Type-erased, runtime-shaped timestamps spec consumed by Bridge. */
+export interface SchemaTimestampsSpec {
+  /** Map of role name → resolved role descriptor. `isBigInt` flags whether
+   *  the field is u64/i64 (Bridge reads via Number(frame[name]) coercion
+   *  for those). `byteOffset` and `kind` are useful for worklet-side
+   *  inliners reading SchemaLayoutDescription. */
+  readonly roles: Readonly<Record<string, {
+    readonly field: string;
+    readonly unit: TimestampUnit;
+    readonly kind: FieldKind;
+    readonly byteOffset: number;
+    readonly isBigInt: boolean;
+  }>>;
+  /** Name of the default role (always one of the keys in `roles`). */
+  readonly defaultRole: string;
+}
+
+/** Type-level helper: extracts the role-name union from a Schema's second
+ *  generic argument. Used by Bridge.ts to type the `{ timestamp }` option
+ *  on `pullEvaluatedLatest`. */
+export type TimestampRoleOf<S> = S extends Schema<infer _F, infer T>
+  ? T extends Record<string, TimestampRoleSpec<infer _G>>
+    ? Extract<keyof T, string>
+    : never
+  : never;
+
+export interface Schema<
+  F extends FieldsObject = FieldsObject,
+  // Second generic carries the timestamps config so role names are
+  // compile-time visible at call sites. Defaults to null (no timestamps);
+  // backwards-compatible with all pre-0.6.5 Schema<F> usage.
+  T extends TimestampsConfig<F> | null = null,
+> {
   readonly fields: F;
   readonly frameByteSize: number;
   readonly compiled: CompiledLayout;
   readonly _brand: "wab/Schema";
   /** Attached invariant spec, or null if none. */
   readonly invariant: SchemaInvariantSpec | null;
+  /** Attached timestamps spec, or null if none. Compile-time role-name
+   *  information lives on the `T` generic; this runtime view is the
+   *  type-erased structure Bridge reads. */
+  readonly timestamps: SchemaTimestampsSpec | null;
   /** Builder: returns a new Schema with the invariant attached. The frame
    *  byte size grows by 8 to accommodate the hidden `__invariant: f64`
    *  field; the f64 type-family is added to `compiled.typesPresent` if not
    *  already present. */
-  withInvariant(fn: InvariantFn<F>): Schema<F>;
+  withInvariant(fn: InvariantFn<F>): Schema<F, T>;
+  /** Builder: returns a new Schema with one or more named timestamp roles
+   *  attached. Validates each role's `field` exists on the schema and is a
+   *  scalar numeric kind. At most one role may carry `default: true`; if
+   *  none does, the first declared role is the default. Does NOT change
+   *  the frame byte layout — timestamps are descriptive metadata on
+   *  existing fields. See file header "Timestamp roles" for the rules. */
+  withTimestamps<U extends TimestampsConfig<F>>(config: U): Schema<F, U>;
 }
 
 /** Map a Schema to the frame object shape used by Bridge push/pull.
  *  Does NOT include the hidden `__invariant` field — that's bridge-managed
- *  and never exposed to user-side reads/writes. */
-export type FrameFor<S> = S extends Schema<infer F>
+ *  and never exposed to user-side reads/writes. The `any` on the second
+ *  generic lets this match schemas with or without `.withTimestamps(...)`
+ *  attached (the timestamps spec doesn't change frame shape). */
+export type FrameFor<S> = S extends Schema<infer F, any>
   ? { -readonly [K in keyof F]: F[K] extends FieldSpec<infer T> ? T : never }
   : never;
 
@@ -318,6 +442,11 @@ export interface SchemaLayoutDescription {
   readonly headerBytes: 32;
   readonly frameByteSize: number;
   readonly fields: Readonly<Record<string, SchemaLayoutFieldDescription>>;
+  /** Timestamps spec carried over from `Schema.timestamps` so worklet-side
+   *  inliners that consume only `describeSchemaLayout` can resolve role
+   *  names without re-importing the Schema object. Null when no
+   *  `.withTimestamps(...)` was attached. (0.6.5) */
+  readonly timestamps: SchemaTimestampsSpec | null;
 }
 
 // ─── Validation + compile ──────────────────────────────────────────────────
@@ -403,11 +532,106 @@ function compileLayout(
   });
 }
 
-function makeSchema<F extends FieldsObject>(
+const VALID_TIMESTAMP_UNITS: ReadonlySet<TimestampUnit> = new Set<TimestampUnit>([
+  "ns", "us", "ms", "s", "samples",
+]);
+
+/** Compile a user-supplied timestamps config into the type-erased runtime
+ *  shape consumed by Bridge. Validates every role; throws on the first
+ *  violation. See file header "Timestamp roles" for the rules. */
+function compileTimestamps<F extends FieldsObject>(
+  config: TimestampsConfig<F>,
+  fields: F,
+  compiled: CompiledLayout,
+): SchemaTimestampsSpec {
+  if (typeof config !== "object" || config === null) {
+    throw new TypeError(
+      "Schema.withTimestamps: argument must be a non-null object of role specs",
+    );
+  }
+  const roleNames = Object.keys(config);
+  if (roleNames.length === 0) {
+    throw new Error("Schema.withTimestamps: must declare at least one role");
+  }
+  let defaultRole: string | null = null;
+  const roles: Record<string, {
+    field: string;
+    unit: TimestampUnit;
+    kind: FieldKind;
+    byteOffset: number;
+    isBigInt: boolean;
+  }> = {};
+  for (const role of roleNames) {
+    if (!IDENT_RE.test(role)) {
+      throw new Error(
+        `Schema.withTimestamps: role name '${role}' is not a valid JS identifier`,
+      );
+    }
+    const spec = config[role];
+    if (!spec || typeof spec !== "object" || typeof spec.field !== "string") {
+      throw new Error(
+        `Schema.withTimestamps: role '${role}' must be { field, unit, default? }`,
+      );
+    }
+    const fieldSpec = fields[spec.field];
+    if (!fieldSpec) {
+      throw new Error(
+        `Schema.withTimestamps: role '${role}' references unknown field '${spec.field}'`,
+      );
+    }
+    if (fieldSpec.length !== undefined) {
+      throw new Error(
+        `Schema.withTimestamps: role '${role}' references array field '${spec.field}'; timestamps must be scalar`,
+      );
+    }
+    if (!VALID_TIMESTAMP_UNITS.has(spec.unit)) {
+      throw new Error(
+        `Schema.withTimestamps: role '${role}' has invalid unit '${String(spec.unit)}'; expected one of ${[...VALID_TIMESTAMP_UNITS].join(" / ")}`,
+      );
+    }
+    if (spec.default !== undefined && spec.default !== true) {
+      throw new Error(
+        `Schema.withTimestamps: role '${role}' default flag must be omitted or === true`,
+      );
+    }
+    if (spec.default === true) {
+      if (defaultRole !== null) {
+        throw new Error(
+          `Schema.withTimestamps: roles '${defaultRole}' and '${role}' both set default:true; at most one may`,
+        );
+      }
+      defaultRole = role;
+    }
+    const compiledField = compiled.fields.find((f) => f.name === spec.field);
+    if (!compiledField) {
+      // Defensive — should be unreachable since fields[spec.field] passed above.
+      throw new Error(
+        `Schema.withTimestamps: internal — field '${spec.field}' missing from compiled layout`,
+      );
+    }
+    roles[role] = Object.freeze({
+      field: spec.field,
+      unit: spec.unit,
+      kind: compiledField.kind,
+      byteOffset: compiledField.byteOffset,
+      isBigInt: kindTsType(compiledField.kind) === "bigint",
+    });
+  }
+  if (defaultRole === null) {
+    defaultRole = roleNames[0]!;  // first declared role wins per the contract
+  }
+  return Object.freeze({
+    roles: Object.freeze(roles),
+    defaultRole,
+  });
+}
+
+function makeSchema<F extends FieldsObject, T extends TimestampsConfig<F> | null>(
   fields: F,
   compiled: CompiledLayout,
   invariantFn: InvariantFn<F> | null,
-): Schema<F> {
+  timestamps: SchemaTimestampsSpec | null,
+): Schema<F, T> {
   const invariant: SchemaInvariantSpec | null =
     invariantFn === null || compiled.invariantByteOffset === null
       ? null
@@ -423,16 +647,43 @@ function makeSchema<F extends FieldsObject>(
     compiled,
     _brand: "wab/Schema" as const,
     invariant,
-    withInvariant(fn: InvariantFn<F>): Schema<F> {
+    timestamps,
+    withInvariant(fn: InvariantFn<F>): Schema<F, T> {
       if (typeof fn !== "function") {
         throw new TypeError(
           "Schema.withInvariant: argument must be a function (frame → number)",
         );
       }
       const newCompiled = compileLayout(fields, { invariant: true });
-      return makeSchema(fields, newCompiled, fn);
+      // Re-resolve the timestamps spec against the new compiled layout so
+      // role-field byteOffsets are accurate even if invariant changed
+      // anything (today it appends the hidden lane and doesn't reorder
+      // user fields, but a future repack would).
+      const newTimestamps = timestamps === null
+        ? null
+        : compileTimestamps(
+            // Reconstruct a config-shape view of the runtime spec so
+            // validation runs against the new compiled layout.
+            Object.fromEntries(
+              Object.entries(timestamps.roles).map(([role, r]) => [
+                role,
+                {
+                  field: r.field as keyof F & string,
+                  unit: r.unit,
+                  ...(role === timestamps.defaultRole ? { default: true as const } : {}),
+                },
+              ]),
+            ) as TimestampsConfig<F>,
+            fields,
+            newCompiled,
+          );
+      return makeSchema<F, T>(fields, newCompiled, fn, newTimestamps);
     },
-  }) as Schema<F>;
+    withTimestamps<U extends TimestampsConfig<F>>(config: U): Schema<F, U> {
+      const spec = compileTimestamps(config, fields, compiled);
+      return makeSchema<F, U>(fields, compiled, invariantFn, spec);
+    },
+  }) as Schema<F, T>;
 }
 
 export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
@@ -473,11 +724,13 @@ export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
   }
 
   const compiled = compileLayout(fields, { invariant: false });
-  return makeSchema(fields, compiled, null);
+  return makeSchema<F, null>(fields, compiled, null, null);
 }
 
 /** Produce a postMessage-safe layout description for worklet inliners. */
-export function describeSchemaLayout(schema: Schema): SchemaLayoutDescription {
+export function describeSchemaLayout(
+  schema: Schema<FieldsObject, TimestampsConfig<FieldsObject> | null>,
+): SchemaLayoutDescription {
   const fields: Record<string, SchemaLayoutFieldDescription> = {};
   for (const f of schema.compiled.fields) {
     const base: SchemaLayoutFieldDescription = f.isArray
@@ -491,5 +744,6 @@ export function describeSchemaLayout(schema: Schema): SchemaLayoutDescription {
     headerBytes: 32,
     frameByteSize: schema.frameByteSize,
     fields: Object.freeze(fields),
+    timestamps: schema.timestamps,
   });
 }

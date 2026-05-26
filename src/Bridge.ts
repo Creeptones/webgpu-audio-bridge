@@ -405,9 +405,54 @@
  *       block[i] = this.synth.step(this.evalFrame.vEff);
  *     }
  *
+ * ─── Per-frame evaluator sugar (0.6.5, Pillar 3 second cut) ──────────────
+ *
+ * `pullEvaluatedLatest` + `evaluateAtSampleOffset` collapse the canonical
+ * pull + observe + per-sample dt + evaluate loop into two method calls per
+ * quantum. The hand-rolled five-line inner pattern above becomes:
+ *
+ *     const skipped = this.bridge.pullEvaluatedLatest(
+ *       this.evalFrame, quantumNs, sampleRate,
+ *     );
+ *     if (skipped < 0) return true;  // first quantum, nothing pulled yet
+ *     for (let i = 1; i < 128; i++) {
+ *       this.bridge.evaluateAtSampleOffset(this.evalFrame, i);
+ *       block[i] = this.synth.step(this.evalFrame.vEff);
+ *     }
+ *
+ * (Sample 0 is already evaluated by `pullEvaluatedLatest`.)
+ *
+ * Three building blocks make this work:
+ *
+ *   1. **Timestamp roles** (`.withTimestamps(...)` on the schema). The
+ *      schema declares which field carries the producer's timestamp and
+ *      what unit it's in (ns / us / ms / s / samples). One field can be
+ *      tagged with multiple roles if the producer ships multiple clocks
+ *      (macro / GPU / audio-frame). Each consumer picks the role most
+ *      natural for its math via `{ timestamp: 'roleName' }` (compile-time
+ *      checked against the declared role names); omitting the option uses
+ *      the schema's default role.
+ *   2. **Internal cache** (`cachedRawFrame` + `cachedTimestampNs` +
+ *      `cachedBaseConsumerNs` + `cachedSampleRate`). `pullEvaluatedLatest`
+ *      pulls into the cache once per quantum; `evaluateAtSampleOffset`
+ *      reads from it for the remaining 127 samples without touching the
+ *      SAB. Lazily allocated on first call; survives across calls.
+ *   3. **Unit conversion** (`_resolveTimestampNs`). The timestamp value
+ *      is read, coerced from BigInt → Number if needed, multiplied by
+ *      the per-unit factor (samples uses the per-call sampleRate), and
+ *      stored in ns for the PLL + dt math. dt is delivered to
+ *      `evaluateInto` in seconds — the canonical Pillar 1 contract.
+ *
+ * `sampleRate` is per-call by default; callers who want to omit it can
+ * register a default once via `setSampleRate(rate)` and pass `undefined`
+ * (or omit the arg). The bridge throws a clear error if neither is set.
+ *
+ * `resetEvalCache()` invalidates the cache (use on `AudioContext`
+ * suspend/resume or whenever the producer's timestamp epoch jumps).
+ * Independent of `resetPll()` and `resetSmoother()` — three orthogonal
+ * caches.
+ *
  * Deferred Pillar 3 follow-ups (still in the plan):
- *   - `pullEvaluated(out, sampleOffset, sampleRate)` sugar wrapping
- *     pull + observe + evaluate into a single hot-path call.
  *   - `EvalMode` dispatch (step / alpha / trajectory / catmull) chosen
  *     once at construction so the hot path is one precompiled branch.
  *   - Per-quantum batch API that writes all 128 samples in one call.
@@ -443,6 +488,8 @@ import {
   type FrameFor,
   type Schema,
   type SchemaLayoutDescription,
+  type TimestampRoleOf,
+  type TimestampUnit,
 } from "./schema.js";
 import { evaluateTrajectoryInto } from "./trajectory.js";
 
@@ -508,7 +555,7 @@ const PLL_KI = 0.01;
 // trapped integrator takes at most a few seconds.
 const PLL_INT_LIMIT_NS = 1e6;
 
-export interface BridgeAllocation<S extends Schema<FieldsObject>> {
+export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
   sab: SharedArrayBuffer;
   capacity: number;
   schema: S;
@@ -568,7 +615,7 @@ function isPowerOfTwo(x: number): boolean {
 
 type ScalarOp = (slot: number, frame: Record<string, unknown>) => void;
 
-export class Bridge<S extends Schema<FieldsObject>> {
+export class Bridge<S extends Schema<FieldsObject, any>> {
   public readonly capacity: number;
   public readonly schema: S;
   /** Frame size in bytes; matches schema.frameByteSize. */
@@ -662,6 +709,32 @@ export class Bridge<S extends Schema<FieldsObject>> {
   private pllOffsetNs: number = 0;
   private pllIntegral: number = 0;
   private pllLocked: boolean = false;
+
+  /** Cached raw frame for `pullEvaluatedLatest` / `evaluateAtSampleOffset`.
+   *  Lazily allocated on first `pullEvaluatedLatest`. Persists across calls.
+   *  Independent of `consumerPrev` — that field has its own lifecycle for
+   *  the α-smoother and invariant fallback. (0.6.5) */
+  private cachedRawFrame: FrameFor<S> | null = null;
+  /** True iff `cachedRawFrame` holds a valid pulled frame and the
+   *  cachedTimestampNs / cachedBaseConsumerNs / cachedSampleRate triple is
+   *  set. `evaluateAtSampleOffset` throws if false. `resetEvalCache`
+   *  flips it false; `pullEvaluatedLatest` flips it true on success. */
+  private cachedEvalValid: boolean = false;
+  /** Producer timestamp from the most recent successful `pullEvaluatedLatest`,
+   *  converted to nanoseconds via the active role's unit. Used by
+   *  `evaluateAtSampleOffset` to compute `dt` against `phaseLockedTime(...)`. */
+  private cachedTimestampNs: number = 0;
+  /** Consumer wall-clock (ns) at the start of the active quantum.
+   *  Sample-offset times are computed as `base + sampleOffset / sampleRate * 1e9`. */
+  private cachedBaseConsumerNs: number = 0;
+  /** Active sample rate for the current quantum's evaluations. Resolved
+   *  at `pullEvaluatedLatest` time from the per-call arg or `defaultSampleRate`. */
+  private cachedSampleRate: number = 0;
+  /** Optional default sample rate registered via `setSampleRate(rate)`.
+   *  When `pullEvaluatedLatest`'s `sampleRate` arg is omitted/undefined,
+   *  this value is used. 0 = unset; the bridge throws in that case to
+   *  surface the misconfiguration explicitly. */
+  private defaultSampleRate: number = 0;
 
   /** F64 umbrella view used to read/write the hidden `__invariant` lane on
    *  invariant-enabled schemas. Null when `schema.invariant === null`, in
@@ -831,7 +904,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
   }
 
   /** Byte size needed for a ring of `(capacity, schema)`. */
-  static byteLength<S extends Schema<FieldsObject>>(
+  static byteLength<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
   ): number {
@@ -842,7 +915,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
   }
 
   /** Allocate a SAB sized for the requested ring. */
-  static allocate<S extends Schema<FieldsObject>>(
+  static allocate<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
   ): BridgeAllocation<S> {
@@ -1397,6 +1470,188 @@ export class Bridge<S extends Schema<FieldsObject>> {
       }
     }
     return out as FrameFor<S>;
+  }
+
+  /**
+   * Register a default sample rate so subsequent `pullEvaluatedLatest` /
+   * `evaluateAtSampleOffset` calls can omit the per-call sample-rate
+   * argument. Typical AudioWorklet pattern: call once at consumer init
+   * with `sampleRate` (the worklet's lifetime-fixed audio rate).
+   *
+   * The per-call arg still takes precedence if both are supplied — useful
+   * for the rare sample-rate-change scenarios. (0.6.5)
+   */
+  setSampleRate(rate: number): void {
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new Error(
+        `setSampleRate: rate must be a positive finite number, got ${rate}`,
+      );
+    }
+    this.defaultSampleRate = rate;
+  }
+
+  /**
+   * Drain to the newest available frame, observe its producer-stamped
+   * timestamp against the consumer wall-clock, evaluate sample 0 of the
+   * quantum into `out`, and cache state so subsequent
+   * `evaluateAtSampleOffset(out, i)` calls reconstruct samples 1..N − 1
+   * without further SAB access. The canonical AudioWorklet entry point
+   * for Pillars 1 + 2 + 3 stacked.
+   *
+   * Returns:
+   *  - skipped-frame count (≥ 0): a fresh frame was pulled; PLL observed;
+   *    cache + `out` updated.
+   *  - −1: ring was empty. If the cache was previously valid (any earlier
+   *    successful `pullEvaluatedLatest`), `out` is populated from the
+   *    cached frame using the new quantum's base/sampleRate (the PLL is
+   *    NOT re-observed — repeating a stale producer stamp at advancing
+   *    consumer times would poison the residual). If the cache is empty
+   *    (first quantum with no producer push), `out` is left untouched —
+   *    callers using `scratchEvaluatedFrame()` see zero-initialized
+   *    silence in that case.
+   *
+   * `sampleRate`: per-call audio sample rate. May be omitted (or passed
+   * `undefined`) if a default was registered via `setSampleRate(rate)`;
+   * throws otherwise. Per-call value wins if both are present.
+   *
+   * `opts.timestamp`: name of one of the schema's declared timestamp
+   * roles (`.withTimestamps({ ... })`). Defaults to the role flagged
+   * `default: true` (or the first declared role if none was flagged).
+   * Compile-time-checked via `TimestampRoleOf<S>`.
+   *
+   * Requires the schema to have `.withTimestamps(...)` attached — throws
+   * otherwise. (0.6.5)
+   */
+  pullEvaluatedLatest(
+    out: FrameFor<S>,
+    baseConsumerNs: number,
+    sampleRate?: number,
+    opts?: { timestamp?: TimestampRoleOf<S> },
+  ): number {
+    if (!Number.isFinite(baseConsumerNs)) {
+      throw new Error(
+        `pullEvaluatedLatest: baseConsumerNs must be finite, got ${baseConsumerNs}`,
+      );
+    }
+    const sr = sampleRate ?? this.defaultSampleRate;
+    if (!Number.isFinite(sr) || sr <= 0) {
+      throw new Error(
+        `pullEvaluatedLatest: sampleRate not provided and no default set via setSampleRate(rate)`,
+      );
+    }
+    if (this.schema.timestamps === null) {
+      throw new Error(
+        `pullEvaluatedLatest: schema has no .withTimestamps(...) attached`,
+      );
+    }
+    const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
+    const role = this.schema.timestamps.roles[roleName];
+    if (!role) {
+      throw new Error(
+        `pullEvaluatedLatest: unknown timestamp role '${String(roleName)}'`,
+      );
+    }
+    if (this.cachedRawFrame === null) {
+      this.cachedRawFrame = this.scratchFrame();
+    }
+    const skipped = this.pullLatest(this.cachedRawFrame);
+    if (skipped >= 0) {
+      // Fresh frame — update timestamp cache and drive the PLL. Observing
+      // is gated on a fresh pull because feeding the PLL a repeated
+      // producer stamp at increasing consumer times would poison the
+      // residual (the producer's true clock is advancing, it just hasn't
+      // pushed yet).
+      const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
+      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
+      this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
+      this.observeConsumerTime(baseConsumerNs, this.cachedTimestampNs);
+      this.cachedEvalValid = true;
+    } else if (!this.cachedEvalValid) {
+      // Ring is empty and we've never pulled a frame — nothing to evaluate.
+      return -1;
+    }
+    // Either case (fresh-pull or cache-only): update the quantum context
+    // so sample-offset arithmetic uses this quantum's base/rate, then
+    // evaluate sample 0 into `out`.
+    this.cachedBaseConsumerNs = baseConsumerNs;
+    this.cachedSampleRate = sr;
+    this.evaluateAtSampleOffset(out, 0);
+    return skipped;
+  }
+
+  /**
+   * Evaluate sample `sampleOffset` of the active quantum (set up by the
+   * most recent successful `pullEvaluatedLatest`) into `out`. Computes
+   * `consumerNs = base + sampleOffset / sampleRate · 1e9`, runs the PLL
+   * to map into producer-clock space, computes `dt = (producerEstimate −
+   * cachedTimestampNs) · 1e−9` (seconds), and calls `evaluateInto` against
+   * the cached raw frame.
+   *
+   * Heap-only — never touches the SAB. Cost = one `phaseLockedTime`
+   * (one add + one boolean check post-lock) + one `evaluateInto`
+   * (which itself is ~5–10 ns per trajectory sample at order=2).
+   *
+   * Throws if no successful `pullEvaluatedLatest` has run yet (or after
+   * `resetEvalCache()`). `sampleOffset` may be any finite integer ≥ 0;
+   * the bridge does not enforce that it's < quantumSize, since callers
+   * occasionally want to look ahead. (0.6.5)
+   */
+  evaluateAtSampleOffset(out: FrameFor<S>, sampleOffset: number): void {
+    if (!this.cachedEvalValid) {
+      throw new Error(
+        `evaluateAtSampleOffset: no cached frame; call pullEvaluatedLatest first`,
+      );
+    }
+    if (!Number.isFinite(sampleOffset)) {
+      throw new Error(
+        `evaluateAtSampleOffset: sampleOffset must be finite, got ${sampleOffset}`,
+      );
+    }
+    const consumerNs =
+      this.cachedBaseConsumerNs + (sampleOffset / this.cachedSampleRate) * 1e9;
+    const producerNs = this.phaseLockedTime(consumerNs);
+    const dt_s = (producerNs - this.cachedTimestampNs) * 1e-9;
+    this.evaluateInto(this.cachedRawFrame as FrameFor<S>, dt_s, out);
+  }
+
+  /**
+   * Invalidate the cache shared by `pullEvaluatedLatest` /
+   * `evaluateAtSampleOffset`. After this call, `evaluateAtSampleOffset`
+   * throws until the next successful `pullEvaluatedLatest`. The raw-frame
+   * buffer is retained (no allocation on next pull).
+   *
+   * Independent of `resetSmoother()` (α-smoother prev) and `resetPll()`
+   * (PLL offset estimate). Call on `AudioContext` suspend/resume, when
+   * the producer reconnects with a different timestamp epoch, or
+   * whenever you want to drop the cached quantum context. (0.6.5)
+   */
+  resetEvalCache(): void {
+    this.cachedEvalValid = false;
+  }
+
+  /**
+   * Convert a timestamp value (read from the schema's role field, in the
+   * role's declared unit) into nanoseconds. Used internally by
+   * `pullEvaluatedLatest` to populate `cachedTimestampNs`.
+   *
+   * Supported units: ns / us / ms / s / samples (samples uses the
+   * provided sampleRate). Future extension: a `'custom'` unit with a
+   * caller-supplied `toNs` multiplier on the role spec — a single
+   * `case "custom": return value * role.toNs;` branch added here when a
+   * concrete caller asks for it.
+   */
+  private _timestampToNs(
+    value: number,
+    unit: TimestampUnit,
+    sampleRate: number,
+  ): number {
+    switch (unit) {
+      case "ns":      return value;
+      case "us":      return value * 1e3;
+      case "ms":      return value * 1e6;
+      case "s":       return value * 1e9;
+      case "samples": return (value / sampleRate) * 1e9;
+    }
   }
 
   /**

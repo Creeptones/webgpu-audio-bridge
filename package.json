@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Schema-driven lock-free SPSC SharedArrayBuffer ring for streaming structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet — the control-rate / audio-rate bridge pattern.",
   "type": "module",
   "main": "./dist/index.js",

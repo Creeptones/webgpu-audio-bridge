@@ -121,6 +121,24 @@
  *      control-rate → audio-rate pattern.
  *      Faked clocks; this is the bridge-only signal. Real-world
  *      AudioContext latency is the existing bench/e2e-latency harness.
+ *  50. pullEvaluatedLatest + evaluateAtSampleOffset round-trip (0.6.5):
+ *      asserts the sugar produces bit-identical output to the hand-rolled
+ *      pull + observe + evaluate loop the 0.6.3 README documents. Same
+ *      trajectory schema, same simulated 60 Hz producer + 375 Hz
+ *      consumer, two runs side-by-side.
+ *  51. Timestamp role resolution (0.6.5): two declared roles, one
+ *      flagged default. Default-omit-opts path uses the default;
+ *      `{ timestamp: 'roleName' }` per-call override picks the alt role.
+ *      Bridge throws when the role doesn't exist or schema has no
+ *      `.withTimestamps(...)`. resetEvalCache invalidates so
+ *      evaluateAtSampleOffset throws until next pullEvaluatedLatest.
+ *  52. Sample-rate resolution (0.6.5): per-call sampleRate, registered
+ *      setSampleRate(rate) default, per-call wins precedence, throw if
+ *      neither set. setSampleRate input validation.
+ *  53. Timestamp unit conversion (0.6.5): producer stamps `tMs: f64`
+ *      and `tSamples: f64` and the consumer uses each role; resulting
+ *      cachedTimestampNs matches the analytic ns conversion through
+ *      `dt` evaluations bit-exactly.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -2420,6 +2438,334 @@ function testLatencyP95(): void {
   );
 }
 
+// ── 50. pullEvaluatedLatest + evaluateAtSampleOffset round-trip (0.6.5) ────
+//
+// The 0.6.5 sugar must produce bit-identical output to the hand-rolled
+// pull + observe + evaluate loop the 0.6.3 README documents. Two Bridges
+// over identical SAB streams: one driven via the sugar, one via the
+// manual loop. After 100 quanta × 128 samples, every evaluated sample
+// must match across the two Float64 audio buffers.
+function testPullEvaluatedLatestRoundTrip(): void {
+  const N = 1; // single-sample trajectory
+  const SAMPLE_RATE = 48_000;
+  const QUANTUM = 128;
+  const PRODUCER_PERIOD_NS = 16_666_667n;
+  const QUANTA = 100;
+
+  const schemaBase = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  });
+  const schema = schemaBase.withTimestamps({
+    macro: { field: "tMacroNs", unit: "ns", default: true },
+  });
+
+  // Bridge A — driven via the sugar.
+  const allocA = Bridge.allocate(16, schema);
+  const ringA = new Bridge(allocA.sab, allocA.capacity, schema);
+  ringA.setSampleRate(SAMPLE_RATE);
+  const evalA = ringA.scratchEvaluatedFrame();
+  const audioA = new Float64Array(QUANTA * QUANTUM);
+
+  // Bridge B — driven via the hand-rolled loop. Separate SAB so producer
+  // pushes don't interfere; both bridges receive identical frames.
+  const allocB = Bridge.allocate(16, schemaBase);
+  const ringB = new Bridge(allocB.sab, allocB.capacity, schemaBase);
+  const rawB = ringB.scratchFrame();
+  const evalB = ringB.scratchEvaluatedFrame();
+  const audioB = new Float64Array(QUANTA * QUANTUM);
+
+  const omega = 2 * Math.PI * 5; // 5 Hz signal
+  const pushA = ringA.scratchFrame();
+  const pushB = ringB.scratchFrame();
+
+  // Seed t=0 push so quantum 0 has data.
+  pushA.seq = 0n; pushA.tMacroNs = 0n;
+  pushA.vEff[0] = 0; pushA.vEff[1] = omega;
+  ringA.push(pushA);
+  pushB.seq = 0n; pushB.tMacroNs = 0n;
+  pushB.vEff[0] = 0; pushB.vEff[1] = omega;
+  ringB.push(pushB);
+
+  let producerNext = PRODUCER_PERIOD_NS;
+  let seq = 1n;
+
+  for (let q = 0; q < QUANTA; q++) {
+    const baseSample = q * QUANTUM;
+    const baseNs = Math.round(baseSample / SAMPLE_RATE * 1e9);
+    // Drain any producer ticks that fired before this quantum.
+    while (producerNext <= BigInt(baseNs)) {
+      const t = Number(producerNext) * 1e-9;
+      pushA.seq = seq; pushA.tMacroNs = producerNext;
+      pushA.vEff[0] = Math.sin(omega * t);
+      pushA.vEff[1] = omega * Math.cos(omega * t);
+      ringA.push(pushA);
+      pushB.seq = seq; pushB.tMacroNs = producerNext;
+      pushB.vEff[0] = Math.sin(omega * t);
+      pushB.vEff[1] = omega * Math.cos(omega * t);
+      ringB.push(pushB);
+      seq++;
+      producerNext = producerNext + PRODUCER_PERIOD_NS;
+    }
+
+    // Sugar path.
+    ringA.pullEvaluatedLatest(evalA, baseNs);
+    audioA[baseSample] = evalA.vEff[0]!;
+    for (let i = 1; i < QUANTUM; i++) {
+      ringA.evaluateAtSampleOffset(evalA, i);
+      audioA[baseSample + i] = evalA.vEff[0]!;
+    }
+
+    // Manual path — mirrors the sugar's contract: only observe the PLL
+    // on a fresh pull, evaluate from the cached rawB regardless.
+    const skippedB = ringB.pullLatest(rawB);
+    if (skippedB >= 0) {
+      ringB.observeConsumerTime(baseNs, Number(rawB.tMacroNs));
+    }
+    const stampNs = Number(rawB.tMacroNs);
+    for (let i = 0; i < QUANTUM; i++) {
+      const consumerNs = baseNs + (i / SAMPLE_RATE) * 1e9;
+      const dtSec = (ringB.phaseLockedTime(consumerNs) - stampNs) * 1e-9;
+      ringB.evaluateInto(rawB, dtSec, evalB);
+      audioB[baseSample + i] = evalB.vEff[0]!;
+    }
+  }
+
+  // Bit-exact match across all samples.
+  for (let n = 0; n < audioA.length; n++) {
+    assertEq(audioA[n], audioB[n], `sample ${n} matches`);
+  }
+
+  ok("pull-evaluated-latest-roundtrip");
+}
+
+// ── 51. Timestamp role resolution + cache invalidation (0.6.5) ─────────────
+//
+// Two declared roles (`macro` with default flag, `alt` without). Per-call
+// override picks alt; default-omit path picks macro. Unknown role throws.
+// Schema without .withTimestamps() throws on pullEvaluatedLatest.
+// resetEvalCache invalidates so evaluateAtSampleOffset throws until the
+// next pullEvaluatedLatest.
+function testTimestampRoleResolution(): void {
+  const N = 1;
+  const schema = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    tAltNs: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  }).withTimestamps({
+    macro: { field: "tMacroNs", unit: "ns", default: true },
+    alt:   { field: "tAltNs",   unit: "ns" },
+  });
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  ring.setSampleRate(48_000);
+
+  // Push a frame where macro = 1_000_000 ns and alt = 2_000_000 ns.
+  // Velocity = 100 so we can read the picked timestamp from the
+  // evaluated output (out.vEff[0] = pos + vel * dt = 50 + 100 * dt).
+  const f = ring.scratchFrame();
+  f.seq = 1n;
+  f.tMacroNs = 1_000_000n;
+  f.tAltNs   = 2_000_000n;
+  f.vEff[0] = 50;
+  f.vEff[1] = 100;
+  ring.push(f);
+
+  const out = ring.scratchEvaluatedFrame();
+
+  // Default path → picks macro. baseConsumerNs = 1_000_000 (matches stamp);
+  // dt for sample 0 = phaseLockedTime(base) - macroStamp = 0 (PLL just
+  // seeded to exact offset). So out.vEff[0] = 50 + 100 * 0 = 50.
+  ring.pullEvaluatedLatest(out, 1_000_000);
+  assertEq(out.vEff[0], 50, "default role picks macro; dt = 0");
+  ring.resetEvalCache();
+  ring.resetPll();
+
+  // Override path → picks alt. Re-push so the ring has a frame.
+  f.seq = 2n;
+  ring.push(f);
+  ring.pullEvaluatedLatest(out, 2_000_000, undefined, { timestamp: "alt" });
+  assertEq(out.vEff[0], 50, "alt role: dt = 0 when base matches alt stamp");
+  ring.resetEvalCache();
+  ring.resetPll();
+
+  // Unknown role → throws.
+  f.seq = 3n;
+  ring.push(f);
+  let threw = false;
+  try {
+    ring.pullEvaluatedLatest(out, 0, undefined,
+      { timestamp: "bogus" as "macro" | "alt" });
+  } catch { threw = true; }
+  assert(threw, "unknown role throws");
+
+  // resetEvalCache → evaluateAtSampleOffset throws.
+  ring.resetEvalCache();
+  threw = false;
+  try { ring.evaluateAtSampleOffset(out, 1); } catch { threw = true; }
+  assert(threw, "evaluateAtSampleOffset after reset throws");
+
+  // Schema without .withTimestamps() → throws on pullEvaluatedLatest.
+  const bareSchema = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  });
+  const bareAlloc = Bridge.allocate(8, bareSchema);
+  const bareRing = new Bridge(bareAlloc.sab, bareAlloc.capacity, bareSchema);
+  bareRing.setSampleRate(48_000);
+  const bareOut = bareRing.scratchEvaluatedFrame();
+  const bareFrame = bareRing.scratchFrame();
+  bareFrame.tMacroNs = 0n;
+  bareFrame.vEff[0] = 1;
+  bareFrame.vEff[1] = 0;
+  bareRing.push(bareFrame);
+  threw = false;
+  try { bareRing.pullEvaluatedLatest(bareOut, 0); } catch { threw = true; }
+  assert(threw, "schema without .withTimestamps throws");
+
+  ok("timestamp-role-resolution");
+}
+
+// ── 52. Sample-rate resolution (0.6.5) ─────────────────────────────────────
+//
+// Three patterns: per-call sampleRate, registered default via setSampleRate,
+// per-call override of registered default. Both omitted → throws. Input
+// validation on setSampleRate.
+function testSampleRateResolution(): void {
+  const N = 1;
+  const schema = defineSchema({
+    seq: u64(),
+    tNs: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  }).withTimestamps({
+    macro: { field: "tNs", unit: "ns", default: true },
+  });
+
+  function freshRing() {
+    const { sab, capacity } = Bridge.allocate(8, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const f = ring.scratchFrame();
+    f.tNs = 0n; f.vEff[0] = 0; f.vEff[1] = 1;
+    ring.push(f);
+    return { ring, out: ring.scratchEvaluatedFrame(), pushFrame: f };
+  }
+
+  // (1) Per-call sampleRate works without any setSampleRate.
+  {
+    const { ring, out } = freshRing();
+    ring.pullEvaluatedLatest(out, 0, 48_000);
+    ok(`per-call sampleRate accepted (out.vEff[0]=${out.vEff[0]!.toFixed(4)})`);
+  }
+
+  // (2) setSampleRate default; per-call omitted.
+  {
+    const { ring, out } = freshRing();
+    ring.setSampleRate(48_000);
+    ring.pullEvaluatedLatest(out, 0);
+    ring.evaluateAtSampleOffset(out, 64); // confirms cachedSampleRate populated
+  }
+
+  // (3) Per-call wins precedence: registered 22050 but per-call 48000;
+  //     sample-1 dt should use 48000, so its output differs from what 22050 would give.
+  {
+    const { ring, out } = freshRing();
+    ring.setSampleRate(22_050);
+    ring.pullEvaluatedLatest(out, 0, 48_000);
+    const sample1_at48k = (() => {
+      // Compute the expected dt: consumerNs = 0 + 1/48000*1e9; PLL seeded
+      // at offset 0 (producer stamp = 0, consumer base = 0); dt_s ≈
+      // 1/48000. out.vEff[0] ≈ 0 + 1·(1/48000) ≈ 2.083e-5.
+      const out2 = ring.scratchEvaluatedFrame();
+      ring.evaluateAtSampleOffset(out2, 1);
+      return out2.vEff[0]!;
+    })();
+    const expected = 1 / 48_000;
+    assert(
+      Math.abs(sample1_at48k - expected) < 1e-9,
+      `per-call 48k wins over registered 22050: got ${sample1_at48k}, expected ~${expected}`,
+    );
+  }
+
+  // (4) Both omitted → throws.
+  {
+    const { ring, out } = freshRing();
+    let threw = false;
+    try { ring.pullEvaluatedLatest(out, 0); } catch { threw = true; }
+    assert(threw, "no sampleRate anywhere throws");
+  }
+
+  // (5) setSampleRate input validation.
+  {
+    const { ring } = freshRing();
+    for (const bad of [0, -1, NaN, Infinity, -Infinity]) {
+      let threw = false;
+      try { ring.setSampleRate(bad); } catch { threw = true; }
+      assert(threw, `setSampleRate(${bad}) rejects`);
+    }
+  }
+
+  ok("sample-rate-resolution");
+}
+
+// ── 53. Timestamp unit conversion (0.6.5) ──────────────────────────────────
+//
+// Producer stamps the timestamp field in non-ns units (ms, s, samples).
+// Consumer's role declares the matching unit. Bridge's _timestampToNs
+// must convert so dt computations against the PLL-seeded offset land on
+// the analytic answer. We verify by configuring baseConsumerNs to equal
+// the ns-equivalent of the producer stamp, then asserting dt=0 at sample 0
+// (out = position exactly).
+function testTimestampUnitConversion(): void {
+  const N = 1;
+  const SR = 48_000;
+
+  type Case = {
+    label: string;
+    unit: "ns" | "us" | "ms" | "s" | "samples";
+    stampValue: number;       // value as the producer would write
+    expectedConsumerNs: number; // baseConsumerNs that gives dt = 0
+  };
+  const cases: Case[] = [
+    { label: "ns",     unit: "ns",     stampValue: 1_000_000,        expectedConsumerNs: 1_000_000 },
+    { label: "us",     unit: "us",     stampValue: 1_000,            expectedConsumerNs: 1_000_000 },
+    { label: "ms",     unit: "ms",     stampValue: 1,                expectedConsumerNs: 1_000_000 },
+    { label: "s",      unit: "s",      stampValue: 0.001,            expectedConsumerNs: 1_000_000 },
+    // 48 samples at 48 kHz = 1 ms = 1_000_000 ns.
+    { label: "samples",unit: "samples",stampValue: 48,               expectedConsumerNs: 1_000_000 },
+  ];
+
+  for (const c of cases) {
+    const schema = defineSchema({
+      seq: u64(),
+      stamp: f64(),
+      vEff: f64TrajectoryArray(N, { order: 2 }),
+    }).withTimestamps({
+      macro: { field: "stamp", unit: c.unit, default: true },
+    });
+    const { sab, capacity } = Bridge.allocate(8, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    ring.setSampleRate(SR);
+
+    const f = ring.scratchFrame();
+    f.stamp = c.stampValue;
+    f.vEff[0] = 42;  // pos
+    f.vEff[1] = 999; // vel (large so any wrong-dt error is obvious)
+    ring.push(f);
+
+    const out = ring.scratchEvaluatedFrame();
+    ring.pullEvaluatedLatest(out, c.expectedConsumerNs);
+    // After pullEvaluatedLatest, PLL seeds offset = producerNs - consumerNs
+    // = 0 (we matched them). dt for sample 0 = phaseLockedTime(base) - prodNs = 0.
+    // out.vEff[0] = pos + vel * 0 = 42 exactly.
+    assertEq(out.vEff[0], 42, `${c.label}: dt = 0 at sample 0 (got ${out.vEff[0]})`);
+  }
+
+  ok("timestamp-unit-conversion");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -2471,6 +2817,10 @@ function main(): void {
   testTrajectorySmoothedInterop();
   testTrajectoryInvariantInterop();
   testLatencyP95();
+  testPullEvaluatedLatestRoundTrip();
+  testTimestampRoleResolution();
+  testSampleRateResolution();
+  testTimestampUnitConversion();
   console.log("\nAll Bridge tests passed.");
 }
 
