@@ -1,30 +1,22 @@
 # Cross-engine notify-cost bench
 
-Investigation 1 from the 0.6.11 post-bench planning round. Measures the
-per-pull cost of `Atomics.notify(read_index)` on the consumer hot path
-across **V8** (Chromium / Edge / Node), **JavaScriptCore** (Safari + iOS),
-and **SpiderMonkey** (Firefox).
+Measures the per-pull cost of `Atomics.notify(read_index)` on the
+consumer hot path across **V8** (Chromium / Edge / Node),
+**JavaScriptCore** (Safari + iOS), and **SpiderMonkey** (Firefox).
 
-The Node bench in `bench/Bridge.bench.ts` measures the V8-on-Windows
-delta at ~100 ns per pull, suggesting V8 short-circuits
-`Atomics.notify` calls with zero waiters in user space (no kernel
-roundtrip). The RFC's "syscall on every pull" framing turns out to be
-wrong for V8 in the no-waiter case. **This harness checks whether the
-short-circuit generalizes to JSC and SpiderMonkey.**
+**Status:** Investigation 1 + 3 + RT-safety research complete. The
+proposed 0.7.0 wait-flag wire-format extension was investigated and
+**rejected**. See [`results/wait-flag-protocol-decision.md`](./results/wait-flag-protocol-decision.md)
+for the decision and rationale. The harness lives on as a
+regression-detection mechanism: if any engine release ever
+regresses the empty-waiter short-circuit, re-running this bench
+catches it.
 
-The result decides the shape of the 0.7.0 wait-flag wire-format
-proposal:
-
-- **All three engines ≈ 100 ns delta.** The protocol's per-pull
-  payoff is small everywhere; lane 4 stays reserved and the 0.7.0
-  scope shifts to other surface.
-- **Safari (JSC) or Firefox (SpiderMonkey) shows a clearly larger
-  delta** (say ≥ 500 ns). The protocol becomes a portability fix as
-  much as a perf fix and is clearly worth shipping.
-- **Mixed picture (V8 cheap, others moderate).** Worth designing the
-  protocol so the producer-side cost is small enough that even a
-  100 ns savings is net positive — see CHANGELOG[0.6.11] for the
-  open-question framing.
+Conclusion in short: all three engines short-circuit empty-waiter
+`Atomics.notify` in user space at ~20-100 ns per call. The RFC's
+"syscall on every pull" framing was wrong for every engine. The
+wait-flag protocol's per-pull effect is in the noise on V8 and not
+worth the wire-format break.
 
 ## How to run
 

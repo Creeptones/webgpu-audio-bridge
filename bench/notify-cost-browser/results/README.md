@@ -1,15 +1,21 @@
 # Cross-engine notify-cost + wait-flag protocol research
 
-This directory collects the artifacts of three parallel investigations
-into the proposed 0.7.0 wait-flag wire-format extension:
+This directory collects the artifacts of the investigation cohort
+into the proposed 0.7.0 wait-flag wire-format extension. **The
+decision was: do not ship.** See
+[`wait-flag-protocol-decision.md`](./wait-flag-protocol-decision.md)
+for the rationale and the conditions that would justify revisiting.
 
+- **Decision document** — the source-of-record. Read this first.
+  ([`wait-flag-protocol-decision.md`](./wait-flag-protocol-decision.md))
 - **Investigation 1** — cross-engine notify-cost measurement on the
   steady-state no-waiter path. (`chromium-v8.txt`,
   `firefox-spidermonkey.txt`, `safari-jsc.txt`.)
 - **Investigation 3** — cross-engine wait-flag protocol simulation.
-  Adds `_pullWithWaitFlag` shim + four-path bench. Settles whether
-  the protocol overhead is cheaper than the notify it eliminates.
-  (`investigation-3-*.txt`.)
+  Settled whether the protocol overhead is cheaper than the notify
+  it eliminates. (`investigation-3-chromium-v8.txt`.) The shim and
+  bench cells used to produce these numbers were rolled back after
+  the decision; the measurements remain as a permanent record.
 - **RT-safety / spec research** — does the spec / impls / community
   permit `Atomics.notify` from `process()`? (`rt-safety-research.md`.)
 

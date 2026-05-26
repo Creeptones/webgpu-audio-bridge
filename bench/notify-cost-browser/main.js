@@ -97,27 +97,14 @@ function detectEngine() {
   return { engine, ua };
 }
 
-// One batched-pull benchmark. mode is one of:
-//   "notify"      — public ring.pull (fires Atomics.notify always).
-//   "noNotify"    — dev-only _pullNoNotify shim (never notifies).
-//   "wfClear"     — dev-only _pullWithWaitFlag with lane 4 = 0
-//                   (proposed protocol common case; notify skipped).
-//   "wfSet"       — dev-only _pullWithWaitFlag with lane 4 = 1
-//                   (proposed protocol degenerates to notify+load+branch).
-// Identical push path across all four; the delta isolates the trailing
-// notify behavior under each protocol variant.
-//
-// Investigation 3 / 0.6.12-WIP. The wfClear/wfSet variants exist so
-// the harness can settle whether the proposed protocol's per-pull
-// overhead (Atomics.load(lane 4) + branch) is cheaper than the notify
-// it eliminates, with cross-engine precision the Node bench can't
-// reach at hrtime's 100 ns resolution.
-async function runBench(mode, opts, ring, indices, frame, out, onProgress) {
+// One batched-pull benchmark. mode: "notify" runs the public ring.pull;
+// "noNotify" runs the dev-only _pullNoNotify shim. Identical push path
+// either way so the delta isolates the notify call.
+async function runBench(mode, opts, ring, frame, out, onProgress) {
   const { batchIters, batches, warmupBatches } = opts;
-  const hasWaitFlag = typeof ring._pullWithWaitFlag === "function";
-  // Warmup. Run all four code paths so V8 / JSC / SpiderMonkey JITs tier
-  // up on each before any measurement starts. Without this the first
-  // measured path takes a 2-3x penalty from incomplete tier-up.
+  // Warmup. Run both paths in the warmup phase regardless of which mode
+  // we're measuring — warm V8 / JSC / SpiderMonkey JITs on both code
+  // paths so neither is at a tier-up disadvantage when we measure.
   for (let b = 0; b < warmupBatches; b++) {
     for (let i = 0; i < batchIters; i++) {
       frame.seq = BigInt(i);
@@ -129,29 +116,10 @@ async function runBench(mode, opts, ring, indices, frame, out, onProgress) {
       ring.push(frame);
       ring._pullNoNotify(out);
     }
-    if (hasWaitFlag) {
-      Atomics.store(indices, 4, 0);
-      for (let i = 0; i < batchIters; i++) {
-        frame.seq = BigInt(i);
-        ring.push(frame);
-        ring._pullWithWaitFlag(out);
-      }
-      Atomics.store(indices, 4, 1);
-      for (let i = 0; i < batchIters; i++) {
-        frame.seq = BigInt(i);
-        ring.push(frame);
-        ring._pullWithWaitFlag(out);
-      }
-      Atomics.store(indices, 4, 0);
-    }
     if ((b & 31) === 0) await new Promise((r) => setTimeout(r, 0));
   }
 
   const samples = new Array(batches);
-  // Set lane 4 once before the measure phase if needed; the wfClear /
-  // wfSet inner loops then run with the flag at the expected value.
-  if (mode === "wfClear") Atomics.store(indices, 4, 0);
-  else if (mode === "wfSet") Atomics.store(indices, 4, 1);
   for (let b = 0; b < batches; b++) {
     const t0 = performance.now();
     if (mode === "notify") {
@@ -166,12 +134,6 @@ async function runBench(mode, opts, ring, indices, frame, out, onProgress) {
         ring.push(frame);
         ring._pullNoNotify(out);
       }
-    } else if (mode === "wfClear" || mode === "wfSet") {
-      for (let i = 0; i < batchIters; i++) {
-        frame.seq = BigInt(i);
-        ring.push(frame);
-        ring._pullWithWaitFlag(out);
-      }
     } else {
       throw new Error(`unknown bench mode: ${mode}`);
     }
@@ -182,7 +144,6 @@ async function runBench(mode, opts, ring, indices, frame, out, onProgress) {
       await new Promise((r) => setTimeout(r, 0));
     }
   }
-  if (mode === "wfClear" || mode === "wfSet") Atomics.store(indices, 4, 0);
   return summarize(samples);
 }
 
@@ -201,9 +162,6 @@ async function run() {
     const schema = physicsControlFrameSchema(opts.n);
     const { sab } = SpscRing.allocate(opts.capacity, schema);
     const ring = new SpscRing(sab, opts.capacity, schema);
-    // Direct Int32 view of the SAB header so the wfClear / wfSet
-    // benches can flip lane 4 between the two protocol states.
-    const indices = new Int32Array(sab, 0, 8);
 
     if (typeof ring._pullNoNotify !== "function") {
       REPORT_EL.textContent =
@@ -211,7 +169,6 @@ async function run() {
         "than 0.6.11. Run `npm run build` and reload.";
       return;
     }
-    const hasWaitFlag = typeof ring._pullWithWaitFlag === "function";
 
     const frame = makeFrame(opts.n);
     const out = makeOutFrame(opts.n);
@@ -219,22 +176,12 @@ async function run() {
     const { engine, ua } = detectEngine();
     const startTs = new Date().toISOString();
 
-    const notify = await runBench("notify", opts, ring, indices, frame, out, (s) =>
+    const notify = await runBench("notify", opts, ring, frame, out, (s) =>
       (PROG_EL.textContent = s),
     );
-    const noNotify = await runBench("noNotify", opts, ring, indices, frame, out, (s) =>
+    const noNotify = await runBench("noNotify", opts, ring, frame, out, (s) =>
       (PROG_EL.textContent = s),
     );
-    let wfClear = null;
-    let wfSet = null;
-    if (hasWaitFlag) {
-      wfClear = await runBench("wfClear", opts, ring, indices, frame, out, (s) =>
-        (PROG_EL.textContent = s),
-      );
-      wfSet = await runBench("wfSet", opts, ring, indices, frame, out, (s) =>
-        (PROG_EL.textContent = s),
-      );
-    }
 
     PROG_EL.textContent = "done.";
 
@@ -257,87 +204,44 @@ async function run() {
         `(warmup ${opts.warmupBatches} × ${opts.batchIters})`,
     );
     lines.push(``);
-
-    const fmtRow = (label, s) =>
-      `${label.padEnd(20)} median=${fmtNs(s.median).padStart(9)}  ` +
-        `p99=${fmtNs(s.p99).padStart(9)}  ` +
-        `p999=${fmtNs(s.p999).padStart(9)}  ` +
-        `max=${fmtNs(s.max).padStart(9)}  ` +
-        `mean=${fmtNs(s.mean).padStart(9)}`;
-
-    lines.push(fmtRow("pull (notify)", notify));
-    lines.push(fmtRow("pull (noNotify)", noNotify));
-    if (wfClear && wfSet) {
-      lines.push(fmtRow("pull (wf clear)", wfClear));
-      lines.push(fmtRow("pull (wf set)", wfSet));
-    }
+    lines.push(
+      `pull (notify)   median=${fmtNs(notify.median).padStart(9)}  ` +
+        `p99=${fmtNs(notify.p99).padStart(9)}  ` +
+        `p999=${fmtNs(notify.p999).padStart(9)}  ` +
+        `max=${fmtNs(notify.max).padStart(9)}  ` +
+        `mean=${fmtNs(notify.mean).padStart(9)}`,
+    );
+    lines.push(
+      `pull (noNotify) median=${fmtNs(noNotify.median).padStart(9)}  ` +
+        `p99=${fmtNs(noNotify.p99).padStart(9)}  ` +
+        `p999=${fmtNs(noNotify.p999).padStart(9)}  ` +
+        `max=${fmtNs(noNotify.max).padStart(9)}  ` +
+        `mean=${fmtNs(noNotify.mean).padStart(9)}`,
+    );
     lines.push(``);
     lines.push(
       `notify delta (notify - noNotify)  median=${fmtNs(notify.median - noNotify.median)}  ` +
         `p99=${fmtNs(notify.p99 - noNotify.p99)}  ` +
         `max=${fmtNs(notify.max - noNotify.max)}`,
     );
-
-    if (wfClear && wfSet) {
-      lines.push(``);
-      lines.push(`Investigation 3 — wait-flag protocol simulation`);
-      lines.push(
-        `  protocol overhead (wfClear - noNotify)   = ${fmtNs(wfClear.median - noNotify.median)}` +
-          `  (cost of lane-4 load + branch on no-waiter path)`,
-      );
-      lines.push(
-        `  protocol savings  (notify - wfClear)     = ${fmtNs(notify.median - wfClear.median)}` +
-          `  (notify cost recovered on no-waiter path)`,
-      );
-      lines.push(
-        `  protocol NET      (savings - overhead)   = ${fmtNs((notify.median - wfClear.median) - (wfClear.median - noNotify.median))}` +
-          `  (positive = protocol is net positive per pull)`,
-      );
-      lines.push(
-        `  flag-set sanity   (wfSet ≈ notify?)      delta=${fmtNs(wfSet.median - notify.median)}` +
-          `  (small delta confirms wfSet degenerates to notify+load)`,
-      );
-    }
-
     lines.push(``);
     lines.push(`interpretation:`);
     const delta = notify.median - noNotify.median;
     if (delta < 200) {
       lines.push(
-        `  notify delta < 200 ns. ${engine} appears to short-circuit ` +
-          `Atomics.notify with zero waiters in user space. The 0.7.0 ` +
-          `wait-flag wire-format protocol payoff is small on this engine.`,
+        `  delta < 200 ns. ${engine} appears to short-circuit ` +
+          `Atomics.notify with zero waiters in user space.`,
       );
     } else if (delta < 1000) {
       lines.push(
-        `  200 ns ≤ notify delta < 1 μs. ${engine} has measurable notify ` +
-          `overhead but not a full syscall. The wait-flag protocol is a ` +
-          `moderate win on this engine.`,
+        `  200 ns ≤ delta < 1 μs. ${engine} has measurable notify ` +
+          `overhead but not a full syscall.`,
       );
     } else {
       lines.push(
-        `  notify delta ≥ 1 μs. ${engine}'s notify path goes to the kernel even ` +
-          `with zero waiters — the wait-flag protocol is a clear win on ` +
-          `this engine and the 0.7.0 wire-format extension is justified.`,
+        `  delta ≥ 1 μs. ${engine}'s notify path goes to the kernel even ` +
+          `with zero waiters.`,
       );
-    }
-    if (wfClear) {
-      const net = (notify.median - wfClear.median) - (wfClear.median - noNotify.median);
-      if (net > 5) {
-        lines.push(
-          `  wait-flag protocol is net positive by ${fmtNs(net)} per pull on this engine.`,
-        );
-      } else if (net > -5) {
-        lines.push(
-          `  wait-flag protocol is at the noise floor (net ${fmtNs(net)}) on this engine — ` +
-            `the load + branch overhead is comparable to the notify cost it eliminates.`,
-        );
-      } else {
-        lines.push(
-          `  wait-flag protocol is net NEGATIVE by ${fmtNs(-net)} per pull on this engine — ` +
-            `the lane-4 load + branch costs more than the notify it skips.`,
-        );
-      }
     }
     REPORT_EL.textContent = lines.join("\n");
   } catch (err) {

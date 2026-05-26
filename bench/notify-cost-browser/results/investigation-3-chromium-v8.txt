@@ -1,6 +1,11 @@
 webgpu-audio-bridge — Investigation 3 wait-flag protocol simulation
 Chromium / V8 (Chrome 148, Windows 11)
 
+NOTE: The `_pullWithWaitFlag` shim used to produce these numbers was
+rolled back after the decision to not ship the wait-flag protocol.
+See `wait-flag-protocol-decision.md` for context. These measurements
+are preserved as the historical record of the comparison.
+
 Two back-to-back runs, defaults (1000 batches × 1000 iters, capacity 16,
 schema N=1000, warmup 100 × 1000). Run interval ~1 minute.
 
