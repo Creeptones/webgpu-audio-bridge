@@ -4,6 +4,145 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.8] — 2026-05-26
+
+### Changed — internal extract: `SpscRing`
+
+The SAB / Atomics core of `Bridge<S>` lifts into a new internal class
+`SpscRing<S>` (`src/SpscRing.ts`). **No public-API change. No wire-format
+change. No exported symbol additions.** Every `Bridge<S>` method continues
+to work bit-identically; this is a pure architectural seam that 0.6.9–0.6.10
+will widen and 0.6.10 will export.
+
+- **`src/SpscRing.ts`** (~875 lines, new file) owns: SAB allocation
+  (`byteLength`, `allocate`), header layout (lanes 0–3 active —
+  `write_index`, `read_index`, `flow_scale`, `torn_frame_counter`; lanes
+  4–7 reserved), lane-offset constants (`RING_HEADER_BYTES`,
+  `WRITE_IDX_LANE`, etc.), `push` / `beginPush` / `commitPush` / `abortPush`
+  / `pull` / `pullLatest` mechanics with the unconditional
+  `Atomics.notify` protocol preserved as-is (the lane-4 wait-flag wake
+  protocol is 0.7.0 territory), `available()`, `flowScaleHint()`,
+  `tornFrameCount()` / `incrementTornFrameCount()`, `waitForData` /
+  `waitForSpace`, `describeLayout()`, and the lane-2 adaptive
+  flow-scale PI controller tick (`_updateFlowScale`). Pull-result handoff
+  to `Bridge` uses a reused `pullResult` scratch object — no per-call
+  allocation on the hot path.
+
+- **`src/Bridge.ts`** slims from 2,196 to ~1,329 lines. The class becomes a
+  thin orchestrator that constructs one `SpscRing<S>` as `this.ring` and
+  delegates every ring-mechanic call (`push`, `pull`, `pullLatest`,
+  `available`, `flowScaleHint`, `waitForData`, `waitForSpace`,
+  `describeLayout`, etc.). The consumer-side state machines that are NOT
+  ring mechanics stay on Bridge unchanged: α-smoother (`_applySmoother`,
+  `pullSmoothed`, `pullLatestSmoothed`, `resetSmoother`), schema-invariant
+  classifier (`_classifyInvariant`, `_invariantHandleRaw`,
+  `_invariantHandleSmoothed`) with the 0.6.6 epsilon floor, PLL
+  (`observeConsumerTime`, `phaseLockedTime`, `resetPll`), per-frame
+  trajectory evaluator (`evaluateInto`, `scratchEvaluatedFrame`,
+  `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `setSampleRate`,
+  `resetEvalCache`), and the `telemetry()` snapshot (which now reads
+  through the ring for ring-side counters).
+
+- **`SpscRing` is internal-only at 0.6.8.** Not exported from
+  `src/index.ts`. 0.6.9 will split `FrameSmoother` /
+  `ConsumerClockRecovery` / `AdaptiveFlowController` out of Bridge along
+  the same seam; 0.6.10 promotes the composable primitives to the public
+  API.
+
+### Why — pre-build the v1.0 composable API without breaking 0.6.x
+
+The Bridge<S> god-object had accumulated SAB mechanics, an α-smoother, a
+PLL, an invariant classifier, a per-frame evaluator, and a flow-scale PI
+controller in one class. The 1.0 design — surfaced in the RFC and pinned
+in `.claude/plans/we-need-your-help-swirling-russell.md` — exposes those
+as composable primitives so callers can build custom consumer / producer
+shapes (a smoother-only consumer with no PLL, a PLL-only consumer feeding
+a custom blender, etc.) without paying for the rest. The composable
+shape needs an internal seam first so the pieces can be tested in
+isolation; this patch carves that seam without touching the public API.
+
+The seam shape is "Bridge orchestrates, SpscRing carries SAB I/O." The
+ring owns everything that touches the SAB or the always-notify protocol;
+Bridge owns everything that lives on the heap (smoother prev, PLL
+offset, invariant fallback buffer, evaluator cache). Pull-result handoff
+between the two layers uses a reused scratch object on the ring — no
+per-call allocation, no struct copy. The cost of the extract on the
+1.20 μs N=1000 pull path is below the bench's resolution.
+
+A second motivation: the 1 M-frame concurrent SPSC stress
+(`tests/Bridge.concurrent.test.ts`) is now load-bearing evidence that the
+ring's SPSC protocol survives the extraction. The producer worker still
+talks to a `Bridge<S>` facade via `Bridge.describeLayout()` (no producer-
+worker changes); 1 M frames cross the seam with zero lost wake-ups, zero
+out-of-order seq, zero `fullWaitTimeouts`. If the seam had a release/
+acquire ordering bug the test would flip red within the first few
+hundred frames.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding, torn-frame counter, header / payload boundary — all bit-for-
+  bit identical to 0.6.7. A 0.6.7 peer and a 0.6.8 peer share a SAB
+  transparently. Lanes 4–7 remain reserved for the 0.7.0 wait-flag
+  protocol.
+- **No public-API breakage.** Every `Bridge<S>` method signature, return
+  shape, and exported symbol from `src/index.ts` is byte-identical to
+  0.6.7. `RING_HEADER_BYTES`, `RING_HEADER_LANES`, and `BridgeAllocation`
+  continue to be importable from `./Bridge.js` (re-exported from the new
+  `SpscRing.ts` canonical home).
+- **No exported symbol additions.** `SpscRing`, `RING_HEADER_INT32_LANES`,
+  the lane constants (`WRITE_IDX_LANE`, etc.), and `SpscPullResult`
+  remain internal-only — Bridge consumes them from `./SpscRing.js` but
+  `src/index.ts` does not re-export them. 0.6.10 is the deliberate
+  promotion patch.
+- **One unrelated internal change**: the test-only `_updateFlowScale`
+  method on Bridge is now an underscore-prefixed instance method without
+  a `private` TypeScript modifier (TS would flag it unused since the test
+  reaches it through an `as unknown as { ... }` cast). It delegates
+  through to `SpscRing._updateFlowScale`. Not part of the public API;
+  subject to change without notice.
+
+### Tests
+
+All 6 suites green at the existing pin counts — no new pins added (the
+extraction is validated by every existing pin remaining green):
+
+- `tests/schema.test.ts` 14 pins.
+- `tests/Bridge.test.ts` 60 pins (every smoothed-pull, invariant,
+  flow-scale, PLL, trajectory, and evaluator pin from 0.6.7 passes
+  through the seam unchanged).
+- `tests/Bridge.phaseLock.test.ts`.
+- `tests/Bridge.concurrent.test.ts` — 1,000,000-frame SPSC stress
+  completes in ~600 ms with `emptyWaitTimeouts === 0` and
+  `flow_scale envelope [0.500, 2.000]`. **This is the load-bearing
+  validation for the seam.** Lost wake-ups, out-of-order seq, or a
+  release/acquire regression in the extracted ring would flip the pin
+  red within the first few hundred frames.
+- `tests/Float64RingBuffer.test.ts` 9 pins.
+- `tests/Float64RingBuffer.concurrent.test.ts`.
+
+Bench medians at N=1000 unchanged from 0.6.7: push 1.20 μs, pull 1.20 μs,
+pullLatest 1.20 μs (p99 1.50 μs across all three); `trajEval (fast)`
+1.20 μs / `trajEval (clamp)` 4.80 μs; flow-scale recovery 33 cycles
+(analytic ≈ 46). The pull-result scratch handoff and the extra method
+call across the seam are both below the bench's resolution.
+
+### Documentation
+
+- `src/SpscRing.ts` carries the canonical SAB lane diagram, the
+  release/acquire memory-ordering protocol, the counter representation
+  detail (0.4.0), the always-notify protocol, the adaptive backpressure
+  controller math (0.5.0), and the schema-dispatch overhead note.
+  `src/Bridge.ts`'s file header is rewritten as a slim orchestrator
+  description with a back-pointer comment to `SpscRing.ts` for the
+  protocol detail, and retains the smoother / invariant classifier / PLL
+  / evaluator sections (those are heap-side state machines that stay on
+  Bridge).
+- `CHANGELOG.md` — this entry.
+- `README.md` — single roadmap line under the existing release sequence
+  noting that 0.6.8 ships the internal SpscRing extract preparatory for
+  the 0.6.10 composable exports.
+
 ## [0.6.7] — 2026-05-26
 
 ### Added — trajectory safety clamps
