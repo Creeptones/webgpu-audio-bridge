@@ -644,6 +644,22 @@ A future variant could drop to `Int32` wrapping indices for lower push/pull over
 
 Run `npm run bench` to measure on your hardware. Run `npm run test:concurrent` to validate the protocol across `worker_threads` against a deterministic 1M-frame bit-exact recipe.
 
+### 0.6.11 — isolation cells for downstream planning
+
+Two additional bench cells ship in `bench/Bridge.bench.ts` as of 0.6.11. Both are measurement, not regression gates; they exist so the next planning round (potential frame codegen, potential 0.7.0 wait-flag wire-format extension) has concrete numbers to reason from.
+
+| Cell | Median (Node 22, Windows 11 laptop) | What it isolates |
+|---|---|---|
+| `propAccess (Bridge)` | ~400 ns | One push + pull on a 4-scalar-only schema (`u64 + i32 + f64 + f32`, no array lanes). Whole-stack — closure dispatch + SAB Atomics + notify + flow-scale tick. |
+| `propAccess (inline)` | ~0 ns (sub-`hrtime` resolution) | Equivalent typed-array writes / reads done by hand, no SAB / Atomics / closures. Lower bound on the field-shuffling cost. |
+| **delta** | **~400 ns** | Upper-bound envelope of what frame-codegen could possibly save (codegen would only eliminate the closure portion of this; the SAB protocol + notify cost is irreducible without the wait-flag extension). |
+| `pull (notify)` | ~1.30 μs | `SpscRing.pull` on `physicsControlFrameSchema(1000)` — public path, fires `Atomics.notify(read_index)`. |
+| `pull (noNotify)` | ~1.20 μs | Same body via dev-only `_pullNoNotify` shim (underscore prefix on `SpscRing`, not exported, never reached through `Bridge<S>`). |
+| **delta** | **~100 ns** | Per-pull `Atomics.notify` cost on the consumer hot path — the 0.7.0 wait-flag extension's maximum payoff per pull. The RFC's "syscall on every pull" framing overstates the impact: on V8 with zero waiters the notify sits at roughly the `hrtime.bigint()` resolution floor. |
+
+`_pullNoNotify` is a dev-only shim and is **not** part of the supported API; the underscore prefix is the marker, the same convention as `_updateFlowScale`. `Bridge<S>` continues to call the public `pull` exclusively.
+
+
 ## Back-pressure
 
 The ring's `push()` returns `false` when full and `pull()` / `pullLatest()` return `false` / `-1` when empty. For the control-rate / audio-rate pattern this library is shaped for (slow GPU producer, fast audio consumer, ring almost always near-empty) you can ignore back-pressure entirely — the AudioWorklet polls `pullLatest()` per quantum and tolerates the rare miss via whatever smoothing it already does.

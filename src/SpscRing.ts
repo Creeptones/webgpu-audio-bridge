@@ -700,6 +700,55 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Dev-only bench shim. Mirrors `pull` exactly minus the trailing
+   * `Atomics.notify(this.indices, READ_IDX_LANE, 1)`. NOT part of the public
+   * API — the underscore prefix marks it as internal-only (same convention
+   * as `_updateFlowScale`). Bridge does NOT delegate to it; nothing on a
+   * user-visible code path calls it. Existence is purely so
+   * `bench/Bridge.bench.ts` can isolate the notify cost from the rest of
+   * the pull path. Skipping the notify here means a parked consumer would
+   * miss the wake — that's exactly why this is bench-only and never on a
+   * real consumer's path.
+   *
+   * Added in 0.6.11. See CHANGELOG for the measured notify delta.
+   */
+  _pullNoNotify(out: FrameFor<S>): SpscPullResult {
+    const r = this.pullResult;
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
+    if (writeIdx === readIdx) {
+      r.ok = false;
+      return r;
+    }
+    const slot = (readIdx >>> 0) & this.mask;
+    const frame = out as unknown as Record<string, unknown>;
+    const sr = this.scalarReaders;
+    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+    const al = this.arrayLayout;
+    const av = this.arrayViews;
+    for (let i = 0; i < al.length; i++) {
+      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+      dst.set(av[i]![slot]!);
+    }
+    const invariantStored = this.invariantView !== null
+      ? this.invariantView[
+          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+        ]!
+      : 0;
+    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
+    // NB: Atomics.notify deliberately omitted — that's the whole point of
+    // this shim. Flow-scale tick still runs so the bench compares like for
+    // like on the post-release work.
+    this._updateFlowScale(writeIdx, readIdx);
+    r.ok = true;
+    r.skipped = 0;
+    r.invariantStored = invariantStored;
+    r.preWriteIdx = writeIdx;
+    r.preReadIdx = readIdx;
+    return r;
+  }
+
+  /**
    * Drain to the newest available frame into `out`. Skipped older frames
    * are discarded. Mutates and returns `pullResult` with `skipped` ≥ 0 on
    * success (0 if a single frame was waiting, N if N+1 frames were

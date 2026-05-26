@@ -4,6 +4,121 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.11] — 2026-05-26
+
+### Added — bench cells for downstream decisions
+
+Pure measurement patch. Two new bench cells in `bench/Bridge.bench.ts`
+produce the headline numbers that the next planning round will use to
+decide whether the 0.7.0 wait-flag wire-format work + any future
+frame-codegen evaluation are scope-justified. **No source-code behavior
+change for any user-visible code path. No wire-format change. No public-
+API break.** The shim added to `SpscRing` is dev-only (underscore-
+prefixed, not exported, never called by `Bridge<S>`).
+
+- **`propAccess (Bridge)` vs `propAccess (inline)` cell.** Pushes /
+  pulls a 4-scalar-only schema (`u64` + `i32` + `f64` + `f32`, no array
+  lanes) through a real `Bridge<S>` and through a hand-rolled inline
+  loop that does the equivalent typed-array writes / reads directly,
+  without the per-field closure dispatch + without the SAB / Atomics
+  path. The delta is the **upper-bound envelope** on what frame-codegen
+  could possibly save by inlining the closure dispatch (minus the SAB +
+  notify costs that codegen wouldn't touch). Measured medians on the
+  local machine: **`Bridge` ≈ 400 ns** for one full push+pull on the
+  4-scalar schema; **`inline` ≈ 0 ns** (below `hrtime.bigint()`'s
+  ~100 ns resolution); **delta ≈ 400 ns**, of which most is SAB /
+  Atomics protocol cost rather than closure dispatch. Codegen's
+  realistic ceiling is well under that delta.
+
+- **`pull (notify)` vs `pull (noNotify)` cell.** Drives the same
+  physics-control schema (`physicsControlFrameSchema(1000)`) push / pull
+  cadence through a directly-constructed `SpscRing<S>`, alternating
+  between the public `pull` (which fires `Atomics.notify(read_index)`)
+  and the new dev-only `_pullNoNotify` shim (same body, notify skipped).
+  Measured medians on the local machine: **`pull (notify)` ≈ 1.30 μs**;
+  **`pull (noNotify)` ≈ 1.20 μs**; **delta ≈ 100 ns per pull**. The
+  RFC's "syscall on every pull" framing overstates the impact: an
+  `Atomics.notify` with zero waiters in V8 is around the
+  `hrtime.bigint()` resolution floor, not a microsecond.
+
+### Why
+
+These two numbers are the inputs for the next planning round, not
+something this patch acts on:
+
+- The **codegen** evaluation (whether to ship a build-time or runtime
+  frame codegen that inlines the per-field closures) needs an upper
+  bound on the savings; without it the design conversation runs on
+  vibes. ~400 ns per round-trip on a 4-scalar schema — most of which
+  is the SAB protocol, not the closures — bounds the answer.
+- The **0.7.0 wait-flag** wire-format extension's payoff is precisely
+  the per-pull notify cost. If notify were microseconds, the extension
+  would be a clear win and lane 4 would be activated immediately. At
+  ~100 ns per pull, the case is far more nuanced: the wait-flag
+  protocol adds protocol complexity to the SAB header for a savings on
+  the order of a single cache hit. The 0.7.0 planning round can read
+  the number and decide accordingly.
+
+Both numbers were unknowns before this patch; both go into the next
+planning effort's `Context` section as concrete data.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding, torn-frame counter, header / payload boundary — all
+  bit-for-bit identical to 0.6.10. A 0.6.10 peer and a 0.6.11 peer
+  share a SAB transparently.
+- **No public-API change.** `src/index.ts` is byte-identical to 0.6.10;
+  no symbols added, removed, or retyped. `_pullNoNotify` is a private-
+  by-convention method on `SpscRing` (underscore prefix, no top-level
+  re-export); the type signature on the class is widened by one slot
+  but the surface visible to TS importers via `import { SpscRing }` is
+  unchanged in shape because the new method is documented as dev-only
+  and is not part of the supported API.
+- **No `Bridge<S>` delegation.** `Bridge.pull` continues to call
+  `this.ring.pull(out)` exactly as in 0.6.10; the shim sits beside
+  `pull` on `SpscRing` and is reachable only by callers that hold a
+  direct `SpscRing` reference (i.e. the bench harness).
+- **Lanes 4–7 still reserved** for the 0.7.0 wait-flag protocol.
+
+### Tests
+
+No new test pins. The bench cells are measurement, not regression
+gates. All 7 existing suites green on this patch:
+
+- `tests/schema.test.ts` 14 pins (unchanged).
+- `tests/Bridge.test.ts` 63 pins (unchanged).
+- `tests/BridgeFacades.test.ts` 4 pins (unchanged); the
+  `facade-symmetry-with-bridge` load-bearing pin still passes.
+- `tests/Bridge.phaseLock.test.ts` (unchanged).
+- `tests/Bridge.concurrent.test.ts` — 1,000,000-frame SPSC stress
+  completes in ~830 ms with `emptyWaitTimeouts === 0` and
+  `flow_scale envelope [0.500, 2.000]`. `_pullNoNotify` is dev-only and
+  not on any user-visible code path, so the concurrent stress is
+  unperturbed.
+- `tests/Float64RingBuffer.test.ts` 9 pins (unchanged).
+- `tests/Float64RingBuffer.concurrent.test.ts` (unchanged).
+
+Bench medians on the unchanged cells match the 0.6.10 baseline within
+the `hrtime.bigint()` 100 ns quantization on this machine: push /
+pull / pullLatest 1.20–1.30 μs; `trajEval (fast)` 1.20 μs;
+`trajEval (clamp)` 5.20 μs; flow-scale recovery 33 cycles. The two new
+cells (`propAccess`, notify-on-pull) sit beside them and do not
+displace any existing measurement.
+
+### Documentation
+
+- `README.md` `Performance` section gains a short paragraph documenting
+  the two new bench cells with the measured medians.
+- `bench/Bridge.bench.ts` file header gains a 0.6.11 cell-summary
+  paragraph; both new bench functions carry self-contained header
+  comments explaining what they measure, why, and what the delta
+  represents.
+- `src/SpscRing.ts` `_pullNoNotify` method carries a self-contained
+  doc comment marking it as dev-only / not-on-user-path; the file
+  header surface comment is unchanged because the dev shim is not part
+  of the public protocol.
+
 ## [0.6.10] — 2026-05-26
 
 ### Added — composable consumer / producer + internal primitives exported

@@ -38,15 +38,47 @@
  * the controller's hot-path cost is folded into the regular `pull` cell
  * (one Atomics.store + a handful of muls/adds, ~10 ns over baseline). See
  * src/Bridge.ts "Adaptive backpressure" section for the controller math.
+ *
+ * 0.6.11 cells. Two measurement cells produced for downstream planning —
+ * the numbers feed future codegen / wait-flag decisions; this patch ships
+ * the data, no behavior change. Both cells are isolation studies, not
+ * regression gates.
+ *
+ *   - `propAccess (Bridge)` vs `propAccess (inline)`. A 4-scalar-only
+ *     schema (u64 + i32 + f64 + f32, no array lanes) pushes / pulls
+ *     through `Bridge` and through a hand-rolled inline-loop baseline.
+ *     The delta is the per-frame closure-dispatch + property-write cost
+ *     in V8 for a representative mixed-kind frame — the headline number
+ *     for any future frame-codegen evaluation. Compared to the 1.20 μs
+ *     memcpy-bound N=1000 cell, the smaller frame size here isolates
+ *     property-write cost from the SAB memcpy.
+ *
+ *   - `pull` vs `_pullNoNotify` on the same fixture. `_pullNoNotify` is a
+ *     dev-only shim on `SpscRing` that runs the full pull path minus the
+ *     trailing `Atomics.notify(read_index)`. The delta is the per-pull
+ *     notify cost on the audio thread — the headline number for the
+ *     0.7.0 wait-flag wire-format work. If notify is cheap (<50 ns), the
+ *     RFC's "syscall on every pull" framing overstates the impact.
+ *     Bridge does NOT delegate to `_pullNoNotify`; nothing on a user-
+ *     visible code path calls it.
  */
 
 import { hrtime } from "node:process";
 import { Bridge } from "../src/Bridge.js";
+import { SpscRing } from "../src/SpscRing.js";
 import {
   physicsControlFrameSchema,
   type PhysicsControlFrameSchema,
 } from "../src/schemas/physics.js";
-import type { FrameFor, TrajectorySpec } from "../src/schema.js";
+import {
+  defineSchema,
+  f32,
+  f64,
+  i32,
+  u64,
+  type FrameFor,
+  type TrajectorySpec,
+} from "../src/schema.js";
 import { evaluateTrajectoryInto } from "../src/trajectory.js";
 
 const N = 1000;
@@ -259,6 +291,195 @@ function runTrajectoryEvalBench(): {
   return { fastSamples, clampedSamples };
 }
 
+/**
+ * 0.6.11 cell. Per-frame property-access cost in isolation.
+ *
+ * Goal: measure the per-call cost of `frame[name] = …` writes and
+ * `frame.name` reads across a small mixed-kind schema, isolated from the
+ * SAB memcpy that dominates the N=1000 cells. The schema is four scalars,
+ * one of each representative kind family (bigint + signed int + f64 +
+ * f32) with **no array lanes** — frame size is 16 bytes, so memcpy is a
+ * floor (handful of typed-array subscripts) and the delta vs an inline
+ * loop is the closure dispatch + dynamic property access cost.
+ *
+ * `propAccess (Bridge)` drives a real `Bridge<S>` push + pull on the
+ * 4-scalar schema. `propAccess (inline)` drives the equivalent typed-
+ * array writes / reads by hand, without going through the per-field
+ * closure dispatch, and without the SAB / Atomics path — this is a lower
+ * bound, NOT a fair Bridge replacement (no SAB acquire/release, no
+ * Atomics.notify, no flow-scale tick). The delta is the upper-bound
+ * envelope of what frame-codegen could possibly save by inlining the
+ * closures, minus the SAB/notify costs that codegen wouldn't touch.
+ *
+ * Future codegen evaluation: if the delta is large (multiple μs at N=4
+ * fields), codegen could meaningfully cut per-pull cost. If small
+ * (<200 ns), the property dispatch is already cheap and codegen is
+ * mostly cosmetic. The measured medians ship in CHANGELOG[0.6.11].
+ */
+const PROP_ACCESS_FIELDS = 4;
+
+const propAccessSchema = defineSchema({
+  a: u64(),   // bigint scalar
+  b: i32(),   // signed int scalar
+  c: f64(),   // double scalar
+  d: f32(),   // single scalar
+});
+type PropAccessFrame = FrameFor<typeof propAccessSchema>;
+
+function makePropFrame(): PropAccessFrame {
+  return { a: 0n, b: 0, c: 0, d: 0 };
+}
+
+function runPropAccessBridgeBench(): { samples: number[] } {
+  const { sab } = Bridge.allocate(CAPACITY, propAccessSchema);
+  const bridge = new Bridge(sab, CAPACITY, propAccessSchema);
+  const frame = makePropFrame();
+  const out = makePropFrame();
+
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.a = BigInt(i);
+    frame.b = i | 0;
+    frame.c = i * 1e-3;
+    frame.d = i * 1e-3;
+    bridge.push(frame);
+    bridge.pull(out);
+  }
+
+  const samples = new Array<number>(MEASURE_ITERS);
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.a = BigInt(i);
+    frame.b = i | 0;
+    frame.c = i * 1e-3;
+    frame.d = i * 1e-3;
+    const t0 = hrtime.bigint();
+    bridge.push(frame);
+    bridge.pull(out);
+    const t1 = hrtime.bigint();
+    samples[i] = Number(t1 - t0);
+  }
+  return { samples };
+}
+
+/**
+ * Inline baseline: same per-field traffic as `runPropAccessBridgeBench`
+ * minus the SAB / Atomics / closure-dispatch path. Single fixed slot per
+ * kind, plain typed-array writes + reads. This is a lower bound on the
+ * field-shuffling cost itself; the Bridge delta over this is the
+ * combined SAB-protocol + closure-dispatch overhead, of which codegen
+ * could only address the closure portion.
+ */
+function runPropAccessInlineBench(): { samples: number[] } {
+  const aBuf = new BigUint64Array(1);
+  const bBuf = new Int32Array(1);
+  const cBuf = new Float64Array(1);
+  const dBuf = new Float32Array(1);
+  const frame = makePropFrame();
+  const out = makePropFrame();
+
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.a = BigInt(i);
+    frame.b = i | 0;
+    frame.c = i * 1e-3;
+    frame.d = i * 1e-3;
+    aBuf[0] = frame.a;
+    bBuf[0] = frame.b;
+    cBuf[0] = frame.c;
+    dBuf[0] = frame.d;
+    out.a = aBuf[0]!;
+    out.b = bBuf[0]!;
+    out.c = cBuf[0]!;
+    out.d = dBuf[0]!;
+  }
+
+  const samples = new Array<number>(MEASURE_ITERS);
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.a = BigInt(i);
+    frame.b = i | 0;
+    frame.c = i * 1e-3;
+    frame.d = i * 1e-3;
+    const t0 = hrtime.bigint();
+    aBuf[0] = frame.a;
+    bBuf[0] = frame.b;
+    cBuf[0] = frame.c;
+    dBuf[0] = frame.d;
+    out.a = aBuf[0]!;
+    out.b = bBuf[0]!;
+    out.c = cBuf[0]!;
+    out.d = dBuf[0]!;
+    const t1 = hrtime.bigint();
+    samples[i] = Number(t1 - t0);
+  }
+  return { samples };
+}
+
+/**
+ * 0.6.11 cell. Notify-on-pull cost on the consumer hot path.
+ *
+ * Goal: isolate the cost of the trailing `Atomics.notify(read_index)`
+ * call that fires on every successful `pull` / `pullLatest`. The 0.7.0
+ * wait-flag wire-format work (RFC phase 1) proposes gating notify behind
+ * a producer-side parked flag (lane 4) — but the gating only pays off
+ * if the unconditional notify is meaningfully expensive on a typical
+ * audio-rate pull cadence.
+ *
+ * Approach: drive a `SpscRing<S>` directly (so we can call the dev-only
+ * `_pullNoNotify` shim that's not on Bridge's public surface). Same
+ * physics-control schema as the other cells so the per-pull memcpy + the
+ * scalar/array-loop costs match the existing `pull` cell — only the
+ * trailing notify differs. The reported delta is `pullMed - noNotifyMed`;
+ * raw medians ship for context.
+ *
+ * Note this drives `SpscRing` directly rather than `Bridge` because
+ * `_pullNoNotify` is a dev-only shim (underscore prefix, not exported as
+ * a top-level entry on the public API). `SpscRing` is now an exported
+ * primitive (0.6.10) so the bench imports it directly.
+ */
+function runNotifyOnPullBench(): {
+  pullSamples: number[];
+  noNotifySamples: number[];
+} {
+  const schema = physicsControlFrameSchema(N);
+  const { sab } = Bridge.allocate(CAPACITY, schema);
+  const ring = new SpscRing(sab, CAPACITY, schema);
+  const frame = makeFrame();
+  const out = makeOutFrame();
+
+  // Warm both paths identically.
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring.pull(out);
+  }
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring._pullNoNotify(out);
+  }
+
+  // Measure: alternate push/pull and push/_pullNoNotify so each sample
+  // sees the same steady state (one frame buffered, just-pushed slot
+  // freshly written, cache state similar). Same shape as the existing
+  // pull cell so the medians are directly comparable.
+  const pullSamples = new Array<number>(MEASURE_ITERS);
+  const noNotifySamples = new Array<number>(MEASURE_ITERS);
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t0 = hrtime.bigint();
+    ring.pull(out);
+    const t1 = hrtime.bigint();
+    pullSamples[i] = Number(t1 - t0);
+
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t2 = hrtime.bigint();
+    ring._pullNoNotify(out);
+    const t3 = hrtime.bigint();
+    noNotifySamples[i] = Number(t3 - t2);
+  }
+  return { pullSamples, noNotifySamples };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -340,6 +561,33 @@ function main(): void {
   }
   console.log(
     `  trajEval (clamp) median  ${fmt(trajClampedMed)} (documented, not gated)`,
+  );
+  console.log();
+
+  // 0.6.11 cell — per-frame property-access cost on a 4-scalar schema.
+  // The delta `Bridge - inline` is the closure-dispatch + dynamic property
+  // write/read cost that frame codegen could possibly cut. Not gated.
+  const propBridge = runPropAccessBridgeBench();
+  const propInline = runPropAccessInlineBench();
+  const propBridgeMed = summarize("propAccess (Bridge)", propBridge.samples);
+  const propInlineMed = summarize("propAccess (inline)", propInline.samples);
+  const propDelta = propBridgeMed - propInlineMed;
+  console.log(
+    `  property-access delta (Bridge - inline) = ${fmt(propDelta)}  ` +
+      `(${PROP_ACCESS_FIELDS} scalar fields; codegen upper bound)`,
+  );
+  console.log();
+
+  // 0.6.11 cell — notify-on-pull cost via SpscRing._pullNoNotify shim.
+  // The delta `pull - _pullNoNotify` is the per-pull Atomics.notify cost;
+  // it sizes the 0.7.0 wait-flag-protocol payoff. Not gated.
+  const notify = runNotifyOnPullBench();
+  const notifyPullMed = summarize("pull (notify)", notify.pullSamples);
+  const noNotifyMed = summarize("pull (noNotify)", notify.noNotifySamples);
+  const notifyDelta = notifyPullMed - noNotifyMed;
+  console.log(
+    `  notify-on-pull delta (pull - noNotify) = ${fmt(notifyDelta)}  ` +
+      `(sizes the 0.7.0 wait-flag payoff)`,
   );
   console.log();
 
