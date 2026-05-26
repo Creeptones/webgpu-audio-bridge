@@ -1,0 +1,48 @@
+webgpu-audio-bridge — cross-engine notify-cost bench
+
+engine     : Safari / JavaScriptCore
+UA         : Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1
+platform   : iPhone
+hwConcurr  : 4
+isolated   : true
+timestamp  : 2026-05-26T21:26:52.385Z
+
+schema     : physicsControlFrameSchema(1000)  capacity=16  frameBytes=16032
+batches    : 1000 × 1000 iters  (warmup 100 × 1000)
+
+pull (notify)   median= 880.0 ns  p99=  1.06 μs  p999=  1.30 μs  max=  1.30 μs  mean= 878.5 ns
+pull (noNotify) median= 860.0 ns  p99=  1.02 μs  p999=  1.14 μs  max=  1.14 μs  mean= 867.1 ns
+
+notify delta (notify - noNotify)  median=20.0 ns  p99=40.0 ns  max=160.0 ns
+
+interpretation:
+  delta < 200 ns. Safari / JavaScriptCore appears to short-circuit Atomics.notify with zero waiters (same as V8). The 0.7.0 wait-flag wire-format protocol payoff is small on this engine.
+
+Notes on the run
+================
+
+Captured via ngrok HTTPS tunnel from a Windows 11 host serving the bench
+on localhost:5175. The tunnel preserved the COOP / COEP / CORP headers
+intact — the report shows `isolated : true`, confirming SAB and high-
+resolution timer access were available on iOS Safari through the tunnel.
+No code changes needed for the tunnel path; ngrok is a transparent
+reverse proxy for these headers.
+
+Two unexpected findings beyond the wait-flag conclusion:
+
+  1. JSC is FASTER per pull than browser V8 on this fixture. 880 ns
+     median on a phone vs 1.96 μs on a desktop Chromium 148. Likely
+     reasons: Apple Silicon's ARM64 + JSC's native intrinsics for
+     typed-array operations; the Chrome browser context carries more
+     sandbox / security overhead than the Node V8 path (which was
+     1.30 μs in 0.6.11's bench/Bridge.bench.ts).
+
+  2. JSC's tail is tight. p99 is 180 ns above median, p999/max is
+     420 ns above. Comparable to V8, much tighter than SpiderMonkey
+     (which was 3-7 μs above median on the p99/p999). Lower GC noise
+     in tight typed-array loops on iOS than on desktop Firefox/x86_64.
+
+These observations are tangential to the wait-flag question but they
+do matter for downstream audio-thread jitter discussions — iOS Safari
+may turn out to be the BEST target for tight-loop audio code, not the
+worst, contrary to common assumption.

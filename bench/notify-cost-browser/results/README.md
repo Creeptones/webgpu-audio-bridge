@@ -12,28 +12,75 @@ One file per engine. Pasted reports from running
 |---|---|---|
 | Chromium / V8 (Chrome 148, Win11) | [`chromium-v8.txt`](./chromium-v8.txt) | captured via chrome-devtools MCP |
 | Firefox / SpiderMonkey (Firefox 151, Win11) | [`firefox-spidermonkey.txt`](./firefox-spidermonkey.txt) | captured manually |
-| Safari / JavaScriptCore | `safari-jsc.txt` | TODO — needs manual run |
+| Safari / JavaScriptCore (iOS 18.7, iPhone, Safari 26.5) | [`safari-jsc.txt`](./safari-jsc.txt) | captured via ngrok tunnel from Win11 host |
 
-## Interim cross-engine summary (V8 + SpiderMonkey)
+## Investigation 1 — final cross-engine summary
 
 | Engine | pull (notify) median | pull (noNotify) median | delta median | delta p99 |
 |---|---|---|---|---|
-| Chromium 148 / V8 | 1.96 μs | 1.92 μs | 40 ns | 75 ns |
-| Firefox 151 / SpiderMonkey | 2.02 μs | 2.00 μs | 20 ns | (noise-floor) |
-| Node 22 / V8 (Bridge.bench.ts) | 1.30 μs | 1.20 μs | ~100 ns | 100 ns |
+| Chromium 148 / V8 (desktop) | 1.96 μs | 1.92 μs | **40 ns** | 75 ns |
+| Firefox 151 / SpiderMonkey (desktop) | 2.02 μs | 2.00 μs | **20 ns** | (noise-floor; sign flips) |
+| Safari 26.5 / JSC (iOS 18.7, iPhone) | 880 ns | 860 ns | **20 ns** | 40 ns |
+| Node 22 / V8 (`bench/Bridge.bench.ts`) | 1.30 μs | 1.20 μs | **~100 ns** | 100 ns |
 
-All three measurements sit at or below their respective harness noise
-floors. **Both V8 and SpiderMonkey appear to short-circuit
-`Atomics.notify` with zero waiters in user space, without going to the
-kernel.** The 0.7.0 wait-flag wire-format extension's per-pull payoff
-is small on both engines.
+### Headline conclusion
 
-Safari/JSC is the remaining unknown. If JSC behaves like V8 and
-SpiderMonkey, the 0.7.0 wait-flag protocol is unmotivated by perf and
-lane 4 stays reserved for something with a clearer payoff. If JSC
-calls the platform wake primitive unconditionally (delta on the order
-of 500 ns – several μs), the protocol becomes a portability fix worth
-shipping.
+**All three major browser engine families short-circuit
+`Atomics.notify` with zero waiters in user space.** The per-pull notify
+delta is ≤ 100 ns on every engine measured — comparable to a single L1
+cache hit, not a syscall.
+
+The RFC's framing of "syscall on every pull" was wrong for V8, wrong
+for SpiderMonkey, AND wrong for JSC. The runtime layer is already
+doing the moral equivalent of the wait-flag optimization internally
+(via its own per-address waiter bookkeeping); the proposed wire-
+format extension would add a second redundant check on top.
+
+### Implications for 0.7.0
+
+The wait-flag wire-format extension is **no longer motivated by per-
+pull performance on the common no-waiter case**. Lane 4 stays reserved
+for now. Whether to ship the wait-flag protocol for 0.7.0 hinges on
+the remaining open questions:
+
+- **Investigation 3**: contended-notify cost (when the wake DOES go to
+  the kernel because the producer is actually parked). The wait-flag
+  protocol's whole structural payoff is supposed to be skipping the
+  syscall on the no-waiter case; the contended case has different
+  math entirely.
+- **Investigation 4**: real-AudioWorklet jitter under realistic
+  browser load. Even with the no-waiter notify at 20-100 ns median,
+  the question is whether the audio-thread tail is detectably affected.
+  If `process()` jitter is statistically indistinguishable with vs
+  without the notify, the protocol is provably unnecessary for
+  glitch-free audio.
+- **RT-safety / spec compliance**: independent of perf, is calling
+  `Atomics.notify` from an AudioWorklet `process()` spec-legal? If
+  not, the wait-flag protocol becomes a correctness fix rather than a
+  perf fix and would ship regardless of these bench numbers.
+
+### Surprise findings beyond the headline
+
+1. **JSC on iPhone is FASTER per-pull than V8 on desktop.** 880 ns
+   median on an iPhone vs 1.96 μs on Chromium desktop, both on the
+   same workload. Apple Silicon + JSC's typed-array intrinsics, plus
+   the Chrome browser context's sandbox overhead vs Node's lighter
+   path. iOS Safari may be the *best* target for tight-loop audio
+   code among browsers, not the worst.
+2. **SpiderMonkey tail is fatter than V8 / JSC.** Firefox p99/p999 are
+   3-7 μs above median on tight push+pull loops; V8 and JSC are
+   400-500 ns above median. Likely the GC tier + JIT tier-up timing,
+   not the SAB protocol. Worth recording for the Investigation 4
+   discussion since audio jitter is exactly the kind of thing fat
+   tails surface in.
+
+### What gets reused from Investigation 1
+
+The harness at `bench/notify-cost-browser/` is general — the same
+shape works for any future per-pull / per-push perf-isolation
+question that needs cross-engine numbers (Investigation 4's real-
+AudioWorklet variant could reuse the server + the engine detection +
+the report format, swapping just the inner measurement loop).
 
 The MCP only drives Chromium, so Firefox and Safari reports need to be
 captured by hand: open `http://localhost:5175/` in the browser, click
