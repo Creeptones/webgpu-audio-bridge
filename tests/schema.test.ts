@@ -21,6 +21,11 @@
  *      Byte-compatible with f{32,64}Array(n * order); trajectory tag
  *      propagates to FieldSpec, CompiledField, and SchemaLayoutFieldDescription.
  *      Invalid order / sampleCount rejected; schema stays frozen.
+ *  11. evaluateTrajectoryInto — Pillar 1 consumer-side Taylor evaluator
+ *      (0.6.1). Order=1 copies positions (dt ignored); order=2 is exact
+ *      `p + v·dt`; order=3 is exact `p + v·dt + ½·a·dt²`. f64 and f32
+ *      input variants. Bounds-checked. Allocation-free against caller's
+ *      pre-allocated `out` buffer.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -45,7 +50,9 @@ import {
   type FrameFor,
   type Schema,
   type TrajectoryOrder,
+  type TrajectorySpec,
 } from "../src/schema.js";
+import { evaluateTrajectoryInto } from "../src/trajectory.js";
 
 // ── 1. Scalar + array constructors ─────────────────────────────────────────
 function testConstructors(): void {
@@ -540,6 +547,160 @@ function testTrajectoryArrays(): void {
   ok("trajectory-arrays");
 }
 
+// ── 11. evaluateTrajectoryInto — consumer-side Taylor evaluator ────────────
+//
+// Pillar 1 ships the trajectory tag AND a single consumer-side helper that
+// reads it. Until Pillar 2 (PLL) and Pillar 3 (`pullEvaluated`) land,
+// `evaluateTrajectoryInto` is the bridge between a pulled trajectory frame
+// and an audio-rate consumer. Three orders, two precisions, bounds checks.
+function testEvaluateTrajectory(): void {
+  // order=1: positions only; dt is ignored (no derivative to extrapolate).
+  // The flat array is just [p0, p1, p2, ...].
+  {
+    const flat = new Float64Array([10, 20, 30, 40]);
+    const spec: TrajectorySpec = { order: 1, sampleCount: 4 };
+    const out = new Float64Array(4);
+    evaluateTrajectoryInto(flat, spec, 1234.5, out);
+    assertEq(out[0], 10, "order=1 out[0]");
+    assertEq(out[1], 20, "order=1 out[1]");
+    assertEq(out[2], 30, "order=1 out[2]");
+    assertEq(out[3], 40, "order=1 out[3]");
+  }
+
+  // order=2: linear Taylor. `[p0, v0, p1, v1, ...]`; out[i] = p_i + v_i·dt.
+  // Choose nice integers so the assertion is bit-exact under IEEE-754.
+  {
+    const flat = new Float64Array([
+      1.0, 2.0,   // sample 0: p=1, v=2
+      10.0, -5.0, // sample 1: p=10, v=-5
+      100.0, 0.0, // sample 2: p=100, v=0 (stays put)
+    ]);
+    const spec: TrajectorySpec = { order: 2, sampleCount: 3 };
+    const out = new Float64Array(3);
+    evaluateTrajectoryInto(flat, spec, 0.5, out);
+    assertEq(out[0], 1.0 + 2.0 * 0.5, "order=2 dt=0.5 out[0] = p+v·dt");
+    assertEq(out[1], 10.0 + -5.0 * 0.5, "order=2 dt=0.5 out[1] = p+v·dt");
+    assertEq(out[2], 100.0, "order=2 dt=0.5 out[2] = p (v=0)");
+
+    // dt=0 must return positions exactly (sanity: no NaN/extrapolation drift).
+    evaluateTrajectoryInto(flat, spec, 0, out);
+    assertEq(out[0], 1.0, "order=2 dt=0 returns p exactly");
+    assertEq(out[1], 10.0, "order=2 dt=0 returns p exactly");
+    assertEq(out[2], 100.0, "order=2 dt=0 returns p exactly");
+  }
+
+  // order=3: quadratic Taylor. `[p, v, a, ...]`; out = p + v·dt + ½·a·dt².
+  // Pick values where ½·a·dt² is an integer multiple to keep bit-exact.
+  {
+    const flat = new Float64Array([
+      0.0, 1.0, 4.0,    // sample 0: p=0, v=1, a=4
+      -1.0, 0.0, -2.0,  // sample 1: p=-1, v=0, a=-2
+    ]);
+    const spec: TrajectorySpec = { order: 3, sampleCount: 2 };
+    const out = new Float64Array(2);
+    const dt = 0.5;
+    const halfDt2 = 0.5 * dt * dt; // 0.125
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    assertEq(
+      out[0],
+      0.0 + 1.0 * 0.5 + 4.0 * halfDt2,
+      "order=3 dt=0.5 out[0] = p+v·dt+½a·dt²",
+    );
+    assertEq(
+      out[1],
+      -1.0 + 0.0 * 0.5 + -2.0 * halfDt2,
+      "order=3 dt=0.5 out[1] = p+v·dt+½a·dt²",
+    );
+  }
+
+  // f32 variant: overload selects Float32Array-typed paths.
+  // The element-write truncates to f32 precision automatically.
+  {
+    const flat = new Float32Array([1.5, 2.5, 3.5, -1.0]);
+    const spec: TrajectorySpec = { order: 2, sampleCount: 2 };
+    const out = new Float32Array(2);
+    evaluateTrajectoryInto(flat, spec, 1.0, out);
+    // f32 of (1.5 + 2.5*1.0) = 4.0 exact, (3.5 + -1.0*1.0) = 2.5 exact.
+    assertEq(out[0], 4.0, "f32 order=2 out[0]");
+    assertEq(out[1], 2.5, "f32 order=2 out[1]");
+    assert(out instanceof Float32Array, "f32 out remains Float32Array");
+  }
+
+  // Bounds: `out` too small → throw.
+  {
+    const flat = new Float64Array(4); // order=2, sampleCount=2 → flat needs 4
+    const spec: TrajectorySpec = { order: 2, sampleCount: 2 };
+    let threw = false;
+    try {
+      evaluateTrajectoryInto(flat, spec, 0, new Float64Array(1));
+    } catch {
+      threw = true;
+    }
+    assert(threw, "out length < sampleCount rejected");
+  }
+
+  // Bounds: `flat` too small → throw.
+  {
+    const spec: TrajectorySpec = { order: 3, sampleCount: 4 };
+    let threw = false;
+    try {
+      evaluateTrajectoryInto(
+        new Float64Array(8), // need 12 = 4 * 3
+        spec,
+        0,
+        new Float64Array(4),
+      );
+    } catch {
+      threw = true;
+    }
+    assert(threw, "flat length < sampleCount * order rejected");
+  }
+
+  // Out-buffer aliasing reuse — the function writes into the caller's out
+  // buffer in-place (no replacement). Verify a second call mutates the same
+  // backing Float64Array reference.
+  {
+    const flat = new Float64Array([1.0, 0.5]);
+    const spec: TrajectorySpec = { order: 2, sampleCount: 1 };
+    const out = new Float64Array(1);
+    const sameRef = out;
+    evaluateTrajectoryInto(flat, spec, 2.0, out);
+    assertEq(out[0], 1.0 + 0.5 * 2.0, "in-place write #1");
+    assert(sameRef === out, "out reference unchanged after call");
+    evaluateTrajectoryInto(flat, spec, 4.0, out);
+    assertEq(out[0], 1.0 + 0.5 * 4.0, "in-place write #2 reuses out buffer");
+  }
+
+  // End-to-end with the DSL: pull `spec` straight off a CompiledField,
+  // confirming evaluator + DSL round-trip with no manual TrajectorySpec
+  // construction. This is the pattern downstream consumers will use.
+  {
+    const N = 8;
+    const s = defineSchema({
+      seq: u64(),
+      vEff: f64TrajectoryArray(N, { order: 2 }),
+    });
+    const cf = s.compiled.fields.find((f) => f.name === "vEff")!;
+    assert(cf.trajectory !== undefined, "DSL provides trajectory tag");
+    const flat = new Float64Array(N * 2);
+    for (let i = 0; i < N; i++) {
+      flat[i * 2] = i * 10;       // position
+      flat[i * 2 + 1] = 1.0;      // velocity (all samples drift at 1.0)
+    }
+    const out = new Float64Array(N);
+    evaluateTrajectoryInto(flat, cf.trajectory!, 0.25, out);
+    for (let i = 0; i < N; i++) {
+      assertEq(
+        out[i]!,
+        i * 10 + 1.0 * 0.25,
+        `DSL→evaluator round-trip sample ${i}`,
+      );
+    }
+  }
+
+  ok("evaluate-trajectory");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -551,6 +712,7 @@ function main(): void {
   testSchemaFrozen();
   testWithInvariant();
   testTrajectoryArrays();
+  testEvaluateTrajectory();
   console.log("ALL PASS schema");
 }
 

@@ -4,6 +4,56 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.1] — 2026-05-25
+
+### Added — trajectory arrays (Pillar 1 of phase-locked extrapolation)
+
+The bridge has historically packed *state* into a frame — a sampled position at the producer's timestamp. The consumer that wanted continuous-time output had to guess the derivative from sampled history (the 0.4.1 α-smoother does this implicitly) or accept step-function aliasing at the producer's rate. The producer almost always knows the derivative exactly — a GPU physics shader computes velocity and acceleration as part of its update — and 0.6.0's schema DSL is extensible. 0.6.1 ships the additive schema constructors that let the producer pack derivatives directly into the frame, and a single consumer-side Taylor evaluator that reads them.
+
+- **`f64TrajectoryArray(n, { order })`** and **`f32TrajectoryArray(n, { order })`** — new schema field constructors next to the existing `f{32,64}Array(n)`. The underlying storage is a flat interleaved typed-array of `n * order` elements:
+  - **`order: 1`** — positions only. Byte-identical to `f{32,64}Array(n)`. Lets a schema opt in field-by-field without changing wire format yet.
+  - **`order: 2`** — `[p0, v0, p1, v1, ..., p_{n-1}, v_{n-1}]`. Linear Taylor extrapolation: `value(dt) = p + v · dt`.
+  - **`order: 3`** — `[p0, v0, a0, p1, v1, a1, ...]`. Quadratic Taylor / cubic Hermite: `value(dt) = p + v · dt + ½ · a · dt²`.
+
+  Order is restricted to `1 | 2 | 3` at both the TS literal-type level and the runtime validator. Higher orders on a unitary stepper are an open research direction — deferred until there is a concrete consumer for them.
+
+- **`TrajectorySpec`** (`{ order, sampleCount }`) is a new tag on `FieldSpec`, `CompiledField`, and `SchemaLayoutFieldDescription`. Same shape in all three views so main-thread consumers (which see `Schema`) and worklet-side inliners (which see `SchemaLayoutDescription`) read it from one nested location with no cross-referencing. The tag is descriptive — the codec walks the flat element count exactly like any other array — so non-trajectory consumers ignore it transparently.
+
+- **`evaluateTrajectoryInto(flat, spec, dt, out)`** — the single consumer-side hot-path helper. Overloaded for `Float64Array` and `Float32Array`. Allocation-free against the caller's pre-allocated `out` buffer. The order switch happens once per call (out of the loop); the inner loops are branch-free. Six ALU ops per sample at order=2; eight at order=3. Expected cost ~5–10 ns/sample on a modern x86, well under the 50 ns/sample budget the plan targets for the eventual Bridge-integrated `evaluateInto`.
+
+- **`dt` and unit handling.** The evaluator is unit-agnostic — the producer chose the units of velocity / acceleration when it packed the frame, and the consumer supplies a matching `dt` (`units/second → dt in seconds`, `units/ns → dt in ns`). Clock recovery is the consumer's responsibility until Pillar 2 (PLL) lands; until then, the typical pattern is `dt = (consumerNowNs - frame.tMacroNs) * 1e-9`.
+
+### Why — derivatives the producer already knows, paid forward into audio
+
+A GPU physics shader stepping a wave equation, an FDTD lattice, a spring-mass network, or the wavefunction synth's Strang-split unitary evolution computes velocities (and frequently accelerations) as part of its update. That data has historically been discarded at the SAB boundary, leaving the consumer to estimate derivatives from sampled history with a one-frame lag (α-smoother) or accept the step-function aliasing of pure pull-latest. Both choices waste information the producer already has.
+
+Packing the derivative into the frame and letting the consumer evaluate `p + v · dt` at audio rate is the trivial change that lets the consumer reconstruct a continuous-time signal *consistent with the producer's PDE by construction* — not a numerical approximation. For a unitary stepper (Strang split, leapfrog), the Taylor remainder is bounded by `O(dt²)` at order 2 and `O(dt³)` at order 3 — small in absolute terms over the sub-millisecond `dt` between successive audio-thread evaluations and the most-recent macro-frame timestamp.
+
+Interleaved layout (`[p0, v0, p1, v1, ...]` rather than concatenated `[p0, p1, ..., v0, v1, ...]`) keeps each sample's position and derivatives cache-line adjacent so the evaluator walks the trajectory in one pass with minimal L1 misses for typical `N=128–2048` voice grids.
+
+### Wire compatibility
+
+- **No-trajectory schemas are unaffected.** Existing `f64Array(n)` / `f32Array(n)` fields read and write byte-for-byte as in 0.6.0; no field carries a `trajectory` tag unless explicitly opted in via `f{32,64}TrajectoryArray`. Pure additive metadata.
+- **`f{32,64}TrajectoryArray(n, { order: 1 })` is wire-compatible with `f{32,64}Array(n)`.** A 0.6.0 peer cannot tell the difference — same byte layout, same byte count. Only the field's compiled metadata differs.
+- **`order: 2` and `order: 3` change the field's byte count** (`n × order × bytesPerElement` instead of `n × bytesPerElement`). A schema that swaps `f64Array(64)` for `f64TrajectoryArray(64, { order: 2 })` doubles that field's footprint and produces a different total frame stride. Producer and consumer must agree on the schema (as always).
+- **No header lane changes.** Lanes 0–3 stay as in 0.6.0; lanes 4–7 still reserved (Pillar 2's PLL will use lanes 4–5 in a future release).
+
+### Tests
+
+`tests/schema.test.ts` grows from 9 to 11 pins:
+
+- **`testTrajectoryArrays`** — DSL layer (pin #10). `f64TrajectoryArray(n, { order: 1 })` is byte-identical to `f64Array(n)`; `order: 2` doubles the flat length and stores the trajectory tag; `f32TrajectoryArray` round-trips with `kind: "f32"` and any order. Tag propagates through `defineSchema` → `CompiledField` → `describeSchemaLayout`. Invalid orders (0, 4, 2.5) and invalid sampleCounts (0, -1, 1.5) are rejected. `FieldSpec` and the nested `trajectory` tag are frozen. `FrameFor<S>` inference compiles for the trajectory field.
+
+- **`testEvaluateTrajectory`** — evaluator layer (pin #11). Order=1 copies positions exactly (dt ignored); order=2 is bit-exact `p + v · dt` (verified at `dt = 0` and `dt = 0.5` against analytic expressions); order=3 is bit-exact `p + v · dt + ½ · a · dt²`. f32 overload writes through a `Float32Array` with automatic precision truncation. `out` too small and `flat` too small both throw. In-place writes reuse the same `out` reference across repeated calls. End-to-end with the DSL: pulls the `TrajectorySpec` straight off `compiledField.trajectory!` and evaluates without manual spec construction — the pattern downstream consumers will use.
+
+### Documentation
+
+- New `Trajectory arrays (0.6.1 — Pillar 1 scaffolding)` section in `src/schema.ts` header documenting the interleaved layout, the order restriction, and the wire-compat guarantee for `order: 1`.
+- New `src/trajectory.ts` with the evaluator and full math / units / clock-recovery / performance documentation in its file header.
+- README `Schema DSL` section gains a `#### Trajectory arrays — Pillar 1 of phase-locked extrapolation` subsection with a worked example.
+- README `Roadmap → Shipped` collapses the 0.6.0 entry and adds a 0.6.1 entry pointing at the new section.
+- The Phase-Locked Extrapolation plan ([`WebsitePlans/WebAudioBridge Beyond 1 and 4 - Phase-Locked Extrapolation Plan.md`](../NewProject/website/WebsitePlans/WebAudioBridge%20Beyond%201%20and%204%20-%20Phase-Locked%20Extrapolation%20Plan.md)) anticipates this release as "Optional half-step before 0.7.0" — 0.6.1 is exactly that. Pillars 2 (PLL) and 3 (`pullEvaluated` / `evaluateInto`) remain on the roadmap and will land as future bumps.
+
 ## [0.6.0] — 2026-05-25
 
 ### Added — `Bridge<Schema>` schema invariants (cross-IPC bit-rot detection)

@@ -54,6 +54,10 @@ export type {
   TrajectorySpec,
 } from "./schema.js";
 
+// Trajectory evaluator — consumer-side Taylor extrapolation helper that
+// reads the f{32,64}TrajectoryArray tag. See src/trajectory.ts header.
+export { evaluateTrajectoryInto } from "./trajectory.js";
+
 // Canonical schemas — see src/schemas/physics.ts.
 export {
   physicsControlFrameSchema,

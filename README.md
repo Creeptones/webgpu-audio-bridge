@@ -275,6 +275,7 @@ The full set of field constructors:
 | `u16()` / `i16()` | `number` | `u16Array(n)` / `i16Array(n)` | `Uint16Array` / `Int16Array` |
 | `u8()`  / `i8()`  | `number` | `u8Array(n)`  / `i8Array(n)`  | `Uint8Array`  / `Int8Array`  |
 | `f64()` / `f32()` | `number` | `f64Array(n)` / `f32Array(n)` | `Float64Array` / `Float32Array` |
+| — | — | `f64TrajectoryArray(n, { order })` / `f32TrajectoryArray(n, { order })` | `Float64Array` / `Float32Array` (length `n × order`) |
 
 `defineSchema({ ... })` validates field names (must be valid JS identifiers, no duplicates), groups fields internally by alignment class (8-aligned first, then 4, then 2, then 1; stable within class) so SAB-backed typed-array views land at legal byte offsets, and pads the frame size up to 8.
 
@@ -298,6 +299,45 @@ const schema = defineSchema({
 ```
 
 The bridge auto-computes the invariant at push and verifies at pull, falling back to the last-known-good frame on hard errors and engaging the α-smoother on soft errors. See [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection) for the protocol and recovery behavior.
+
+#### Trajectory arrays — Pillar 1 of phase-locked extrapolation
+
+Pack the producer's derivatives directly into the frame so the consumer can evaluate a continuous-time signal sample-by-sample (0.6.1):
+
+```ts
+import {
+  defineSchema, u64, f64TrajectoryArray, evaluateTrajectoryInto,
+} from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq: u64(),
+  tMacroNs: u64(),
+  // 64 samples, interleaved [p0, v0, p1, v1, ..., p63, v63] — 128 f64 elements.
+  vEff: f64TrajectoryArray(64, { order: 2 }),
+});
+
+// Producer (GPU side): pack position AND velocity into the same field.
+const frame = bridge.scratchFrame();
+for (let i = 0; i < 64; i++) {
+  frame.vEff[i * 2]     = position[i];   // p_i
+  frame.vEff[i * 2 + 1] = velocity[i];   // v_i
+}
+bridge.push(frame);
+
+// Consumer (AudioWorklet): evaluate at sub-sample dt against the
+// producer's timestamp. dt units must match the velocity units chosen
+// at the producer — units/sec → dt in seconds; units/ns → dt in ns.
+const trajSpec = schema.compiled.fields.find((f) => f.name === "vEff")!.trajectory!;
+const out = new Float64Array(64); // pre-allocated once
+// ... pull a frame ...
+const dtSec = (consumerNowNs - Number(frame.tMacroNs)) * 1e-9;
+evaluateTrajectoryInto(frame.vEff, trajSpec, dtSec, out);
+synth.step(out); // out[i] = p_i + v_i · dt
+```
+
+The trajectory tag (`{ order, sampleCount }`) rides on `FieldSpec`, `CompiledField`, and `SchemaLayoutFieldDescription`, so worklet-side inliners that consume only `bridge.describeLayout()` can read it from the same place. Order is `1 | 2 | 3`: `order: 1` is byte-identical to `f64Array(n)` (positions only), `order: 2` enables linear Taylor extrapolation (`p + v · dt`), `order: 3` enables quadratic Taylor / cubic Hermite (`p + v · dt + ½ · a · dt²`). The interleaved layout (rather than concatenated `[p…, v…, a…]`) keeps each sample's position and derivatives cache-line adjacent.
+
+This is the Pillar 1 release of the [Phase-Locked Extrapolation plan](https://github.com/Creeptones/webgpu-audio-bridge#roadmap) — the schema + evaluator half. Pillars 2 (nanosecond PLL for clock recovery between producer and consumer) and 3 (`bridge.pullEvaluated(out, sampleOffset)` that wraps pull + PLL + evaluate into one hot-path call) remain on the roadmap. Until they land, the consumer wires the dt by hand as shown above.
 
 ### Legacy API — `Float64RingBuffer`
 
@@ -492,6 +532,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with skip-scaling (`α_eff = α_base · 2⁻ˢᵏⁱᵖᵖᵉᵈ`) on the latest variant.
 - ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
 - ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
+- ✅ **0.6.1 — Trajectory arrays (Pillar 1 of phase-locked extrapolation)** (`f64TrajectoryArray(n, { order })`, `f32TrajectoryArray(n, { order })`, and `evaluateTrajectoryInto(...)`). Producers pack interleaved `(p, v, [a])` samples into a frame field; consumers Taylor-extrapolate to a continuous-time signal at audio rate via the helper. Pillars 2 (nanosecond PLL) and 3 (`pullEvaluated`) remain ahead — see [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
 
 ### Remaining 1.0 work
 
