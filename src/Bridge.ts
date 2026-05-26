@@ -350,6 +350,56 @@
  *   - Cross-process observability via lanes 4-5. Producer can read the
  *     consumer's offset for unified telemetry / DevTools dashboards.
  *
+ * ─── Per-frame evaluator (0.6.3, Pillar 3 first cut) ─────────────────────
+ *
+ * `bridge.evaluateInto(srcFrame, dt, outFrame)` is the consumer-side
+ * primitive that closes the trajectory-evaluation story. With Pillar 1
+ * (0.6.1) the consumer had to loop over trajectory fields manually,
+ * calling `evaluateTrajectoryInto` per field; with Pillar 3 the bridge
+ * walks `compiled.fields` and applies the per-field evaluator across the
+ * whole frame in one call.
+ *
+ * Field dispatch:
+ *   - Trajectory field → evaluateTrajectoryInto with the field's spec.
+ *   - Non-trajectory array → outFrame[name].set(srcFrame[name]).
+ *   - Scalar → outFrame[name] = srcFrame[name].
+ *
+ * Heap-only. Never touches the SAB. The producer can be writing the
+ * *next* frame in shared memory while the consumer re-evaluates the
+ * *current* one in its private heap copy at audio rate — no cache-line
+ * pingpong, no atomic ops.
+ *
+ * Shape contract on `outFrame`:
+ *   - Trajectory fields: length ≥ `spec.sampleCount` (positions only;
+ *     NOT sampleCount * order — the source carries derivatives, the
+ *     output is post-Taylor-evaluation positions).
+ *   - Non-trajectory arrays: length ≥ srcFrame's length.
+ *   - Scalars: any value of the matching type (will be overwritten).
+ *
+ * `scratchEvaluatedFrame()` allocates an outFrame with the correct shape
+ * for any schema. Call once at consumer init, reuse on every evaluateInto.
+ *
+ * `dt` is unit-agnostic — same contract as evaluateTrajectoryInto.
+ * Velocity / acceleration units chosen at the producer; the caller
+ * supplies a matching `dt`. The canonical AudioWorklet pattern combines
+ * pullLatest + observeConsumerTime + per-sample dt + evaluateInto:
+ *
+ *     this.bridge.pullLatest(this.rawFrame);
+ *     this.bridge.observeConsumerTime(quantumNs, Number(this.rawFrame.tMacroNs));
+ *     for (let i = 0; i < 128; i++) {
+ *       const cNs = quantumNs + (i / sampleRate) * 1e9;
+ *       const dtNs = this.bridge.phaseLockedTime(cNs) - Number(this.rawFrame.tMacroNs);
+ *       this.bridge.evaluateInto(this.rawFrame, dtNs * 1e-9, this.evalFrame);
+ *       block[i] = this.synth.step(this.evalFrame.vEff);
+ *     }
+ *
+ * Deferred Pillar 3 follow-ups (still in the plan):
+ *   - `pullEvaluated(out, sampleOffset, sampleRate)` sugar wrapping
+ *     pull + observe + evaluate into a single hot-path call.
+ *   - `EvalMode` dispatch (step / alpha / trajectory / catmull) chosen
+ *     once at construction so the hot path is one precompiled branch.
+ *   - Per-quantum batch API that writes all 128 samples in one call.
+ *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
  * Compared to the hand-rolled Float64RingBuffer code path, Bridge<S> pays a
@@ -382,6 +432,7 @@ import {
   type Schema,
   type SchemaLayoutDescription,
 } from "./schema.js";
+import { evaluateTrajectoryInto } from "./trajectory.js";
 
 export const RING_HEADER_BYTES = 32;
 export const RING_HEADER_LANES = 2; // active counter lanes: write_index (Int32 lane 0), read_index (Int32 lane 1). Other active control lanes (flow_scale on lane 2) are accounted for separately — this constant counts only SPSC counters.
@@ -1200,6 +1251,120 @@ export class Bridge<S extends Schema<FieldsObject>> {
     this.pllLocked = false;
     this.pllOffsetNs = 0;
     this.pllIntegral = 0;
+  }
+
+  /**
+   * Per-frame trajectory evaluator (0.6.3, Pillar 3 first cut). Walks every
+   * field of the schema and applies the Pillar 1 evaluator to trajectory
+   * fields; everything else passes through into `outFrame` verbatim. Heap-
+   * only — no SAB access, no internal state — so safe to call repeatedly
+   * at audio rate without cache-line pingpong against the producer.
+   *
+   * Field dispatch (compiled.fields order):
+   *   - trajectory field → evaluateTrajectoryInto(srcFrame[name], spec, dt,
+   *     outFrame[name]). outFrame's field must be a typed-array of length
+   *     ≥ spec.sampleCount (NOT sampleCount * order — the output is the
+   *     extrapolated positions only). Pre-allocate via scratchEvaluatedFrame().
+   *   - non-trajectory array → outFrame[name].set(srcFrame[name]). Lengths
+   *     must match.
+   *   - scalar (number or BigInt) → outFrame[name] = srcFrame[name].
+   *
+   * `dt` is unit-agnostic — same contract as evaluateTrajectoryInto. The
+   * producer chose the velocity / acceleration units when packing the
+   * trajectory; the caller supplies a matching `dt`. Combined with Pillar
+   * 2's PLL, the canonical AudioWorklet pattern is:
+   *
+   *     this.bridge.pullLatest(this.rawFrame);
+   *     this.bridge.observeConsumerTime(quantumNs, Number(this.rawFrame.tMacroNs));
+   *     for (let i = 0; i < 128; i++) {
+   *       const cNs = quantumNs + (i / sampleRate) * 1e9;
+   *       const dtNs = this.bridge.phaseLockedTime(cNs) - Number(this.rawFrame.tMacroNs);
+   *       this.bridge.evaluateInto(this.rawFrame, dtNs * 1e-9, this.evalFrame);
+   *       block[i] = this.synth.step(this.evalFrame.vEff);
+   *     }
+   *
+   * Cost scales with field count. ~5-10 ns per trajectory sample at
+   * order=2; a couple of ns per scalar field; one typed-array .set() per
+   * non-trajectory array. Allocation-free against caller-owned buffers.
+   *
+   * Pillar 3 deferred (still in the plan, queued for follow-ups):
+   *   - bridge.pullEvaluated(out, sampleOffset, sampleRate) sugar wrapping
+   *     pull + observe + evaluate into a single hot-path call.
+   *   - EvalMode dispatch (step / alpha / trajectory / catmull) — needs
+   *     design discussion about composition with pullSmoothed.
+   *   - Per-quantum batch API (write all 128 samples in one call).
+   */
+  evaluateInto(srcFrame: FrameFor<S>, dt: number, outFrame: FrameFor<S>): void {
+    if (!Number.isFinite(dt)) {
+      throw new Error(`evaluateInto: dt must be finite, got ${dt}`);
+    }
+    const src = srcFrame as unknown as Record<string, unknown>;
+    const out = outFrame as unknown as Record<string, unknown>;
+    const fields = this.schema.compiled.fields;
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i]!;
+      const name = field.name;
+      if (field.trajectory) {
+        // Trajectory field. evaluateTrajectoryInto throws on length
+        // mismatch — we don't pre-validate, the helper's message is clearer.
+        if (field.kind === "f64") {
+          evaluateTrajectoryInto(
+            src[name] as Float64Array,
+            field.trajectory,
+            dt,
+            out[name] as Float64Array,
+          );
+        } else if (field.kind === "f32") {
+          evaluateTrajectoryInto(
+            src[name] as Float32Array,
+            field.trajectory,
+            dt,
+            out[name] as Float32Array,
+          );
+        } else {
+          // Defensive — the DSL only allows trajectory tags on f64/f32.
+          throw new Error(
+            `evaluateInto: trajectory field '${name}' has unexpected kind '${field.kind}'`,
+          );
+        }
+      } else if (field.isArray) {
+        // Non-trajectory array — verbatim .set(). TypedArray.set throws
+        // RangeError if out is shorter than src; we let that surface.
+        (out[name] as { set(s: ArrayLike<unknown>): void }).set(
+          src[name] as ArrayLike<unknown>,
+        );
+      } else {
+        // Scalar (number or BigInt) — direct copy.
+        out[name] = src[name];
+      }
+    }
+  }
+
+  /**
+   * Allocate a reusable output frame shaped for evaluateInto. Trajectory
+   * fields are sized to `sampleCount` (post-Taylor-evaluation positions);
+   * everything else matches scratchFrame() — non-trajectory arrays at
+   * their full length, scalars zero-initialized.
+   *
+   * Call once at consumer init outside the hot loop; reuse the returned
+   * object on every evaluateInto call.
+   */
+  scratchEvaluatedFrame(): FrameFor<S> {
+    const out: Record<string, unknown> = {};
+    for (const field of this.schema.compiled.fields) {
+      if (field.trajectory) {
+        // Post-evaluation: extrapolated positions only, length = sampleCount.
+        out[field.name] = newHeapTypedArray(
+          field.kind,
+          field.trajectory.sampleCount,
+        );
+      } else if (field.isArray) {
+        out[field.name] = newHeapTypedArray(field.kind, field.length);
+      } else {
+        out[field.name] = kindTsType(field.kind) === "bigint" ? 0n : 0;
+      }
+    }
+    return out as FrameFor<S>;
   }
 
   /**

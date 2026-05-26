@@ -88,6 +88,17 @@
  *  43. PLL step-response, resetPll, and argument validation. Sudden
  *      offset jump settles via PI math; resetPll() flips back to
  *      unlocked; non-finite arguments throw.
+ *  44. evaluateInto round-trip on a mixed schema (0.6.3, Pillar 3 first
+ *      cut). Trajectory fields (f64 order=2, f32 order=3) Taylor-evaluate
+ *      to expected closed-form values; non-trajectory arrays copy verbatim;
+ *      scalars (BigInt + number) copy verbatim. scratchEvaluatedFrame
+ *      sizes trajectory fields to sampleCount (not sampleCount * order).
+ *  45. evaluateInto on a no-trajectory schema is a pure copy: every field
+ *      ends up bit-exact in outFrame. Validates the "passes through"
+ *      contract for the trivial-degenerate case.
+ *  46. evaluateInto validation: non-finite dt throws; outFrame too small
+ *      for a trajectory field surfaces evaluateTrajectoryInto's error
+ *      (consistent with calling the helper directly).
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -98,12 +109,14 @@ import { Bridge, RING_HEADER_BYTES } from "../src/Bridge.js";
 import {
   defineSchema,
   f32,
+  f32TrajectoryArray,
   f64,
+  f64Array,
+  f64TrajectoryArray,
   u64,
   u32,
   u8,
   u8Array,
-  f64Array,
   type FrameFor,
 } from "../src/schema.js";
 import {
@@ -1868,6 +1881,178 @@ function testPllStepAndResetAndValidation(): void {
   ok("pll-step-and-reset-and-validation");
 }
 
+// ── 44. evaluateInto round-trip on a mixed-field schema (0.6.3, Pillar 3) ──
+//
+// A schema with both trajectory and non-trajectory fields exercises the
+// full field-walk dispatch. Trajectory fields run evaluateTrajectoryInto;
+// non-trajectory arrays copy via .set(); scalars copy verbatim. The
+// scratchEvaluatedFrame() helper sizes trajectory fields to sampleCount
+// (the post-evaluation length) rather than sampleCount * order.
+function testEvaluateIntoMixedSchema(): void {
+  const N = 8;
+  const schema = defineSchema({
+    seq: u64(),                                  // BigInt scalar
+    tMacroNs: u64(),                             // BigInt scalar
+    vMax: f64(),                                 // number scalar
+    label: u8Array(4),                           // non-trajectory array
+    vEff: f64TrajectoryArray(N, { order: 2 }),   // f64 order=2 (interleaved p,v)
+    aEff: f32TrajectoryArray(N, { order: 3 }),   // f32 order=3 (interleaved p,v,a)
+  });
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  // Build src: each sample i has position=10*i, velocity=1, acceleration=2
+  // (for the f32 order=3 field). The f64 order=2 field uses position=100*i,
+  // velocity=-5 so we can distinguish them.
+  const src = ring.scratchFrame();
+  src.seq = 42n;
+  src.tMacroNs = 1_234_567_890n;
+  src.vMax = 0.5;
+  src.label.set([0xAA, 0xBB, 0xCC, 0xDD]);
+  for (let i = 0; i < N; i++) {
+    src.vEff[i * 2]     = 100 * i;   // p
+    src.vEff[i * 2 + 1] = -5;        // v
+    src.aEff[i * 3]     = 10 * i;    // p
+    src.aEff[i * 3 + 1] = 1;         // v
+    src.aEff[i * 3 + 2] = 2;         // a
+  }
+
+  // scratchEvaluatedFrame sizes trajectory fields to sampleCount.
+  const out = ring.scratchEvaluatedFrame();
+  assertEq(out.vEff.length, N, "scratchEvaluatedFrame: vEff length = sampleCount");
+  assertEq(out.aEff.length, N, "scratchEvaluatedFrame: aEff length = sampleCount");
+  assertEq(out.label.length, 4, "scratchEvaluatedFrame: non-trajectory array length matches");
+  assert(out.vEff instanceof Float64Array, "scratchEvaluatedFrame: f64 trajectory → Float64Array");
+  assert(out.aEff instanceof Float32Array, "scratchEvaluatedFrame: f32 trajectory → Float32Array");
+  assertEq(typeof out.seq, "bigint", "scratchEvaluatedFrame: BigInt scalar zero-init");
+  assertEq(out.seq, 0n, "scratchEvaluatedFrame: BigInt scalar = 0n");
+  assertEq(out.vMax, 0, "scratchEvaluatedFrame: number scalar = 0");
+
+  // Evaluate at dt = 0.5 (unit-agnostic; matches whatever the producer's
+  // velocity units are — here we treat them as samples-per-dt-unit for
+  // ease of computing closed-form expectations).
+  const dt = 0.5;
+  ring.evaluateInto(src, dt, out);
+
+  // Scalars copied verbatim.
+  assertEq(out.seq, 42n, "scalar BigInt copied verbatim");
+  assertEq(out.tMacroNs, 1_234_567_890n, "scalar BigInt copied verbatim (tMacroNs)");
+  assertEq(out.vMax, 0.5, "scalar number copied verbatim");
+
+  // Non-trajectory array copied verbatim via .set().
+  assertEq(out.label[0], 0xAA, "non-trajectory array: byte 0 copied");
+  assertEq(out.label[1], 0xBB, "non-trajectory array: byte 1 copied");
+  assertEq(out.label[2], 0xCC, "non-trajectory array: byte 2 copied");
+  assertEq(out.label[3], 0xDD, "non-trajectory array: byte 3 copied");
+
+  // f64 order=2 trajectory: out[i] = 100*i + -5 * 0.5 = 100*i - 2.5.
+  for (let i = 0; i < N; i++) {
+    assertEq(
+      out.vEff[i],
+      100 * i + -5 * dt,
+      `vEff[${i}] = p + v·dt = ${100 * i + -5 * dt}`,
+    );
+  }
+
+  // f32 order=3 trajectory: out[i] = 10*i + 1 * 0.5 + 0.5 * 2 * 0.25
+  //                                = 10*i + 0.5 + 0.25 = 10*i + 0.75.
+  // f32 precision: 10*i + 0.75 is exact for small i (≤ 2^24/10 ≈ 1.6M).
+  for (let i = 0; i < N; i++) {
+    const expected = 10 * i + 1 * dt + 0.5 * 2 * dt * dt;
+    assertEq(out.aEff[i], expected, `aEff[${i}] = p + v·dt + ½·a·dt² = ${expected}`);
+  }
+
+  // dt=0 with order≥2 returns positions exactly (sanity).
+  ring.evaluateInto(src, 0, out);
+  for (let i = 0; i < N; i++) {
+    assertEq(out.vEff[i], 100 * i, `dt=0: vEff[${i}] = p exactly`);
+    assertEq(out.aEff[i], 10 * i, `dt=0: aEff[${i}] = p exactly`);
+  }
+
+  // Round-trippable: call again with same src, get same result. No hidden
+  // state mutation between calls.
+  ring.evaluateInto(src, dt, out);
+  assertEq(out.vEff[3], 300 - 2.5, "round-tripped: vEff[3] still matches");
+  assertEq(out.aEff[2], 20 + 0.75, "round-tripped: aEff[2] still matches");
+
+  ok("evaluate-into-mixed-schema");
+}
+
+// ── 45. evaluateInto on a no-trajectory schema is a pure copy ──────────────
+//
+// Degenerate case — no trajectory fields means evaluateInto reduces to a
+// memcpy of every field from src to out. Pins the "non-trajectory fields
+// pass through" contract for schemas that don't (yet) use trajectories.
+// Useful primitive for snapshotting frames without forcing trajectory
+// migration.
+function testEvaluateIntoNoTrajectorySchema(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const src = makePhysFrame(7, n);
+  const out = ring.scratchEvaluatedFrame();
+  // scratchEvaluatedFrame on a no-trajectory schema is identical to
+  // scratchFrame: arrays at full length, scalars zero-init.
+  assertEq(out.vEff.length, n, "scratchEvaluatedFrame: vEff length = n");
+  assertEq(out.jEff.length, n, "scratchEvaluatedFrame: jEff length = n");
+
+  // dt is irrelevant when no trajectory fields are present. Pick a
+  // recognizable value to confirm it does NOT leak into the output.
+  ring.evaluateInto(src, 999.9, out);
+
+  assertEq(out.seq, src.seq, "no-trajectory: seq copied verbatim");
+  assertEq(out.tMacroNs, src.tMacroNs, "no-trajectory: tMacroNs copied verbatim");
+  assertEq(out.vMax, src.vMax, "no-trajectory: vMax copied verbatim");
+  assertEq(out.jMax, src.jMax, "no-trajectory: jMax copied verbatim");
+  for (let k = 0; k < n; k++) {
+    assertEq(out.vEff[k], src.vEff[k], `no-trajectory: vEff[${k}] copied verbatim`);
+    assertEq(out.jEff[k], src.jEff[k], `no-trajectory: jEff[${k}] copied verbatim`);
+  }
+
+  ok("evaluate-into-no-trajectory-schema");
+}
+
+// ── 46. evaluateInto validation ────────────────────────────────────────────
+//
+// Non-finite dt throws cleanly. An out-frame's trajectory field too small
+// to hold the evaluated positions surfaces evaluateTrajectoryInto's
+// error message (we explicitly do NOT pre-validate to avoid double-checking
+// the same contract).
+function testEvaluateIntoValidation(): void {
+  const N = 4;
+  const schema = defineSchema({
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  });
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const src = ring.scratchFrame();
+  const out = ring.scratchEvaluatedFrame();
+
+  // Non-finite dt rejected.
+  let threw = false;
+  try { ring.evaluateInto(src, NaN, out); } catch { threw = true; }
+  assert(threw, "evaluateInto: NaN dt throws");
+  threw = false;
+  try { ring.evaluateInto(src, Infinity, out); } catch { threw = true; }
+  assert(threw, "evaluateInto: Infinity dt throws");
+  threw = false;
+  try { ring.evaluateInto(src, -Infinity, out); } catch { threw = true; }
+  assert(threw, "evaluateInto: -Infinity dt throws");
+
+  // Out-frame trajectory field too small: evaluateTrajectoryInto throws.
+  const undersized = ring.scratchEvaluatedFrame();
+  // Replace the vEff buffer with one that's too small.
+  (undersized as unknown as { vEff: Float64Array }).vEff = new Float64Array(N - 1);
+  threw = false;
+  try { ring.evaluateInto(src, 0.1, undersized); } catch { threw = true; }
+  assert(threw, "evaluateInto: undersized out trajectory throws");
+
+  ok("evaluate-into-validation");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -1913,6 +2098,9 @@ function main(): void {
   testPllColdStart();
   testPllConvergence();
   testPllStepAndResetAndValidation();
+  testEvaluateIntoMixedSchema();
+  testEvaluateIntoNoTrajectorySchema();
+  testEvaluateIntoValidation();
   console.log("\nAll Bridge tests passed.");
 }
 

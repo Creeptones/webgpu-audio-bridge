@@ -377,7 +377,58 @@ The PLL is a 2nd-order PI controller (proportional + integral) over the residual
 
 State lives entirely on the consumer's `Bridge` instance — the SAB header is byte-for-byte unchanged from 0.6.1, so a 0.6.2 peer and a 0.6.1 peer share a SAB transparently. `bridge.telemetry()` exposes `pllLocked` and `pllOffsetNs` for diagnostics. Call `bridge.resetPll()` on AudioContext suspend/resume or whenever the producer's `tMacroNs` epoch jumps.
 
-This is the **first cut** of Pillar 2 — offset estimation only. Drift estimation, the Mahalanobis outlier gate for `mapAsync` stalls, and cross-process observability via header lanes 4-5 remain queued as future patches. Pillar 3 (`bridge.pullEvaluated(out, sampleOffset)` that wraps pull + observe + evaluate into one hot-path call) is also still ahead.
+This is the **first cut** of Pillar 2 — offset estimation only. Drift estimation, the Mahalanobis outlier gate for `mapAsync` stalls, and cross-process observability via header lanes 4-5 remain queued as future patches. Pillar 3's full `bridge.pullEvaluated(out, sampleOffset)` sugar wrapping pull + observe + evaluate is still ahead; the primitive evaluator is below.
+
+#### Per-frame evaluator — Pillar 3 of phase-locked extrapolation (first cut)
+
+The bridge walks every field of the schema in one call, applying the Pillar 1 evaluator to trajectory fields and passing everything else through (0.6.3):
+
+```ts
+import { defineSchema, u64, f64, f64TrajectoryArray } from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq: u64(),
+  tMacroNs: u64(),
+  vMax: f64(),
+  vEff: f64TrajectoryArray(1000, { order: 2 }),
+});
+
+class WavefunctionWorklet extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.bridge = new Bridge(opts.processorOptions.sab, 16, schema);
+    this.rawFrame  = this.bridge.scratchFrame();           // length 2000 for vEff
+    this.evalFrame = this.bridge.scratchEvaluatedFrame();  // length 1000 for vEff
+  }
+
+  process(_inputs, outputs) {
+    const block = outputs[0][0]; // 128 samples
+
+    // 1. Pull the latest control frame (skip-tolerant).
+    if (this.bridge.pullLatest(this.rawFrame) < 0) return true;
+
+    // 2. Drive the PLL with the pulled frame's timestamp.
+    const quantumNs = currentTime * 1e9;
+    this.bridge.observeConsumerTime(quantumNs, Number(this.rawFrame.tMacroNs));
+
+    // 3. Per-sample: compute dt, evaluate the whole frame, feed the synth.
+    for (let i = 0; i < block.length; i++) {
+      const cNs = quantumNs + (i / sampleRate) * 1e9;
+      const dtNs = this.bridge.phaseLockedTime(cNs) - Number(this.rawFrame.tMacroNs);
+      this.bridge.evaluateInto(this.rawFrame, dtNs * 1e-9, this.evalFrame);
+      block[i] = this.synth.step(this.evalFrame.vEff); // 1000 evaluated positions
+    }
+
+    return true;
+  }
+}
+```
+
+`evaluateInto` is heap-only — never touches the SAB, never invokes atomic ops, so the producer can be writing the *next* frame in shared memory while the consumer re-evaluates the *current* one in private heap memory at audio rate. Per-call cost scales with field count: ~5–10 ns per trajectory sample at order=2, a couple of ns per scalar, one typed-array `.set()` per non-trajectory array.
+
+`scratchEvaluatedFrame()` is the matching allocator — it returns a frame with trajectory fields sized to `sampleCount` (post-Taylor-evaluation length) and everything else like `scratchFrame()`. Pre-allocate once at worklet init; reuse on every `evaluateInto`.
+
+This is the **first cut** of Pillar 3 — the heap-only per-frame evaluator and its scratch-buffer helper. The `bridge.pullEvaluated(out, sampleOffset, sampleRate)` sugar that collapses the entire `process()` loop into a single call, the `EvalMode` dispatch (step / alpha / trajectory / catmull), and the per-quantum batch API remain queued as follow-up patches.
 
 ### Legacy API — `Float64RingBuffer`
 
@@ -574,6 +625,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
 - ✅ **0.6.1 — Trajectory arrays (Pillar 1 of phase-locked extrapolation)** (`f64TrajectoryArray(n, { order })`, `f32TrajectoryArray(n, { order })`, and `evaluateTrajectoryInto(...)`). Producers pack interleaved `(p, v, [a])` samples into a frame field; consumers Taylor-extrapolate to a continuous-time signal at audio rate via the helper. Pillars 2 (nanosecond PLL) and 3 (`pullEvaluated`) remain ahead — see [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
 - ✅ **0.6.2 — Phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut — offset only)** (`bridge.observeConsumerTime(consumerNs, producerNs)`, `bridge.phaseLockedTime(consumerNs)`, `bridge.resetPll()`, plus `pllLocked` / `pllOffsetNs` on `telemetry()`). Consumer-side PI loop tracks the producer↔consumer clock offset; sub-μs convergence in ~30 observations. Heap-only — SAB byte layout unchanged from 0.6.1. Drift estimator, outlier gate, and cross-process observability via lanes 4-5 are queued patches; Pillar 3 (`pullEvaluated`) remains ahead — see [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
+- ✅ **0.6.3 — Per-frame evaluator (Pillar 3 of phase-locked extrapolation, first cut)** (`bridge.evaluateInto(srcFrame, dt, outFrame)` + `bridge.scratchEvaluatedFrame()`). Bridge walks every field of the schema in one call, applying the Pillar 1 evaluator to trajectory fields and passing scalars + non-trajectory arrays through. Heap-only; the producer can be writing the next frame while the consumer re-evaluates the current one in private heap memory at audio rate. `pullEvaluated` sugar, `EvalMode` dispatch, and per-quantum batch API remain queued patches — see [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 
 ### Remaining 1.0 work
 

@@ -4,6 +4,82 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.3] — 2026-05-25
+
+### Added — per-frame trajectory evaluator (Pillar 3 of phase-locked extrapolation, first cut)
+
+0.6.1 made trajectory fields a first-class schema concept and shipped a per-field consumer-side evaluator (`evaluateTrajectoryInto`). 0.6.2 made the consumer↔producer clock relationship a first-class bridge concept (`observeConsumerTime` / `phaseLockedTime`). 0.6.3 closes the per-frame evaluation gap: the bridge now walks the whole schema in one call, applying the Pillar 1 evaluator to every trajectory field and passing everything else through. The full pull → observe → evaluate loop becomes three method calls per audio quantum instead of a hand-rolled per-field iteration.
+
+- **`bridge.evaluateInto(srcFrame, dt, outFrame)`** — heap-only per-frame evaluator. Walks `compiled.fields`:
+  - **Trajectory field** → `evaluateTrajectoryInto(srcFrame[name], spec, dt, outFrame[name])`. Out frame's trajectory field must have length ≥ `spec.sampleCount` (positions only — the source is `sampleCount * order`, the output is `sampleCount` after Taylor evaluation).
+  - **Non-trajectory array** → `outFrame[name].set(srcFrame[name])`.
+  - **Scalar (number or BigInt)** → `outFrame[name] = srcFrame[name]`.
+
+  Pure function — no internal state, no SAB access, no atomic ops. Allocation-free against caller-owned buffers. Safe to call repeatedly at audio rate without cache-line pingpong against the producer (which can be writing the *next* frame while the consumer re-evaluates the *current* one in private heap memory).
+
+- **`bridge.scratchEvaluatedFrame()`** — sugar allocator that returns a fresh out-frame with trajectory fields sized to `sampleCount` instead of `sampleCount * order`. Mirrors `scratchFrame()` for everything else (non-trajectory arrays at full length, scalars zero-initialized). Call once at consumer init outside the hot loop; reuse on every `evaluateInto`.
+
+- **Canonical AudioWorklet pattern** (Pillars 1 + 2 + 3 stacked):
+
+  ```ts
+  const trajSpec = schema.compiled.fields.find((f) => f.name === "vEff")!.trajectory!;
+  this.rawFrame = this.bridge.scratchFrame();          // pulled-frame shape (sampleCount * order)
+  this.evalFrame = this.bridge.scratchEvaluatedFrame(); // post-eval shape (sampleCount)
+
+  process(_inputs, outputs) {
+    const block = outputs[0][0]; // 128 samples
+    if (this.bridge.pullLatest(this.rawFrame) < 0) return true;
+    const quantumNs = currentTime * 1e9;
+    this.bridge.observeConsumerTime(quantumNs, Number(this.rawFrame.tMacroNs));
+    for (let i = 0; i < block.length; i++) {
+      const cNs = quantumNs + (i / sampleRate) * 1e9;
+      const dtNs = this.bridge.phaseLockedTime(cNs) - Number(this.rawFrame.tMacroNs);
+      this.bridge.evaluateInto(this.rawFrame, dtNs * 1e-9, this.evalFrame);
+      block[i] = this.synth.step(this.evalFrame.vEff);
+    }
+    return true;
+  }
+  ```
+
+  Three method calls per quantum + per-sample evaluation in the inner loop. The full Pillar 3 plan replaces all of that with a single `bridge.pullEvaluated(out, sampleOffset, sampleRate)` call (deferred — see below).
+
+### Why — close the per-field iteration gap
+
+After 0.6.1 and 0.6.2 the trajectory + PLL primitives existed but composing them at audio rate still meant a hand-written per-field loop in every consumer:
+
+```ts
+for (const field of trajectoryFields) {
+  evaluateTrajectoryInto(rawFrame[field.name], field.spec, dt, evalFrame[field.name]);
+}
+for (const field of nonTrajectoryFields) { /* copy */ }
+```
+
+That's repeated in every worklet, easy to get wrong (field iteration order, length mismatches between rawFrame and evalFrame, forgetting to pass through non-trajectory fields). `evaluateInto` collapses it to one call that's guaranteed to walk every field in compiled order, with the right dispatch per kind, against a `scratchEvaluatedFrame()`-shaped out buffer that's known-correct for the schema.
+
+It also unlocks the per-sample evaluation pattern at audio rate: the same `evaluateInto` call runs in a tight inner loop with different `dt` per sample. Heap-only + allocation-free + no atomic ops means it's bounded-cost regardless of how often the consumer pulls (which is the entire point of decoupling pull from evaluation).
+
+### Wire compatibility
+
+- **No SAB changes.** evaluateInto and scratchEvaluatedFrame are heap-only consumer-side methods. Header lanes 0-3 unchanged from 0.6.0; lanes 4-7 still reserved. A 0.6.2 peer and a 0.6.3 peer share a SAB transparently.
+- **API additions only.** No removed or renamed members. No changes to `pull` / `push` / `pullLatest` / `pullSmoothed` / `telemetry` / `observeConsumerTime` / `phaseLockedTime` semantics.
+
+### Tests
+
+`tests/Bridge.test.ts` grows from 43 to 46 pins:
+
+- **`testEvaluateIntoMixedSchema`** (pin #44) — schema with all three trajectory orders absent / present (u64 scalars, f64 scalar, u8Array non-trajectory, f64 order=2 trajectory, f32 order=3 trajectory). `scratchEvaluatedFrame` sizes trajectory fields to `sampleCount` and non-trajectory arrays at full length. Evaluation at `dt = 0.5` matches closed-form `p + v·dt` (order=2) and `p + v·dt + ½·a·dt²` (order=3) bit-exactly. Scalars and non-trajectory arrays copy verbatim. `dt = 0` returns positions exactly. No hidden state between calls (re-evaluation reproduces).
+
+- **`testEvaluateIntoNoTrajectorySchema`** (pin #45) — degenerate case on `physicsControlFrameSchema(4)`. Every field is non-trajectory; evaluateInto reduces to a pure memcpy. `dt` is irrelevant (does not leak into output). Useful primitive for snapshotting frames without forcing trajectory migration.
+
+- **`testEvaluateIntoValidation`** (pin #46) — non-finite `dt` (NaN, ±Infinity) throws. Out-frame trajectory field shorter than `sampleCount` surfaces `evaluateTrajectoryInto`'s error message (we deliberately don't pre-validate to avoid double-checking the same contract).
+
+### Documentation
+
+- New `Per-frame evaluator (0.6.3, Pillar 3 first cut)` section in `src/Bridge.ts` header documenting the field-walk dispatch, the heap-only contract, the src/out shape requirements, and what's deferred (`pullEvaluated` sugar, EvalMode dispatch, per-quantum batch API).
+- JSDoc on `evaluateInto` and `scratchEvaluatedFrame` covers the per-field semantics, the dt unit contract, and the canonical AudioWorklet integration pattern.
+- README gains a `#### Per-frame evaluator` subsection under the Phase-locked loop block, with the full pull + observe + evaluate AudioWorklet example showing Pillars 1 + 2 + 3 stacked.
+- Roadmap `Shipped` adds the 0.6.3 entry; "phase-locked extrapolation" stays on the active roadmap with Pillar 2 extensions (drift estimator, outlier gate, lane publication) and Pillar 3 sugar (`pullEvaluated`, EvalMode dispatch) still ahead.
+
 ## [0.6.2] — 2026-05-25
 
 ### Added — consumer-side phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut: offset only)
