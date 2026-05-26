@@ -250,11 +250,22 @@ export const RING_HEADER_INT32_LANES = 8;
 //   lanes 0-1: SPSC counters (acquire/release ordering, wrap-mod-2^32)
 //   lane 2:    flow_scale — Q16.16 consumer→producer hint (0.5.0)
 //   lane 3:    torn_frame_counter — Int32 monotonic wrap-counter (0.6.0)
-//   lanes 4-7: reserved
+//   lanes 4-5: PLL offset (Int64 ns, atomic via aliased BigInt64Array; 0.6.16)
+//   lane 6:    PLL drift (Q16.16 ppm signed Int32; 0.6.16)
+//   lane 7:    PLL status word (bit 0 = locked, bits 1-31 reserved; 0.6.16)
 export const WRITE_IDX_LANE = 0;
 export const READ_IDX_LANE = 1;
 export const FLOW_SCALE_LANE = 2;
 export const TORN_FRAME_LANE = 3;
+export const PLL_OFFSET_LANE_LOW = 4;
+export const PLL_OFFSET_LANE_HIGH = 5;
+export const PLL_DRIFT_LANE = 6;
+export const PLL_STATUS_LANE = 7;
+// PLL status word bit positions.
+const PLL_STATUS_LOCKED_BIT = 1; // bit 0
+// Q16.16 conversion factor for drift ppm publication. Drift range is
+// effectively ±32768 ppm, which dwarfs any realistic clock drift (≤ 200 ppm).
+const PLL_DRIFT_Q16_16 = 65536;
 
 // Flow-scale fixed-point constant. Q16.16 encoding lives on
 // AdaptiveFlowController (controller math + encode), but SpscRing keeps a
@@ -434,6 +445,19 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   private readonly indices: Int32Array;
   private readonly mask: number;
 
+  /** BigInt64 view aliased over lanes 4-5 (bytes 16-23) of the header.
+   *  Used for atomic 8-byte publication / read of the PLL offset
+   *  (`Atomics.store` / `Atomics.load` on a BigInt64Array is a single
+   *  atomic operation, avoiding the torn-read window of reading lanes 4
+   *  and 5 separately as Int32). Lanes 4 and 5 alias the same memory,
+   *  so the Int32 reads in `tornFrameCount` etc. don't conflict — the
+   *  spec guarantees the BigInt64 write is atomic at the 8-byte
+   *  granularity, but a concurrent Int32 read of the low or high 4
+   *  bytes returns the old-or-new 4-byte half without intra-half
+   *  tearing. The BigInt64 view's only use is the PLL lane 4-5
+   *  publication path (0.6.16). */
+  private readonly indicesI64: BigInt64Array;
+
   /** Per array field per slot: a typed-array view pointing at that slot's
    *  bytes for that field. Used for zero-alloc .set() on push/pull. */
   private readonly arrayViews: AnyTypedArray[][];
@@ -578,6 +602,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.frameByteSize = schema.frameByteSize;
     this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
     this.mask = capacity - 1;
+    // PLL offset lanes 4-5 live at bytes 16-23. 8-byte aligned ✓ since
+    // 16 is divisible by 8. One element of BigInt64 = 8 bytes covering
+    // lanes 4+5 atomically. (0.6.16)
+    this.indicesI64 = new BigInt64Array(sab, 16, 1);
 
     // Policy + block-timeout from opts. Validated here so invalid configs
     // surface at construction rather than as a confusing branch-miss later.
@@ -1233,6 +1261,76 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  2^32 like the other Int32 lanes. */
   incrementTornFrameCount(): void {
     Atomics.add(this.indices, TORN_FRAME_LANE, 1);
+  }
+
+  /**
+   * Publish PLL state to lanes 4-7 for cross-process observability
+   * (0.6.16). Called by the Bridge from `observeConsumerTime` /
+   * `resetPll` when `publishPllToSab` is enabled. A second worker / DevTools
+   * panel can read these lanes via `readPublishedPllState()` on its own
+   * `SpscRing` instance over the same SAB without IPC.
+   *
+   * - Lanes 4-5 are written as one atomic 8-byte BigInt64 store via the
+   *   aliased view — no torn-read window between the low/high halves
+   *   for cross-thread readers using `readPublishedPllState`.
+   * - Lane 6 (drift) is an Int32 atomic store of the Q16.16-encoded
+   *   ppm value.
+   * - Lane 7 (status) is an Int32 atomic store with bit 0 = locked.
+   *
+   * Three atomic stores total. Allocation-free. Safe to call from an
+   * AudioWorklet's `process()` body.
+   */
+  publishPllState(offsetNs: number, driftPpm: number, locked: boolean): void {
+    // Round to nearest ns to convert the f64 offset to Int64. The
+    // offset's f64 precision (~15 sig figs) is sub-ns at any realistic
+    // wall-clock scale, so Math.round here is essentially a no-op for
+    // typical inputs — it just makes the BigInt conversion lossless.
+    const offsetI64 = BigInt(Math.round(offsetNs));
+    Atomics.store(this.indicesI64, 0, offsetI64);
+    // Drift as signed Q16.16 ppm. Range ±32768 ppm clamped — any
+    // realistic clock drift (single-digit to tens of ppm) sits well
+    // inside this envelope.
+    let driftQ = Math.round(driftPpm * PLL_DRIFT_Q16_16) | 0;
+    const MAX_Q = 0x7fffffff;
+    const MIN_Q = -0x80000000;
+    if (driftQ > MAX_Q) driftQ = MAX_Q;
+    else if (driftQ < MIN_Q) driftQ = MIN_Q;
+    Atomics.store(this.indices, PLL_DRIFT_LANE, driftQ);
+    Atomics.store(
+      this.indices,
+      PLL_STATUS_LANE,
+      locked ? PLL_STATUS_LOCKED_BIT : 0,
+    );
+  }
+
+  /**
+   * Read the published PLL state from lanes 4-7 (0.6.16). Returns the
+   * snapshot a peer last wrote via `publishPllState`. If no peer has
+   * published since SAB allocation, the status lane reads 0 and
+   * `locked` is false (the SAB starts zero-filled).
+   *
+   * For cross-process observability: a second worker / DevTools panel
+   * constructs its own `SpscRing` / `Bridge` over the SAME SAB the
+   * consumer Bridge is using, and calls this method to inspect the
+   * consumer's PLL state without postMessage or other IPC. Returns the
+   * point-in-time snapshot; under live observer activity the three
+   * fields are individually atomic but not mutually atomic.
+   *
+   * Three atomic loads + one ppm decode. Allocation-free.
+   */
+  readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
+    const status = Atomics.load(this.indices, PLL_STATUS_LANE);
+    const locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
+    const offsetI64 = Atomics.load(this.indicesI64, 0);
+    // BigInt → Number conversion: offsets are bounded to ±2^53 in
+    // practice (offset is wall-clock difference in ns; 2^53 ns ≈ 104
+    // days, way past any realistic mismatched-epoch case), so the
+    // Number(BigInt) conversion is exact. We accept loss of precision
+    // beyond 2^53 ns — it's a hard limit but well outside production.
+    const offsetNs = Number(offsetI64);
+    const driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
+    const driftPpm = driftQ / PLL_DRIFT_Q16_16;
+    return { locked, offsetNs, driftPpm };
   }
 
   /** Current producer counter (unsigned-decoded for telemetry). */

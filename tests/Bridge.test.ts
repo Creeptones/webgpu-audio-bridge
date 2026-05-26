@@ -305,6 +305,24 @@
  *      hundreds of μs to ms over a multi-second extrapolation
  *      window. Also validates: `driftGain` validation (NaN /
  *      non-positive throws); `reset()` clears drift state.
+ *  78. PLL lane 4-5 publication — cross-process readability (0.6.16).
+ *      Two Bridge instances over the same SAB. Consumer-side bridge
+ *      calls `observeConsumerTime` repeatedly; observer-side bridge
+ *      (which doesn't call observe) reads via
+ *      `readPublishedPllState()` and sees the consumer's published
+ *      offset / drift / locked state. After consumer's `resetPll()`,
+ *      observer sees the reset state. With `publishPllToSab: false`
+ *      the lanes stay at default (locked=false, offset=0, drift=0)
+ *      regardless of observe activity.
+ *  79. PLL lane 4-5 publication — wire compatibility + lane layout
+ *      (0.6.16). A new 0.6.16 peer over a SAB that an old 0.6.15
+ *      peer (which never published to lanes 4-7) used continues to
+ *      read locked=false from the publication lanes — old peers
+ *      leave the lanes at the SAB's zero-initialized state, which a
+ *      new peer interprets as "no published state." Q16.16 ppm
+ *      encoding round-trips ±50 ppm within precision; Int64 offset
+ *      round-trips through ±1 day of nanoseconds within precision
+ *      (covering all realistic offsets).
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -312,6 +330,7 @@
 
 import { assert, assertEq, ok } from "./_assert.js";
 import { Bridge, RING_HEADER_BYTES } from "../src/Bridge.js";
+import { SpscRing } from "../src/SpscRing.js";
 import {
   defineSchema,
   f32,
@@ -4394,6 +4413,139 @@ function testPllDriftEstimatorPhaseLockedTime(): void {
   ok("pll-drift-estimator-phase-locked-time");
 }
 
+// ── 78. PLL lane publication — cross-process readability (0.6.16) ────────
+function testPllLanePublicationCrossPeer(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+
+  // Two Bridge instances over the SAME SAB. One is the "consumer"
+  // that runs observe(); the other is the "observer" that only
+  // reads published lanes.
+  const consumer = new Bridge(sab, capacity, schema);
+  const observer = new Bridge(sab, capacity, schema);
+
+  // Pre-observe: observer reads default-zero lanes.
+  const initial = observer.readPublishedPllState();
+  assertEq(initial.locked, false, "pre-observe published locked = false");
+  assertEq(initial.offsetNs, 0, "pre-observe published offset = 0");
+  assertEq(initial.driftPpm, 0, "pre-observe published drift = 0");
+
+  // Consumer locks the PLL at offset = 12,345 ns.
+  consumer.observeConsumerTime(0, 12_345);
+  const afterSeed = observer.readPublishedPllState();
+  assertEq(afterSeed.locked, true, "post-seed published locked = true");
+  assertEq(afterSeed.offsetNs, 12_345, "post-seed published offset = 12345");
+
+  // Drive convergence on a sequence of observations.
+  let consumerNs = 1_000_000;
+  for (let i = 0; i < 50; i++) {
+    consumerNs += 16_666_667;
+    consumer.observeConsumerTime(consumerNs, consumerNs + 12_345);
+  }
+  const afterRun = observer.readPublishedPllState();
+  const consumerOffset = consumer.telemetry().pllOffsetNs;
+  assertEq(afterRun.locked, true, "post-run still locked");
+  // Published offset should match consumer's heap-side state within
+  // 1 ns (Math.round is the only source of difference).
+  assert(
+    Math.abs(afterRun.offsetNs - consumerOffset) <= 1,
+    `published offset matches consumer heap state (publishedNs=${afterRun.offsetNs}, heap=${consumerOffset})`,
+  );
+
+  // resetPll → observer sees the reset.
+  consumer.resetPll();
+  const afterReset = observer.readPublishedPllState();
+  assertEq(afterReset.locked, false, "post-reset published locked = false");
+  assertEq(afterReset.offsetNs, 0, "post-reset published offset = 0");
+  assertEq(afterReset.driftPpm, 0, "post-reset published drift = 0");
+
+  // Opt-out: with publishPllToSab: false, the lanes don't update.
+  const { sab: sab2 } = Bridge.allocate(16, schema);
+  const consumerSilent = new Bridge(sab2, 16, schema, { publishPllToSab: false });
+  const observerSilent = new Bridge(sab2, 16, schema);
+  consumerSilent.observeConsumerTime(0, 99_999);
+  consumerSilent.observeConsumerTime(16_666_667, 16_666_667 + 99_999);
+  const silentRead = observerSilent.readPublishedPllState();
+  assertEq(silentRead.locked, false, "publishPllToSab:false keeps locked at default");
+  assertEq(silentRead.offsetNs, 0, "publishPllToSab:false keeps offset at default");
+
+  ok("pll-lane-publication-cross-peer");
+}
+
+// ── 79. PLL lane publication — encoding round-trips + wire-compat (0.6.16) ─
+function testPllLanePublicationEncoding(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+
+  // Int64 offset round-trip. ±1 day of nanoseconds = ±8.64e13 ns,
+  // well within Int64 range and below Number precision boundary
+  // (2^53 ≈ 9e15).
+  const offsets = [
+    0,
+    1,
+    -1,
+    1_000_000_000,           // 1 sec
+    -1_000_000_000,
+    8.64e13,                 // 1 day
+    -8.64e13,
+  ];
+  for (const target of offsets) {
+    const { sab } = Bridge.allocate(16, schema);
+    const writer = new Bridge(sab, 16, schema);
+    const reader = new Bridge(sab, 16, schema);
+    // Seed PLL with the target offset.
+    writer.observeConsumerTime(0, target);
+    const r = reader.readPublishedPllState();
+    assert(
+      Math.abs(r.offsetNs - target) <= 1,
+      `Int64 offset round-trip: target=${target}, read=${r.offsetNs}`,
+    );
+  }
+
+  // Q16.16 drift ppm round-trip. Range ±50 ppm covers all realistic
+  // clock drift; precision = 1/65536 ppm ≈ 1.5e-5 ppm (way below
+  // anything observable). Drive via direct SpscRing access (already
+  // imported at top of file) so the test controls the exact value the
+  // publisher writes — Bridge's publish path goes via the live PLL,
+  // which would interact with the outlier gate / drift estimator.
+  const drifts = [0, 1, -1, 10, -10, 50, -50, 100, -100];
+  for (const targetPpm of drifts) {
+    const { sab } = Bridge.allocate(16, schema);
+    const ring = new SpscRing(sab, 16, schema);
+    ring.publishPllState(0, targetPpm, true);
+    const r = ring.readPublishedPllState();
+    assert(
+      Math.abs(r.driftPpm - targetPpm) < 1e-4,
+      `Q16.16 drift round-trip: target=${targetPpm} ppm, read=${r.driftPpm}`,
+    );
+  }
+
+  // Wire-compat scenario. Imagine an "old peer" wrote frames to the
+  // SAB but never published to PLL lanes (i.e. lanes 4-7 stay at SAB
+  // default zero). A new peer over the same SAB reads the lanes:
+  // gets the all-zero default, which is interpreted as
+  // "no usable estimate" — locked=false, offset=0, drift=0.
+  const { sab: legacySab } = Bridge.allocate(16, schema);
+  const newPeer = new Bridge(legacySab, 16, schema);
+  // (No publishPllState calls — simulating the legacy peer.)
+  // Push a few frames through to exercise the rest of the protocol
+  // and confirm lanes 4-7 are untouched.
+  const frame = newPeer.scratchFrame() as PhysFrame;
+  for (let i = 0; i < 5; i++) {
+    frame.seq = BigInt(i);
+    newPeer.push(frame);
+  }
+  const out = emptyPhysFrame(n);
+  newPeer.pull(out);
+  const legacyRead = newPeer.readPublishedPllState();
+  assertEq(legacyRead.locked, false, "legacy SAB → reader sees locked=false");
+  assertEq(legacyRead.offsetNs, 0, "legacy SAB → reader sees offset=0");
+  assertEq(legacyRead.driftPpm, 0, "legacy SAB → reader sees drift=0");
+
+  ok("pll-lane-publication-encoding");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -4473,6 +4625,8 @@ function main(): void {
   testPllDriftEstimatorDefaultOff();
   testPllDriftEstimatorConvergence();
   testPllDriftEstimatorPhaseLockedTime();
+  testPllLanePublicationCrossPeer();
+  testPllLanePublicationEncoding();
   console.log("\nAll Bridge tests passed.");
 }
 

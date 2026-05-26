@@ -4,6 +4,118 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.16] — 2026-05-26
+
+### Added — PLL lane 4-5 publication (Pillar 2 cross-process observability)
+
+`Bridge<S>` now publishes the live PLL state to SAB header lanes 4-7 on
+every `observeConsumerTime` and `resetPll`. A second worker / DevTools
+panel constructing its own `Bridge` (or `SpscRing`) over the SAME SAB
+can read the consumer's PLL state via the new `readPublishedPllState()`
+method without IPC.
+
+- **Lane layout (activates previously reserved 4-7).**
+  - Lane 4-5: `offsetNs` as a signed Int64 (atomic 8-byte
+    BigInt64-array store via aliased view). Range ±2^53 ns ≈ ±104
+    days, well past any realistic clock offset.
+  - Lane 6: `driftPpm` as Q16.16 signed Int32. Range ±32768 ppm,
+    precision ≈ 1.5e-5 ppm.
+  - Lane 7: status word. Bit 0 = `locked`; bits 1-31 reserved for
+    future use (additional flags, generation counter, etc.).
+
+- **Publisher contract.** `Bridge.observeConsumerTime` and
+  `Bridge.resetPll` each end with a three-Atomics-store publication
+  sequence. ~100 ns overhead per call, dominated by the Int64
+  BigInt-bridge cost (BigInt allocation + Atomics.store). The flag
+  `publishPllToSab` (in `BridgeOptions`) defaults to `true`; set to
+  `false` to skip publication on hot paths where the cost matters
+  more than cross-process visibility.
+
+- **Reader contract.** `Bridge.readPublishedPllState()` returns
+  `{ locked, offsetNs, driftPpm }`. Three atomic loads + one ppm
+  decode. Allocation-free, safe to call from any thread (including
+  AudioWorklets, though typically you'd just read your own heap
+  state there).
+
+- **Atomicity.** The offset Int64 is written and read atomically via
+  the BigInt64 8-byte path — no torn-read window between the high
+  and low 32-bit halves. The other two lanes (drift + status) are
+  atomic individually. Cross-lane reads (offset vs drift vs status)
+  are not mutually atomic — under live observer activity, the three
+  fields are individually consistent but not necessarily from the
+  same observe instant. Acceptable for the observability use case;
+  point-in-time precision can be added via a generation counter in
+  status lane bits 1-31 if a use case demands it.
+
+### Why
+
+The 0.6.2 PLL kept its state heap-only. The Phase-Locked Extrapolation
+Plan flagged cross-process observability via the reserved header lanes
+as a queued patch — useful when a second worker / DevTools extension
+wants to graph the consumer's clock alignment without round-tripping
+through postMessage. The wait-flag protocol's "do not ship" decision
+(0.6.11) left lanes 4-7 reserved with no committed use; 0.6.16
+activates 4-5 (plus 6 + 7) for PLL state, since the PLL state is the
+most-asked-for cross-process diagnostic in the bridge.
+
+The lane layout was designed in 0.6.16 explicitly to avoid conflict
+with any future wait-flag protocol — the wait-flag protocol (if ever
+revisited) would use a different lane or a higher bit of lane 7's
+status word.
+
+### Wire compatibility
+
+- **Strictly additive.** Pre-0.6.16 peers never wrote to lanes 4-7
+  and don't read from them. A 0.6.15 producer + 0.6.16 consumer
+  share a SAB transparently: the consumer's `readPublishedPllState`
+  reads the SAB-default zero state (`{ locked: false, offsetNs: 0,
+  driftPpm: 0 }`), interpreted as "no published state yet" — which
+  is correct since the legacy peer never published. The 0.6.16 peer
+  can still publish its own state to its own SAB instance for any
+  modern peer that watches.
+- **No frame layout change.** Lanes 0-3 (write/read index, flow
+  scale, torn counter) are byte-for-byte identical; the payload
+  region at byte 32 is unchanged.
+- **No public-API break.** `BridgeOptions` gains
+  `publishPllToSab?: boolean` (default true); existing constructors
+  continue to compile. `readPublishedPllState()` is additive on
+  `Bridge<S>`.
+- **Bench unchanged.** Push / pull / pullLatest medians stay at
+  1.20 μs — publication only fires on `observeConsumerTime` /
+  `resetPll`, which aren't on the bench's measured path.
+
+### Tests
+
+Two new test pins (#78–79) in `tests/Bridge.test.ts`:
+
+- **#78 — cross-peer readability.** Two `Bridge` instances over the
+  same SAB. Consumer-side observes, observer-side reads via
+  `readPublishedPllState()`. Pre-observe: defaults (locked=false,
+  offset=0). Post-observe: published state matches consumer's heap
+  state within 1 ns (Math.round difference). Post-reset:
+  defaults restored. `publishPllToSab: false` skips publication
+  cleanly.
+- **#79 — encoding + wire-compat.** Int64 offset round-trips across
+  ±1 day of nanoseconds within 1 ns; Q16.16 drift round-trips
+  ±100 ppm within 1e-4 ppm. Legacy SAB scenario (no peer ever
+  published): reader sees the all-zero default and interprets it
+  as "no published state" — confirming 0.6.15 → 0.6.16
+  interoperability.
+
+All 7 suites green; bench medians unchanged at 1.20 μs.
+
+### Documentation
+
+- `src/SpscRing.ts` header table updates to reflect lane 4-7 as
+  PLL state (no longer "reserved"). The two new methods
+  (`publishPllState`, `readPublishedPllState`) carry self-contained
+  doc-comments explaining atomicity and encoding.
+- `src/Bridge.ts` gains `readPublishedPllState()` on the public
+  surface and a `publishPllToSab` flag on `BridgeOptions`.
+- `README.md` §Phase-locked loop gains a paragraph documenting the
+  cross-process observability use case + the new
+  `readPublishedPllState()` method.
+
 ## [0.6.15] — 2026-05-26
 
 ### Added — PLL drift estimator (Pillar 2 second-order)

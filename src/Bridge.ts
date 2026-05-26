@@ -274,10 +274,20 @@ export interface SmoothedPullOptions {
 }
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
- *  Forwards directly to the inner `SpscRing` — see `SpscRingOptions` for the
- *  per-field contract. Forward-compatible shape; future patches can add
- *  fields here without breaking the constructor signature. */
-export interface BridgeOptions extends SpscRingOptions {}
+ *  Forwards `policy` / `blockTimeoutMs` directly to the inner `SpscRing` —
+ *  see `SpscRingOptions` for the per-field contract. Forward-compatible
+ *  shape; future patches can add fields here without breaking the
+ *  constructor signature. */
+export interface BridgeOptions extends SpscRingOptions {
+  /** Publish PLL state to SAB lanes 4-7 on every `observeConsumerTime` /
+   *  `resetPll` for cross-process observability (0.6.16). When enabled,
+   *  a second worker / DevTools panel constructing its own `Bridge` (or
+   *  `SpscRing`) over the SAME SAB can read the consumer's PLL state via
+   *  `readPublishedPllState()` without IPC. Defaults to `true`. Three
+   *  atomic stores per observation (≈ 100 ns total); disable only if
+   *  you've measured the cost mattering for your hot path. */
+  readonly publishPllToSab?: boolean;
+}
 
 type AnyTypedArray =
   | Float64Array
@@ -385,6 +395,10 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   static readonly INVARIANT_SOFT_THRESHOLD = INVARIANT_SOFT_THRESHOLD;
   static readonly INVARIANT_SOFT_ALPHA_BASE = INVARIANT_SOFT_ALPHA_BASE;
 
+  /** Publish PLL state to SAB lanes 4-7 after every PLL state change.
+   *  See `BridgeOptions.publishPllToSab` for the contract. (0.6.16) */
+  private readonly publishPllToSab: boolean;
+
   constructor(
     sab: SharedArrayBuffer,
     capacity: number,
@@ -399,6 +413,11 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     this.invariantAbsoluteEpsilon = schema.invariant !== null
       ? schema.invariant.absoluteEpsilon
       : 0;
+    // PLL publication is opt-out, default-on (0.6.16). Publishing costs
+    // three atomic stores per observe; readers depend on it for cross-
+    // process visibility. Callers who don't need cross-process readers
+    // can pass `publishPllToSab: false` to save the ~100 ns/observe.
+    this.publishPllToSab = opts.publishPllToSab !== false;
 
     // FrameSmoother owns the consumer-side prev buffer + classification
     // tables + the trajectory-aware blender. Pass `scratchFrame` as the
@@ -650,6 +669,18 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    */
   observeConsumerTime(consumerNs: number, producerNs: number): void {
     this.pll.observe(consumerNs, producerNs);
+    if (this.publishPllToSab) {
+      // 0.6.16 — push the post-observe PLL state to lanes 4-7 for any
+      // peer that's watching via readPublishedPllState. Cheap: three
+      // atomic stores. The outlier gate (0.6.14) and the drift
+      // estimator (0.6.15) both feed in here — the published state
+      // is whatever the PLL settled on after applying both.
+      this.ring.publishPllState(
+        this.pll.offsetNs,
+        this.pll.driftPpm,
+        this.pll.locked,
+      );
+    }
   }
 
   /**
@@ -668,6 +699,36 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    */
   resetPll(): void {
     this.pll.reset();
+    if (this.publishPllToSab) {
+      // 0.6.16 — publish the reset state (offset = 0, drift = 0,
+      // locked = false) so cross-process readers see the unlock event.
+      this.ring.publishPllState(0, 0, false);
+    }
+  }
+
+  /**
+   * Cross-process PLL observability (0.6.16). Returns the snapshot of
+   * PLL state most recently published to SAB lanes 4-7 by ANY peer
+   * over this SAB (typically the consumer that owns the PLL state).
+   *
+   * Use case: a second worker / DevTools panel constructs its own
+   * `Bridge` (or `SpscRing`) over the SAME SAB the consumer is using,
+   * and calls this method to inspect the consumer's PLL state without
+   * postMessage or other IPC. The returned object is a point-in-time
+   * snapshot:
+   *
+   *   { locked: boolean, offsetNs: number, driftPpm: number }
+   *
+   * Three atomic loads. Allocation-free, safe to call from any thread.
+   * If no peer has published since SAB allocation (the SAB is
+   * zero-filled by `new SharedArrayBuffer`), returns
+   * `{ locked: false, offsetNs: 0, driftPpm: 0 }` — which is also what
+   * the consumer publishes on `resetPll()`, so the two states are
+   * indistinguishable to a reader. That's deliberate: a fresh SAB and
+   * a freshly-reset PLL both signal "no usable estimate."
+   */
+  readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
+    return this.ring.readPublishedPllState();
   }
 
   /**
