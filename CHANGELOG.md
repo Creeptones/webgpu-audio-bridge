@@ -2,7 +2,184 @@
 
 All notable changes to this project will be documented here. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
+> **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
+
+## [0.6.10] — 2026-05-26
+
+### Added — composable consumer / producer + internal primitives exported
+
+The deliberate promotion patch. The four internal heap state machines that
+0.6.8 + 0.6.9 carved out of `Bridge<S>` move to the public composable API,
+joined by two thin facade classes that wrap them as explicit consumer /
+producer objects. `Bridge<S>` continues to work unchanged and remains the
+recommended monolithic entry point; the facades are the alternative path
+for users who want explicit control over which primitives are composed and
+which invariant-failure policy is active. **No public-API break. No
+wire-format change. Additive only.**
+
+- **`src/index.ts`** widens its export surface (~24 lines → ~58 lines).
+  Four primitive classes promoted from internal-only:
+  - `SpscRing<S>` + the `SpscPullResult` type (the SAB / Atomics core).
+  - `FrameSmoother<S>` (the unified consumer-side prev buffer + the
+    trajectory-aware one-pole blender).
+  - `ConsumerClockRecovery` (the PLL heap state machine).
+  - `AdaptiveFlowController` (the lane-2 PI controller).
+  Plus two new facade classes:
+  - `BridgeConsumer<S>` + the `BridgeConsumerOptions` / `InvariantFailurePolicy`
+    / `InvariantFailureCallback` types.
+  - `BridgeProducer<S>`.
+
+- **`src/BridgeConsumer.ts`** (~330 lines, new file). Thin wrapper over an
+  `SpscRing<S>` + an optional `FrameSmoother<S>` + an optional
+  `ConsumerClockRecovery`. Constructor takes the ring + an options bag:
+  ```ts
+  new BridgeConsumer(ring, {
+    smoother?: FrameSmoother<S> | null,    // null = opt out
+    pll?: ConsumerClockRecovery | null,    // null = opt out
+    onInvariantFailure?: 'fallback-to-previous' | 'throw' | 'pass-through'
+                       | ((out, computed, stored) => void),
+  });
+  ```
+  Defaults match `Bridge<S>` bit-for-bit: a fresh `FrameSmoother<S>` wired
+  to the consumer's own `scratchFrame` factory, a fresh
+  `ConsumerClockRecovery`, and `'fallback-to-previous'` on hard
+  invariant errors. Exposes the consumer surface from `Bridge<S>`: `pull`,
+  `pullLatest`, `pullSmoothed`, `pullLatestSmoothed`, `resetSmoother`,
+  `observeConsumerTime`, `phaseLockedTime`, `resetPll`, `available`,
+  `flowScaleHint`, `tornFrameCount`, `scratchFrame`. Opt-out semantics:
+  passing `smoother: null` makes the smoothed-pull methods throw with a
+  clear message; passing `pll: null` makes the PLL methods throw. Custom
+  callback policies receive `(out, computed, stored)` and may mutate `out`
+  in place.
+
+- **`src/BridgeProducer.ts`** (~120 lines, new file). Thin wrapper over an
+  `SpscRing<S>`. No options; constructor takes just the ring. Exposes
+  `push` / `beginPush` / `commitPush` / `abortPush` / `flowScaleHint` /
+  `waitForSpace` / `scratchFrame`. SPSC rules apply: one `BridgeProducer`
+  per ring, one `BridgeConsumer` per ring.
+
+- **`src/Bridge.ts` unchanged in public shape.** The monolithic class
+  continues to compose `SpscRing` + `FrameSmoother` + `ConsumerClockRecovery`
+  internally the same way it did in 0.6.9, with the same `private`
+  modifiers and the same external surface. The file header now lists the
+  composable facades as the alternative path.
+
+### Why — settle the API surface before locking in 1.0
+
+0.6.8 + 0.6.9 carved the primitives. 0.6.10 promotes them — but the
+promotion lands AS a patch, not a minor, deliberately. The new export
+surface is purely additive: every existing `Bridge<S>` call site
+continues to work bit-identically, the SAB protocol is unchanged, the
+test-hook seam (`_updateFlowScale`) is unchanged. Users who don't want
+the composable surface never have to know it exists.
+
+Two motivations stack:
+
+1. **Compose-vs-monolith choice for users.** Some callers want the full
+   `Bridge<S>` and never look inside; the monolith stays for them. Others
+   want to plug in a custom smoother (different α policy, different blend
+   field rules), opt out of the PLL on a consumer that doesn't need
+   clock recovery, or build a producer-only worker without the consumer
+   machinery. The facades give those users explicit control without
+   forcing them to fork `Bridge<S>`.
+
+2. **API surface settles before 1.0.** The composable primitives now have
+   public TS signatures, exported types, and pinned behavior contracts —
+   any drift between `BridgeConsumer` and `Bridge<S>` (e.g. a future
+   change to the invariant classifier on one path but not the other)
+   surfaces through the `facade-symmetry-with-bridge` pin immediately.
+   The promotion-while-additive shape means the symmetry pin is
+   load-bearing and the next decade of patches has a clean way to keep
+   both surfaces in sync.
+
+Per the post-0.6.9 CLAUDE.md slowdown extension, the 0.7.x cohort is now
+expected to reach deep into the patch space — `0.7.0 → 0.7.99` is the
+planned envelope before any `0.8.0` is considered, with the same rule at
+every subsequent minor. 0.6.10 is the last patch in the Phase B
+"compose internals" arc; Phase C (0.6.11 bench cells + 0.6.12
+Float64RingBuffer hard-deprecate) continues from the same plan.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding, torn-frame counter, header / payload boundary — all
+  bit-for-bit identical to 0.6.9. A 0.6.9 peer and a 0.6.10 peer share
+  a SAB transparently. The facade-built peer is wire-compatible with
+  the `Bridge<S>`-built peer: a `BridgeProducer` over one ring
+  interoperates with a `Bridge<S>` consumer over the matching SAB, and
+  vice versa.
+- **No public-API breakage.** Every existing exported symbol from
+  `src/index.ts` (`Bridge`, `RING_HEADER_BYTES`, `RING_HEADER_LANES`,
+  `BridgeAllocation`, `SmoothedPullOptions`, `SmootherSkipPolicy`, all
+  the schema DSL exports, the trajectory evaluator, the canonical
+  schemas, the deprecated legacy ring) is byte-identical to 0.6.9. The
+  new exports are purely additive.
+- **`Bridge<S>` is unchanged in shape.** All 1,134 lines stay; the file
+  header mentions the facades as the alternative path but the class
+  itself is identical. The `_updateFlowScale` test-hook seam is
+  unchanged. `Bridge<S>` still composes `SpscRing` + `FrameSmoother` +
+  `ConsumerClockRecovery` internally the same way; 0.6.10 simply
+  exports those classes for direct use.
+- **Lanes 4–7 still reserved** for the 0.7.0 wait-flag protocol.
+
+### Tests
+
+Test counts grow: a new `tests/BridgeFacades.test.ts` file with 4 pins
+joins the suite (`Bridge.test.ts` stays at 63 pins). All 7 suites green:
+
+- `tests/schema.test.ts` 14 pins (unchanged).
+- `tests/Bridge.test.ts` 63 pins (unchanged).
+- **`tests/BridgeFacades.test.ts` 4 pins (new)**:
+  - `facade-construction-defaults` — default-constructed `BridgeConsumer`
+    has non-null `FrameSmoother` + `ConsumerClockRecovery`; `scratchFrame`
+    on both facades returns usable views; `smoother: null` / `pll: null`
+    opt-out makes the affected methods throw with clear messages; raw
+    pull on a smoother-less consumer still works.
+  - `facade-round-trip` — `BridgeProducer` → `BridgeConsumer` over the
+    same `SpscRing` round-trips physics frames bit-exact; `pullLatest`
+    skipped count is correct; `beginPush` / `commitPush` works through
+    the producer facade; `flowScaleHint` is symmetric across both
+    facades.
+  - **`facade-symmetry-with-bridge`** — the load-bearing pin. On two
+    SABs of identical (capacity, schema) driven by the same producer
+    pattern, `BridgeConsumer.pull` and `BridgeConsumer.pullLatestSmoothed`
+    produce bit-identical output to `Bridge<S>.pull` /
+    `Bridge<S>.pullLatestSmoothed`. Covers both `'stall-smooth'`
+    (default) and `'catch-up'` skip policies. Catches drift in the
+    duplicated invariant classifier and the smoother dispatch
+    immediately.
+  - `facade-invariant-policies` — the four `onInvariantFailure` modes.
+    Default `'fallback-to-previous'` matches Bridge<S> bit-for-bit on
+    the canonical corrupt-byte fixture (returns last-known-good A,
+    tornFrames++). `'throw'` raises a clear Error and still bumps
+    tornFrames. `'pass-through'` returns the corrupt payload unchanged
+    and still bumps tornFrames. A custom callback receives
+    `(out, computed, stored)` and its mutation of `out` is observable
+    by the caller.
+- `tests/Bridge.phaseLock.test.ts` (unchanged).
+- `tests/Bridge.concurrent.test.ts` — 1,000,000-frame SPSC stress
+  completes in ~600 ms with `emptyWaitTimeouts === 0` and
+  `flow_scale envelope [0.500, 2.000]`. Still the load-bearing
+  validation; SAB protocol surface is unchanged from 0.6.9 so the
+  facade promotion does not perturb it.
+- `tests/Float64RingBuffer.test.ts` 9 pins (unchanged).
+- `tests/Float64RingBuffer.concurrent.test.ts` (unchanged).
+
+Bench medians at N=1000 unchanged from 0.6.9: push 1.20 μs, pull 1.20 μs,
+pullLatest 1.20 μs; `trajEval (fast)` 1.10 μs / `trajEval (clamp)`
+~5.0 μs; flow-scale recovery 33 cycles. The facades are a thin layer of
+method delegation; they do not touch the hot path's `SpscRing` mechanics
+and are below the bench's resolution.
+
+### Documentation
+
+- `README.md` gains a new subsection under the API reference, "Composable
+  consumer / producer (0.6.10)", showing side-by-side `Bridge<S>` vs
+  `SpscRing` + `BridgeProducer` + `BridgeConsumer` composition. Roadmap
+  line updated.
+- The two new facade source files each carry a self-contained file header
+  documenting the constructor shape, the wire-compatibility guarantee,
+  and the invariant-failure policy table.
 
 ## [0.6.9] — 2026-05-26
 

@@ -244,6 +244,68 @@ Frozen point-in-time observability snapshot. All fields are O(1) `Atomics.load` 
 
 Returns a JSON-safe byte-offset table for the schema's frame layout — pass this through `postMessage` / `processorOptions` to a worklet that wants to inline the read protocol without importing the library on the audio thread.
 
+### Composable consumer / producer (0.6.10)
+
+`Bridge<Schema>` is the monolithic entry point that composes the SAB ring + smoother + PLL + invariant classifier in a single object. 0.6.10 exposes the same machinery as a set of small composable primitives for users who want explicit control:
+
+| Class | Role |
+|---|---|
+| `SpscRing<Schema>` | the SAB / Atomics core (push / pull mechanics, always-notify wake protocol, lane-2 flow-scale controller, wait helpers) |
+| `BridgeProducer<Schema>` | thin facade over `SpscRing` exposing producer methods (`push`, `beginPush` / `commitPush` / `abortPush`, `flowScaleHint`, `waitForSpace`, `scratchFrame`) |
+| `BridgeConsumer<Schema>` | thin facade over `SpscRing` + composed `FrameSmoother` + `ConsumerClockRecovery`. Configurable invariant-failure policy. |
+| `FrameSmoother<Schema>` | the consumer-side α-smoother prev buffer + trajectory-aware blender |
+| `ConsumerClockRecovery` | the PLL: gains, integral term, offset estimate |
+| `AdaptiveFlowController` | the lane-2 flow-scale PI controller (composed inside `SpscRing`) |
+
+Side-by-side comparison — both shapes produce wire-identical SAB traffic; a `BridgeProducer` peer interoperates with a `Bridge<S>` consumer peer (and vice versa):
+
+```ts
+// Monolithic — Bridge<S> from 0.3.0 onward (recommended default).
+import { Bridge, physicsControlFrameSchema } from "webgpu-audio-bridge";
+
+const schema = physicsControlFrameSchema(8);
+const { sab, capacity } = Bridge.allocate(16, schema);
+const bridge = new Bridge(sab, capacity, schema);
+bridge.push(frame);
+bridge.pull(out);
+bridge.pullLatestSmoothed(out, 0.1);
+
+// Composable — explicit primitives (0.6.10). Same SAB protocol.
+import {
+  SpscRing,
+  BridgeProducer,
+  BridgeConsumer,
+  FrameSmoother,
+  ConsumerClockRecovery,
+  physicsControlFrameSchema,
+} from "webgpu-audio-bridge";
+
+const schema = physicsControlFrameSchema(8);
+const { sab, capacity } = SpscRing.allocate(16, schema);
+const ring = new SpscRing(sab, capacity, schema);
+
+const producer = new BridgeProducer(ring);
+const consumer = new BridgeConsumer(ring, {
+  smoother: new FrameSmoother(schema, () => consumer.scratchFrame()), // optional; defaults match Bridge<S>
+  pll: new ConsumerClockRecovery(),                                    // optional; defaults match Bridge<S>
+  onInvariantFailure: "fallback-to-previous",                          // default; or 'throw' / 'pass-through' / callback
+});
+
+producer.push(frame);
+consumer.pull(out);
+consumer.pullLatestSmoothed(out, 0.1);
+```
+
+Behavior compatibility is bit-exact when default options are used. `BridgeConsumer` and `Bridge<S>` reach the same blend math, the same PLL convergence, and the same invariant classification on the same SAB. The `tests/BridgeFacades.test.ts#facade-symmetry-with-bridge` pin enforces this against a `Bridge<S>` reference.
+
+When to reach for the composable surface:
+
+- **Pluggable smoother / PLL** — pass your own subclass or alternative implementation. Pass `null` to opt out entirely (e.g. a clock-recovery-free consumer; raw pulls work, PLL methods throw).
+- **Producer-only or consumer-only workers** — `BridgeProducer` carries none of the consumer-side state machinery (no smoother, no PLL, no invariant classifier); useful in compute workers that never read frames back.
+- **Custom invariant-failure policy** — `'throw'` to escalate hard errors to exceptions, `'pass-through'` to let corrupt payloads through with `tornFrames++` but no fallback, or a callback `(out, computed, stored) => void` to log / alert / mutate the output frame yourself.
+
+`Bridge<S>` itself is unchanged and remains the recommended monolithic entry point; the composable surface is purely additive.
+
 ### Canonical schemas
 
 The library ships ready-made schemas for the historical V/J control-rate physics shape:
@@ -733,6 +795,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.6.10 — Composable consumer / producer + internal primitives exported**. The four heap state machines from 0.6.8 + 0.6.9 (`SpscRing`, `FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`) are now exported from `src/index.ts`. Two new facade classes — `BridgeConsumer<S>` and `BridgeProducer<S>` — wrap them as explicit consumer / producer objects. `Bridge<S>` continues to work unchanged; defaults on `BridgeConsumer` make it bit-identical to `Bridge<S>` on the same SAB. New `onInvariantFailure` policy on `BridgeConsumer` lets callers swap the hard-error behavior (`'fallback-to-previous'` default, `'throw'`, `'pass-through'`, or a custom callback). No public-API break; no wire-format change; SAB protocol identical to 0.6.9 so a facade-built peer interoperates with a `Bridge<S>`-built peer. See [Composable consumer / producer](#composable-consumer--producer-0610).
 - ✅ **0.6.9 — Internal extract: `FrameSmoother` / `ConsumerClockRecovery` / `AdaptiveFlowController`**. Three more heap-state machines lift out of `Bridge<S>` / `SpscRing<S>` into dedicated internal classes (`src/FrameSmoother.ts`, `src/ConsumerClockRecovery.ts`, `src/AdaptiveFlowController.ts`), continuing the seam 0.6.8 carved. The α-smoother prev buffer + trajectory-aware blender + per-field classification tables move to `FrameSmoother`; the PLL offset / integrator / gains move to `ConsumerClockRecovery`; the flow-scale PI loop + Q16.16 encode move to `AdaptiveFlowController`. No public-API change, no wire-format change, no exported symbol additions — every `Bridge<S>` method continues to work bit-identically and the 1 M-frame concurrent SPSC stress passes the new seams unchanged. Preparatory for the 0.6.10 composable exports.
 - ✅ **0.6.8 — Internal `SpscRing` extract**. The SAB / Atomics core of `Bridge<S>` lifts into a new internal class `SpscRing<S>` (`src/SpscRing.ts`). No public-API change, no wire-format change, no exported symbol additions — every `Bridge<S>` method continues to work bit-identically and the 1 M-frame concurrent SPSC stress passes the seam unchanged. Preparatory for the 0.6.10 composable exports.
 - ✅ **0.6.6 — Invariant epsilon floor + smoother named modes**. `.withInvariant(fn, { absoluteEpsilon? })` opts bag adds an absolute lower floor on the classifier's OK band (default `1e-12`) so subnormal-zero and tiny f64 rounding noise no longer misclassify as hard; the relative path is preserved for any non-trivial `stored` so all existing pin behavior is bit-exact. `pullSmoothed` / `pullLatestSmoothed` accept `opts.skipPolicy: 'stall-smooth' | 'catch-up'` (default `'stall-smooth'`, preserves 0.4.1..0.6.5 behavior bit-exact); opt-in `'catch-up'` uses the closed-form `α_eff = 1 − (1 − α_base)^(skipped + 1)` for chase-latency-first behavior on control surfaces. Heap-only; SAB byte layout unchanged from 0.6.5. See [Schema invariants](#schema-invariants--withinvariantfn-opts) and [Smoothed pulls](#smoothed-pulls--pullsmoothed--pulllatestsmoothed).

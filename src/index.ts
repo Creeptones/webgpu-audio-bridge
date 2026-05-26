@@ -5,12 +5,20 @@
  * a Web Worker (typically driving WebGPU compute) into an AudioWorklet — the
  * control-rate-GPU / audio-rate-CPU pattern.
  *
- * Two public surfaces:
+ * Three public surfaces:
  *
  *   - `Bridge<Schema>` (recommended for new code): schema-driven frame
  *     codec. Describe your frame with `defineSchema({ ... })` and arbitrary
  *     primitive types (f64/f32/u64/i64/u32/i32/u16/i16/u8/i8 scalars and
- *     arrays). Ship in 0.3.
+ *     arrays). Ships the monolithic producer + consumer API. Shipped 0.3.
+ *
+ *   - `SpscRing<Schema>` + `BridgeProducer<Schema>` /
+ *     `BridgeConsumer<Schema>` + `FrameSmoother<Schema>` /
+ *     `ConsumerClockRecovery` / `AdaptiveFlowController` (0.6.10): the
+ *     composable alternative. `Bridge<S>` continues to work unchanged; the
+ *     facades are for users who want explicit control over which primitives
+ *     are wired in and which invariant-failure policy is active. Same SAB
+ *     protocol — a facade-built peer interoperates with a Bridge-built peer.
  *
  *   - `Float64RingBuffer` (deprecated): the original hard-coded
  *     `[seq, tMacroNs, vMax, jMax] + V_eff[N] + J_eff[N]` Float64 frame.
@@ -21,7 +29,7 @@
  * See README.md for the architectural pattern and use cases.
  */
 
-// ── New (recommended): Bridge<Schema> ──────────────────────────────────────
+// ── Recommended: Bridge<Schema> ───────────────────────────────────────────
 
 export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
 export type {
@@ -29,6 +37,28 @@ export type {
   SmoothedPullOptions,
   SmootherSkipPolicy,
 } from "./Bridge.js";
+
+// ── Composable primitives (0.6.10) ────────────────────────────────────────
+//
+// The four heap state machines that `Bridge<S>` composes internally, plus
+// the two thin facade classes that wrap them as explicit consumer / producer
+// objects. `Bridge<S>` continues to work unchanged; these are an additive
+// alternative for users who want explicit composition. See the file headers
+// of each module for the per-primitive contract.
+
+export { SpscRing } from "./SpscRing.js";
+export type { SpscPullResult } from "./SpscRing.js";
+export { FrameSmoother } from "./FrameSmoother.js";
+export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
+export { AdaptiveFlowController } from "./AdaptiveFlowController.js";
+
+export { BridgeConsumer } from "./BridgeConsumer.js";
+export type {
+  BridgeConsumerOptions,
+  InvariantFailurePolicy,
+  InvariantFailureCallback,
+} from "./BridgeConsumer.js";
+export { BridgeProducer } from "./BridgeProducer.js";
 
 export {
   defineSchema,
