@@ -23,6 +23,16 @@ Pre-1.0 the project has been moving fast: `0.1.x → 0.2.0 → 0.3.0 → 0.4.0 �
 
 The rapid 0.4 → 0.6 sequence was justified by each improvement adding a wire-format change AND a substantial public-API addition simultaneously. That bundling shouldn't be the norm — future improvements should usually land as `0.6.x` patches and accumulate.
 
+**Extended slowdown from 0.7.0 onward (post-0.6.9 policy update).** Each minor-level cohort should reach deep into the patch space before promoting:
+
+- `0.7.0 → 0.7.1 → 0.7.2 → … → 0.7.99` is the **expected** patch lifetime for a minor cohort. Don't promote to `0.8.0` after a handful of patches — let the patches accumulate and use each one as a checkpoint to assess "are we ready for 1.0 yet?"
+- The same applies at every subsequent minor: `0.8.x` should likewise go deep before `0.9.0`, and `0.9.x` before `1.0.0`.
+- Rationale: 80% of the polish toward 1.0 happens in the last 20% of the work. Treating minor bumps as cheap promotions inflates the version number past the actual maturity. Treating patches as effectively unbounded gives us a clean "assess at every step" cadence without ever feeling pressure to ship a premature 1.0.
+
+The minor-bump triggers remain unchanged from the 0.6.x rule (wire-format change, breaking public-API change, or a deliberate "coherent release moment" promotion) — this rule just raises the bar on the third trigger. A coherent release moment that would have landed as `0.7.5 → 0.8.0` should now land as `0.7.5 → 0.7.6` and the promotion question revisited after another N patches.
+
+If a session is genuinely unsure whether the change warrants a minor bump under this stricter rule, default to the patch bump and let the user promote later — same asymmetry as the original 0.6.x rule.
+
 ## Commit policy
 
 - Each release-grade change gets its own commit with a multi-line message (subject line names the version + tagline; body describes what shipped, why, and any wire-compat notes).
@@ -36,7 +46,7 @@ Mandatory before any commit that bumps the version:
 
 ```bash
 npm run typecheck   # tsc --noEmit, must be clean
-npm test            # all 5 suites green (schema / Bridge / Bridge.concurrent / Float64RingBuffer / Float64RingBuffer.concurrent)
+npm test            # all 6 suites green (schema / Bridge / Bridge.phaseLock / Bridge.concurrent / Float64RingBuffer / Float64RingBuffer.concurrent)
 npm run bench       # push/pull/pullLatest median sanity-check vs documented baseline (~1.20 μs at N=1000)
 ```
 
@@ -44,12 +54,16 @@ The concurrent test has a known timing-sensitive `emptyWaitTimeouts === 0` asser
 
 ## What lives where
 
-- `src/Bridge.ts` — the primary public surface. ~1100 lines as of 0.6.0. Header comment blocks document every lane and every protocol invariant; keep them current when changing behavior.
-- `src/schema.ts` — DSL + compile pass. `.withInvariant(fn)` is the most recent addition (0.6.0).
+- `src/Bridge.ts` — the primary public surface. ~1,134 lines as of 0.6.9. Header comment blocks document every lane and every protocol invariant; keep them current when changing behavior. Bridge composes one `SpscRing<S>` (`this.ring`), one `FrameSmoother<S>` (`this.smoother`), and one `ConsumerClockRecovery` (`this.pll`) — every public method is either a delegator or the invariant-classifier orchestration.
+- `src/SpscRing.ts` — internal SAB / Atomics core (0.6.8 extract). ~866 LOC. Composes one `AdaptiveFlowController` for the lane-2 PI tick. Internal-only through 0.6.9; 0.6.10 is the promotion patch.
+- `src/FrameSmoother.ts` / `src/ConsumerClockRecovery.ts` / `src/AdaptiveFlowController.ts` — the three internal heap-state machines extracted in 0.6.9. ~312 / ~134 / ~131 LOC. Each carries a self-contained file header documenting invariants + the math. Internal-only through 0.6.9.
+- `src/schema.ts` — DSL + compile pass. `.withInvariant(fn, { absoluteEpsilon? })` (0.6.6 added the epsilon opts).
+- `src/trajectory.ts` — order-1/2/3 Taylor evaluator with optional safety clamps (0.6.7). Fast / clamped paths split per-spec.
 - `src/Float64RingBuffer.ts` — deprecated legacy class. Frozen at v0.1.x byte format. Removal scheduled no earlier than 2.0.
-- `tests/Bridge.test.ts` — 40 single-thread pins (file header lists each by number). New pins append at the end with a numbered header comment and get added to `main()`'s call list. Use the existing `assert` / `assertEq` / `ok` helpers from `tests/_assert.ts`; no test framework.
+- `tests/Bridge.test.ts` — 63 single-thread pins as of 0.6.9 (file header lists each by number). New pins append at the end with a numbered header comment and get added to `main()`'s call list. Use the existing `assert` / `assertEq` / `ok` helpers from `tests/_assert.ts`; no test framework.
 - `tests/Bridge.concurrent.test.ts` — 1 M-frame cross-thread SPSC stress. Producer is an inline-eval Worker; uses `Bridge.describeLayout()` so schema changes auto-propagate.
-- `bench/Bridge.bench.ts` — three cells (push / pull / pullLatest) + 0.5.0's `flow_scale recovery` characterization cell.
+- `tests/Bridge.phaseLock.test.ts` — FFT-based phase-lock spectrum pin (added 0.6.4).
+- `bench/Bridge.bench.ts` — push / pull / pullLatest cells + 0.5.0's `flow_scale recovery` characterization cell + 0.6.7's `trajEval (fast)` / `trajEval (clamp)` cells.
 - `CHANGELOG.md` — newest entry at top. Entries follow the established structure.
 - `README.md` — public docs; mirror CHANGELOG entries for shipped features under the relevant section (API reference, Back-pressure, Roadmap, etc.).
 
