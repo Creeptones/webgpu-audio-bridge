@@ -253,6 +253,32 @@
  *      draining and refilling does NOT decrease it (monotonic).
  *      `pullLatest` that drains the full ring observes pre-pull
  *      buffered = capacity, so it's also covered.
+ *  72. PLL Mahalanobis outlier gate — single spike rejected (0.6.14).
+ *      Default-constructed gate (`outlierSigmaMultiplier=6`,
+ *      `outlierWarmupObservations=5`, `outlierConsecutiveLimit=3`).
+ *      Build up σ̂ via a sequence of clean ±100 μs jittered
+ *      observations, then inject a single 30 ms residual (the
+ *      canonical `mapAsync` stall scenario). The gate rejects it:
+ *      `pllOutliersRejected` increments by 1 and `pllOffsetNs` stays
+ *      within 1 μs of the pre-spike estimate (instead of being
+ *      yanked by `KP · 30 ms = 6 ms` as the ungated PI would do).
+ *  73. PLL outlier gate — sustained step admitted after consecutive
+ *      limit (0.6.14). After lock + warmup, induce a 5 ms step in
+ *      the producer-stamped clock. The first 3 post-step observations
+ *      gate as outliers (the gate doesn't know yet whether it's a
+ *      single spike or a real epoch change); the 4th observation
+ *      tips the consecutive counter past the limit, resets σ̂, and
+ *      admits the residual. From there the PI math takes over and
+ *      the offset converges to the new truth within a bounded number
+ *      of cycles. `pllOutliersRejected` increments by exactly 3.
+ *  74. PLL outlier gate — opt-out and tuning surface (0.6.14). With
+ *      `outlierSigmaMultiplier: Infinity`, the gate is disabled and a
+ *      single huge spike DOES move the offset (proving the gate was
+ *      the thing protecting it in pin 72). With a tight
+ *      `outlierSigmaMultiplier: 3`, a residual that's ~4σ gates that
+ *      would otherwise pass at the default 6σ. Construction validates
+ *      the opts (negative warmup throws, α outside (0,1] throws,
+ *      non-positive sigma throws).
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -3951,6 +3977,232 @@ function testTelemetryMaxOccupancy(): void {
   ok("telemetry-max-occupancy");
 }
 
+// ── 72. PLL Mahalanobis outlier gate — single spike rejected (0.6.14) ────
+function testPllOutlierGateSingleSpike(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const TRUE_OFFSET_NS = 0;
+  const rng = mulberry32(0x55aa);
+  // Seed exactly at truth.
+  ring.observeConsumerTime(0, TRUE_OFFSET_NS);
+  // Feed 25 clean ±100 μs jittered observations to build σ̂.
+  let consumerNs = 1_000_000;
+  for (let i = 0; i < 25; i++) {
+    consumerNs += 16_666_667;
+    const jitter = (rng() - 0.5) * 200_000; // ±100 μs
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + jitter);
+  }
+  const cleanOffset = ring.telemetry().pllOffsetNs;
+  assertEq(
+    ring.telemetry().pllOutliersRejected,
+    0,
+    "no outliers from clean jittered observations",
+  );
+  // σ̂ should be around 50-60 μs (½ of ±100 μs uniform range, EWMA-averaged).
+  // We won't pin a tight number — just that it's positive (gate is armed).
+
+  // Now inject a single 30 ms outlier — the classic mapAsync stall.
+  consumerNs += 16_666_667;
+  const SPIKE_NS = 30_000_000;
+  ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + SPIKE_NS);
+  // Gate rejects it. Counter += 1. Offset is unchanged.
+  const t = ring.telemetry();
+  assertEq(t.pllOutliersRejected, 1, "30 ms spike gates as 1 outlier");
+  assert(
+    Math.abs(t.pllOffsetNs - cleanOffset) < 100,
+    `outlier rejected: offset moved by ${Math.abs(t.pllOffsetNs - cleanOffset).toFixed(0)} ns < 100 ns`,
+  );
+
+  // Feed a few more clean observations — the consecutive-outlier counter
+  // resets immediately on the first clean observation. (One clean call
+  // proves the streak resets.)
+  for (let i = 0; i < 3; i++) {
+    consumerNs += 16_666_667;
+    const jitter = (rng() - 0.5) * 200_000;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + jitter);
+  }
+  // No new outliers from the clean tail.
+  assertEq(
+    ring.telemetry().pllOutliersRejected,
+    1,
+    "clean tail does not increment outlier counter",
+  );
+
+  ok("pll-outlier-gate-single-spike");
+}
+
+// ── 73. PLL outlier gate — sustained step admitted (0.6.14) ──────────────
+function testPllOutlierGateSustainedStep(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const TRUE_OFFSET_NS = 0;
+  // Seed + warmup with no jitter so σ̂ is small and a sustained step is
+  // unambiguously larger than the gate threshold.
+  ring.observeConsumerTime(0, TRUE_OFFSET_NS);
+  let consumerNs = 1_000_000;
+  // Use a small jitter (10 μs) so σ̂ is non-zero but small.
+  const rng = mulberry32(0xbeef);
+  for (let i = 0; i < 15; i++) {
+    consumerNs += 16_666_667;
+    const jitter = (rng() - 0.5) * 20_000;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + jitter);
+  }
+  const preStepOffset = ring.telemetry().pllOffsetNs;
+  const preStepOutliers = ring.telemetry().pllOutliersRejected;
+
+  // Step: producer clock jumps 5 ms ahead persistently.
+  const STEP_NS = 5_000_000;
+  // First 3 post-step observations: gate rejects (single-spike interpretation).
+  for (let i = 0; i < 3; i++) {
+    consumerNs += 16_666_667;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + STEP_NS);
+  }
+  const afterThreeRejects = ring.telemetry();
+  assertEq(
+    afterThreeRejects.pllOutliersRejected,
+    preStepOutliers + 3,
+    "first 3 post-step observations gate as outliers",
+  );
+  assert(
+    Math.abs(afterThreeRejects.pllOffsetNs - preStepOffset) < 1000,
+    `offset still close to pre-step (gated, no movement): Δ=${Math.abs(afterThreeRejects.pllOffsetNs - preStepOffset).toFixed(0)} ns`,
+  );
+
+  // 4th post-step observation: consecutive count exceeds limit → step
+  // detected → σ̂ resets → this observation flows into the normal PI path.
+  consumerNs += 16_666_667;
+  ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + STEP_NS);
+  const afterStepAdmit = ring.telemetry();
+  // Counter does NOT increment on the step-admit (we admitted, not gated).
+  assertEq(
+    afterStepAdmit.pllOutliersRejected,
+    preStepOutliers + 3,
+    "step-admit does not bump outlier counter",
+  );
+  // Offset has begun moving toward the new truth.
+  assert(
+    afterStepAdmit.pllOffsetNs > preStepOffset + 100_000,
+    `step-admit moves offset toward new truth: Δ=${(afterStepAdmit.pllOffsetNs - preStepOffset).toFixed(0)} ns > 100 μs`,
+  );
+
+  // Continue feeding the step value — should converge to STEP_NS within
+  // 200 cycles (same envelope as the pre-0.6.14 step pin #43).
+  for (let i = 0; i < 200; i++) {
+    consumerNs += 16_666_667;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + STEP_NS);
+  }
+  const settled = ring.telemetry().pllOffsetNs;
+  const residual = Math.abs(settled - STEP_NS);
+  // Loose bound — 100 μs of residual is fine; the gate's step-detection
+  // path doesn't impact final convergence accuracy, just initial latency.
+  assert(
+    residual < 100_000,
+    `step convergence post-gate: |offset - STEP_NS| ${residual.toFixed(0)} ns < 100,000 ns`,
+  );
+
+  ok("pll-outlier-gate-sustained-step");
+}
+
+// ── 74. PLL outlier gate — opt-out + tuning + validation (0.6.14) ────────
+function testPllOutlierGateTuningAndValidation(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+
+  // (a) Opt out by passing Infinity. Direct construction of the
+  // primitive — the gate must let a 30 ms spike through the PI path.
+  const pllDisabled = new ConsumerClockRecovery({ outlierSigmaMultiplier: Infinity });
+  pllDisabled.observe(0, 0);
+  // Build σ̂ — irrelevant since gate is off, but mirrors pin 72's setup.
+  let consumerNs = 1_000_000;
+  for (let i = 0; i < 25; i++) {
+    consumerNs += 16_666_667;
+    pllDisabled.observe(consumerNs, consumerNs);
+  }
+  const preSpike = pllDisabled.offsetNs;
+  // 30 ms spike — gate off, PI math runs unconditionally.
+  consumerNs += 16_666_667;
+  pllDisabled.observe(consumerNs, consumerNs + 30_000_000);
+  const postSpike = pllDisabled.offsetNs;
+  // PI moves offset by KP · residual ≈ 0.2 · 30 ms = 6 ms.
+  assert(
+    Math.abs(postSpike - preSpike) > 1_000_000,
+    `gate-disabled: 30 ms spike moves offset by > 1 ms (got ${Math.abs(postSpike - preSpike).toFixed(0)} ns)`,
+  );
+  assertEq(
+    pllDisabled.outliersRejected,
+    0,
+    "gate-disabled: outlier counter stays at 0",
+  );
+
+  // (b) Tight gate. With multiplier=3 and σ̂ around 5 μs (from ±10 μs
+  // jitter), a 30 μs residual sits at ~6σ — gates at 3σ, doesn't at 6σ.
+  const pllTight = new ConsumerClockRecovery({ outlierSigmaMultiplier: 3 });
+  pllTight.observe(0, 0);
+  const rng = mulberry32(0xc0de);
+  let cn = 1_000_000;
+  // 25 ±10 μs jittered observations build σ̂ ≈ 5 μs.
+  for (let i = 0; i < 25; i++) {
+    cn += 16_666_667;
+    const jit = (rng() - 0.5) * 20_000;
+    pllTight.observe(cn, cn + jit);
+  }
+  const sigmaBefore = pllTight.sigmaEstimateNs;
+  assert(sigmaBefore > 0, "σ̂ should be positive after warmup");
+  // 30 μs residual — between 3σ and 6σ at the typical sigmaBefore.
+  cn += 16_666_667;
+  const spikeMid = sigmaBefore * 5; // 5σ
+  pllTight.observe(cn, cn + spikeMid);
+  // Either gated (counter increments) or admitted; only require: if it
+  // exceeds 3σ, it must be gated.
+  if (spikeMid > sigmaBefore * 3) {
+    assert(
+      pllTight.outliersRejected >= 1,
+      `5σ residual gates under tight (3σ) threshold`,
+    );
+  }
+
+  // (c) Construction validation.
+  let threw = false;
+  try { new ConsumerClockRecovery({ outlierSigmaMultiplier: 0 }); } catch { threw = true; }
+  assert(threw, "outlierSigmaMultiplier=0 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierSigmaMultiplier: -1 }); } catch { threw = true; }
+  assert(threw, "outlierSigmaMultiplier<0 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierWarmupObservations: -1 }); } catch { threw = true; }
+  assert(threw, "negative warmup throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierWarmupObservations: 1.5 }); } catch { threw = true; }
+  assert(threw, "non-integer warmup throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierEwmaAlpha: 0 }); } catch { threw = true; }
+  assert(threw, "outlierEwmaAlpha=0 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierEwmaAlpha: 1.5 }); } catch { threw = true; }
+  assert(threw, "outlierEwmaAlpha>1 throws");
+  threw = false;
+  try { new ConsumerClockRecovery({ outlierConsecutiveLimit: -1 }); } catch { threw = true; }
+  assert(threw, "negative outlierConsecutiveLimit throws");
+
+  // (d) Sanity: schema parameter is unused by the construct test but
+  // include a quick smoke pass through Bridge to confirm the wiring.
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+  bridge.observeConsumerTime(0, 0);
+  assert(
+    bridge.telemetry().pllOutliersRejected === 0,
+    "Bridge.telemetry().pllOutliersRejected starts at 0",
+  );
+
+  ok("pll-outlier-gate-tuning-and-validation");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -4024,6 +4276,9 @@ function main(): void {
   testTelemetryPushPullSkipCounters();
   testTelemetryWaitDurations();
   testTelemetryMaxOccupancy();
+  testPllOutlierGateSingleSpike();
+  testPllOutlierGateSustainedStep();
+  testPllOutlierGateTuningAndValidation();
   console.log("\nAll Bridge tests passed.");
 }
 

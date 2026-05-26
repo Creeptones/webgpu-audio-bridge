@@ -4,6 +4,131 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.14] — 2026-05-26
+
+### Added — PLL Mahalanobis outlier gate (Pillar 2 robustness)
+
+`ConsumerClockRecovery` (the heap-side PLL `Bridge<S>` composes) gains a
+default-on Mahalanobis-distance outlier gate that rejects single-frame
+residual spikes — the canonical "30 ms mapAsync stall poisons the offset
+estimate" scenario the README + Phase-Locked Extrapolation Plan flagged.
+
+- **EWMA scale estimator.** Each post-warmup observation updates a
+  running σ̂ of `|residual|` via a one-pole low-pass:
+  `σ̂_{n+1} = (1 − α_σ)·σ̂_n + α_σ·|residual|`. Default `α_σ = 0.05`,
+  effective window ~20 observations.
+
+- **Gate test.** A residual gates as an outlier when
+  `|residual| / σ̂ > outlierSigmaMultiplier`. Default multiplier is `6`
+  (six-sigma). Gated observations skip both the PI update AND the EWMA
+  update — they don't move the offset and they don't inflate σ̂.
+
+- **Warmup.** The gate is disabled for the first
+  `outlierWarmupObservations` (default `5`) post-seed observations so
+  σ̂ has time to build up from zero. Pre-warmup observations participate
+  in σ̂ but bypass the gate.
+
+- **Step-detection escape.** A genuine offset epoch change (e.g.
+  `AudioContext` suspend/resume) shows up as a sustained sequence of
+  large residuals, not a single spike. After
+  `outlierConsecutiveLimit` (default `3`) consecutive gated
+  observations, the loop concludes a step occurred, resets σ̂ to
+  `|residual| / multiplier`, and admits the latest observation. The
+  step-recovery latency is `outlierConsecutiveLimit + 1` observations
+  ≈ 67 ms at 60 Hz.
+
+- **Public surface.** `ConsumerClockRecovery` constructor now takes an
+  optional `ConsumerClockRecoveryOptions` bag with four tuning fields.
+  Pass `outlierSigmaMultiplier: Infinity` to opt out entirely
+  (preserves pre-0.6.14 behavior bit-exact for legacy tests).
+  `Bridge.telemetry()` gains `pllOutliersRejected: number`. The
+  exported `ConsumerClockRecoveryOptions` type joins the rest of the
+  composable surface in `src/index.ts`.
+
+### Why
+
+The 0.6.2 PLL first-cut was honest about being a first cut: offset-
+only, no drift estimator, no outlier protection. The convergence
+analysis assumes Gaussian-jittered residuals around the true offset,
+which holds for steady-state operation but breaks immediately under
+any single-frame anomaly — and a 30 ms anomaly drives an
+ungated 0.6.13 PLL into a 30-observation recovery sequence even after
+the spike has cleared.
+
+For the bridge to be production-grade — and 10/10 caliber for a 1.0
+release — the PLL has to survive realistic browser-thread misbehavior
+without manual intervention. The Mahalanobis gate is the standard
+robust-statistics tool for this: cheap (5 ops per non-gated
+observation, 3 ops + 1 compare on the gated path), per-instance heap-
+only, and self-tuning via σ̂ once warmup completes.
+
+The step-detection escape is the load-bearing complication. Without
+it, a genuine offset epoch change would gate indefinitely and the PLL
+would be stuck at the old offset forever. With it, the gate
+self-corrects: 3 frames of "wait and see," then the loop accepts the
+new reality. The 67 ms latency is well below any human-perceivable
+audio glitch budget.
+
+### Wire compatibility
+
+- **No SAB changes.** The gate is heap-only on `ConsumerClockRecovery`.
+  A 0.6.13 peer and a 0.6.14 peer share a SAB transparently.
+- **No public-API break.** The `ConsumerClockRecovery` constructor
+  gains an optional opts parameter that defaults to `{}` (all gate
+  defaults). All existing call sites continue to compile and run.
+  `Bridge.telemetry()` adds one field; existing destructures keep
+  working.
+- **Default-on behavior change** — strictly speaking, the gate
+  defaults are now active for any Bridge that wasn't pinning the
+  exact pre-0.6.14 PI output. The two existing PLL pins (#42 / #43)
+  still pass because: (a) the convergence pin's ±100 μs jitter is
+  well below the 6σ-of-σ̂ threshold; (b) the step pin's 1 ms step
+  arrives during the warmup window AND the step-detection escape
+  releases subsequent observations within the existing 200-cycle
+  envelope. Callers who do pin exact pre-0.6.14 offset trajectories
+  should construct `ConsumerClockRecovery` with
+  `outlierSigmaMultiplier: Infinity`.
+- **Lanes 4–7 still reserved** for the PLL publication patch in this
+  cohort.
+
+### Tests
+
+Three new test pins (#72–74) in `tests/Bridge.test.ts`:
+
+- **#72 — single spike rejected.** Build σ̂ via 25 ±100 μs jittered
+  observations, then inject a single 30 ms residual. Gate rejects:
+  `pllOutliersRejected += 1`, offset moves < 100 ns (vs the
+  `KP · 30 ms = 6 ms` movement under ungated PI). Subsequent clean
+  observations don't re-bump the counter.
+- **#73 — sustained step admitted after consecutive limit.** After
+  warmup, induce a 5 ms step. First 3 post-step observations gate
+  (`pllOutliersRejected += 3`); 4th observation tips the consecutive
+  counter past the limit, σ̂ resets, observation admits. From there
+  the PI math converges to the new truth within the existing
+  200-cycle step-response envelope.
+- **#74 — opt-out + tuning + validation.** `outlierSigmaMultiplier:
+  Infinity` disables the gate and a 30 ms spike yanks the offset by
+  the expected `KP · spike` amount. Tight `multiplier: 3` gates
+  observations that pass under the default. Construction validates
+  all four opts fields (positive sigma, non-negative integer warmup,
+  α in (0, 1], non-negative consecutive limit).
+
+All 7 suites green; bench medians unchanged at 1.20 μs (PLL is not on
+the bench's measured path).
+
+### Documentation
+
+- `src/ConsumerClockRecovery.ts` gains a self-contained "Mahalanobis
+  outlier gate" section in the file header, covering the math, the
+  warmup rationale, the step-detection escape, and the default
+  tuning.
+- `src/Bridge.ts` `telemetry()` return type annotates the new
+  `pllOutliersRejected` field; the field's semantics are documented
+  on the underlying `ConsumerClockRecovery.outliersRejected` getter.
+- `README.md` §Phase-locked loop gains a paragraph documenting the
+  default-on gate, the opt-out path, and the recommended pairing
+  with `resetPll()` for `AudioContext` suspend/resume cycles.
+
 ## [0.6.13] — 2026-05-26
 
 ### Added — observability dashboards (1.0 must-have, item 2 of 2)

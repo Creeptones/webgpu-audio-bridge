@@ -55,6 +55,7 @@ export type {
 } from "./SpscRing.js";
 export { FrameSmoother } from "./FrameSmoother.js";
 export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
+export type { ConsumerClockRecoveryOptions } from "./ConsumerClockRecovery.js";
 export { AdaptiveFlowController } from "./AdaptiveFlowController.js";
 
 export { BridgeConsumer } from "./BridgeConsumer.js";

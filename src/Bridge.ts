@@ -1043,6 +1043,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     readonly readIndex: number;
     readonly pllLocked: boolean;
     readonly pllOffsetNs: number;
+    readonly pllOutliersRejected: number;
     readonly policy: BackpressurePolicy;
     readonly droppedFrames: number;
     readonly pushedFrames: number;
@@ -1065,6 +1066,10 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       // are still reserved; cross-process observability lands in a follow-up.
       pllLocked: this.pll.locked,
       pllOffsetNs: this.pll.offsetNs,
+      // 0.6.14 — Mahalanobis outlier gate counter. Cumulative since the
+      // bridge's PLL was constructed; the field doc explains the gate
+      // semantics and what counts as a rejection.
+      pllOutliersRejected: this.pll.outliersRejected,
       // 0.6.12 — backpressure policy + heap-side drop counter.
       policy: this.ring.policy,
       droppedFrames: this.ring.droppedCount(),
