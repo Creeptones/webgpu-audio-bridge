@@ -66,6 +66,22 @@ export type {
 } from "./BridgeConsumer.js";
 export { BridgeProducer } from "./BridgeProducer.js";
 
+// ── GPU readback automation (0.6.18) ──────────────────────────────────────
+//
+// The headline helper that closes the loop from "compute pass on the GPU"
+// to "AudioWorklet pull" with automated staging-buffer ring + mapAsync
+// overlap. See src/BridgeGPUSource.ts for the lifecycle + WebGPU typing
+// approach.
+
+export { BridgeGPUSource } from "./BridgeGPUSource.js";
+export type {
+  GpuBufferLike,
+  GpuDeviceLike,
+  GpuCommandEncoderLike,
+  GpuReadbackDecoder,
+  BridgeGPUSourceOptions,
+} from "./BridgeGPUSource.js";
+
 export {
   defineSchema,
   describeSchemaLayout,

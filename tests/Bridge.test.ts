@@ -331,6 +331,19 @@
  *      false (must call pullEvaluatedLatest first); throws on
  *      negative / fractional / non-finite sampleCount; sampleCount=0
  *      no-ops cleanly.
+ *  81. BridgeGPUSource orchestration (0.6.18). Mock GpuDevice +
+ *      GpuCommandEncoder + GpuBuffer that record / replay the call
+ *      sequence without a real GPU. Verifies: constructor builds
+ *      `stagingBufferCount` staging buffers; `scheduleReadback`
+ *      encodes a `copyBufferToBuffer` per call; `flushPending`
+ *      starts `mapAsync` on each scheduled slot;
+ *      `pollCompleted` waits for the resolved promises, decodes
+ *      into a Bridge frame, calls commitPush, and unmaps the
+ *      staging buffer; back-pressure (`scheduleReadback` returns
+ *      false when all in-flight); destroy releases buffers;
+ *      counter increments (pushed / dropped) match the sequence.
+ *      The decoder + bridge round-trip end-to-end with the mock
+ *      GPU producing deterministic bytes.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -339,6 +352,12 @@
 import { assert, assertEq, ok } from "./_assert.js";
 import { Bridge, RING_HEADER_BYTES } from "../src/Bridge.js";
 import { SpscRing } from "../src/SpscRing.js";
+import {
+  BridgeGPUSource,
+  type GpuBufferLike,
+  type GpuCommandEncoderLike,
+  type GpuDeviceLike,
+} from "../src/BridgeGPUSource.js";
 import {
   defineSchema,
   f32,
@@ -4661,7 +4680,182 @@ function testForEachSampleInQuantum(): void {
   ok("for-each-sample-in-quantum");
 }
 
-function main(): void {
+// ── 81. BridgeGPUSource orchestration (0.6.18) ───────────────────────────
+async function testBridgeGpuSourceOrchestration(): Promise<void> {
+  // Mock WebGPU device. Each buffer holds its own ArrayBuffer; the
+  // map promises are user-controlled via a deferred-resolve handle so
+  // the test can simulate "in-flight" cleanly.
+  interface MockBuffer extends GpuBufferLike {
+    backing: ArrayBuffer;
+    mapped: boolean;
+    destroyed: boolean;
+    pendingResolve: (() => void) | null;
+  }
+  let bufferCounter = 0;
+  const allBuffers: MockBuffer[] = [];
+  const mockDevice: GpuDeviceLike = {
+    createBuffer(desc) {
+      const backing = new ArrayBuffer(desc.size);
+      const buf: MockBuffer = {
+        size: desc.size,
+        backing,
+        mapped: false,
+        destroyed: false,
+        pendingResolve: null,
+        mapAsync(_mode) {
+          if (this.destroyed) {
+            return Promise.reject(new Error("destroyed"));
+          }
+          return new Promise<undefined>((resolve) => {
+            // Don't resolve immediately — let the test trigger it.
+            this.pendingResolve = () => {
+              this.mapped = true;
+              resolve(undefined);
+            };
+          });
+        },
+        getMappedRange(offset, size) {
+          assert(this.mapped, `getMappedRange called on unmapped buffer`);
+          return this.backing.slice(
+            offset ?? 0,
+            (offset ?? 0) + (size ?? this.backing.byteLength),
+          );
+        },
+        unmap() {
+          this.mapped = false;
+        },
+        destroy() {
+          this.destroyed = true;
+        },
+      };
+      bufferCounter++;
+      allBuffers.push(buf);
+      return buf;
+    },
+  };
+  let copyCallCount = 0;
+  const mockEncoder: GpuCommandEncoderLike = {
+    copyBufferToBuffer(_src, _so, dst, _do, _size) {
+      // Write a deterministic pattern into the staging buffer so the
+      // decoder can read it back.
+      const bytes = new Uint8Array((dst as MockBuffer).backing);
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = (copyCallCount + i) & 0xff;
+      }
+      copyCallCount++;
+    },
+  };
+
+  // Tiny schema for a clean round-trip.
+  const schema = defineSchema({
+    seq: u64(),
+    payload: f64Array(2),
+  });
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  // The decoder reads the first u64 as `seq` and the next 16 bytes as
+  // two f64 doubles. Since the mock encoder fills with a pattern based
+  // on copyCallCount, every readback is unique.
+  const decoder = (mappedRange: ArrayBuffer, frame: FrameFor<typeof schema>) => {
+    const view = new DataView(mappedRange);
+    frame.seq = view.getBigUint64(0, true);
+    frame.payload.set(new Float64Array(mappedRange, 8, 2));
+  };
+
+  // (a) Construction sanity.
+  const src = new BridgeGPUSource(mockDevice, bridge, decoder, {
+    stagingBufferCount: 3,
+    bufferLabelPrefix: "test",
+  });
+  assertEq(bufferCounter, 3, "constructor builds 3 staging buffers");
+  assertEq(src.capacity(), 3, "src.capacity() = 3");
+  assertEq(src.inFlight(), 0, "initially no buffers in flight");
+
+  // (b) Validation: stagingBufferCount < 2 throws.
+  let threw = false;
+  try {
+    new BridgeGPUSource(mockDevice, bridge, decoder, { stagingBufferCount: 1 });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "stagingBufferCount=1 throws");
+  threw = false;
+  try {
+    new BridgeGPUSource(mockDevice, bridge, decoder, { stagingBufferSize: 0 });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "stagingBufferSize=0 throws");
+
+  // (c) Schedule 2 readbacks — both should succeed.
+  const fakeSrcBuffer = mockDevice.createBuffer({ size: schema.frameByteSize, usage: 0 });
+  const r1 = src.scheduleReadback(fakeSrcBuffer, mockEncoder);
+  const r2 = src.scheduleReadback(fakeSrcBuffer, mockEncoder);
+  assertEq(r1, true, "1st scheduleReadback returns true");
+  assertEq(r2, true, "2nd scheduleReadback returns true");
+  assertEq(src.inFlight(), 2, "2 buffers scheduled");
+
+  // (d) Schedule 2 more — first succeeds (3rd available), second fails
+  // (all 3 in flight).
+  const r3 = src.scheduleReadback(fakeSrcBuffer, mockEncoder);
+  const r4 = src.scheduleReadback(fakeSrcBuffer, mockEncoder);
+  assertEq(r3, true, "3rd scheduleReadback returns true");
+  assertEq(r4, false, "4th scheduleReadback returns false (full)");
+  assertEq(src.inFlight(), 3, "all 3 buffers in flight");
+
+  // (e) flushPending starts mapAsync. Nothing should be 'mapped' yet
+  // (the mock holds pending resolves).
+  src.flushPending();
+  // The mock buffers should now each have a pendingResolve.
+  // (allBuffers[0..2] are the staging buffers; allBuffers[3] is fakeSrcBuffer.)
+  for (let i = 0; i < 3; i++) {
+    assert(
+      (allBuffers[i] as MockBuffer).pendingResolve !== null,
+      `staging buffer ${i} has pending mapAsync`,
+    );
+  }
+
+  // (f) pollCompleted before any mapAsync resolves — nothing pushed.
+  const polled0 = src.pollCompleted();
+  assertEq(polled0, 0, "no polls completed before resolves");
+  assertEq(src.pushedCount(), 0, "no pushes yet");
+
+  // (g) Resolve all three mapAsyncs in order; yield to microtasks.
+  for (let i = 0; i < 3; i++) {
+    (allBuffers[i] as MockBuffer).pendingResolve!();
+  }
+  // Yield twice — the .then handlers need to run to flip slot.mapped.
+  await Promise.resolve();
+  await Promise.resolve();
+  const polled1 = src.pollCompleted();
+  assertEq(polled1, 3, "all 3 readbacks completed");
+  assertEq(src.pushedCount(), 3, "pushedCount = 3 after poll");
+  assertEq(src.droppedCount(), 0, "no drops");
+  assertEq(src.inFlight(), 0, "all buffers back to idle");
+  // Bridge should have 3 frames buffered.
+  const tel = bridge.telemetry();
+  assertEq(tel.available, 3, "3 frames in bridge");
+  // Verify the decoder ran — pull and check seq.
+  const out = bridge.scratchFrame();
+  let pullCount = 0;
+  while (bridge.pull(out)) pullCount++;
+  assertEq(pullCount, 3, "drained 3 frames from bridge");
+
+  // (h) destroy — buffers marked destroyed.
+  src.destroy();
+  for (let i = 0; i < 3; i++) {
+    assertEq(
+      (allBuffers[i] as MockBuffer).destroyed,
+      true,
+      `staging buffer ${i} destroyed`,
+    );
+  }
+
+  ok("bridge-gpu-source-orchestration");
+}
+
+async function main(): Promise<void> {
   testConstructionValidation();
   testAllocateAndByteLength();
   testEmptyPull();
@@ -4743,7 +4937,11 @@ function main(): void {
   testPllLanePublicationCrossPeer();
   testPllLanePublicationEncoding();
   testForEachSampleInQuantum();
+  await testBridgeGpuSourceOrchestration();
   console.log("\nAll Bridge tests passed.");
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

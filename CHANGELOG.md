@@ -4,6 +4,158 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.18] — 2026-05-26
+
+### Added — `BridgeGPUSource` — the headline GPU readback helper
+
+The named feature the library has been advertising since 0.3.0. Closes
+the loop from "compute pass on the GPU writes a storage buffer" to
+"AudioWorklet pulls the result via `Bridge<S>.pullLatest`" by automating
+the boilerplate every WebGPU-audio project re-implements:
+
+```ts
+import { Bridge, BridgeGPUSource, physicsControlFrameSchema } from
+  "webgpu-audio-bridge";
+
+const schema = physicsControlFrameSchema(1000);
+const { sab, capacity } = Bridge.allocate(16, schema);
+const bridge = new Bridge(sab, capacity, schema);
+
+const source = new BridgeGPUSource(
+  device,             // GPUDevice from navigator.gpu.requestAdapter().requestDevice()
+  bridge,
+  (mappedBytes, frame) => {
+    // Decoder: read mapped staging-buffer bytes into the SAB-backed
+    // frame view. Allocation-free; mutations land directly in the SAB.
+    const view = new DataView(mappedBytes);
+    frame.seq = view.getBigUint64(0, true);
+    frame.tMacroNs = view.getBigUint64(8, true);
+    frame.vMax = view.getFloat64(16, true);
+    frame.jMax = view.getFloat64(24, true);
+    frame.vEff.set(new Float64Array(mappedBytes, 32, 1000));
+    frame.jEff.set(new Float64Array(mappedBytes, 32 + 8000, 1000));
+  },
+);
+
+// Per control-rate tick:
+const encoder = device.createCommandEncoder();
+// ... encode the compute dispatch ...
+source.scheduleReadback(myStorageBuffer, encoder);
+device.queue.submit([encoder.finish()]);
+source.flushPending();
+source.pollCompleted();
+```
+
+The helper manages:
+
+- **Staging-buffer ring** (default 3 buffers) sized to the schema's
+  `frameByteSize`. Allows 2 readbacks in flight while a third is
+  being decoded.
+- **`copyBufferToBuffer` encoding** — `scheduleReadback` writes the
+  copy command into the user's command encoder and reserves a free
+  staging buffer.
+- **`mapAsync` orchestration** — `flushPending` starts the async
+  maps after the user's `device.queue.submit()`. A `.then` handler
+  flips an internal flag so `pollCompleted` can synchronously
+  check completion without blocking.
+- **Decoder dispatch** — `pollCompleted` invokes the user-provided
+  decoder against the mapped `ArrayBuffer` with a
+  `BridgeProducer.beginPush()` slot as the output frame, so the
+  decoder writes directly into the SAB. After the decoder returns,
+  the helper calls `commitPush` and unmaps the staging buffer.
+- **Back-pressure indicator** — `scheduleReadback` returns `false`
+  when all staging buffers are in flight; the producer's pacing
+  loop can use this to drop or delay the next dispatch.
+- **Bridge-policy interaction** — if the bridge's push policy
+  drops the frame (e.g. `'drop-newest'` with a full ring), the
+  helper still unmaps the staging buffer and increments its
+  internal `droppedCount` so dashboards pick up the loss.
+
+The point of the staging-buffer ring is **overlap**. Naive "submit,
+await mapAsync, push, repeat" serializes the GPU and the readback
+— the next compute pass waits for the previous readback to land.
+With ≥ 3 staging buffers, two readbacks can be in flight while a
+third is being decoded, so the GPU pipeline keeps running and the
+end-to-end latency drops from `mapAsync`'s 5-15 ms ([Chromium
+41487454](https://issues.chromium.org/issues/41487454),
+[gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)) to the
+dispatch cadence itself — typically 1–4 ms at 60 Hz.
+
+### Why
+
+This is the named feature the library has been advertising since
+0.3.0 — the wrapper that justifies the package name and the whole
+"WebGPU compute → AudioWorklet" story. Every WebGPU-audio project
+that hits the `mapAsync` latency wall ends up writing some version
+of this code; shipping it as part of the bridge means the
+canonical path is one import + one constructor + three lifecycle
+calls per tick.
+
+The original phased plan named this as 0.8.0 territory (a "wrapper
+on top of the existing trajectory-schema + PLL machinery, not new
+primitives"). Bringing it forward to 0.6.18 is deliberate: the
+helper is the gateway feature that gets eyes on the rest of the
+library. Without it, the bridge looks like "a clever SAB ring
+abstraction"; with it, the bridge is "the working primitive for
+WebGPU → AudioWorklet."
+
+### Wire compatibility
+
+- **No SAB changes.** The helper is heap-side over the existing
+  `Bridge<S>.beginPush` / `commitPush` surface. A 0.6.17 peer and
+  a 0.6.18 peer share a SAB transparently.
+- **No public-API break.** The `BridgeGPUSource` class and its
+  five type exports (`GpuBufferLike`, `GpuDeviceLike`,
+  `GpuCommandEncoderLike`, `GpuReadbackDecoder`,
+  `BridgeGPUSourceOptions`) are additive.
+- **No `@webgpu/types` dependency.** The helper uses minimal
+  structural interfaces (`GpuBufferLike`, `GpuDeviceLike`,
+  `GpuCommandEncoderLike`) that the real WebGPU types satisfy
+  structurally. Users on browsers (lib.dom.d.ts) or Node-with-
+  WebGPU (`@webgpu/types`) pass real `GPUDevice` / `GPUBuffer` /
+  `GPUCommandEncoder` directly without coercion. The bridge has
+  no runtime WebGPU dependency.
+- **Bench unchanged.** The helper is not on the bench path
+  (`push` / `pull` / `pullLatest` medians stay at 1.20 μs).
+
+### Tests
+
+One new test pin (#81) in `tests/Bridge.test.ts`:
+
+- **#81 — orchestration coverage.** A mock `GpuDevice` /
+  `GpuCommandEncoder` / `GpuBuffer` that record + replay the call
+  sequence without a real GPU. Verifies the full lifecycle:
+  constructor builds N staging buffers; `scheduleReadback`
+  encodes one `copyBufferToBuffer` per call and reserves a slot;
+  back-pressure (`scheduleReadback` returns false when all in
+  flight); `flushPending` starts `mapAsync` on each scheduled
+  slot; `pollCompleted` waits for resolved promises, invokes the
+  decoder against the mapped `ArrayBuffer`, calls `commitPush`,
+  unmaps the staging buffer, returns the slot to idle. Counter
+  increments (`pushedCount`, `droppedCount`) match the sequence.
+  `destroy` releases all buffers. Constructor validates
+  `stagingBufferCount ≥ 2` and `stagingBufferSize > 0`.
+
+  The test is async (yields to microtasks to let the `.then`
+  handlers fire before `pollCompleted`); `main()` is now
+  `async function` and `await`s the helper test. The other 80
+  pins remain synchronous.
+
+All 7 suites green; bench medians unchanged at 1.20 μs.
+
+### Documentation
+
+- New `src/BridgeGPUSource.ts` with a self-contained file header
+  covering the lifecycle, the overlap rationale, the structural
+  WebGPU typing approach, and the per-method contract.
+- `src/index.ts` widens the export surface by one class + five
+  types.
+- `README.md` §See it running / §The problem this solves gain
+  short paragraphs pointing at `BridgeGPUSource` as the
+  canonical path for the WebGPU → AudioWorklet integration; the
+  full helper docs sit in the new §`BridgeGPUSource` section
+  (alongside the existing trajectory + PLL sections).
+
 ## [0.6.17] — 2026-05-26
 
 ### Added — `forEachSampleInQuantum` batch evaluation API

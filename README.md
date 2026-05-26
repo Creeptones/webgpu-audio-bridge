@@ -63,6 +63,8 @@ npm run dev:demo          # http://localhost:5173
 
 For end-to-end latency measurements (push → audio-thread consume, percentiles under load), see [`bench/e2e-latency/`](./bench/e2e-latency/) — `npm run bench:e2e`.
 
+For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource-0618) (0.6.18) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest.
+
 For headless browser smoke tests against the demo, `npm run test:browser` (Playwright; Chromium only for now).
 
 ## Quick start
@@ -645,6 +647,75 @@ ring.pullLatest(outV, outJ, outHeader);
 
 The wire bytes match the schema produced by `legacyPhysicsControlFrameSchema(n)`. If you need to migrate incrementally — keep your existing v0.1.x SAB layout, swap to `Bridge<Schema>` — start there.
 
+## BridgeGPUSource (0.6.18)
+
+The headline helper the library has been advertising since 0.3.0. Closes the loop from "compute pass on the GPU writes a storage buffer" to "AudioWorklet pulls the result via `Bridge<S>.pullLatest`" by automating the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration:
+
+```ts
+import { Bridge, BridgeGPUSource, physicsControlFrameSchema } from
+  "webgpu-audio-bridge";
+
+const schema = physicsControlFrameSchema(1000);
+const { sab, capacity } = Bridge.allocate(16, schema);
+const bridge = new Bridge(sab, capacity, schema);
+
+// Acquire a GPUDevice (e.g. via navigator.gpu.requestAdapter().requestDevice()).
+const source = new BridgeGPUSource(
+  device,
+  bridge,
+  (mapped, frame) => {
+    // Decoder: 5 lines. Read the mapped bytes into the SAB-backed frame.
+    const view = new DataView(mapped);
+    frame.seq      = view.getBigUint64(0,  true);
+    frame.tMacroNs = view.getBigUint64(8,  true);
+    frame.vMax     = view.getFloat64(16, true);
+    frame.jMax     = view.getFloat64(24, true);
+    frame.vEff.set(new Float64Array(mapped, 32,         1000));
+    frame.jEff.set(new Float64Array(mapped, 32 + 8000,  1000));
+  },
+  { stagingBufferCount: 3 },   // default — 2 in-flight + 1 decoding
+);
+
+// Per control-rate tick (e.g. inside a Worker's requestAnimationFrame loop):
+const encoder = device.createCommandEncoder();
+// ... encode your compute dispatch into encoder ...
+source.scheduleReadback(myStorageBuffer, encoder);    // reserves a staging buffer
+device.queue.submit([encoder.finish()]);              // GPU runs
+source.flushPending();                                // starts mapAsync on scheduled
+const pushed = source.pollCompleted();                // pushes any-ready frames
+```
+
+### Why this matters
+
+Native `mapAsync` readback runs **5-15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). Naïve "submit → await mapAsync → push → repeat" serializes the GPU and the readback: the next compute dispatch waits for the previous readback to land, total end-to-end latency floors at one full readback round trip.
+
+The staging-buffer ring breaks the serialization. With 3 buffers, two readbacks stay in flight while a third decodes; the GPU pipeline keeps running and the end-to-end latency drops to the **dispatch cadence itself** — typically 1-4 ms at 60 Hz. The `mapAsync` cost is still paid per readback, it just stops being on the critical path.
+
+### Lifecycle
+
+Each staging buffer goes through a 4-state cycle: `idle → scheduled → in-flight → idle` (with the buffer mapped and decoded between in-flight and idle). The three user-facing calls correspond to the state transitions:
+
+| Call | Transitions | Returns |
+|---|---|---|
+| `scheduleReadback(srcBuffer, encoder, srcOffset?)` | acquires an `idle` slot → `scheduled` | `true` if a slot was available; `false` if all in flight (back-pressure) |
+| `flushPending()` | every `scheduled` slot → `in-flight` (starts `mapAsync`) | void; idempotent |
+| `pollCompleted()` | every `in-flight` slot whose `mapAsync` resolved → decoder → bridge push → `idle` | number of frames pushed |
+
+The `scheduleReadback` / `flushPending` split exists because `mapAsync` must be called **after** `device.queue.submit()` — starting it before submit risks reading stale GPU state. The user submits between the two calls.
+
+### Diagnostics
+
+The helper exposes simple counters:
+
+- `source.pushedCount()` — cumulative successful readbacks (decoder ran + bridge push succeeded)
+- `source.droppedCount()` — cumulative drops (decoder skipped because bridge was full at commit time; respects the bridge's `policy`)
+- `source.inFlight()` — staging buffers currently in some non-idle state
+- `source.capacity()` — total staging buffer count
+
+### WebGPU type compatibility
+
+The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
+
 ## Use cases
 
 The pattern this library implements unblocks browser projects that previously had no clean answer:
@@ -905,6 +976,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, two readbacks stay in flight while a third decodes — `mapAsync`'s 5-15 ms latency drops to the dispatch cadence itself (1-4 ms at 60 Hz). No `@webgpu/types` runtime dependency; structural interfaces accept real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
 - ✅ **0.6.17 — `forEachSampleInQuantum` batch evaluation** (per-quantum hot loop API). Wraps the canonical "evaluate every sample of an audio quantum" pattern into one call: `bridge.forEachSampleInQuantum(evalFrame, sampleCount, (i, frame) => { block[i] = synth.step(frame.vEff) })`. Bit-identical output to a hand-rolled `evaluateAtSampleOffset` loop, but with per-sample method-dispatch + cache-validity checks hoisted out of the inner loop. EvalMode dispatch (step / alpha / trajectory / catmull) deferred to a future patch — needs the K=4 catmull history ring and interaction story with `resetSmoother` / `resetEvalCache`. SAB byte layout unchanged from 0.6.11. See [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 - ✅ **0.6.16 — PLL lane 4-5 publication** (cross-process observability, default-on). `Bridge<S>` publishes the live PLL state (offsetNs Int64, driftPpm Q16.16, locked bit) to SAB header lanes 4-7 on every `observeConsumerTime` / `resetPll`. A second peer constructing its own `Bridge` over the same SAB can read via the new `readPublishedPllState()` method without IPC. Strictly additive wire-format use — legacy 0.6.15 peers continue to interoperate. Opt out via `{ publishPllToSab: false }` in `BridgeOptions`. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
 - ✅ **0.6.15 — PLL drift estimator** (opt-in, 2nd-order g-h alpha-beta filter). Pillar 2 second-order: track both `offsetNs` AND `driftRate` (parts-per-million between producer + consumer clocks). When opted in via `enableDriftEstimator: true`, `phaseLockedTime` extrapolates between observations so a quantum-rate AudioWorklet stays sub-μs accurate even when its `AudioContext.currentTime` drifts at tens of ppm against the producer's `performance.now()`. The PI integral is OFF in drift mode (the drift estimator IS the integrator at 2nd order; a redundant KI fights it). `telemetry()` gains `pllDriftPpm`. Default-off preserves 0.6.14 behavior bit-exact. SAB byte layout unchanged from 0.6.11. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
