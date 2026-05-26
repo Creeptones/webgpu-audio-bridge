@@ -46,7 +46,8 @@ import {
   physicsControlFrameSchema,
   type PhysicsControlFrameSchema,
 } from "../src/schemas/physics.js";
-import type { FrameFor } from "../src/schema.js";
+import type { FrameFor, TrajectorySpec } from "../src/schema.js";
+import { evaluateTrajectoryInto } from "../src/trajectory.js";
 
 const N = 1000;
 const CAPACITY = 16;
@@ -213,6 +214,51 @@ function runFlowScaleRecoveryBench(): {
   };
 }
 
+/**
+ * 0.6.7 cell. `evaluateTrajectoryInto` clamp-free vs clamped.
+ *
+ * Verifies the split path didn't introduce overhead on the fast path
+ * (target: <1.25 μs at N=1000, order=2) and documents the clamped-path
+ * cost separately. Both branches call the same exported function on
+ * identical input arrays — the only difference is the presence of a clamp
+ * field on the spec.
+ */
+function runTrajectoryEvalBench(): {
+  fastSamples: number[];
+  clampedSamples: number[];
+} {
+  const flat = new Float64Array(N * 2);
+  const out = new Float64Array(N);
+  for (let k = 0; k < flat.length; k++) flat[k] = Math.sin(k * 0.01);
+  const specFast: TrajectorySpec = { order: 2, sampleCount: N };
+  const specClamped: TrajectorySpec = {
+    order: 2,
+    sampleCount: N,
+    velocityClamp: 10.0,
+    maxDeltaPerSample: 1.0,
+    overflowFallback: "saturate",
+  };
+  const dt = 0.5;
+
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    evaluateTrajectoryInto(flat, specFast, dt, out);
+    evaluateTrajectoryInto(flat, specClamped, dt, out);
+  }
+
+  const fastSamples = new Array<number>(MEASURE_ITERS);
+  const clampedSamples = new Array<number>(MEASURE_ITERS);
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    const t0 = hrtime.bigint();
+    evaluateTrajectoryInto(flat, specFast, dt, out);
+    const t1 = hrtime.bigint();
+    evaluateTrajectoryInto(flat, specClamped, dt, out);
+    const t2 = hrtime.bigint();
+    fastSamples[i] = Number(t1 - t0);
+    clampedSamples[i] = Number(t2 - t1);
+  }
+  return { fastSamples, clampedSamples };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -274,6 +320,29 @@ function main(): void {
       `pullLatest misses=${pullLatestResult.misses}`,
   );
   console.log();
+  // 0.6.7 trajectory eval cell — clamp-free fast path vs clamped path.
+  const traj = runTrajectoryEvalBench();
+  const trajFastMed = summarize("trajEval (fast)", traj.fastSamples);
+  const trajClampedMed = summarize("trajEval (clamp)", traj.clampedSamples);
+  // The clamp-free fast path is the headline regression target — it must
+  // stay near the 0.6.6 1.20 μs baseline. The clamped path is reported but
+  // not budget-gated; downstream callers opt into it explicitly.
+  const TRAJ_FAST_BUDGET_NS = 1250;
+  if (trajFastMed < TRAJ_FAST_BUDGET_NS) {
+    console.log(
+      `  within fast-path budget  trajEval (fast) median ${fmt(trajFastMed)} < ${fmt(TRAJ_FAST_BUDGET_NS)}`,
+    );
+  } else {
+    console.error(
+      `  FAIL                trajEval (fast) median ${fmt(trajFastMed)} ≥ budget ${fmt(TRAJ_FAST_BUDGET_NS)}`,
+    );
+    process.exitCode = 1;
+  }
+  console.log(
+    `  trajEval (clamp) median  ${fmt(trajClampedMed)} (documented, not gated)`,
+  );
+  console.log();
+
   const recovery = runFlowScaleRecoveryBench();
   console.log(
     `  flow_scale recovery: saturated=${recovery.saturationCycles > 0 ? "yes" : "no"} ` +

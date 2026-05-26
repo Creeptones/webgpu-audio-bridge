@@ -40,6 +40,14 @@
  *      negative, or non-numeric. Opts object itself must be undefined or an
  *      object (no other primitives). Schema stays frozen and behavior is
  *      otherwise identical to the no-opts builder.
+ *  14. Trajectory safety clamps round-trip (0.6.7). velocityClamp /
+ *      accelerationClamp / maxDeltaPerSample / overflowFallback on
+ *      f{32,64}TrajectoryArray(n, opts) propagate to FieldSpec.trajectory,
+ *      CompiledField.trajectory, and SchemaLayoutFieldDescription.trajectory.
+ *      Clamp-free constructions are byte-identical to the equivalent
+ *      clamp-equipped schema (descriptive metadata only). Validation
+ *      rejects non-finite / non-positive clamps and unknown
+ *      overflowFallback strings. Trajectory tag stays frozen.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -948,6 +956,142 @@ function testWithInvariantOpts(): void {
   ok("with-invariant-opts");
 }
 
+// ── 14. Trajectory safety clamps round-trip (0.6.7) ────────────────────────
+//
+// f{32,64}TrajectoryArray accepts optional safety clamps that are descriptive
+// metadata only — they ride on FieldSpec.trajectory, CompiledField.trajectory,
+// and SchemaLayoutFieldDescription.trajectory, but never change SAB byte
+// layout. A clamp-equipped schema and its clamp-free twin produce identical
+// frame bytes. Validation rejects non-finite / non-positive clamps and
+// unknown overflowFallback strings.
+function testTrajectoryClamps(): void {
+  // Happy path: every clamp set, plus an explicit overflowFallback.
+  const t = f64TrajectoryArray(64, {
+    order: 3,
+    velocityClamp: 1.5,
+    accelerationClamp: 2.0,
+    maxDeltaPerSample: 0.25,
+    overflowFallback: "saturate",
+  });
+  assertEq(t.kind, "f64", "clamp-equipped kind preserved");
+  assertEq(t.length, 64 * 3, "clamp-equipped flat length unchanged");
+  assertEq(t.byteSize, 8 * 64 * 3, "clamp-equipped byteSize unchanged");
+  assertEq(t.trajectory?.order, 3, "trajectory.order");
+  assertEq(t.trajectory?.sampleCount, 64, "trajectory.sampleCount");
+  assertEq(t.trajectory?.velocityClamp, 1.5, "trajectory.velocityClamp");
+  assertEq(t.trajectory?.accelerationClamp, 2.0, "trajectory.accelerationClamp");
+  assertEq(t.trajectory?.maxDeltaPerSample, 0.25, "trajectory.maxDeltaPerSample");
+  assertEq(t.trajectory?.overflowFallback, "saturate", "trajectory.overflowFallback");
+
+  // Clamp-free twin: identical bytes, no clamp keys on the tag.
+  const tBare = f64TrajectoryArray(64, { order: 3 });
+  assertEq(tBare.byteSize, t.byteSize, "clamp-free byteSize == clamp-equipped (metadata-only)");
+  assertEq(tBare.length, t.length, "clamp-free length == clamp-equipped");
+  assertEq(tBare.trajectory?.velocityClamp, undefined, "clamp-free omits velocityClamp");
+  assertEq(tBare.trajectory?.accelerationClamp, undefined, "clamp-free omits accelerationClamp");
+  assertEq(tBare.trajectory?.maxDeltaPerSample, undefined, "clamp-free omits maxDeltaPerSample");
+  assertEq(tBare.trajectory?.overflowFallback, undefined, "clamp-free omits overflowFallback");
+
+  // Trajectory tag is frozen on the clamp-equipped variant too.
+  let mutated = false;
+  try {
+    (t.trajectory as { velocityClamp: number }).velocityClamp = 99;
+  } catch {
+    mutated = true;
+  }
+  assert(mutated, "clamp-equipped trajectory tag is frozen");
+
+  // Round-trip through defineSchema + describeSchemaLayout.
+  const N = 32;
+  const s = defineSchema({
+    seq: u64(),
+    vEff: f64TrajectoryArray(N, {
+      order: 2,
+      velocityClamp: 3.0,
+      maxDeltaPerSample: 0.1,
+      overflowFallback: "hold",
+    }),
+  });
+  const cf = s.compiled.fields.find((f) => f.name === "vEff")!;
+  assertEq(cf.trajectory?.velocityClamp, 3.0, "compiled field carries velocityClamp");
+  assertEq(cf.trajectory?.accelerationClamp, undefined, "compiled field omits unset accelerationClamp");
+  assertEq(cf.trajectory?.maxDeltaPerSample, 0.1, "compiled field carries maxDeltaPerSample");
+  assertEq(cf.trajectory?.overflowFallback, "hold", "compiled field carries overflowFallback");
+
+  const desc = describeSchemaLayout(s);
+  assertEq(desc.fields.vEff!.trajectory?.velocityClamp, 3.0, "layout description velocityClamp");
+  assertEq(desc.fields.vEff!.trajectory?.maxDeltaPerSample, 0.1, "layout description maxDeltaPerSample");
+  assertEq(desc.fields.vEff!.trajectory?.overflowFallback, "hold", "layout description overflowFallback");
+
+  // Wire-byte equivalence: the clamp-equipped schema and the clamp-free
+  // schema have identical frameByteSize.
+  const sBare = defineSchema({
+    seq: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  });
+  assertEq(
+    s.frameByteSize,
+    sBare.frameByteSize,
+    "clamp-equipped schema is byte-identical to clamp-free equivalent",
+  );
+
+  // Validation: every clamp must be finite + positive.
+  const badClampValues: ReadonlyArray<unknown> = [
+    0, -1, NaN, Infinity, -Infinity, "0.5", null,
+  ];
+  for (const bad of badClampValues) {
+    let threw = false;
+    try {
+      f64TrajectoryArray(8, { order: 2, velocityClamp: bad as number });
+    } catch {
+      threw = true;
+    }
+    assert(threw, `velocityClamp=${String(bad)} rejected`);
+    threw = false;
+    try {
+      f64TrajectoryArray(8, { order: 3, accelerationClamp: bad as number });
+    } catch {
+      threw = true;
+    }
+    assert(threw, `accelerationClamp=${String(bad)} rejected`);
+    threw = false;
+    try {
+      f64TrajectoryArray(8, { order: 2, maxDeltaPerSample: bad as number });
+    } catch {
+      threw = true;
+    }
+    assert(threw, `maxDeltaPerSample=${String(bad)} rejected`);
+  }
+
+  // overflowFallback must be one of the three union members.
+  for (const bad of ["clamp", "wrap", "", "saturate ", "Hold"]) {
+    let threw = false;
+    try {
+      f64TrajectoryArray(8, {
+        order: 2,
+        maxDeltaPerSample: 0.1,
+        overflowFallback: bad as "hold" | "linear" | "saturate",
+      });
+    } catch {
+      threw = true;
+    }
+    assert(threw, `overflowFallback='${bad}' rejected`);
+  }
+
+  // f32 twin accepts the same opts.
+  const t32 = f32TrajectoryArray(16, {
+    order: 2,
+    velocityClamp: 0.5,
+    maxDeltaPerSample: 1e-3,
+    overflowFallback: "linear",
+  });
+  assertEq(t32.kind, "f32", "f32 trajectory clamps: kind");
+  assertEq(t32.trajectory?.velocityClamp, 0.5, "f32 trajectory.velocityClamp");
+  assertEq(t32.trajectory?.overflowFallback, "linear", "f32 trajectory.overflowFallback");
+
+  ok("trajectory-clamps");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -962,6 +1106,7 @@ function main(): void {
   testEvaluateTrajectory();
   testWithTimestamps();
   testWithInvariantOpts();
+  testTrajectoryClamps();
   console.log("ALL PASS schema");
 }
 

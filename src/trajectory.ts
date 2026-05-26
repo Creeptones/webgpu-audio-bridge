@@ -43,6 +43,29 @@
  * hot-path call. Until those land, the consumer wires the dt by hand and
  * uses this helper directly.
  *
+ * ─── Safety clamps (0.6.7) ───────────────────────────────────────────────
+ *
+ * Long extrapolation distances on order=2 / order=3 are sensitive to
+ * transient producer values: a single huge velocity sample drives the
+ * audio block to wild excursions. `TrajectorySpec` accepts four optional
+ * clamp fields (`velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`,
+ * `overflowFallback`) that the evaluator honors on a separate clamped
+ * path. Behavior:
+ *
+ *   - No clamp set → fast path; bit-exact equal to the 0.6.6 evaluator
+ *     across all orders.
+ *   - Any clamp set → clamped path. The spec is resolved once at call
+ *     entry into a small per-call config so the inner loop stays
+ *     branch-free per-spec (no per-sample `if` on metadata).
+ *
+ *   `velocityClamp` / `accelerationClamp` clamp the loaded derivative
+ *   into `[-clamp, +clamp]` before the Taylor multiply.
+ *   `maxDeltaPerSample` is consulted after the Taylor sum: if the
+ *   would-be output is more than `maxDelta` away from the previous
+ *   output, the configured fallback runs (`'hold'` freezes; `'linear'`
+ *   drops the acceleration term; `'saturate'` (default) clamps the
+ *   would-be output into the per-sample band).
+ *
  * ─── Performance ─────────────────────────────────────────────────────────
  *
  * Allocation-free: the caller owns the output buffer; we walk the flat
@@ -59,6 +82,16 @@
  */
 
 import type { TrajectorySpec } from "./schema.js";
+
+/** Does this spec carry any per-sample safety clamp? Used to select the
+ *  fast path (no clamps, 0.6.6 bit-exact) vs the clamped path. */
+function specHasClamps(spec: TrajectorySpec): boolean {
+  return (
+    spec.velocityClamp !== undefined ||
+    spec.accelerationClamp !== undefined ||
+    spec.maxDeltaPerSample !== undefined
+  );
+}
 
 export function evaluateTrajectoryInto(
   flat: Float64Array,
@@ -90,6 +123,10 @@ export function evaluateTrajectoryInto(
       `evaluateTrajectoryInto: flat length ${flat.length} < sampleCount * order (${required})`,
     );
   }
+  if (specHasClamps(spec)) {
+    evaluateClamped(flat, spec, dt, out);
+    return;
+  }
   switch (order) {
     case 1: {
       for (let i = 0; i < sampleCount; i++) {
@@ -109,6 +146,126 @@ export function evaluateTrajectoryInto(
       for (let i = 0; i < sampleCount; i++) {
         const j = i * 3;
         out[i] = flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2;
+      }
+      return;
+    }
+  }
+}
+
+/** Clamped trajectory evaluator (0.6.7). Engaged whenever any clamp field
+ *  is set on `spec`. The order switch and the per-spec config (which
+ *  clamps are active, fallback id) are resolved once at function entry so
+ *  the inner loop stays branch-free per call. */
+function evaluateClamped(
+  flat: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  dt: number,
+  out: Float64Array | Float32Array,
+): void {
+  const { order, sampleCount } = spec;
+  // Resolve clamps into local primitives. Use +Infinity when no clamp is
+  // set so `Math.max(-INF, Math.min(INF, x)) === x` becomes a no-op — keeps
+  // the inner loop straight-line without per-sample branching.
+  const vClamp = spec.velocityClamp ?? Infinity;
+  const aClamp = spec.accelerationClamp ?? Infinity;
+  const hasDelta = spec.maxDeltaPerSample !== undefined;
+  const maxDelta = spec.maxDeltaPerSample ?? Infinity;
+  // Fallback id encoded as a small int so the inner-loop branch reduces to
+  // an integer compare. Only consulted when hasDelta && violation; the
+  // hot per-sample path is the unclamped Taylor.
+  //   0 = saturate (default), 1 = hold, 2 = linear.
+  let fallbackId = 0;
+  if (spec.overflowFallback === "hold") fallbackId = 1;
+  else if (spec.overflowFallback === "linear") fallbackId = 2;
+
+  switch (order) {
+    case 1: {
+      // Order-1 is positions only — clamps on derivatives are dormant.
+      // maxDeltaPerSample still applies (positions can carry transients).
+      let prev = 0;
+      for (let i = 0; i < sampleCount; i++) {
+        const p = flat[i]!;
+        if (hasDelta && i > 0) {
+          const d = p - prev;
+          if (d > maxDelta || d < -maxDelta) {
+            if (fallbackId === 1) {
+              out[i] = prev;
+              continue;
+            }
+            // 'linear' has nothing extra to drop on order-1 (no acceleration);
+            // fall through to saturate so order-1 + linear ≡ saturate.
+            const saturated = d > maxDelta ? prev + maxDelta : prev - maxDelta;
+            out[i] = saturated;
+            prev = saturated;
+            continue;
+          }
+        }
+        out[i] = p;
+        prev = p;
+      }
+      return;
+    }
+    case 2: {
+      let prev = 0;
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 2;
+        const p = flat[j]!;
+        let v = flat[j + 1]!;
+        if (v > vClamp) v = vClamp;
+        else if (v < -vClamp) v = -vClamp;
+        let y = p + v * dt;
+        if (hasDelta && i > 0) {
+          const d = y - prev;
+          if (d > maxDelta || d < -maxDelta) {
+            if (fallbackId === 1) {
+              y = prev; // hold
+            } else if (fallbackId === 2) {
+              // 'linear' on order=2 collapses to the same y (no acceleration
+              // term to drop); fall through to saturate so behavior is
+              // documented and stable.
+              y = d > maxDelta ? prev + maxDelta : prev - maxDelta;
+            } else {
+              y = d > maxDelta ? prev + maxDelta : prev - maxDelta; // saturate
+            }
+          }
+        }
+        out[i] = y;
+        prev = y;
+      }
+      return;
+    }
+    case 3: {
+      const halfDt2 = 0.5 * dt * dt;
+      let prev = 0;
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 3;
+        const p = flat[j]!;
+        let v = flat[j + 1]!;
+        let a = flat[j + 2]!;
+        if (v > vClamp) v = vClamp;
+        else if (v < -vClamp) v = -vClamp;
+        if (a > aClamp) a = aClamp;
+        else if (a < -aClamp) a = -aClamp;
+        let y = p + v * dt + a * halfDt2;
+        if (hasDelta && i > 0) {
+          const d = y - prev;
+          if (d > maxDelta || d < -maxDelta) {
+            if (fallbackId === 1) {
+              y = prev; // hold
+            } else if (fallbackId === 2) {
+              // 'linear' = drop acceleration term, then re-check vs band.
+              const yLin = p + v * dt;
+              const dLin = yLin - prev;
+              if (dLin > maxDelta) y = prev + maxDelta;
+              else if (dLin < -maxDelta) y = prev - maxDelta;
+              else y = yLin;
+            } else {
+              y = d > maxDelta ? prev + maxDelta : prev - maxDelta; // saturate
+            }
+          }
+        }
+        out[i] = y;
+        prev = y;
       }
       return;
     }

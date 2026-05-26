@@ -92,6 +92,27 @@
  * `f64TrajectoryArray(64, { order: 1 })` produces identical SAB bytes;
  * only the field's compiled metadata changes.
  *
+ * ─── Trajectory safety clamps (0.6.7) ─────────────────────────────────────
+ *
+ * `f{32,64}TrajectoryArray(n, opts)` accepts optional safety clamps that
+ * make order-2/3 Taylor extrapolation robust against transient producer
+ * values (a spurious huge velocity / acceleration sample). Clamps are
+ * schema metadata and never change the SAB byte layout — a clamp-equipped
+ * schema and its clamp-free twin produce identical bytes, so a 0.6.7 peer
+ * and a 0.6.6 peer interoperate transparently.
+ *
+ *   - `velocityClamp`     — `|v_i|` capped pre-evaluation (both signs).
+ *   - `accelerationClamp` — `|a_i|` capped pre-evaluation (order=3 only).
+ *   - `maxDeltaPerSample` — `|out[i] - out[i-1]|` capped post-evaluation.
+ *   - `overflowFallback`  — `'hold' | 'linear' | 'saturate'` (default
+ *                           `'saturate'`); consulted only when
+ *                           `maxDeltaPerSample` fires.
+ *
+ * When no clamp is set, `evaluateTrajectoryInto` uses the 0.6.6 fast path
+ * bit-exactly. When any clamp is set the evaluator switches to a clamped
+ * path that pre-resolves the spec into a small per-spec config so the hot
+ * loop stays branch-free per call.
+ *
  * ─── Timestamp roles (0.6.5) ───────────────────────────────────────────────
  *
  * `defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`
@@ -176,14 +197,47 @@ export function kindTsType(kind: FieldKind): "bigint" | "number" {
  *  3 = position + velocity + acceleration (quadratic Taylor / cubic Hermite). */
 export type TrajectoryOrder = 1 | 2 | 3;
 
+/** Behavior of the clamped trajectory evaluator when a per-sample clamp band is
+ *  exceeded (0.6.7). Only consulted when `maxDeltaPerSample` is set.
+ *    'hold'     — use the previous sample's output value (freeze the signal
+ *                 when extrapolation goes out of band).
+ *    'linear'   — fall back to order-2 (`p + v·dt`) ignoring acceleration; for
+ *                 order=2 this collapses to the same fast-path formula.
+ *    'saturate' — clamp the would-be output into
+ *                 `[out[i-1] - maxDelta, out[i-1] + maxDelta]`. */
+export type TrajectoryOverflowFallback = "hold" | "linear" | "saturate";
+
 /** Descriptive metadata attached to fields built via
  *  `f{32,64}TrajectoryArray(n, { order })`. The underlying storage is a flat
  *  interleaved array of `sampleCount * order` elements; this tag tells
- *  downstream consumers how to interpret those elements as (p, v, [a]) tuples. */
+ *  downstream consumers how to interpret those elements as (p, v, [a]) tuples.
+ *
+ *  0.6.7 adds optional safety clamps. They are schema metadata only — the SAB
+ *  bytes are identical with or without clamps set, so a 0.6.7 producer and a
+ *  0.6.6 consumer (or vice versa) interoperate transparently. The clamps act
+ *  consumer-side in `evaluateTrajectoryInto`'s clamped path and are dormant on
+ *  the fast path when none are set. */
 export interface TrajectorySpec {
   readonly order: TrajectoryOrder;
   /** Number of logical samples. Underlying typed-array length = sampleCount * order. */
   readonly sampleCount: number;
+  /** Upper bound on `|v_i|` pre-evaluation. When set the clamped evaluator
+   *  clamps each loaded velocity to `[-velocityClamp, +velocityClamp]` before
+   *  the Taylor multiply. Must be finite + positive. */
+  readonly velocityClamp?: number;
+  /** Upper bound on `|a_i|` pre-evaluation. Only meaningful at `order: 3`.
+   *  Must be finite + positive. */
+  readonly accelerationClamp?: number;
+  /** Upper bound on `|out[i] - out[i-1]|`. When set, the clamped evaluator
+   *  observes successive output samples and consults `overflowFallback` on the
+   *  first violation (sample 0 is always allowed since there is no previous
+   *  output). Must be finite + positive. */
+  readonly maxDeltaPerSample?: number;
+  /** Behavior when `maxDeltaPerSample` is exceeded. Default `'saturate'`. When
+   *  only `velocityClamp` / `accelerationClamp` are set (no per-sample delta
+   *  band), the clamped evaluator uses the clamped derivatives as-is and never
+   *  consults this field. */
+  readonly overflowFallback?: TrajectoryOverflowFallback;
 }
 
 export interface FieldSpec<T = unknown> {
@@ -249,23 +303,71 @@ export const i8Array  = (n: number): FieldSpec<Int8Array>      => array<Int8Arra
 // an interleaved (p, v, [a]) sequence rather than opaque samples. See the
 // "Trajectory arrays" section at the top of this file for the layout.
 
+/** Options accepted by `f{32,64}TrajectoryArray(n, opts)`. The `order` field
+ *  is required; clamp fields are optional and trigger the clamped evaluator
+ *  path in `evaluateTrajectoryInto` (0.6.7). */
+export interface TrajectoryArrayOptions {
+  readonly order: TrajectoryOrder;
+  readonly velocityClamp?: number;
+  readonly accelerationClamp?: number;
+  readonly maxDeltaPerSample?: number;
+  readonly overflowFallback?: TrajectoryOverflowFallback;
+}
+
+const VALID_OVERFLOW_FALLBACKS: ReadonlySet<TrajectoryOverflowFallback> = new Set<
+  TrajectoryOverflowFallback
+>(["hold", "linear", "saturate"]);
+
+function validatePositiveFiniteClamp(label: string, v: unknown): void {
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    throw new Error(
+      `Schema: trajectory ${label} must be a finite positive number, got ${String(v)}`,
+    );
+  }
+}
+
 function trajectoryArray<T>(
   kind: "f64" | "f32",
   sampleCount: number,
-  order: TrajectoryOrder,
+  opts: TrajectoryArrayOptions,
 ): FieldSpec<T> {
   if (!Number.isInteger(sampleCount) || sampleCount <= 0) {
     throw new Error(
       `Schema: trajectory sampleCount must be a positive integer, got ${sampleCount}`,
     );
   }
+  const { order } = opts;
   if (order !== 1 && order !== 2 && order !== 3) {
     throw new Error(
       `Schema: trajectory order must be 1 | 2 | 3, got ${String(order)}`,
     );
   }
+  if (opts.velocityClamp !== undefined) {
+    validatePositiveFiniteClamp("velocityClamp", opts.velocityClamp);
+  }
+  if (opts.accelerationClamp !== undefined) {
+    validatePositiveFiniteClamp("accelerationClamp", opts.accelerationClamp);
+  }
+  if (opts.maxDeltaPerSample !== undefined) {
+    validatePositiveFiniteClamp("maxDeltaPerSample", opts.maxDeltaPerSample);
+  }
+  if (
+    opts.overflowFallback !== undefined &&
+    !VALID_OVERFLOW_FALLBACKS.has(opts.overflowFallback)
+  ) {
+    throw new Error(
+      `Schema: trajectory overflowFallback must be 'hold' | 'linear' | 'saturate', got ${String(opts.overflowFallback)}`,
+    );
+  }
   const flatLength = sampleCount * order;
-  const trajectory: TrajectorySpec = Object.freeze({ order, sampleCount });
+  const trajectory: TrajectorySpec = Object.freeze({
+    order,
+    sampleCount,
+    ...(opts.velocityClamp !== undefined ? { velocityClamp: opts.velocityClamp } : {}),
+    ...(opts.accelerationClamp !== undefined ? { accelerationClamp: opts.accelerationClamp } : {}),
+    ...(opts.maxDeltaPerSample !== undefined ? { maxDeltaPerSample: opts.maxDeltaPerSample } : {}),
+    ...(opts.overflowFallback !== undefined ? { overflowFallback: opts.overflowFallback } : {}),
+  });
   return Object.freeze({
     kind,
     length: flatLength,
@@ -276,9 +378,9 @@ function trajectoryArray<T>(
 
 export const f64TrajectoryArray = (
   n: number,
-  opts: { order: TrajectoryOrder },
+  opts: TrajectoryArrayOptions,
 ): FieldSpec<Float64Array> =>
-  trajectoryArray<Float64Array>("f64", n, opts.order);
+  trajectoryArray<Float64Array>("f64", n, opts);
 
 /** f32 variant — preferred for memory-tight high-order cases (order=3 at
  *  large N). Loses ~7 decimal digits of precision per sample vs f64; only
@@ -286,9 +388,9 @@ export const f64TrajectoryArray = (
  *  derivatives. */
 export const f32TrajectoryArray = (
   n: number,
-  opts: { order: TrajectoryOrder },
+  opts: TrajectoryArrayOptions,
 ): FieldSpec<Float32Array> =>
-  trajectoryArray<Float32Array>("f32", n, opts.order);
+  trajectoryArray<Float32Array>("f32", n, opts);
 
 // ─── Schema container + inference ──────────────────────────────────────────
 

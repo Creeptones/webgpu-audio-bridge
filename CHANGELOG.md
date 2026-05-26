@@ -4,6 +4,55 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.7] — 2026-05-26
+
+### Added — trajectory safety clamps
+
+`f64TrajectoryArray(n, opts)` and its f32 twin gain four optional safety fields that make order-2 / order-3 Taylor extrapolation robust against transient producer values without changing the SAB byte layout.
+
+- **`velocityClamp?: number`** — `|v_i|` capped pre-evaluation (both signs).
+- **`accelerationClamp?: number`** — `|a_i|` capped pre-evaluation (order=3 only in practice; the spec accepts it on any order but the clamp is dormant at order ≤ 2).
+- **`maxDeltaPerSample?: number`** — `|out[i] - out[i-1]|` capped post-evaluation. Sample 0 is always allowed (no prev).
+- **`overflowFallback?: 'hold' | 'linear' | 'saturate'`** — consulted only when `maxDeltaPerSample` fires. Default `'saturate'` clamps the would-be output into `[prev - maxDelta, prev + maxDelta]`. `'hold'` freezes the signal at `prev`. `'linear'` drops the acceleration term and re-checks (collapses to saturate at order ≤ 2).
+
+When no clamp is set the evaluator's fast path is preserved bit-exact equal to 0.6.6 across orders 1 / 2 / 3 (f64 + f32). When any clamp is set the evaluator switches to a clamped path that pre-resolves the spec into a small per-spec config (clamp values, fallback id) at function entry so the inner loop stays branch-free per call — no per-sample if/else on metadata. New exports: type `TrajectoryArrayOptions`, type `TrajectoryOverflowFallback`.
+
+### Why — make order-3 trajectories safe under transient producer values
+
+Order-2 and order-3 trajectory schemas trade producer-side derivative correctness for consumer-side extrapolation distance. The math is correct under the assumption that the derivatives are bounded by the underlying signal's bandwidth; a single transient (a numerical instability in the producer's PDE solver, a frame-boundary discontinuity, a `NaN`-to-large recovery glitch) propagates a huge velocity or acceleration straight into the audio block. At order=3 the quadratic term is especially fragile — a 100×-larger `a` blows the output by 100× in the next quantum.
+
+The four clamp fields cover the three places extrapolation can go wrong: at the derivative load (`velocityClamp` / `accelerationClamp` cap the input pre-multiply), and at the output projection (`maxDeltaPerSample` caps successive-sample excursion). Pre-resolving the spec at function entry keeps the hot loop unrolled per-order and per-clamp-set — the fast path runs zero extra ops vs 0.6.6; the clamped path runs only the ops its config selects. This is the same dispatch shape as the 0.6.4 trajectory-aware smoother fix: behavior switched by precomputed metadata, not by per-sample branches.
+
+Hermite interpolation was an alternative considered and deferred. Hermite would improve quality at the cost of changing the math contract (4-point stencil vs the current 1-point Taylor) and requires the producer to also publish a future sample. Clamps are the smaller, opt-in fix that doesn't change the wire shape or the producer pattern.
+
+### Wire compatibility
+
+- **No SAB changes.** Clamps are pure schema metadata. A clamp-equipped `TrajectorySpec` and its clamp-free twin produce identical frame bytes; a 0.6.7 producer and a 0.6.6 consumer (or vice versa) share a SAB transparently. Header lanes 0–3 unchanged from 0.6.0; lanes 4–7 still reserved.
+- **No public-API breakage.** `f64TrajectoryArray(n, { order })` (no clamps) still works and produces a schema indistinguishable from one built without 0.6.7. All 0.6.6 call sites compile and execute unchanged. `TrajectorySpec`'s new fields are all optional.
+- **Type-erased `SchemaLayoutFieldDescription.trajectory` carries the new optional fields.** `describeSchemaLayout(...)` propagates them to worklet-side inliners that read only the layout description; consumers that don't read the clamp fields see no change.
+
+### Tests
+
+`tests/schema.test.ts` grows from 13 to 14 pins:
+
+- **`testTrajectoryClamps`** (pin #14) — every clamp field round-trips through `FieldSpec.trajectory` → `CompiledField.trajectory` → `SchemaLayoutFieldDescription.trajectory`; clamp-equipped and clamp-free schemas are byte-identical (`frameByteSize` matches); validation rejects non-finite / non-positive clamps (`0`, `-1`, `NaN`, `±Infinity`, strings, `null`) and unknown `overflowFallback` strings; trajectory tag stays frozen; f32 twin accepts the same opts.
+
+`tests/Bridge.test.ts` grows from 55 to 60 pins:
+
+- **`testTrajectoryVelocityClamp`** (pin #56) — order=2 with `velocityClamp: 2.0`; samples carrying `v = +10`, `v = -100`, `v = +1.5`, `v = -2.0` all classify correctly (clamped on overshoot, untouched in-band, untouched at boundary); dt=0 returns position regardless of clamp.
+- **`testTrajectoryAccelerationClamp`** (pin #57) — order=3 with `accelerationClamp: 4.0`; samples with `a = +100`, `a = -1000`, `a = +2` evaluate to the expected `p + v·dt + ½·a_clamped·dt²` closed form.
+- **`testTrajectoryHoldFallback`** (pin #58) — order=2 with `maxDeltaPerSample: 0.1` + `overflowFallback: 'hold'`; a square-wave-style transient (1.0 → 1.05 → 99 → 99.5 → 1.10) freezes at the held value for the duration of the spike and resumes when the raw signal returns within band. Bounded max |out| < 2.0 across the run.
+- **`testTrajectoryDeltaSaturate`** (pin #59) — default `'saturate'` fallback bounds every per-sample step by `maxDelta`; against an alternating 0 / 100 input the output climbs / descends by exactly `maxDelta` per sample.
+- **`testTrajectoryClampFreeBitExact`** (pin #60) — across orders 1 / 2 / 3 with N=128 mulberry32-seeded random fixtures, `evaluateTrajectoryInto` produces bit-identical output to the inlined Taylor formula; f32 spot check confirms order=2 byte-exact under f32 truncation. Sanity sub-pin shows the clamp path engages only when a clamp field is set.
+
+All 6 test suites green (schema 14 pins / Bridge 60 pins / Bridge phase-lock / Bridge.concurrent / Float64RingBuffer 9 pins / Float64RingBuffer.concurrent). The clamp-free fast path bench cell holds the regression target (<1.25 μs at N=1000); the clamped path is documented as a separate median.
+
+### Documentation
+
+- `src/schema.ts` header gains a `Trajectory safety clamps (0.6.7)` section enumerating each clamp field and the fast-path / clamped-path dispatch contract; `TrajectorySpec` JSDoc covers each new optional field; `TrajectoryArrayOptions` and `TrajectoryOverflowFallback` are JSDoc'd at their declaration sites.
+- `src/trajectory.ts` header gains a `Safety clamps (0.6.7)` section explaining the path split, the precomputed inner-loop config, and the per-fallback semantics.
+- README `Trajectory arrays` subsection gains a clamp example and roadmap entry for 0.6.7.
+
 ## [0.6.6] — 2026-05-26
 
 ### Added — invariant epsilon floor + smoother named modes

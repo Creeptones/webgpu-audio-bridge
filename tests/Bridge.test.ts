@@ -154,6 +154,28 @@
  *      matches the closed form at skipped = 0 / 1 / 5 / 10. Default-omit
  *      path is bit-exact identical to the pre-0.6.6 `α_base · 2^(-skipped)`
  *      formula on the same skipped values — preserves all of pins 18..27.
+ *  56. Trajectory velocity clamp (0.6.7). order=2 with `velocityClamp` set:
+ *      a producer-side huge velocity sample is clamped pre-evaluation so
+ *      the output excursion is bounded by `velocityClamp · dt`. Signed
+ *      clamp on both sides; finite + zero-dt edges land correctly.
+ *  57. Trajectory acceleration clamp (0.6.7). order=3 with
+ *      `accelerationClamp` set: a producer-side huge acceleration sample
+ *      is clamped pre-evaluation so the quadratic term is bounded by
+ *      `½ · accelerationClamp · dt²`.
+ *  58. Trajectory 'hold' fallback (0.6.7). order=2 with
+ *      `maxDeltaPerSample` + `overflowFallback: 'hold'`: a sample whose
+ *      Taylor value lands more than `maxDelta` away from the previous
+ *      output freezes the signal — out[i] = out[i-1]. Bounded outputs
+ *      across a run of held samples.
+ *  59. Trajectory per-sample delta clamp default 'saturate' (0.6.7). With
+ *      `maxDeltaPerSample` set and no explicit fallback, the evaluator
+ *      clamps each successive output into the per-sample band so
+ *      `|out[i] - out[i-1]| <= maxDelta` for every i > 0.
+ *  60. Trajectory clamp-free fast path bit-exact equal to 0.6.6 (0.6.7).
+ *      Across orders 1 / 2 / 3 (f64 + f32 spot checks), `evaluateTrajectoryInto`
+ *      with no clamps set produces bit-identical output to the inlined
+ *      Taylor formula — proving the fast path is preserved and that the
+ *      clamped path is engaged only when a clamp field is present.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -178,6 +200,8 @@ import {
   physicsControlFrameSchema,
   type PhysicsControlFrameSchema,
 } from "../src/schemas/physics.js";
+import { evaluateTrajectoryInto } from "../src/trajectory.js";
+import type { TrajectorySpec } from "../src/schema.js";
 
 function mulberry32(seed: number): () => number {
   let a = seed | 0;
@@ -3043,6 +3067,269 @@ function testSmootherCatchUpPolicy(): void {
   ok("smoother-catch-up-policy");
 }
 
+// ── 56. Trajectory velocity clamp (0.6.7) ──────────────────────────────────
+//
+// order=2: producer ships a huge velocity sample; with `velocityClamp` set
+// the evaluator clamps |v| pre-multiply so the output excursion is bounded
+// by `velocityClamp · dt`. Symmetric on negative velocities; v inside the
+// band passes through untouched.
+function testTrajectoryVelocityClamp(): void {
+  const N = 4;
+  const spec: TrajectorySpec = {
+    order: 2,
+    sampleCount: N,
+    velocityClamp: 2.0,
+  };
+  const flat = new Float64Array([
+    1.0,   10.0, // sample 0: p=1,  v=10  (clamped to +2)
+    2.0, -100.0, // sample 1: p=2,  v=-100 (clamped to -2)
+    3.0,    1.5, // sample 2: p=3,  v=1.5 (within band, untouched)
+    4.0,   -2.0, // sample 3: p=4,  v=-2  (exactly at band edge, untouched)
+  ]);
+  const out = new Float64Array(N);
+  const dt = 0.5;
+  evaluateTrajectoryInto(flat, spec, dt, out);
+
+  assertEq(out[0], 1.0 + 2.0 * dt, "v-clamp: positive overshoot caps at +velocityClamp");
+  assertEq(out[1], 2.0 + -2.0 * dt, "v-clamp: negative overshoot caps at -velocityClamp");
+  assertEq(out[2], 3.0 + 1.5 * dt, "v-clamp: in-band velocity passes through");
+  assertEq(out[3], 4.0 + -2.0 * dt, "v-clamp: boundary value passes through");
+
+  // dt = 0: clamping is dormant in effect (multiplied by 0) but path still
+  // engages without throwing or producing NaN.
+  const out0 = new Float64Array(N);
+  evaluateTrajectoryInto(flat, spec, 0, out0);
+  assertEq(out0[0], 1.0, "v-clamp: dt=0 returns position regardless of clamp");
+  assertEq(out0[1], 2.0, "v-clamp: dt=0 returns position regardless of clamp");
+
+  ok("trajectory-velocity-clamp");
+}
+
+// ── 57. Trajectory acceleration clamp (0.6.7) ──────────────────────────────
+//
+// order=3: producer ships a huge acceleration sample; with
+// `accelerationClamp` set the evaluator clamps |a| pre-multiply so the
+// quadratic term is bounded by `½ · accelerationClamp · dt²`. Velocity
+// unchanged (no velocityClamp), so the velocity contribution is full
+// fidelity.
+function testTrajectoryAccelerationClamp(): void {
+  const N = 3;
+  const spec: TrajectorySpec = {
+    order: 3,
+    sampleCount: N,
+    accelerationClamp: 4.0,
+  };
+  const flat = new Float64Array([
+    0.0, 1.0,   100.0,  // sample 0: p=0, v=1, a=100 (clamped to +4)
+    1.0, 0.5, -1000.0,  // sample 1: p=1, v=0.5, a=-1000 (clamped to -4)
+    2.0, 0.0,     2.0,  // sample 2: p=2, v=0, a=2 (in-band, untouched)
+  ]);
+  const out = new Float64Array(N);
+  const dt = 0.5;
+  const halfDt2 = 0.5 * dt * dt;
+  evaluateTrajectoryInto(flat, spec, dt, out);
+
+  assertEq(
+    out[0],
+    0.0 + 1.0 * dt + 4.0 * halfDt2,
+    "a-clamp: huge positive a clamps to +accelerationClamp",
+  );
+  assertEq(
+    out[1],
+    1.0 + 0.5 * dt + -4.0 * halfDt2,
+    "a-clamp: huge negative a clamps to -accelerationClamp",
+  );
+  assertEq(
+    out[2],
+    2.0 + 0.0 * dt + 2.0 * halfDt2,
+    "a-clamp: in-band a passes through",
+  );
+
+  ok("trajectory-acceleration-clamp");
+}
+
+// ── 58. Trajectory 'hold' fallback (0.6.7) ─────────────────────────────────
+//
+// order=2 with `maxDeltaPerSample` + `overflowFallback: 'hold'`. A sample
+// whose Taylor output would land further than `maxDelta` from the previous
+// output freezes the signal at the previous value. Successive holds keep
+// the same level until the raw signal returns within band.
+function testTrajectoryHoldFallback(): void {
+  const N = 5;
+  const spec: TrajectorySpec = {
+    order: 2,
+    sampleCount: N,
+    maxDeltaPerSample: 0.1,
+    overflowFallback: "hold",
+  };
+  // Velocities zero everywhere so out[i] = p_i exactly (no clamp on v).
+  // Positions step like a square wave: 1.0, 1.05, 99.0, 99.5, 1.0.
+  const flat = new Float64Array([
+    1.0,  0.0, // sample 0: 1.0 (no prev — passes through)
+    1.05, 0.0, // sample 1: 1.05 (delta 0.05 < 0.1 → passes through)
+    99.0, 0.0, // sample 2: 99.0 (delta 97.95 > 0.1 → hold prev = 1.05)
+    99.5, 0.0, // sample 3: 99.5 (delta 98.45 > 0.1 → hold prev = 1.05)
+    1.10, 0.0, // sample 4: 1.10 (delta 0.05 < 0.1 vs held 1.05 → passes through)
+  ]);
+  const out = new Float64Array(N);
+  evaluateTrajectoryInto(flat, spec, 1.0, out);
+
+  assertEq(out[0], 1.0, "hold: sample 0 passes through (no prev)");
+  assertEq(out[1], 1.05, "hold: sample 1 in-band, passes through");
+  assertEq(out[2], 1.05, "hold: sample 2 out-of-band, freezes at prev (1.05)");
+  assertEq(out[3], 1.05, "hold: sample 3 still out-of-band, stays frozen");
+  assertEq(out[4], 1.10, "hold: sample 4 returns within band, passes through");
+
+  // Bounded excursion across the whole run.
+  let maxAbs = 0;
+  for (let i = 0; i < N; i++) {
+    const v = Math.abs(out[i]!);
+    if (v > maxAbs) maxAbs = v;
+  }
+  assert(maxAbs < 2.0, `hold: max |out| ${maxAbs} stays bounded (< 2.0) despite raw 99-spike`);
+
+  ok("trajectory-hold-fallback");
+}
+
+// ── 59. Trajectory per-sample delta clamp 'saturate' (0.6.7) ───────────────
+//
+// Default `overflowFallback` is 'saturate': the would-be output is clamped
+// into `[prev - maxDelta, prev + maxDelta]`. This bounds the per-sample
+// excursion across the entire run by maxDelta — useful as a click /
+// glitch guard.
+function testTrajectoryDeltaSaturate(): void {
+  const N = 10;
+  const maxDelta = 0.05;
+  const spec: TrajectorySpec = {
+    order: 2,
+    sampleCount: N,
+    maxDeltaPerSample: maxDelta,
+    // no overflowFallback set → defaults to 'saturate' in the evaluator
+  };
+  // Square-wave-style transient: starting at 0, jumping to 100 every other
+  // sample. Velocities zero (so out[i] = p_i with no clamping path active).
+  const flat = new Float64Array(N * 2);
+  for (let i = 0; i < N; i++) {
+    flat[i * 2] = i % 2 === 0 ? 0 : 100;
+    flat[i * 2 + 1] = 0;
+  }
+  const out = new Float64Array(N);
+  evaluateTrajectoryInto(flat, spec, 1.0, out);
+
+  // sample 0 is always allowed (no prev) → passes through as 0.
+  assertEq(out[0], 0, "saturate: sample 0 passes through");
+  // Every subsequent step is clamped to ±maxDelta.
+  for (let i = 1; i < N; i++) {
+    const diff = Math.abs(out[i]! - out[i - 1]!);
+    assert(
+      diff <= maxDelta + 1e-12,
+      `saturate: |out[${i}] - out[${i - 1}]| = ${diff} <= maxDelta (${maxDelta})`,
+    );
+  }
+  // The series climbs by maxDelta per step toward 100 (never reaches it).
+  assertEq(out[1], maxDelta, "saturate: sample 1 = prev + maxDelta toward target");
+  assertEq(out[2], 0, "saturate: sample 2 saturates downward by maxDelta");
+  assertEq(out[3], maxDelta, "saturate: sample 3 climbs back by maxDelta");
+
+  ok("trajectory-delta-saturate");
+}
+
+// ── 60. Trajectory clamp-free fast path bit-exact equal to 0.6.6 (0.6.7) ──
+//
+// With no clamp field set the evaluator must produce bit-identical output
+// to the inlined Taylor formula across orders 1 / 2 / 3 (f64 + f32 spot
+// check). This is the regression pin proving 0.6.7's split keeps the fast
+// path byte-for-byte equivalent — any future refactor that quietly engages
+// the clamped path on a clamp-free spec flips this red.
+function testTrajectoryClampFreeBitExact(): void {
+  // Deterministic pseudo-random fixtures.
+  const rng = mulberry32(0xC0FFEE);
+  const N = 128;
+  const dt = 0.314159;
+
+  // ── order=1 ──────────────────────────────────────────────────────────
+  {
+    const flat = new Float64Array(N);
+    for (let i = 0; i < N; i++) flat[i] = (rng() - 0.5) * 1000;
+    const spec: TrajectorySpec = { order: 1, sampleCount: N };
+    const out = new Float64Array(N);
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    for (let i = 0; i < N; i++) {
+      assertEq(out[i], flat[i]!, `clamp-free order=1 sample ${i} bit-exact`);
+    }
+  }
+
+  // ── order=2 ──────────────────────────────────────────────────────────
+  {
+    const flat = new Float64Array(N * 2);
+    for (let k = 0; k < flat.length; k++) flat[k] = (rng() - 0.5) * 1000;
+    const spec: TrajectorySpec = { order: 2, sampleCount: N };
+    const out = new Float64Array(N);
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 2;
+      const want = flat[j]! + flat[j + 1]! * dt;
+      assertEq(out[i], want, `clamp-free order=2 sample ${i} bit-exact`);
+    }
+  }
+
+  // ── order=3 ──────────────────────────────────────────────────────────
+  {
+    const flat = new Float64Array(N * 3);
+    for (let k = 0; k < flat.length; k++) flat[k] = (rng() - 0.5) * 1000;
+    const spec: TrajectorySpec = { order: 3, sampleCount: N };
+    const out = new Float64Array(N);
+    const halfDt2 = 0.5 * dt * dt;
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 3;
+      const want = flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2;
+      assertEq(out[i], want, `clamp-free order=3 sample ${i} bit-exact`);
+    }
+  }
+
+  // ── f32 spot check, order=2 ─────────────────────────────────────────
+  // f32 element-write truncates to float32 precision; the bit-exact
+  // assertion is against the inlined formula computed with the same
+  // truncation contract.
+  {
+    const flat = new Float32Array(N * 2);
+    for (let k = 0; k < flat.length; k++) flat[k] = Math.fround((rng() - 0.5) * 100);
+    const spec: TrajectorySpec = { order: 2, sampleCount: N };
+    const out = new Float32Array(N);
+    const ref = new Float32Array(N);
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 2;
+      ref[i] = flat[j]! + flat[j + 1]! * dt;
+    }
+    for (let i = 0; i < N; i++) {
+      assertEq(out[i], ref[i]!, `clamp-free f32 order=2 sample ${i} bit-exact`);
+    }
+  }
+
+  // ── Sanity: the clamped path (any clamp field set) is NOT engaged on a
+  // spec that omits all clamp fields — proved by the above bit-exactness.
+  // A spec with one clamp set produces output that may differ; just verify
+  // that the path is reachable and the bounded behavior pin (#58/#59)
+  // covers correctness.
+  {
+    const flat = new Float64Array([10, 1000]); // huge v
+    const out = new Float64Array(1);
+    evaluateTrajectoryInto(flat, { order: 2, sampleCount: 1 }, 1.0, out);
+    assertEq(out[0], 10 + 1000 * 1.0, "no-clamp control: huge v passes through");
+    evaluateTrajectoryInto(
+      flat,
+      { order: 2, sampleCount: 1, velocityClamp: 5 },
+      1.0,
+      out,
+    );
+    assertEq(out[0], 10 + 5 * 1.0, "with-clamp control: huge v clamped");
+  }
+
+  ok("trajectory-clamp-free-bit-exact");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -3100,6 +3387,11 @@ function main(): void {
   testTimestampUnitConversion();
   testInvariantEpsilonFloor();
   testSmootherCatchUpPolicy();
+  testTrajectoryVelocityClamp();
+  testTrajectoryAccelerationClamp();
+  testTrajectoryHoldFallback();
+  testTrajectoryDeltaSaturate();
+  testTrajectoryClampFreeBitExact();
   console.log("\nAll Bridge tests passed.");
 }
 
