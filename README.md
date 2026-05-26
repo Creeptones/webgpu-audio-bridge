@@ -232,6 +232,10 @@ Producer-side park. Block until the consumer advances `read_index` or the timeou
 
 Consumer-side park. Mirror of `waitForSpace`. **Not real-time safe** — must NOT be called from `AudioWorklet.process()`. AudioWorklets should continue to poll via `pullLatest()` and tolerate misses.
 
+#### `flowScaleHint() → number`
+
+Producer-side adaptive backpressure hint, in `[0.5, 2.0]`. Returns the consumer's most recent `flow_scale` reading: `1.0` means the consumer's controller sees rates matched; `< 1.0` means slow down (consumer overfull); `> 1.0` means speed up (consumer starved). Best-effort — the bridge does not enforce; the producer voluntarily honors. See [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style) for the contract and a worked example.
+
 #### `describeLayout() → SchemaLayoutDescription`
 
 Returns a JSON-safe byte-offset table for the schema's frame layout — pass this through `postMessage` / `processorOptions` to a worklet that wants to inline the read protocol without importing the library on the audio thread.
@@ -342,6 +346,31 @@ while (!ring.push(vEff, jEff, header)) {
 
 Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic, so the load-then-park race is closed: if the peer advances its index between your load and your wait, the wait returns `"not-equal"` immediately rather than parking forever. The matching `Atomics.notify` is **unconditional** on every `push` / `pull` / `pullLatest` — a parked peer is guaranteed to be woken on the next state change. This is deliberately not edge-triggered; an earlier iteration tried "notify only on empty→non-empty / full→non-full" and lost wake-ups under genuine 2-thread contention. See the "Park / wake protocol" section in `src/Float64RingBuffer.ts` for the full story.
 
+### Adaptive backpressure (CFL-style)
+
+0.5.0 adds a continuous rate-control signal that producer and consumer use to stay matched continuously instead of only reacting after `push` rejects or `pullLatest` reports skips. The consumer runs a PI controller against the ring's pre-pull occupancy and publishes the controller's output on lane 2 of the header as a Q16.16 fixed-point in `[0.5, 2.0]`. The producer reads it via `bridge.flowScaleHint()` and voluntarily honors:
+
+```ts
+// Producer side. Baseline cadence + voluntary scaling:
+const baselineDtMs = 1000 / 60; // 60 Hz baseline
+let lastTick = performance.now();
+function tick() {
+  const dt = (performance.now() - lastTick) / 1000;
+  lastTick = performance.now();
+  // ... compute payload using dt ...
+  ring.push(frame);
+  // Scale next tick interval by the hint:
+  //   hint > 1.0 → consumer wants us faster → smaller next interval
+  //   hint < 1.0 → consumer wants us slower → larger next interval
+  const nextDelayMs = baselineDtMs / ring.flowScaleHint();
+  setTimeout(tick, nextDelayMs);
+}
+```
+
+`flowScaleHint()` returns `1.0` until the consumer issues its first pull, so producer-side code that starts before the consumer is up runs at baseline cadence. The hint is **best-effort** — the bridge does not enforce it. The hard contract is still capacity-based push reject; the soft hint, when honored, keeps the producer/consumer match continuous so the hard reject is reached only under genuine overload.
+
+The controller targets half-full occupancy with `Kp = 0.5, Ki = 0.05` (~10 ms settling time at the canonical 375 Hz consumer cadence). The integrator is bounded to `±20` for anti-windup so a long stall can't trap the controller in permanent over-correction. See the "Adaptive backpressure (CFL-style)" section in `src/Bridge.ts` for the full controller math and the CHANGELOG `[0.5.0]` entry for the design rationale.
+
 ## Memory ordering (for serious readers)
 
 The ring uses the standard release/acquire pattern for SPSC over SAB. A note for systems readers: ECMA-262 only defines sequentially-consistent atomics — there is no `memory_order_acquire` in JS. `Atomics.load` and `Atomics.store` are seq-cst, which is strictly stronger than release/acquire, so the protocol below is sound; we describe it in R/A terms because that's the load-bearing structure.
@@ -387,16 +416,20 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 ## Roadmap
 
-### Shipped in 0.3.0
+### Shipped
 
-- ✅ **Schema-driven frames** — `Bridge<Schema>` + `defineSchema({ ... })` with mixed primitive types as scalars or fixed-length arrays. Replaces the hard-coded `(seq, tMacroNs, vMax, jMax) + V_eff + J_eff` layout that the v0.1.x / v0.2.x `Float64RingBuffer` baked into its method signatures. Old class kept around (deprecated) for byte-compat.
+- ✅ **0.3.0 — Schema-driven frames** (`Bridge<Schema>` + `defineSchema({ ... })`). Replaces the hard-coded `Float64RingBuffer` layout with a typed DSL that supports mixed primitive types as scalars or fixed-length arrays.
+- ✅ **0.4.0 — Int32 wrap counters** (ringbuf.js-class atomic floor). `write_index` / `read_index` lanes moved from BigInt64 to Int32 wrapping mod 2^32; isolated atomic load+store+notify drops from ~160 ns to ~100 ns on V8.
+- ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with skip-scaling (`α_eff = α_base · 2⁻ˢᵏⁱᵖᵖᵉᵈ`) on the latest variant.
+- ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
 
 ### Remaining 1.0 work
 
-1. **Backpressure policies** — `policy: 'reject' | 'drop-oldest' | 'drop-newest' | 'block'` constructor option. Today only `reject` (the historical contract) is implemented; the other three are useful for telemetry-style and critical-data streams respectively.
-2. **Observability snapshot** — `ring.snapshot()` returning pushed/pulled/dropped counters, current/max depth, and last-wait durations. Lets consumers build DevTools panels, load shedding, and dashboards without instrumenting both ends by hand.
+1. **Schema invariant header** — `defineSchema({ ... }).withInvariant(fn)` adds a per-frame integrity field (Σ|f|² / CRC / xxhash, caller's choice) that the bridge auto-computes at push and verifies at pull. Soft errors (small ratio deviation) engage the 0.4.1 smoother for inaudible recovery; hard errors fall back to the last-known-good frame and increment a `tornFrameCounter` on lane 3. Cross-IPC bit-rot detection as a protocol concern instead of a per-caller responsibility. Target: 0.6.0.
+2. **Backpressure policies** — `policy: 'reject' | 'drop-oldest' | 'drop-newest' | 'block'` constructor option. Today only `reject` (the historical contract) is implemented; the other three are useful for telemetry-style and critical-data streams. With #4 landed and the soft hint already running, `reject` is rarely needed in practice, but the policies cover the cases where the producer can't honor the hint at all.
+3. **Observability snapshot** — `ring.telemetry()` returning pushed/pulled/dropped counters, current/max depth, `flowScale`, `tornFrames`, and last-wait durations. Lets consumers build DevTools panels, load shedding, and dashboards without instrumenting both ends by hand. Mostly falls out of #1 once `tornFrameCounter` lands on lane 3.
 
-These are sequenced after #3 because all three change the constructor / class surface and should land before 1.0 freezes the API.
+These are sequenced together because all three change the constructor / class surface and should land before 1.0 freezes the API.
 
 ### Beyond 1.0
 

@@ -2,6 +2,89 @@
 
 All notable changes to this project will be documented here. This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-25
+
+### Added — `Bridge<Schema>` adaptive backpressure (CFL-style)
+
+The bridge's existing backpressure model is binary: `push` returns `false` when full (and the caller drops or stalls), `pullLatest` reports `skipped > 0` when the consumer fell behind (and the caller smooths or accepts the jump). Neither side has any continuous signal of what's actually happening on the peer's side until something has already gone wrong. 0.5.0 adds that continuous signal as a first-class lane on the bridge header.
+
+- **Lane 2 of the Int32 header is now active.** Encodes `flow_scale` as a Q16.16 fixed-point in `[0.5, 2.0]` (stored `[32768, 131072]`). Default is `65536` = `1.0` = "no scaling." The lane is independent of the SPSC counter lanes — no acquire/release ordering with the payload, no compare-exchange needed; the consumer's controller is the sole writer and the producer's read is best-effort.
+- **`bridge.flowScaleHint() → number`** — producer-side read. Returns the consumer's most recent flow_scale in `[0.5, 2.0]`:
+  - `1.0` — rates are matched, no action needed.
+  - `< 1.0` — consumer is overfull, producer should slow down (scale its `dt`, drop frames, sleep a fraction of its interval).
+  - `> 1.0` — consumer is starved, producer should speed up.
+- **The bridge does NOT enforce the hint.** The hard contract is still capacity-based push reject; the producer voluntarily honors the soft hint. When honored, the producer/consumer match continuously and the hard reject is reached only under genuine overload — which is the entire point.
+
+### Why — first SPSC ring with control-theoretic flow control
+
+Existing SPSC ring libraries (`ringbuf.js`, LMAX Disruptor, `jack-ringbuffer`, `crossbeam::channel`) all do binary block-or-drop. Their assumption is "the caller picks the right capacity and tolerates the rest." Real audio pipelines don't have a right capacity — producer and consumer rates drift, especially at the GPU compute / audio worklet boundary where the GPU's mapAsync cadence is irregular and the audio quantum is hard-real-time.
+
+Lineage: this is the SPSC analog of the CFL stability condition in the wavefunction-synth project's `wf2dStepper.js:100-116`:
+
+```js
+if (maxRate * dt > PHASE_CAP) {
+  dt = PHASE_CAP / maxRate;
+}
+```
+
+The stepper measures a per-step "I'm about to exceed the safety bound" signal and adapts its step size to stay under. The bridge's controller measures a per-pull "buffer is filling / draining" signal and publishes a producer-side adaptation hint. Same control-theoretic shape (P + I closing a feedback loop against a measured invariant), different domain (ring-buffer occupancy vs phase advance per step).
+
+### The control law
+
+```
+err      = occupancy - 0.5                            // pre-pull, signed
+integral = clamp(integral + err, ±FLOW_SCALE_INT_LIMIT)
+scale    = clamp(1 - Kp·err - Ki·integral, 0.5, 2.0)
+```
+
+- **`Kp = 0.5`, `Ki = 0.05`** — conservative gains designed for ~10 ms settling time at the canonical 375 Hz consumer cadence (≈4 controller cycles per settling time). Bode-style argument: `occupancy_dot = (push_rate - pull_rate) / capacity`, PI closes the loop with crossover well below the audio rate.
+- **Target occupancy = 0.5** — half-full leaves equal slack for producer overrun and consumer overrun. Other choices are valid; 0.5 is the symmetric default.
+- **Anti-windup**: integral is clamped to `±20` so a long stall can't trap the controller in permanent over-correction (`INT_LIMIT = (range/2) / Ki = 1.0 / 0.05 = 20`). Without anti-windup, a 100 k-cycle full-ring stall would leave the integral at a value the controller could never recover from in human time.
+- **Sign**: positive err (consumer overfull) gives `scale < 1` (slow down); negative err (consumer starved) gives `scale > 1` (speed up). The hint is "rate multiplier the producer should aim for relative to its baseline."
+
+### Where the controller runs
+
+`_updateFlowScale(write, read)` is called from `pull`, `pullLatest`, `pullSmoothed`, `pullLatestSmoothed` AFTER the release-store on `read_index` but ONLY on the successful (frame-was-consumed) branch:
+
+- Empty-pull early-returns do NOT update the lane. The "occupancy = 0" reading on an empty-pull would misleadingly say "producer too slow" when in fact the consumer hasn't actually consumed a frame.
+- `available()` is a pure observer and never touches the lane.
+- The lane is published AFTER the read-index release-store so the producer's slot is freed before the controller math runs.
+
+The cost is ~10 ns on the hot path (one mul, one add, two clamps, one `Math.floor`, one `Atomics.store`). The 0.5.0 bench at N=1000 shows push/pull/pullLatest median unchanged from 0.4.1 — the controller cost is invisible against the 1.20 μs Atomics-notify-dominated baseline.
+
+### Wire compatibility
+
+- **Bytes are compatible across 0.4.x ↔ 0.5.0.** Lane 2 was reserved in 0.4.x (stored as zero); the 0.5.0 constructor uses `Atomics.compareExchange(lane2, 0, 65536)` to seed only if the lane is still zero. A 0.4.x peer that ignores lane 2 will see no behavioral change.
+- A 0.5.0 producer running against a 0.4.x consumer: `flowScaleHint()` will keep reading the 0.5.0 default (1.0) because the 0.4.x consumer never updates the lane. The producer behaves as if no controller is running — which is correct.
+- A 0.4.x producer running against a 0.5.0 consumer: the controller still runs on the consumer side and publishes to lane 2, but the producer never reads it (it doesn't have the method). Harmless.
+
+### Added — `flow_scale` test pins
+
+`tests/Bridge.test.ts` grows from 27 to 33 pins:
+
+- **`testFlowScaleLaneInit`** — brand-new Bridge has lane 2 seeded to `Q16.16(1.0) = 65536`; `flowScaleHint()` returns `1.0`.
+- **`testFlowScaleQ1616RoundTrip`** — sweeps `[0.5, 2.0]` in 0.1 steps; round-trip error bounded by `2⁻¹⁶`. Clamp boundaries `0.5` and `2.0` round-trip exactly.
+- **`testFlowScalePIStepResponse`** — synthetic controller test via direct `_updateFlowScale` access. Pins the first three cycles' analytic values bit-exactly (within Q16.16 quantum), then verifies 100-cycle saturation at the low clamp = `0.5` (output clamp + anti-windup engaged).
+- **`testFlowScaleIntegrationDirection`** — drives the controller through real push/pull cycles at two regimes:
+  - push1/pull1 (starved, pre-pull occupancy = 1/16) → hint saturates at the high clamp `2.0`.
+  - full+refill (overfull, pre-pull occupancy = 1.0) → hint saturates at the low clamp `0.5`.
+- **`testFlowScaleStability`** — 5000 randomized push/pull operations (mulberry32 seed `0xfacefeed`), counting zero-crossings of `flowScaleHint() − 1`. With `Kp=0.5/Ki=0.05` the P-dominant response shouldn't ring; ≤ 50 sign changes asserted (typical run ≈ 37). A truly oscillating controller would cross ~2500 times.
+- **`testFlowScaleAntiWindup`** — saturates the integrator low for 200 cycles, switches to starvation, asserts the controller recovers to `scale > 1` within 100 cycles (analytic ≈ 46). Without anti-windup, recovery would take ~∞ cycles; this pin catches any future regression of the integral clamp.
+
+`tests/Bridge.concurrent.test.ts` cross-thread pin extended with a flow-scale envelope sampler. After every pull chunk, `flowScaleHint()` is sampled into a running `[min, max]` envelope. End-of-run assertion: the envelope must stay within `[0.5, 2.0]` for the full 1 M-frame run. A reading outside this band would indicate a sign-flip, clamp miss, or encoder overflow. The 1 M-frame run on a dev laptop covers both clamps because the producer/consumer rates are unmatched (producer is a tight loop, consumer pulls in 8 k chunks).
+
+### Added — `flow_scale recovery` bench cell
+
+`bench/Bridge.bench.ts` gets a third measurement cell. Drives the controller through a saturate-then-step disturbance (200 overfull cycles, then switch to starved), reports the recovery cycle count, and fails if recovery exceeds 100 cycles. Local measurement: 33 cycles to recover, well under the 100-cycle budget (analytic ≈ 46). This is not a per-op latency measurement — the controller's hot-path cost is folded into the regular `pull` cell, which still measures at the 1.20 μs floor.
+
+### Documentation
+
+- New `Adaptive backpressure (CFL-style, 0.5.0)` section in `src/Bridge.ts` header documenting the math, the gain rationale, the run-site selection (only on the successful pull branch), and the cost.
+- `Layout` block updated: lane 2 now documented as `flow_scale (Q16.16 consumer→producer PI hint)`, with a reserved-lane table covering lanes 0-7.
+- JSDoc on `flowScaleHint()` covers the producer contract (voluntarily honor, not enforced) and the Q16.16 quantum.
+- README gets a new "Adaptive backpressure (CFL-style)" subsection under [Back-pressure](#back-pressure) showing the producer's voluntary-honor pattern with a `dt` scaling example.
+- Roadmap updated: #1 (adaptive backpressure) marked shipped; #4 (schema invariant header for cross-IPC bit-rot detection) is the remaining open item targeting 0.6.0.
+
 ## [0.4.1] — 2026-05-25
 
 ### Added — `Bridge<Schema>` smoothed-pull API

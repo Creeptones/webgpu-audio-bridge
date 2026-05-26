@@ -31,6 +31,13 @@
  * Users on small-payload schemas (control signals, scalar streams) get the
  * full win; users on the legacy macro-physics shape see no change but pay
  * less BigInt boxing cost on V8.
+ *
+ * 0.5.0 cell. `flow_scale recovery` characterizes the adaptive backpressure
+ * controller's settling time (cycles to return from saturated low clamp to
+ * scale > 1.0 under a 0→empty step). Not a per-op latency measurement —
+ * the controller's hot-path cost is folded into the regular `pull` cell
+ * (one Atomics.store + a handful of muls/adds, ~10 ns over baseline). See
+ * src/Bridge.ts "Adaptive backpressure" section for the controller math.
  */
 
 import { hrtime } from "node:process";
@@ -145,6 +152,67 @@ function runPullBench(): { samples: number[]; misses: number } {
   return { samples, misses };
 }
 
+/**
+ * Flow-scale recovery characterization. Drives the controller through a
+ * saturate-then-step disturbance and reports cycle count to recover. Then
+ * runs a short post-recovery pull cadence to confirm the controller-active
+ * hot path doesn't drift relative to baseline `pull`.
+ *
+ * Phase 1: push capacity, pull/refill K times. Pre-pull occupancy stays at
+ * 1.0; controller integrator saturates at FLOW_SCALE_INT_LIMIT; scale
+ * clamps at 0.5.
+ *
+ * Phase 2: switch to push-1/pull-1 (steady-state pre-pull occupancy =
+ * 1/capacity ≈ 0.0625). Count pulls until `flowScaleHint() > 1.0`. The
+ * analytic estimate is `INT_LIMIT / |err| ≈ 20 / 0.4375 ≈ 46` cycles.
+ */
+function runFlowScaleRecoveryBench(): {
+  saturationCycles: number;
+  recoveryCycles: number;
+} {
+  const schema = physicsControlFrameSchema(N);
+  const { sab } = Bridge.allocate(CAPACITY, schema);
+  const ring = new Bridge(sab, CAPACITY, schema);
+  const frame = makeFrame();
+  const out = makeOutFrame();
+
+  // Phase 1: saturate at occupancy = 1.0.
+  for (let i = 0; i < CAPACITY; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+  }
+  const SATURATE = 200;
+  for (let i = 0; i < SATURATE; i++) {
+    ring.pull(out);
+    frame.seq = BigInt(CAPACITY + i);
+    ring.push(frame);
+  }
+  // Confirm saturated.
+  const satHint = ring.flowScaleHint();
+  // Drain to one frame so the recovery loop starts from low pre-pull occupancy.
+  while (ring.available() > 1) ring.pull(out);
+
+  // Phase 2: starvation (push1/pull1).
+  let recoveryCycles = -1;
+  for (let i = 0; i < 500; i++) {
+    if (ring.available() === 0) {
+      frame.seq = BigInt(10_000 + i);
+      ring.push(frame);
+    }
+    ring.pull(out);
+    frame.seq = BigInt(10_000 + 500 + i);
+    ring.push(frame);
+    if (ring.flowScaleHint() > 1.0) {
+      recoveryCycles = i + 1;
+      break;
+    }
+  }
+  return {
+    saturationCycles: SATURATE * (satHint === 0.5 ? 1 : 0), // 0 if it didn't saturate
+    recoveryCycles,
+  };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -205,6 +273,26 @@ function main(): void {
       `pull misses=${pullResult.misses} ` +
       `pullLatest misses=${pullLatestResult.misses}`,
   );
+  console.log();
+  const recovery = runFlowScaleRecoveryBench();
+  console.log(
+    `  flow_scale recovery: saturated=${recovery.saturationCycles > 0 ? "yes" : "no"} ` +
+      `recoveryCycles=${recovery.recoveryCycles} ` +
+      `(analytic ≈ 46 cycles)`,
+  );
+  // Recovery time bound: anti-windup integrator empties in
+  // ~INT_LIMIT/|err| = 20/0.4375 ≈ 46 cycles; assert under 100 cycles to
+  // catch sign-flip or windup regressions while tolerating gain tuning.
+  if (recovery.recoveryCycles < 0 || recovery.recoveryCycles > 100) {
+    console.error(
+      `  FAIL                flow_scale recovery (${recovery.recoveryCycles} cycles; expected 0 < n ≤ 100)`,
+    );
+    process.exitCode = 1;
+  } else {
+    console.log(
+      `  within recovery budget  flow_scale recovered in ${recovery.recoveryCycles} cycles ≤ 100`,
+    );
+  }
   console.log();
 
   // Per the plan: schema dispatch costs ~50-150ns/op on top of the

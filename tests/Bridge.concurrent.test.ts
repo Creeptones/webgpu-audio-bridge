@@ -25,6 +25,12 @@
  *      producer's recipe — `assertEq` (===), not `assertNear`.
  *   5. The producer completes (no deadlock under steady-state back-pressure).
  *   6. Neither side records a wait-timeout (lost-notify regression alarm).
+ *   7. Consumer-side flow_scale hint stays within the documented
+ *      [0.5, 2.0] band for the whole run — sampled at pull-chunk
+ *      boundaries, asserted at end. A reading outside the band would
+ *      indicate a sign-flip, clamp miss, or encoder overflow. This is the
+ *      cross-thread pin for #1 (0.5.0); the single-threaded controller math
+ *      is exhaustively covered by tests/Bridge.test.ts pins 28-33.
  *
  * If the release/acquire protocol is broken on either side OR the schema-
  * driven offset math drifts from what the consumer reads, the inner payload
@@ -267,6 +273,15 @@ async function runConcurrentStress(): Promise<void> {
   const startedAt = Date.now();
   let lastHeartbeatAt = startedAt;
   let lastHeartbeatConsumed = 0;
+  // Flow-scale envelope sampler. The producer never reads the hint in this
+  // test (the inline-eval producer is unchanged from 0.4.x and predates
+  // flow_scale). The consumer's controller still publishes on every pull;
+  // we sample at heartbeat boundaries to pin the running min/max in
+  // [0.5, 2.0]. Drift outside the band would indicate a bad encode/decode
+  // or a broken anti-windup clamp.
+  let flowScaleMin = Infinity;
+  let flowScaleMax = -Infinity;
+  let flowScaleSamples = 0;
   process.stderr.write(
     `[watchdog] t=0.0s starting bridge-concurrent-spsc-stress ` +
       `TOTAL_FRAMES=${TOTAL_FRAMES.toLocaleString()} CAPACITY=${CAPACITY} N=${N} ` +
@@ -332,6 +347,14 @@ async function runConcurrentStress(): Promise<void> {
       consumed++;
       progressedThisChunk = true;
     }
+    // Sample the consumer-side flow_scale hint after each pull chunk so the
+    // recorded envelope sees both the steady-state and the post-burst
+    // transient. Bounded read — single Atomics.load — adds no measurable
+    // cost vs the pull loop itself.
+    const fs = ring.flowScaleHint();
+    if (fs < flowScaleMin) flowScaleMin = fs;
+    if (fs > flowScaleMax) flowScaleMax = fs;
+    flowScaleSamples++;
     const nowMs = Date.now();
     if (nowMs - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
       const elapsed = (nowMs - startedAt) / 1000;
@@ -349,6 +372,7 @@ async function runConcurrentStress(): Promise<void> {
           `rate=${rate.toFixed(0)}f/s ` +
           `emptyPolls=${emptyPolls.toLocaleString()} ` +
           `emptyWaits=${emptyWaits.toLocaleString()} ` +
+          `fs=[${flowScaleMin.toFixed(3)},${flowScaleMax.toFixed(3)}] ` +
           producerLine +
           "\n",
       );
@@ -405,10 +429,25 @@ async function runConcurrentStress(): Promise<void> {
     0,
     `consumer Atomics.wait never times out under a healthy producer (got ${emptyWaitTimeouts})`,
   );
+  // Flow-scale envelope. The hint must stay within the documented [0.5, 2.0]
+  // range for the entire run — the controller's output is bounded by the
+  // FLOW_SCALE_MIN/MAX clamp and the anti-windup integrator limit, so a
+  // sample outside this range indicates a sign-flip, clamp miss, or encoder
+  // overflow. We require at least one sample (sanity); flowScaleSamples ≈
+  // number of pull chunks across the run.
+  assert(
+    flowScaleSamples > 0,
+    `flow-scale envelope sampled at least once (got ${flowScaleSamples})`,
+  );
+  assert(
+    flowScaleMin >= 0.5 && flowScaleMax <= 2.0,
+    `flow-scale envelope [${flowScaleMin}, ${flowScaleMax}] within [0.5, 2.0] (${flowScaleSamples} samples)`,
+  );
   ok(
     `bridge-concurrent-spsc-stress (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +
       `producer ${fullWaits.toLocaleString()} full-waits / ${producerNotifies.toLocaleString()} push-notifies; ` +
-      `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyPolls.toLocaleString()} empty polls)`,
+      `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyPolls.toLocaleString()} empty polls; ` +
+      `flow-scale envelope [${flowScaleMin.toFixed(3)}, ${flowScaleMax.toFixed(3)}] over ${flowScaleSamples.toLocaleString()} samples)`,
   );
 }
 

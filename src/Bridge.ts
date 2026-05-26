@@ -11,7 +11,17 @@
  *   Header (32 bytes, Int32 lanes via Atomics):
  *     [byte 0..3]    write_index   producer counter (Atomics, release; wraps mod 2^32)
  *     [byte 4..7]    read_index    consumer counter (Atomics, release; wraps mod 2^32)
- *     [byte 8..31]   reserved (24 bytes — earmarked for future flow_scale + telemetry)
+ *     [byte 8..11]   flow_scale    consumer→producer PI hint (Q16.16; 0.5..2.0)
+ *                                  default 65536 = 1.0 (no scaling). Independent
+ *                                  atomic — best-effort, no ordering vs the
+ *                                  counter lanes. See "Adaptive backpressure"
+ *                                  section below. Reserved-lane table:
+ *                                    lane 0: write_index            (active, 0.4.0)
+ *                                    lane 1: read_index             (active, 0.4.0)
+ *                                    lane 2: flow_scale             (active, 0.5.0)
+ *                                    lane 3: torn_frame_counter     (reserved)
+ *                                    lanes 4-7: reserved
+ *     [byte 12..31]  reserved (20 bytes — earmarked for torn_frame_counter etc.)
  *
  *   Payload region (typed-array umbrella views at SAB byte 32):
  *     For each FieldKind present in the schema, one umbrella view spanning
@@ -158,6 +168,56 @@
  * possible (the smoother adds no critical-section length to the SPSC
  * handoff).
  *
+ * ─── Adaptive backpressure (CFL-style, 0.5.0) ─────────────────────────────
+ *
+ * The bridge exposes a soft rate-control signal on lane 2 (`flow_scale`,
+ * Q16.16 fixed-point in [0.5, 2.0]; default 1.0 = no scaling). The consumer
+ * runs a PI controller against pre-pull occupancy (`(write - read) /
+ * capacity`) on every successful pull and stores the controller's output
+ * into the lane. The producer reads it via `flowScaleHint()` and may
+ * voluntarily honor it — by scaling its `dt`, dropping frames, sleeping a
+ * fraction of its interval, etc. The bridge does NOT enforce: the lane is a
+ * hint, not a gate. The existing capacity-based push reject (`push` returns
+ * false when full) is the hard contract; `flow_scale` is the soft layer
+ * that, when honored, keeps the producer/consumer rate match continuous so
+ * the hard reject is reached only under genuine overload.
+ *
+ * Math. With `err = occupancy - 0.5`, controller state `integral += err`
+ * (clamped to ±20 for anti-windup), and gains `Kp = 0.5`, `Ki = 0.05`:
+ *
+ *   scale = clamp(1 - Kp·err - Ki·integral, 0.5, 2.0)
+ *
+ * Sign: positive err (consumer is overfull) gives `scale < 1` (producer
+ * should slow down); negative err (consumer is starved) gives `scale > 1`
+ * (producer should speed up). The integrator removes steady-state offset
+ * — without it, a sustained producer/consumer mismatch would leave a
+ * residual occupancy error.
+ *
+ * Gain rationale. Designed for ~10 ms settling at the canonical 375 Hz
+ * consumer cadence (≈4 controller cycles per settling time). Bode-style
+ * argument: occupancy_dot = (push_rate - pull_rate) / capacity, PI closes
+ * the loop with crossover well below the audio rate. The 0.5 / 0.05
+ * starting point is conservative; faster gains are possible but ring when
+ * the rate mismatch reverses. Anti-windup limit `INT_LIMIT = (range/2)/Ki =
+ * 1.0/0.05 = 20`: integral contribution alone can drive `scale` across the
+ * full range, but cannot drive it past saturation — long stalls don't trap
+ * the controller in a permanent over-correction.
+ *
+ * Where it runs. `_updateFlowScale(write, read)` is called from `pull`,
+ * `pullLatest`, `pullSmoothed`, `pullLatestSmoothed` AFTER the release-
+ * store on read_index but only on the successful path (an empty-pull
+ * early-return does NOT update the lane; its "occupancy = 0" reading would
+ * misleadingly say "producer too slow" when in fact the consumer hasn't
+ * actually consumed). `available()` is a pure observer and never touches
+ * the lane. The lane is a separate atomic from the counters — no acquire/
+ * release ordering with the payload, no compare-exchange needed; plain
+ * `Atomics.store` / `Atomics.load` suffice because the producer's reading
+ * is best-effort.
+ *
+ * Cost. Adds ~10 ns to the hot path (one multiply, one add, two clamps,
+ * one `Math.floor`, one `Atomics.store`). Bench cell `flowScaleRecovery`
+ * pins the settling-time signal as a separate measurement.
+ *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
  * Compared to the hand-rolled Float64RingBuffer code path, Bridge<S> pays a
@@ -192,14 +252,37 @@ import {
 } from "./schema.js";
 
 export const RING_HEADER_BYTES = 32;
-export const RING_HEADER_LANES = 2; // active counter lanes: write_index (Int32 lane 0), read_index (Int32 lane 1); remaining 6 Int32 lanes reserved
+export const RING_HEADER_LANES = 2; // active counter lanes: write_index (Int32 lane 0), read_index (Int32 lane 1). Other active control lanes (flow_scale on lane 2) are accounted for separately — this constant counts only SPSC counters.
 export const RING_HEADER_INT32_LANES = 8; // 32-byte header viewed as Int32 = 8 lanes total
 
-// Internal lane indices into the Int32 header view. WRITE/READ are the
-// counter lanes; lanes 2-7 stay zero (reserved for the planned flow_scale /
-// observability fields, see roadmap items #6 and #7).
+// Internal lane indices into the Int32 header view.
+//   lanes 0-1: SPSC counters (acquire/release ordering, wrap-mod-2^32)
+//   lane 2:    flow_scale — Q16.16 consumer→producer hint (0.5.0)
+//   lane 3:    reserved for torn_frame_counter
+//   lanes 4-7: reserved
 const WRITE_IDX_LANE = 0;
 const READ_IDX_LANE = 1;
+const FLOW_SCALE_LANE = 2;
+
+// Flow-scale fixed-point + PI controller constants.
+//
+// Q16.16: store(scale) = floor(scale * 65536). Range [0.5, 2.0] maps to
+// [32768, 131072], all within positive signed-32 → Atomics.load on Int32Array
+// returns the stored value bit-for-bit (no sign weirdness).
+const FLOW_SCALE_Q = 65536;
+const FLOW_SCALE_MIN = 0.5;
+const FLOW_SCALE_MAX = 2.0;
+const FLOW_SCALE_DEFAULT_Q = FLOW_SCALE_Q; // 1.0 * Q
+
+// PI gains. See file header "Adaptive backpressure" for the derivation.
+// Conservative starting point: Kp dominates the transient, Ki removes
+// steady-state offset under sustained rate mismatch.
+const FLOW_SCALE_KP = 0.5;
+const FLOW_SCALE_KI = 0.05;
+// Anti-windup: cap |integral| so Ki·integral alone covers the full half-extent
+// of scale's range (1.0). Past this, the integrator would saturate the output
+// and recovery from a long stall would be unable to back off.
+const FLOW_SCALE_INT_LIMIT = 20; // = 1.0 / FLOW_SCALE_KI
 
 export interface BridgeAllocation<S extends Schema<FieldsObject>> {
   sab: SharedArrayBuffer;
@@ -303,6 +386,12 @@ export class Bridge<S extends Schema<FieldsObject>> {
   private readonly arrayIsBigInt: ReadonlyArray<boolean>;
   private readonly arrayIsInteger: ReadonlyArray<boolean>;
 
+  /** PI controller integral state. Persists across pull calls; clamped to
+   *  ±FLOW_SCALE_INT_LIMIT for anti-windup. Reset to 0 on construction (no
+   *  external invalidation path — the controller is a feedback loop that
+   *  re-converges within a few cycles after any disturbance). */
+  private piIntegral: number = 0;
+
   constructor(sab: SharedArrayBuffer, capacity: number, schema: S) {
     if (!isPowerOfTwo(capacity)) {
       throw new Error(
@@ -330,6 +419,17 @@ export class Bridge<S extends Schema<FieldsObject>> {
     this.frameByteSize = schema.frameByteSize;
     this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
     this.mask = capacity - 1;
+    // Seed flow_scale = 1.0 so any producer that reads `flowScaleHint()`
+    // before the consumer has issued a single pull sees "no scaling." Both
+    // peers construct their own Bridge over the SAB; this CAS sets the lane
+    // ONLY if it's still 0 (fresh SAB), so a late-constructed peer cannot
+    // clobber a consumer's already-running controller state.
+    Atomics.compareExchange(
+      this.indices,
+      FLOW_SCALE_LANE,
+      0,
+      FLOW_SCALE_DEFAULT_Q,
+    );
 
     // Build one umbrella view per type-family present in the schema. These
     // are captured by the per-scalar-field writer/reader closures below; we
@@ -587,6 +687,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
     // Non-smoothed pull invalidates the smoother's prev — next smoothed call
     // re-seeds. Allocation-free; the prev buffer (if any) is retained.
     this.smoothPrevValid = false;
+    this._updateFlowScale(writeIdx, readIdx);
     return true;
   }
 
@@ -619,6 +720,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
     // Non-smoothed pullLatest invalidates the smoother's prev — next smoothed
     // call re-seeds. Allocation-free; prev buffer is retained.
     this.smoothPrevValid = false;
+    this._updateFlowScale(writeIdx, readIdx);
     return skipped;
   }
 
@@ -660,6 +762,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0);
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
     this._applySmoother(frame, alphaBase);
+    this._updateFlowScale(writeIdx, readIdx);
     return true;
   }
 
@@ -706,6 +809,7 @@ export class Bridge<S extends Schema<FieldsObject>> {
     // we accept the small JS-call overhead in exchange for clarity.
     const alphaEff = alphaBase * Math.pow(2, -skipped);
     this._applySmoother(frame, alphaEff);
+    this._updateFlowScale(writeIdx, readIdx);
     return skipped;
   }
 
@@ -789,6 +893,46 @@ export class Bridge<S extends Schema<FieldsObject>> {
     }
   }
 
+  /**
+   * Run one PI controller cycle against the pre-pull occupancy and publish
+   * the new flow_scale on lane 2. Called from the four pull paths after the
+   * release-store on read_index, only on the successful (frame-was-consumed)
+   * branch — empty-pull early-returns skip this so the controller never sees
+   * a misleading "occupancy = 0 because nobody pulled" sample.
+   *
+   * Pre-pull occupancy = `(writeIdx - readIdx) / capacity`, where readIdx is
+   * the value BEFORE the consumer's increment — i.e. "how full was the ring
+   * when the consumer arrived to take a frame." For `pullLatest` the diff is
+   * `skipped + 1`. The wrap-invariant signed subtraction `(a - b) | 0` is
+   * the same trick used throughout for the SPSC counters.
+   *
+   * See file header "Adaptive backpressure" for the gain rationale and
+   * anti-windup design.
+   */
+  private _updateFlowScale(writeIdx: number, readIdx: number): void {
+    const buffered = (writeIdx - readIdx) | 0;
+    const occupancy = buffered / this.capacity;
+    const err = occupancy - 0.5;
+    let integral = this.piIntegral + err;
+    // Anti-windup: bound the integrator so a long stall can't trap the
+    // controller in permanent over-correction.
+    if (integral > FLOW_SCALE_INT_LIMIT) integral = FLOW_SCALE_INT_LIMIT;
+    else if (integral < -FLOW_SCALE_INT_LIMIT) integral = -FLOW_SCALE_INT_LIMIT;
+    this.piIntegral = integral;
+    // Sign: err > 0 (consumer overfull) → scale < 1 (producer slow down);
+    // err < 0 (consumer starved) → scale > 1 (producer speed up).
+    let scale = 1 - FLOW_SCALE_KP * err - FLOW_SCALE_KI * integral;
+    if (scale < FLOW_SCALE_MIN) scale = FLOW_SCALE_MIN;
+    else if (scale > FLOW_SCALE_MAX) scale = FLOW_SCALE_MAX;
+    // Q16.16 encode. floor not round — preserves the boundary semantics
+    // documented in flowScaleHint().
+    Atomics.store(
+      this.indices,
+      FLOW_SCALE_LANE,
+      Math.floor(scale * FLOW_SCALE_Q),
+    );
+  }
+
   /** Copy `src` into `dst` field-by-field. Used to seed `smoothPrev` on the
    *  first smoothed call. Scalars are plain assigns; arrays use typed-array
    *  `.set()` so length / element-kind validation happens at the runtime
@@ -812,6 +956,32 @@ export class Bridge<S extends Schema<FieldsObject>> {
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     return ((writeIdx - readIdx) | 0);
+  }
+
+  /**
+   * Producer-side adaptive backpressure hint. Returns the consumer's most
+   * recent flow_scale value in [0.5, 2.0]:
+   *
+   *   1.0  no scaling — producer/consumer rates are matched
+   *   <1.0 consumer is overfull — producer should slow down (push less)
+   *   >1.0 consumer is starved  — producer should speed up (push more)
+   *
+   * Best-effort: the bridge does NOT enforce this. The producer voluntarily
+   * honors the hint by scaling its `dt`, dropping frames, sleeping a
+   * fraction of its interval, etc. The hard contract is still capacity-
+   * based push reject (`push()` returns false when full); flow_scale is the
+   * soft layer that, when honored, keeps the producer/consumer matched so
+   * the hard reject is reached only under genuine overload.
+   *
+   * See file header "Adaptive backpressure" for the controller math.
+   *
+   * Q16.16 encoding detail: `floor(scale * 65536)`, so the returned value is
+   * quantized to multiples of 2⁻¹⁶ on the way out. The producer should treat
+   * the result as a real number; the round-trip error is below any practical
+   * tuning resolution.
+   */
+  flowScaleHint(): number {
+    return (Atomics.load(this.indices, FLOW_SCALE_LANE) | 0) / FLOW_SCALE_Q;
   }
 
   /**

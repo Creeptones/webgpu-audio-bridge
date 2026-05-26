@@ -37,6 +37,24 @@
  *  26. Integer-kind blends Math.round through to integer (u8 scalar, u32
  *      scalar, u8Array elements); float fields are not rounded.
  *  27. f64 array blends elementwise (cross-checks the array path).
+ *  28. flow_scale lane is seeded to Q16.16(1.0) = 65536 on construction;
+ *      flowScaleHint() returns 1.0 on a brand-new Bridge.
+ *  29. Q16.16 encoding round-trips across the [0.5, 2.0] range with the
+ *      documented 2⁻¹⁶ precision; clamp boundaries are exact.
+ *  30. PI controller step response (synthetic): cycling the controller at
+ *      pre-pull occupancy = 1.0 produces the analytic
+ *      `scale = 1 − Kp·err − Ki·Σerr` trajectory for the first few cycles,
+ *      then saturates to 0.5 (output clamp) once the integrator hits
+ *      ±FLOW_SCALE_INT_LIMIT.
+ *  31. Integration: driving pull at a known pre-pull occupancy through real
+ *      push/pull cycles moves flowScaleHint() in the expected direction
+ *      (occupancy=1.0 → hint clamps low; occupancy≈0 → hint clamps high).
+ *  32. Stability under random producer/consumer ratio: 5000 randomized
+ *      operations, sign-change count of `flowScaleHint() − 1` stays well
+ *      below the per-cycle rate (no high-frequency oscillation).
+ *  33. Anti-windup: 200 saturating overfull cycles then a switch to
+ *      starvation — the controller recovers to scale > 1 within a bounded
+ *      number of cycles (not trapped at the low clamp).
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -1016,6 +1034,283 @@ function testSmoothedFloatArrayBlend(): void {
   ok("smoothed-float-array-blend");
 }
 
+// ── 28. flow_scale lane initialization ─────────────────────────────────────
+//
+// Fresh Bridge: lane 2 holds Q16.16(1.0) = 65536, flowScaleHint() returns
+// 1.0 ("no scaling"). This is the first thing a producer reads before the
+// consumer has issued any pulls.
+function testFlowScaleLaneInit(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  assertEq(ring.flowScaleHint(), 1.0, "flowScaleHint defaults to 1.0");
+  const idx = new Int32Array(sab, 0, 8);
+  assertEq(Atomics.load(idx, 2), 65536, "lane 2 = Q16.16(1.0) = 65536");
+  ok("flow-scale-lane-init");
+}
+
+// ── 29. Q16.16 round-trip ─────────────────────────────────────────────────
+//
+// Writing a known scale value into lane 2 directly, reading via
+// flowScaleHint(): the round-trip error is below the documented 2⁻¹⁶
+// quantum. Verifies the encode (floor(scale*65536)) / decode (/65536) pair
+// is consistent and that Int32 sign handling never reinterprets the value
+// (lane values in [32768, 131072] are within positive signed-32 range).
+function testFlowScaleQ1616RoundTrip(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const idx = new Int32Array(sab, 0, 8);
+  const Q = 65536;
+  const epsilon = 1 / Q;
+  // Sweep [0.5, 2.0] in steps of 0.1. Encode then decode then compare.
+  for (let s = 0.5; s <= 2.0 + 1e-9; s += 0.1) {
+    Atomics.store(idx, 2, Math.floor(s * Q));
+    const got = ring.flowScaleHint();
+    assert(
+      Math.abs(got - s) <= epsilon + 1e-12,
+      `Q16.16 round-trip s=${s.toFixed(3)}: got=${got}`,
+    );
+  }
+  // Clamp boundaries — exact representations.
+  Atomics.store(idx, 2, Math.floor(0.5 * Q));
+  assertEq(ring.flowScaleHint(), 0.5, "Q16.16 boundary 0.5 exact");
+  Atomics.store(idx, 2, Math.floor(2.0 * Q));
+  assertEq(ring.flowScaleHint(), 2.0, "Q16.16 boundary 2.0 exact");
+  ok("flow-scale-q1616-round-trip");
+}
+
+// ── 30. PI controller step response (synthetic) ────────────────────────────
+//
+// Drive the private `_updateFlowScale(write, read)` directly with synthetic
+// occupancy samples to isolate the controller math from the SPSC plumbing.
+// Step from occupancy=0.5 (err=0) to occupancy=1.0 (err=+0.5):
+//
+//   cycle 0  integral=+0.5  scale = 1 − 0.5·0.5 − 0.05·0.5 = 0.725
+//   cycle 1  integral=+1.0  scale = 1 − 0.5·0.5 − 0.05·1.0 = 0.700
+//   cycle 2  integral=+1.5  scale = 1 − 0.5·0.5 − 0.05·1.5 = 0.675
+//   ...
+//   ~40 cycles in, integral hits the anti-windup limit (=20). Past that
+//   point scale is clamped at 0.5 and never moves regardless of further
+//   accumulation.
+//
+// Pinning the first few cycles and the saturated tail catches any sign
+// flip, gain-tuning regression, or anti-windup miswire.
+function testFlowScalePIStepResponse(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  // Test-only direct controller access. Tightly scoped: this file is the
+  // only place the private surface gets touched.
+  const update = (
+    ring as unknown as { _updateFlowScale(w: number, r: number): void }
+  )._updateFlowScale.bind(ring);
+
+  // Initial — lane already at 1.0 from constructor.
+  assertEq(ring.flowScaleHint(), 1.0, "step-response t=0 hint=1.0");
+
+  // Cycle 1: occupancy=1.0 (writeIdx=16, readIdx=0). integral=+0.5,
+  // scale = 1 − 0.25 − 0.025 = 0.725.
+  update(16, 0);
+  const after1 = ring.flowScaleHint();
+  const expected1 = 1 - 0.5 * 0.5 - 0.05 * 0.5;
+  assert(
+    Math.abs(after1 - expected1) < 1 / 65536 + 1e-9,
+    `step-response cycle 1: expected ${expected1}, got ${after1}`,
+  );
+
+  // Cycle 2: integral=+1.0, scale = 1 − 0.25 − 0.05 = 0.700.
+  update(16, 0);
+  const after2 = ring.flowScaleHint();
+  const expected2 = 1 - 0.5 * 0.5 - 0.05 * 1.0;
+  assert(
+    Math.abs(after2 - expected2) < 1 / 65536 + 1e-9,
+    `step-response cycle 2: expected ${expected2}, got ${after2}`,
+  );
+
+  // Cycle 3: integral=+1.5, scale = 1 − 0.25 − 0.075 = 0.675.
+  update(16, 0);
+  const after3 = ring.flowScaleHint();
+  const expected3 = 1 - 0.5 * 0.5 - 0.05 * 1.5;
+  assert(
+    Math.abs(after3 - expected3) < 1 / 65536 + 1e-9,
+    `step-response cycle 3: expected ${expected3}, got ${after3}`,
+  );
+
+  // Saturate: 100 more cycles at occupancy=1.0. integral pegs to the
+  // anti-windup limit (=20); scale clamps at 0.5 and stays there.
+  for (let i = 0; i < 100; i++) update(16, 0);
+  assertEq(
+    ring.flowScaleHint(),
+    0.5,
+    "step-response saturates at scale=0.5 (output clamp + anti-windup)",
+  );
+  ok("flow-scale-pi-step-response");
+}
+
+// ── 31. Integration: pull-driven controller tracks occupancy direction ─────
+//
+// Push 1 / pull 1 alternation keeps the ring at low occupancy (pre-pull
+// diff = 1, occupancy = 1/16 = 0.0625, err ≈ −0.4375). After enough cycles
+// the controller drives flowScaleHint() to the high clamp (2.0).
+//
+// Then fill the ring and pull repeatedly while refilling — pre-pull diff =
+// capacity, occupancy = 1.0, err = +0.5. The controller drives hint down to
+// the low clamp (0.5).
+//
+// The pin asserts the direction: low-occupancy → hint > 1, high-occupancy
+// → hint < 1, both saturating to the respective clamp under sustained
+// mismatch.
+function testFlowScaleIntegrationDirection(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  // Starved case.
+  {
+    const { sab } = Bridge.allocate(capacity, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyPhysFrame(n);
+    for (let i = 0; i < 200; i++) {
+      ring.push(makePhysFrame(i, n));
+      assertEq(ring.pull(out), true, `starved cycle ${i} pull`);
+    }
+    const hint = ring.flowScaleHint();
+    assertEq(
+      hint,
+      2.0,
+      `starved (push1/pull1) drives hint to high clamp; got ${hint}`,
+    );
+  }
+  // Overfull case. Pre-fill, then sustain at capacity by push-1/pull-1
+  // refill pattern.
+  {
+    const { sab } = Bridge.allocate(capacity, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyPhysFrame(n);
+    // Fill ring.
+    for (let i = 0; i < capacity; i++) {
+      assertEq(ring.push(makePhysFrame(i, n)), true, `prefill ${i}`);
+    }
+    // Each cycle: pull (consume 1) → push (refill 1). Pre-pull diff stays
+    // at capacity → occupancy = 1.0.
+    for (let i = 0; i < 200; i++) {
+      assertEq(ring.pull(out), true, `overfull pull ${i}`);
+      assertEq(
+        ring.push(makePhysFrame(capacity + i, n)),
+        true,
+        `overfull refill ${i}`,
+      );
+    }
+    const hint = ring.flowScaleHint();
+    assertEq(
+      hint,
+      0.5,
+      `overfull (full+refill) drives hint to low clamp; got ${hint}`,
+    );
+  }
+  ok("flow-scale-integration-direction");
+}
+
+// ── 32. Stability — bounded sign changes under randomized workload ─────────
+//
+// Random push/pull mix over 5000 cycles with mulberry32 RNG (deterministic
+// run). At each step that yielded a successful pull, record `hint − 1` and
+// count zero-crossings of this signal. With Kp=0.5/Ki=0.05 the controller
+// is P-dominant and shouldn't ring; a healthy run should cross zero only a
+// handful of times across the whole 5000 cycles. We assert ≤ 50 sign
+// changes — comfortably above any healthy run, well below the ~2500 that a
+// truly oscillating controller would produce (cycle-by-cycle flipping).
+function testFlowScaleStability(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  const rng = mulberry32(0xfacefeed);
+  let lastSign = 0;
+  let signChanges = 0;
+  let pulls = 0;
+  let pushes = 0;
+  for (let i = 0; i < 5000; i++) {
+    const op = rng();
+    if (op < 0.5) {
+      ring.push(makePhysFrame(i, n));
+      pushes++;
+    } else if (ring.pull(out)) {
+      pulls++;
+      const e = ring.flowScaleHint() - 1.0;
+      const s = e > 0 ? 1 : e < 0 ? -1 : 0;
+      if (s !== 0 && lastSign !== 0 && s !== lastSign) signChanges++;
+      if (s !== 0) lastSign = s;
+    }
+  }
+  assert(
+    signChanges <= 50,
+    `stability: signChanges=${signChanges} over ${pulls} pulls (≤ 50 expected; ` +
+      `${pushes} pushes total)`,
+  );
+  ok(`flow-scale-stability (signChanges=${signChanges}/${pulls} pulls)`);
+}
+
+// ── 33. Anti-windup — controller recovers from saturated stall ─────────────
+//
+// Drive 200 overfull cycles (push+pull at full ring): integrator pegs at
+// FLOW_SCALE_INT_LIMIT (=20), scale clamps at 0.5. Then switch to a
+// starved workload (push1/pull1). The handoff requires bounded recovery:
+// scale must return to >1 within a small number of cycles (NOT trapped at
+// the low clamp forever).
+//
+// Math: each starved cycle subtracts ≈0.4375 from integral; from +20 the
+// integral hits zero in ~46 cycles; from there a few more cycles drive it
+// negative, at which point scale crosses back above 1.0. We assert recovery
+// within 100 cycles — comfortably above the analytic ~50, far below what a
+// missing anti-windup would force (∞).
+function testFlowScaleAntiWindup(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+  // Saturate low.
+  for (let i = 0; i < capacity; i++) ring.push(makePhysFrame(i, n));
+  for (let i = 0; i < 200; i++) {
+    assertEq(ring.pull(out), true, `windup pull ${i}`);
+    assertEq(
+      ring.push(makePhysFrame(capacity + i, n)),
+      true,
+      `windup refill ${i}`,
+    );
+  }
+  assertEq(ring.flowScaleHint(), 0.5, "windup: scale saturated at 0.5");
+  // Drain everything but one frame, so the switch to starved mode starts
+  // from a low pre-pull occupancy.
+  while (ring.available() > 1) assertEq(ring.pull(out), true, "drain");
+  // Recovery phase: push1/pull1.
+  let recoveryCycle = -1;
+  for (let i = 0; i < 200; i++) {
+    if (ring.available() === 0) ring.push(makePhysFrame(10_000 + i, n));
+    assertEq(ring.pull(out), true, `recovery pull ${i}`);
+    ring.push(makePhysFrame(10_000 + 200 + i, n));
+    if (ring.flowScaleHint() > 1.0) {
+      recoveryCycle = i;
+      break;
+    }
+  }
+  assert(
+    recoveryCycle >= 0 && recoveryCycle < 100,
+    `anti-windup: scale recovered to >1.0 at cycle ${recoveryCycle} (expected < 100)`,
+  );
+  ok(`flow-scale-anti-windup (recovered at cycle ${recoveryCycle})`);
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -1045,6 +1340,12 @@ function main(): void {
   testResetSmoother();
   testSmoothedIntegerRounding();
   testSmoothedFloatArrayBlend();
+  testFlowScaleLaneInit();
+  testFlowScaleQ1616RoundTrip();
+  testFlowScalePIStepResponse();
+  testFlowScaleIntegrationDirection();
+  testFlowScaleStability();
+  testFlowScaleAntiWindup();
   console.log("\nAll Bridge tests passed.");
 }
 
