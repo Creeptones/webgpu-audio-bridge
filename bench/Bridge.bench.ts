@@ -17,6 +17,20 @@
  * the Float64RingBuffer median and the ceiling is acceptable for the schema
  * path (users wanting peak perf on the legacy shape still have
  * Float64RingBuffer exported).
+ *
+ * 0.4.0 perf note. The counter representation switched from BigInt64 to Int32
+ * wrap (see src/Bridge.ts "Counter representation" section). At N=1000 the
+ * per-op cost is dominated by the payload memcpy, so the median is unchanged.
+ * The win lives in the isolated atomic path: pure load+store+notify is ~100ns
+ * on i32 vs ~160ns on BigInt — ringbuf.js-class. End-to-end push by N:
+ *   N=1    (48 B):    100 ns    (atomic-only floor — ringbuf.js territory)
+ *   N=4   (96 B):    200 ns
+ *   N=64  (1056 B):  200 ns
+ *   N=256 (4128 B):  400 ns
+ *   N=1000 (16032 B): 1100 ns   (memcpy-bound, atomics invisible)
+ * Users on small-payload schemas (control signals, scalar streams) get the
+ * full win; users on the legacy macro-physics shape see no change but pay
+ * less BigInt boxing cost on V8.
  */
 
 import { hrtime } from "node:process";

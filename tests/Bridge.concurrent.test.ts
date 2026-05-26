@@ -113,7 +113,13 @@ const PRODUCER_SOURCE = `
   const payloadBytes = capacity * layout.frameByteSize;
   const u64View = new BigUint64Array(sab, headerBytes, payloadBytes / 8);
   const f64View = new Float64Array(sab, headerBytes, payloadBytes / 8);
-  const indices = new BigInt64Array(sab, 0, 2);
+  // Post-0.4: indices are i32 lanes (8 lanes × 4B = 32B header), not BigInt64.
+  // Mirrors Bridge's Int32 counter representation — see the "Counter
+  // representation" section of src/Bridge.ts. The wrap-invisible algebra below
+  // ((a - b) | 0 for signed diff, (a >>> 0) & mask for slot) is the same trick
+  // ringbuf.js uses; only the lane width and the diff op change vs the pre-0.4
+  // BigInt path.
+  const indices = new Int32Array(sab, 0, 8);
 
   // Per-field stride + elem offset. Stride is frameByteSize / sizeof(elem);
   // since the physics schema's frame byte size is a multiple of 8 and every
@@ -126,31 +132,36 @@ const PRODUCER_SOURCE = `
   const vEffElemOff = layout.fields.vEff.byteOffset / 8;
   const jEffElemOff = layout.fields.jEff.byteOffset / 8;
 
-  const mask = BigInt(capacity - 1);
-  const capacityBig = BigInt(capacity);
+  const mask = capacity - 1;
 
   let pushed = 0;
   let fullWaits = 0;
   let fullWaitTimeouts = 0;
   let notifyCalls = 0;
+  // Schema field 'seq' is u64 in physicsControlFrameSchema — it stays a BigInt
+  // value because the SCHEMA declares it as u64. The ring's internal counter
+  // is i32 wrap (unrelated). Don't conflate the two.
   let nextSeq = 0n;
 
   while (pushed < totalFrames) {
     const writeIdx = indices[0];
     const readIdx = Atomics.load(indices, 1);
-    if (writeIdx - readIdx >= capacityBig) {
+    // Signed-32 diff: wrap-invisible because capacity ≤ 2^30 keeps the
+    // true diff well within [-2^31, 2^31).
+    if (((writeIdx - readIdx) | 0) >= capacity) {
       // Full — park until consumer's pull() notifies.
       fullWaits++;
       const status = Atomics.wait(indices, 1, readIdx, waitTimeoutMs);
       if (status === "timed-out") fullWaitTimeouts++;
       continue;
     }
-    const slot = Number(writeIdx & mask);
+    // Slot via unsigned-then-mask — wrap-invariant.
+    const slot = (writeIdx >>> 0) & mask;
     const base = slot * stride8;
     const seqNum = Number(nextSeq);
 
     // Deterministic recipe (must match the consumer-side validator):
-    //   seq:       nextSeq (bigint)
+    //   seq:       nextSeq (bigint, schema u64)
     //   tMacroNs:  nextSeq * 16_666_667n
     //   vMax:      seqNum                     (f64)
     //   jMax:      -seqNum                    (f64)
@@ -166,7 +177,7 @@ const PRODUCER_SOURCE = `
     }
 
     // Release-store + unconditional notify. Matches Bridge.push.
-    Atomics.store(indices, 0, writeIdx + 1n);
+    Atomics.store(indices, 0, (writeIdx + 1) | 0);
     notifyCalls++;
     Atomics.notify(indices, 0, 1);
     nextSeq++;

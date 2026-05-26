@@ -21,6 +21,9 @@
  *  14. Mixed-type schema (u64 + u8Array + f32) round-trip — exercises the
  *      alignment-grouping path (3 type-families, declared order != physical
  *      order).
+ *  15. Wrap across the Int32 sign boundary (post-0.4 counter representation).
+ *  16. Full-fill behavior straddling the Int32 sign boundary.
+ *  17. Signed-32 counter algebra vs BigInt oracle across 10k randomized increments.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -543,6 +546,142 @@ function testMixedTypeSchema(): void {
   ok("mixed-type-schema");
 }
 
+// ── 15. Wrap across the Int32 sign boundary ────────────────────────────────
+//
+// Post-0.4 the ring counters are Int32 wrapping mod 2^32, with the signed-32
+// diff `(a - b) | 0` carrying the true delta for any |delta| < 2^31. This
+// test seeds both counters just below INT32_MAX so a small loop pushes them
+// across the sign boundary (0x7FFFFFFF → 0x80000000, which is -2^31 signed).
+// Each cycle must still: (a) accept push, (b) compute the right slot via
+// `(idx >>> 0) & mask`, (c) compute the right available count via signed
+// subtraction, (d) round-trip every schema field.
+function testWrapAcrossInt32Boundary(): void {
+  const capacity = 4;
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  // Seed both counters to (INT32_MAX - 2). Ring is empty (write === read).
+  const seed = ((1 << 31) - 3) | 0; // 0x7FFFFFFD
+  const idx = new Int32Array(sab, 0, 2);
+  Atomics.store(idx, 0, seed);
+  Atomics.store(idx, 1, seed);
+  const ring = new Bridge(sab, capacity, schema);
+  assertEq(ring.available(), 0, "wrap-seeded ring is empty");
+  const out = emptyPhysFrame(n);
+  // Walk push/pull 20 times. Counters cross 0x7FFFFFFF → 0x80000000 (negative
+  // signed). The signed diff and unsigned mask must both stay correct.
+  for (let i = 0; i < 20; i++) {
+    assertEq(ring.push(makePhysFrame(2000 + i, n)), true, `wrap-i32 push ${i}`);
+    assertEq(ring.available(), 1, `wrap-i32 available after push ${i}`);
+    assertEq(ring.pull(out), true, `wrap-i32 pull ${i}`);
+    assertEq(out.seq, BigInt(2000 + i), `wrap-i32 seq round-trip ${i}`);
+    assertEq(out.vEff[0], 2000 + i, `wrap-i32 vEff[0] round-trip ${i}`);
+    assertEq(ring.available(), 0, `wrap-i32 available after pull ${i}`);
+  }
+  // Sanity: the counters actually crossed the sign boundary.
+  const finalWrite = Atomics.load(idx, 0);
+  assert(
+    finalWrite < 0,
+    `wrap-i32: writeIdx is now negative (=${finalWrite}); confirms the sign bit crossed`,
+  );
+  ok("wrap-across-int32-boundary");
+}
+
+// ── 16. Full-fill straddling Int32 sign boundary ───────────────────────────
+//
+// Fill to capacity while the counters cross INT32_MAX → INT32_MIN. Verifies
+// the full-check (signed-32 diff >= capacity) keeps working when writeIdx is
+// negative and readIdx is positive.
+function testFullPushAtInt32Boundary(): void {
+  const capacity = 4;
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab } = Bridge.allocate(capacity, schema);
+  // Seed so writeIdx wraps mid-fill: starting at INT32_MAX - 1, after 4
+  // pushes it's at INT32_MAX + 3, which signed-32 is INT32_MIN + 2 (negative).
+  const seed = ((1 << 31) - 2) | 0; // 0x7FFFFFFE
+  const idx = new Int32Array(sab, 0, 2);
+  Atomics.store(idx, 0, seed);
+  Atomics.store(idx, 1, seed);
+  const ring = new Bridge(sab, capacity, schema);
+  for (let i = 0; i < capacity; i++) {
+    assertEq(
+      ring.push(makePhysFrame(3000 + i, n)),
+      true,
+      `wrap-full push ${i}`,
+    );
+  }
+  assertEq(ring.available(), capacity, "available === capacity across boundary");
+  assertEq(
+    ring.push(makePhysFrame(3999, n)),
+    false,
+    "full push rejected across boundary",
+  );
+  // Drain in order — FIFO must hold across wrap.
+  const out = emptyPhysFrame(n);
+  for (let i = 0; i < capacity; i++) {
+    assertEq(ring.pull(out), true, `wrap-full pull ${i}`);
+    assertEq(out.seq, BigInt(3000 + i), `wrap-full seq order ${i}`);
+  }
+  ok("full-push-at-int32-boundary");
+}
+
+// ── 17. Signed-32 counter algebra vs BigInt oracle ────────────────────────
+//
+// Mirrors the methodology of the wavefunction-synth's doubleSingle.test.ts
+// (the DS-f32 validator that drives WGSL): randomized stream of pushes/pulls
+// under both an i32-wrapping counter and a BigInt-monotonic oracle, asserting
+// the signed-32 diff `(a - b) | 0` and the unsigned-mask slot `(a >>> 0) & mask`
+// match the oracle bit-exactly at every step. Seeded near INT32_MAX so the
+// run covers the sign boundary. The integer algebra is exact, so we assert
+// === (not assertNear).
+function testCounterArithmeticVsOracle(): void {
+  const rng = mulberry32(0xdeadbeef);
+  const capacity = 16;
+  const mask = capacity - 1;
+  // Seed near INT32_MAX so the wrap fires within the 10k-iter budget.
+  const seed = ((1 << 31) - 100) | 0;
+  let writeOracle = BigInt(seed);
+  let readOracle = BigInt(seed);
+  let writeI32 = seed | 0;
+  let readI32 = seed | 0;
+  let crossedBoundary = false;
+  for (let iter = 0; iter < 10_000; iter++) {
+    // Property 1: signed-32 diff matches the oracle's true diff.
+    // Holds for any |true_diff| < 2^31; in this test |diff| ≤ capacity.
+    const oracleDiff = writeOracle - readOracle;
+    const i32Diff = ((writeI32 - readI32) | 0);
+    if (BigInt(i32Diff) !== oracleDiff) {
+      throw new Error(
+        `iter ${iter}: i32 diff=${i32Diff} vs oracle=${oracleDiff} ` +
+          `(write i32=${writeI32}/oracle=${writeOracle}, read i32=${readI32}/oracle=${readOracle})`,
+      );
+    }
+    // Property 2: unsigned-mask slot matches the oracle's mod-capacity slot.
+    // Holds for any writeIdx regardless of signed-ness because the low
+    // log2(capacity) bits are sign-invariant.
+    const slotOracle = Number(writeOracle & BigInt(mask));
+    const slotI32 = (writeI32 >>> 0) & mask;
+    if (slotI32 !== slotOracle) {
+      throw new Error(
+        `iter ${iter}: i32 slot=${slotI32} vs oracle=${slotOracle} (writeI32=${writeI32}, writeOracle=${writeOracle})`,
+      );
+    }
+    if (writeI32 < 0) crossedBoundary = true;
+    // Pick op: 50% push (gated by oracle-not-full), 50% pull (gated by oracle-not-empty).
+    const op = rng();
+    if (op < 0.5 && oracleDiff < BigInt(capacity)) {
+      writeOracle += 1n;
+      writeI32 = (writeI32 + 1) | 0;
+    } else if (oracleDiff > 0n) {
+      readOracle += 1n;
+      readI32 = (readI32 + 1) | 0;
+    }
+  }
+  assert(crossedBoundary, "fuzz crossed the Int32 sign boundary (writeI32 went negative)");
+  ok(`counter-arithmetic-vs-oracle (10k iters, sign boundary crossed)`);
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -559,6 +698,9 @@ function main(): void {
   testFuzzVsOracle();
   testDescribeLayout();
   testMixedTypeSchema();
+  testWrapAcrossInt32Boundary();
+  testFullPushAtInt32Boundary();
+  testCounterArithmeticVsOracle();
   console.log("\nAll Bridge tests passed.");
 }
 

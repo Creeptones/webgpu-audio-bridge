@@ -8,11 +8,10 @@
  *
  * ─── Layout ──────────────────────────────────────────────────────────────
  *
- *   Header (32 bytes, BigInt64 lanes via Atomics):
- *     [0..7]    write_index   producer monotonic counter (Atomics, release)
- *     [8..15]   read_index    consumer monotonic counter (Atomics, release)
- *     [16..23]  reserved
- *     [24..31]  reserved
+ *   Header (32 bytes, Int32 lanes via Atomics):
+ *     [byte 0..3]    write_index   producer counter (Atomics, release; wraps mod 2^32)
+ *     [byte 4..7]    read_index    consumer counter (Atomics, release; wraps mod 2^32)
+ *     [byte 8..31]   reserved (24 bytes — earmarked for future flow_scale + telemetry)
  *
  *   Payload region (typed-array umbrella views at SAB byte 32):
  *     For each FieldKind present in the schema, one umbrella view spanning
@@ -59,6 +58,41 @@
  * write_index establishes happens-before for the payload writes; the
  * consumer's acquire-load on write_index observes them. That is the full
  * synchronization the protocol needs.
+ *
+ * ─── Counter representation (0.4.0) ──────────────────────────────────────
+ *
+ * Pre-0.4 the counters were BigInt64. The Atomics path then paid both the
+ * notify syscall AND BigInt boxing on every push/pull. The boxing was a
+ * smaller cost than the notify (we measured ~40 ns/op extra on Windows + V8),
+ * but it pushed the pure atomic load+store+notify sequence to ~160 ns vs
+ * ~100 ns on i32 — a ~25 % gap against the ringbuf.js-class floor.
+ *
+ * Post-0.4 the counters are plain Int32 wrapping mod 2^32, computed via the
+ * standard SPSC modular trick:
+ *
+ *   diff = (writeIdx - readIdx) | 0       // signed-32 subtraction
+ *   slot = (idx >>> 0) & mask              // unsigned-then-mask
+ *
+ * The signed-32 diff is correct for any |true_diff| < 2^31. Capacity is
+ * power-of-two and bounded (default: 16; max: 2^30), so the diff is always
+ * small and the wrap is invisible. Slot mask is wrap-correct because the low
+ * log2(capacity) bits don't depend on signed-ness.
+ *
+ * The wire format changes: write_index occupies bytes [0..3] (was [0..7])
+ * and read_index occupies bytes [4..7] (was [8..15]). v0.3.x and v0.4.0
+ * SABs cannot be opened by the other version; this is the breaking change
+ * the minor bump tracks. `Float64RingBuffer` is untouched and continues to
+ * carry the v0.1.x byte format for users on the deprecated path.
+ *
+ * Wrap clock: 2^32 / 48000 ≈ 24h at audio rate; 2^32 / 60 ≈ 2.27 years at a
+ * 60 Hz control-rate producer. The SEMANTIC monotonic seq is whatever your
+ * schema declares (e.g. `physicsControlFrameSchema(n)` declares `seq: u64`
+ * which is exact through 2^64) — the ring's INTERNAL counter only needs to
+ * indicate "which slot is next" and "how full is the ring," both of which
+ * are wrap-invariant operations. Conceptual inspiration: small lanes with
+ * proven algebra replace the boxed wide type — see also the wavefunction-
+ * synth project's `doubleSingle.ts` (Knuth two-sum on f32 pairs) for the
+ * floating-point analog of the same move.
  *
  * ─── Park / wake protocol (Atomics.wait / Atomics.notify) ─────────────────
  *
@@ -125,7 +159,14 @@ import {
 } from "./schema.js";
 
 export const RING_HEADER_BYTES = 32;
-export const RING_HEADER_LANES = 2; // write_index, read_index (rest reserved)
+export const RING_HEADER_LANES = 2; // active counter lanes: write_index (Int32 lane 0), read_index (Int32 lane 1); remaining 6 Int32 lanes reserved
+export const RING_HEADER_INT32_LANES = 8; // 32-byte header viewed as Int32 = 8 lanes total
+
+// Internal lane indices into the Int32 header view. WRITE/READ are the
+// counter lanes; lanes 2-7 stay zero (reserved for the planned flow_scale /
+// observability fields, see roadmap items #6 and #7).
+const WRITE_IDX_LANE = 0;
+const READ_IDX_LANE = 1;
 
 export interface BridgeAllocation<S extends Schema<FieldsObject>> {
   sab: SharedArrayBuffer;
@@ -193,9 +234,8 @@ export class Bridge<S extends Schema<FieldsObject>> {
   /** Frame size in bytes; matches schema.frameByteSize. */
   public readonly frameByteSize: number;
 
-  private readonly indices: BigInt64Array;
-  private readonly mask: bigint;
-  private readonly capacityBig: bigint;
+  private readonly indices: Int32Array;
+  private readonly mask: number;
 
   /** Per array field per slot: a typed-array view pointing at that slot's
    *  bytes for that field. Used for zero-alloc .set() on push/pull. */
@@ -220,6 +260,15 @@ export class Bridge<S extends Schema<FieldsObject>> {
         `Bridge: capacity must be power of two, got ${capacity}`,
       );
     }
+    // Cap at 2^30 so the signed-32 diff used by the counter algebra never
+    // approaches 2^31 even under malformed peers — the wrap-invisible
+    // subtraction needs headroom. (Practically, capacity is small: the
+    // canonical control-rate ring is 16.)
+    if (capacity > (1 << 30)) {
+      throw new Error(
+        `Bridge: capacity must be ≤ 2^30 (signed-32 diff headroom), got ${capacity}`,
+      );
+    }
     const expectedBytes = Bridge.byteLength(capacity, schema);
     if (sab.byteLength < expectedBytes) {
       throw new Error(
@@ -230,9 +279,8 @@ export class Bridge<S extends Schema<FieldsObject>> {
     this.capacity = capacity;
     this.schema = schema;
     this.frameByteSize = schema.frameByteSize;
-    this.indices = new BigInt64Array(sab, 0, RING_HEADER_LANES);
-    this.mask = BigInt(capacity - 1);
-    this.capacityBig = BigInt(capacity);
+    this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
+    this.mask = capacity - 1;
 
     // Build one umbrella view per type-family present in the schema. These
     // are captured by the per-scalar-field writer/reader closures below; we
@@ -352,12 +400,17 @@ export class Bridge<S extends Schema<FieldsObject>> {
    * No per-call allocations.
    */
   push(view: FrameFor<S>): boolean {
-    const writeIdx = this.indices[0]!; // plain-read own counter (SPSC)
-    const readIdx = Atomics.load(this.indices, 1); // acquire
-    if (writeIdx - readIdx >= this.capacityBig) {
+    // SPSC: own counter is plain-read (sole producer), peer counter
+    // acquire-loaded. Both i32, wrap-mod-2^32; the signed-32 subtraction
+    // `(a - b) | 0` gives the correct true diff for |true_diff| < 2^31.
+    const writeIdx = this.indices[WRITE_IDX_LANE]!;
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    if (((writeIdx - readIdx) | 0) >= this.capacity) {
       return false; // full
     }
-    const slot = Number(writeIdx & this.mask);
+    // Unsigned-then-mask: the low log2(capacity) bits don't depend on
+    // signed-ness, so this is wrap-invariant.
+    const slot = (writeIdx >>> 0) & this.mask;
     const sw = this.scalarWriters;
     const frame = view as unknown as Record<string, unknown>;
     for (let i = 0; i < sw.length; i++) sw[i]!(slot, frame);
@@ -369,9 +422,9 @@ export class Bridge<S extends Schema<FieldsObject>> {
       (av[i]![slot] as { set: (src: ArrayLike<number> | ArrayLike<bigint>) => void })
         .set(frame[al[i]!.name] as ArrayLike<number> | ArrayLike<bigint>);
     }
-    Atomics.store(this.indices, 0, writeIdx + 1n); // release
+    Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0); // release
     // Unconditional notify — see file header on the always-notify protocol.
-    Atomics.notify(this.indices, 0, 1);
+    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
     return true;
   }
 
@@ -402,12 +455,12 @@ export class Bridge<S extends Schema<FieldsObject>> {
         "Bridge.beginPush: a previous beginPush is still pending; call commitPush or abortPush first",
       );
     }
-    const writeIdx = this.indices[0]!;
-    const readIdx = Atomics.load(this.indices, 1);
-    if (writeIdx - readIdx >= this.capacityBig) {
+    const writeIdx = this.indices[WRITE_IDX_LANE]!;
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    if (((writeIdx - readIdx) | 0) >= this.capacity) {
       return null;
     }
-    const slot = Number(writeIdx & this.mask);
+    const slot = (writeIdx >>> 0) & this.mask;
     const frame: Record<string, unknown> = {};
     for (let i = 0; i < this.arrayLayout.length; i++) {
       frame[this.arrayLayout[i]!.name] = this.arrayViews[i]![slot]!;
@@ -431,9 +484,9 @@ export class Bridge<S extends Schema<FieldsObject>> {
     for (let i = 0; i < sw.length; i++) sw[i]!(slot, frame);
     // Array writes happened in place via the user's `.set(...)` calls into
     // the SAB-backed views handed out by beginPush. Nothing to copy here.
-    const writeIdx = this.indices[0]!;
-    Atomics.store(this.indices, 0, writeIdx + 1n);
-    Atomics.notify(this.indices, 0, 1);
+    const writeIdx = this.indices[WRITE_IDX_LANE]!;
+    Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0);
+    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
     this.pendingPushFrame = null;
     this.pendingPushSlot = -1;
   }
@@ -449,12 +502,12 @@ export class Bridge<S extends Schema<FieldsObject>> {
    * read_index. Returns false on empty.
    */
   pull(out: FrameFor<S>): boolean {
-    const readIdx = this.indices[1]!;
-    const writeIdx = Atomics.load(this.indices, 0); // acquire
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
     if (writeIdx === readIdx) {
-      return false; // empty
+      return false; // empty — exact i32 equality is wrap-correct
     }
-    const slot = Number(readIdx & this.mask);
+    const slot = (readIdx >>> 0) & this.mask;
     const frame = out as unknown as Record<string, unknown>;
     const sr = this.scalarReaders;
     for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
@@ -464,8 +517,8 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
-    Atomics.store(this.indices, 1, readIdx + 1n); // release
-    Atomics.notify(this.indices, 1, 1);
+    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
+    Atomics.notify(this.indices, READ_IDX_LANE, 1);
     return true;
   }
 
@@ -478,12 +531,12 @@ export class Bridge<S extends Schema<FieldsObject>> {
    * macro-rate frame, drop staleness, minimize control→audio lag.
    */
   pullLatest(out: FrameFor<S>): number {
-    const readIdx = this.indices[1]!;
-    const writeIdx = Atomics.load(this.indices, 0);
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx === readIdx) return -1;
-    const newestIdx = writeIdx - 1n;
-    const skipped = Number(newestIdx - readIdx);
-    const slot = Number(newestIdx & this.mask);
+    const newestIdx = (writeIdx - 1) | 0;
+    const skipped = ((newestIdx - readIdx) | 0); // ≥ 0 by the empty-check above
+    const slot = (newestIdx >>> 0) & this.mask;
     const frame = out as unknown as Record<string, unknown>;
     const sr = this.scalarReaders;
     for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
@@ -493,16 +546,16 @@ export class Bridge<S extends Schema<FieldsObject>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
-    Atomics.store(this.indices, 1, writeIdx); // consume everything up to writeIdx
-    Atomics.notify(this.indices, 1, 1);
+    Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
+    Atomics.notify(this.indices, READ_IDX_LANE, 1);
     return skipped;
   }
 
   /** Number of frames currently buffered (≤ capacity). */
   available(): number {
-    const writeIdx = Atomics.load(this.indices, 0);
-    const readIdx = Atomics.load(this.indices, 1);
-    return Number(writeIdx - readIdx);
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    return ((writeIdx - readIdx) | 0);
   }
 
   /**
@@ -521,10 +574,10 @@ export class Bridge<S extends Schema<FieldsObject>> {
    * that is hard-real-time and must never block.
    */
   waitForSpace(timeoutMs?: number): "ok" | "not-equal" | "timed-out" {
-    const writeIdx = this.indices[0]!;
-    const readIdx = Atomics.load(this.indices, 1);
-    if (writeIdx - readIdx < this.capacityBig) return "not-equal";
-    return Atomics.wait(this.indices, 1, readIdx, timeoutMs);
+    const writeIdx = this.indices[WRITE_IDX_LANE]!;
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    if (((writeIdx - readIdx) | 0) < this.capacity) return "not-equal";
+    return Atomics.wait(this.indices, READ_IDX_LANE, readIdx, timeoutMs);
   }
 
   /**
@@ -537,10 +590,10 @@ export class Bridge<S extends Schema<FieldsObject>> {
    * via pullLatest() and tolerate misses.
    */
   waitForData(timeoutMs?: number): "ok" | "not-equal" | "timed-out" {
-    const readIdx = this.indices[1]!;
-    const writeIdx = Atomics.load(this.indices, 0);
+    const readIdx = this.indices[READ_IDX_LANE]!;
+    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx !== readIdx) return "not-equal";
-    return Atomics.wait(this.indices, 0, writeIdx, timeoutMs);
+    return Atomics.wait(this.indices, WRITE_IDX_LANE, writeIdx, timeoutMs);
   }
 
   /**
