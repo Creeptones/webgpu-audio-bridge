@@ -1,0 +1,91 @@
+webgpu-audio-bridge — Investigation 3 wait-flag protocol simulation
+Chromium / V8 (Chrome 148, Windows 11)
+
+Two back-to-back runs, defaults (1000 batches × 1000 iters, capacity 16,
+schema N=1000, warmup 100 × 1000). Run interval ~1 minute.
+
+================================================================
+Run 1 — timestamp 2026-05-26T21:38:51.409Z
+================================================================
+pull (notify)        median=  2.23 μs  p99=  3.00 μs  p999=  4.21 μs  max=  4.21 μs  mean=  2.27 μs
+pull (noNotify)      median=  2.21 μs  p99=  2.99 μs  p999=  3.69 μs  max=  3.69 μs  mean=  2.25 μs
+pull (wf clear)      median=  2.27 μs  p99=  3.29 μs  p999= 20.50 μs  max= 20.50 μs  mean=  2.35 μs
+pull (wf set)        median=  2.37 μs  p99=  3.22 μs  p999=  4.17 μs  max=  4.17 μs  mean=  2.41 μs
+
+notify delta (notify - noNotify):     20 ns
+protocol overhead (wfClear - noNotify): 65 ns
+protocol savings  (notify - wfClear):  -45 ns
+protocol NET:                         -110 ns  (net NEGATIVE)
+flag-set sanity (wfSet - notify):     135 ns
+
+================================================================
+Run 2 — timestamp 2026-05-26T21:39:53.214Z
+================================================================
+pull (notify)        median=  2.36 μs  p99=  3.20 μs  p999=  4.23 μs  max=  4.23 μs  mean=  2.39 μs
+pull (noNotify)      median=  2.19 μs  p99=  2.96 μs  p999=  3.68 μs  max=  3.68 μs  mean=  2.24 μs
+pull (wf clear)      median=  2.25 μs  p99=  3.04 μs  p999=  3.89 μs  max=  3.89 μs  mean=  2.29 μs
+pull (wf set)        median=  2.33 μs  p99=  3.08 μs  p999=  4.19 μs  max=  4.19 μs  mean=  2.38 μs
+
+notify delta (notify - noNotify):     165 ns
+protocol overhead (wfClear - noNotify): 55 ns
+protocol savings  (notify - wfClear):  110 ns
+protocol NET:                         +55 ns  (net POSITIVE)
+flag-set sanity (wfSet - notify):     -30 ns
+
+================================================================
+Reading
+================================================================
+
+The two runs DISAGREE on the sign of the protocol's net effect. Run 1
+says the protocol makes per-pull WORSE by 110 ns; Run 2 says it makes
+per-pull BETTER by 55 ns. **This is the critical finding for V8: the
+per-pull signal is below the bench-to-bench variance.**
+
+What's stable across runs:
+  - Protocol overhead (wfClear - noNotify): 55-65 ns. A real, repeatable
+    cost. This is the lane-4 Atomics.load + branch + extra function-call
+    indirection.
+  - Magnitude of the means: ~2.20-2.40 μs across all four paths.
+  - Flag-set degenerate case (wfSet) sits within ±150 ns of pull-notify,
+    confirming wfSet ≈ noNotify + load + notify as designed.
+
+What VARIES across runs:
+  - Notify cost (notify - noNotify): 20 ns vs 165 ns. The signal itself.
+  - Protocol savings (notify - wfClear): -45 ns vs +110 ns. Direct
+    function of the notify-cost variance.
+  - Protocol NET: ±100 ns. Sign-flipping between runs.
+
+**Practical implication.** On V8 Chromium with this harness, the wait-
+flag protocol's per-pull effect is statistically indistinguishable
+from zero at the single-run resolution. The protocol overhead is real
+and repeatable (~60 ns); the savings it recovers are dominated by the
+between-run variance of V8's own notify-cost.
+
+Plain reading: the perf case for the protocol on V8 is officially
+**neutral-at-best**. There is no run-to-run-stable positive signal.
+The 0.7.0 decision cannot be motivated by per-pull perf on V8.
+
+================================================================
+What would settle this on V8 alone
+================================================================
+
+Two paths:
+  - Bigger sample size. 10x the iters (10k batches × 10k iters) takes
+    ~5 minutes per run; the SE of the mean drops from ~5 ns to ~0.5 ns
+    which should resolve the 20-160 ns signal cleanly.
+  - More runs. 10 runs of the current size, computed as
+    median-of-medians, would give a similarly tight figure.
+
+Neither is critical at this stage because:
+  1. The RT-safety / community-alignment case for the protocol stands
+     independently of the per-pull perf signal.
+  2. Investigations 1 + 3 together already establish that V8's notify
+     is "fast enough that user-code can't beat it." That's the
+     headline finding; the exact sign of the net effect doesn't
+     change the 0.7.0 framing.
+
+The Firefox + Safari cells (TODO) will check whether the noisy
+result is V8-specific or reproduces on other engines. If Firefox /
+JSC show consistent net-positive deltas, the protocol case is
+stronger; if they also flip sign between runs, the cross-engine
+conclusion is "perf is in the noise, ship for hygiene reasons."

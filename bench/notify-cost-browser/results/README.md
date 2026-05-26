@@ -1,4 +1,19 @@
-# Investigation 1 results — cross-engine notify-cost bench
+# Cross-engine notify-cost + wait-flag protocol research
+
+This directory collects the artifacts of three parallel investigations
+into the proposed 0.7.0 wait-flag wire-format extension:
+
+- **Investigation 1** — cross-engine notify-cost measurement on the
+  steady-state no-waiter path. (`chromium-v8.txt`,
+  `firefox-spidermonkey.txt`, `safari-jsc.txt`.)
+- **Investigation 3** — cross-engine wait-flag protocol simulation.
+  Adds `_pullWithWaitFlag` shim + four-path bench. Settles whether
+  the protocol overhead is cheaper than the notify it eliminates.
+  (`investigation-3-*.txt`.)
+- **RT-safety / spec research** — does the spec / impls / community
+  permit `Atomics.notify` from `process()`? (`rt-safety-research.md`.)
+
+## Investigation 1 — cross-engine notify-cost bench
 
 One file per engine. Pasted reports from running
 `http://localhost:5175/` in each browser with the same default knobs:
@@ -81,6 +96,76 @@ shape works for any future per-pull / per-push perf-isolation
 question that needs cross-engine numbers (Investigation 4's real-
 AudioWorklet variant could reuse the server + the engine detection +
 the report format, swapping just the inner measurement loop).
+
+## Investigation 3 — wait-flag protocol simulation
+
+Adds the dev-only `SpscRing._pullWithWaitFlag` shim that implements
+the proposed 0.7.0 protocol's consumer-side check: read lane 4, fire
+`Atomics.notify(read_index)` only if lane 4 is non-zero. Bench runs
+four paths on the same fixture:
+
+| Path | Body |
+|---|---|
+| `pull (notify)` | public `SpscRing.pull` — always notifies |
+| `pull (noNotify)` | `_pullNoNotify` — never notifies |
+| `pull (wf clear)` | `_pullWithWaitFlag` with lane 4 = 0 — protocol skips notify |
+| `pull (wf set)` | `_pullWithWaitFlag` with lane 4 = 1 — protocol falls through to notify |
+
+Two deltas that matter:
+- **Protocol overhead = wfClear - noNotify**: cost of the lane-4
+  load + branch on the common no-waiter path.
+- **Protocol savings = pull(notify) - wfClear**: the notify cost the
+  protocol recovers.
+
+If overhead < savings, the protocol is net positive on this engine.
+
+### Chromium / V8 — two runs, sign-flipping result
+
+See [`investigation-3-chromium-v8.txt`](./investigation-3-chromium-v8.txt)
+for the full data. Headline:
+
+| Run | notify Δ | protocol overhead | protocol savings | protocol NET |
+|---|---|---|---|---|
+| 1 | 20 ns | 65 ns | -45 ns | **-110 ns** |
+| 2 | 165 ns | 55 ns | 110 ns | **+55 ns** |
+
+**The per-pull signal is below the bench-to-bench variance on V8.**
+What's stable: protocol overhead at ~60 ns. What's noisy: the notify
+cost itself (20-165 ns) and therefore the savings + net.
+
+Reading: **on V8, the protocol is statistically indistinguishable
+from zero per pull at single-run precision.** Either the perf case
+needs much tighter measurement (10×+ iters or multi-run median) or
+the 0.7.0 decision rests on non-perf grounds (the RT-hygiene case
+laid out in `rt-safety-research.md`).
+
+### Firefox / SpiderMonkey
+
+TODO — needs manual re-run. The Investigation 1 Firefox data
+predates the wait-flag shim. Just re-open
+`http://localhost:5175/` in Firefox 151 → Run → Copy report. The
+page now reports all four paths automatically.
+
+### Safari / JavaScriptCore
+
+TODO — needs ngrok tunnel up + manual iOS re-run. Same as Firefox:
+the Investigation 1 Safari data predates the wait-flag shim. With
+the tunnel up, open the ngrok URL in iOS Safari → Run → Copy report.
+
+## RT-safety / spec research
+
+See [`rt-safety-research.md`](./rt-safety-research.md) for the full
+write-up. Headline: **the spec permits `Atomics.notify` from
+`process()`, all three engines permit it, but the established
+practitioner consensus (Paul Adenot, ringbuf.js, Loke.dev,
+Chrome's design-pattern docs) is "don't, even though you can."**
+The contended-notify path acquires a per-WaiterList mutex; the
+wait-flag protocol eliminates the racing-with-mutex risk by
+construction.
+
+Recommended 0.7.0 framing: ship the protocol motivated by **RT-
+hygiene + community alignment**, not perf. Cite Adenot's blog post
+as the authoritative practitioner source.
 
 The MCP only drives Chromium, so Firefox and Safari reports need to be
 captured by hand: open `http://localhost:5175/` in the browser, click

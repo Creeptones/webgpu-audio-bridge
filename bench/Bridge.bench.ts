@@ -480,6 +480,135 @@ function runNotifyOnPullBench(): {
   return { pullSamples, noNotifySamples };
 }
 
+/**
+ * 0.6.12-WIP / Investigation 3 cell. Wait-flag protocol simulation.
+ *
+ * Goal: settle whether the proposed 0.7.0 wait-flag wire-format
+ * extension actually recovers the per-pull notify cost that
+ * Investigation 1 measured at 20-100 ns across V8 / SpiderMonkey / JSC.
+ *
+ * The proposed protocol gates the trailing `Atomics.notify(read_index)`
+ * behind a lane-4 "producer is parked" flag. When the flag is clear
+ * (the common no-waiter steady state), the consumer skips the notify
+ * entirely. The protocol's per-pull consumer overhead is one extra
+ * `Atomics.load(lane 4)` + one branch. The question Investigation 3
+ * answers: is that load + branch cheaper than the notify it eliminates?
+ *
+ * Three paths, same schema + same producer:
+ *   - `pull (notify)`           — baseline, fires Atomics.notify always.
+ *   - `pull (noNotify)`         — floor, never notifies (dev-only shim).
+ *   - `pull (waitFlag, clear)`  — proposed protocol with flag = 0. The
+ *                                 conditional notify gets skipped.
+ *   - `pull (waitFlag, set)`    — proposed protocol with flag = 1. The
+ *                                 conditional notify fires (degenerates
+ *                                 to ~pull-notify cost plus the lane-4
+ *                                 load overhead).
+ *
+ * The two deltas that matter for the 0.7.0 decision:
+ *   - `(waitFlag clear) - noNotify` = the protocol's pure overhead. The
+ *     cost of the lane-4 load + branch on the common no-waiter path.
+ *     Should be small (< 20 ns) — single atomic load + predictable
+ *     branch.
+ *   - `pull (notify) - (waitFlag clear)` = the protocol's savings on
+ *     the common path. The amount of notify cost the protocol recovers.
+ *
+ * If the protocol's pure overhead (first delta) is less than the
+ * savings (second delta), the protocol is net positive. Otherwise the
+ * protocol is net negative and shouldn't ship.
+ */
+function runWaitFlagSimBench(): {
+  pullSamples: number[];
+  noNotifySamples: number[];
+  waitFlagClearSamples: number[];
+  waitFlagSetSamples: number[];
+} {
+  const schema = physicsControlFrameSchema(N);
+  const { sab } = Bridge.allocate(CAPACITY, schema);
+  const ring = new SpscRing(sab, CAPACITY, schema);
+  // Direct Int32 view of the SAB header so the bench can flip lane 4
+  // between the "clear" and "set" measurements. In the real protocol
+  // the producer flips this before/after `Atomics.wait`; the bench
+  // owns it directly because there's no parked producer here.
+  const indices = new Int32Array(sab, 0, 8);
+  const frame = makeFrame();
+  const out = makeOutFrame();
+
+  // Warm all three code paths identically. Each warmup loop hits a
+  // different JIT-tier-up trigger so the medians are comparable.
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring.pull(out);
+  }
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring._pullNoNotify(out);
+  }
+  Atomics.store(indices, 4, 0);
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring._pullWithWaitFlag(out);
+  }
+  Atomics.store(indices, 4, 1);
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    ring._pullWithWaitFlag(out);
+  }
+  Atomics.store(indices, 4, 0);
+
+  // Measure. Each iteration measures one push+pull pair across all
+  // four paths. Pushing on each path keeps the steady state identical
+  // (one frame buffered, just-written) so the differences attributable
+  // to the pull body are isolated.
+  const pullSamples = new Array<number>(MEASURE_ITERS);
+  const noNotifySamples = new Array<number>(MEASURE_ITERS);
+  const waitFlagClearSamples = new Array<number>(MEASURE_ITERS);
+  const waitFlagSetSamples = new Array<number>(MEASURE_ITERS);
+
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t0 = hrtime.bigint();
+    ring.pull(out);
+    const t1 = hrtime.bigint();
+    pullSamples[i] = Number(t1 - t0);
+
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t2 = hrtime.bigint();
+    ring._pullNoNotify(out);
+    const t3 = hrtime.bigint();
+    noNotifySamples[i] = Number(t3 - t2);
+
+    Atomics.store(indices, 4, 0);
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t4 = hrtime.bigint();
+    ring._pullWithWaitFlag(out);
+    const t5 = hrtime.bigint();
+    waitFlagClearSamples[i] = Number(t5 - t4);
+
+    Atomics.store(indices, 4, 1);
+    frame.seq = BigInt(i);
+    ring.push(frame);
+    const t6 = hrtime.bigint();
+    ring._pullWithWaitFlag(out);
+    const t7 = hrtime.bigint();
+    waitFlagSetSamples[i] = Number(t7 - t6);
+  }
+  // Leave the flag clear so subsequent bench cells see a clean state.
+  Atomics.store(indices, 4, 0);
+  return {
+    pullSamples,
+    noNotifySamples,
+    waitFlagClearSamples,
+    waitFlagSetSamples,
+  };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -588,6 +717,34 @@ function main(): void {
   console.log(
     `  notify-on-pull delta (pull - noNotify) = ${fmt(notifyDelta)}  ` +
       `(sizes the 0.7.0 wait-flag payoff)`,
+  );
+  console.log();
+
+  // Investigation 3 cell — wait-flag protocol simulation.
+  // Settles whether the proposed protocol's per-pull overhead (one
+  // Atomics.load(lane 4) + branch) is cheaper than the notify it
+  // eliminates. The two deltas that matter:
+  //   - (waitFlag clear) - noNotify  : protocol's pure overhead.
+  //   - pull - (waitFlag clear)      : protocol's savings (≈ notifyDelta).
+  // If overhead < savings, protocol is net positive.
+  const wf = runWaitFlagSimBench();
+  const wfPullMed = summarize("wf: pull notify", wf.pullSamples);
+  const wfNoNotifyMed = summarize("wf: pull noNotify", wf.noNotifySamples);
+  const wfClearMed = summarize("wf: pull clear", wf.waitFlagClearSamples);
+  const wfSetMed = summarize("wf: pull set", wf.waitFlagSetSamples);
+  const protocolOverhead = wfClearMed - wfNoNotifyMed;
+  const protocolSavings = wfPullMed - wfClearMed;
+  const protocolNet = protocolSavings - protocolOverhead;
+  console.log(
+    `  wait-flag protocol overhead (waitFlag clear - noNotify) = ${fmt(protocolOverhead)}`,
+  );
+  console.log(
+    `  wait-flag protocol savings  (pull notify - waitFlag clear) = ${fmt(protocolSavings)}`,
+  );
+  console.log(
+    `  wait-flag protocol NET      (savings - overhead) = ${fmt(protocolNet)}  ` +
+      `(${protocolNet > 0 ? "net positive" : "net negative"}; ` +
+      `wf-set cost ${fmt(wfSetMed)} ≈ pull-notify ${fmt(wfPullMed)} as expected)`,
   );
   console.log();
 
