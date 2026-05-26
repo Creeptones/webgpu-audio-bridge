@@ -323,6 +323,14 @@
  *      encoding round-trips ±50 ppm within precision; Int64 offset
  *      round-trips through ±1 day of nanoseconds within precision
  *      (covering all realistic offsets).
+ *  80. forEachSampleInQuantum batch eval (0.6.17). Walks
+ *      `[0, sampleCount)` invoking the callback per sample; output
+ *      values are bit-identical to a hand-rolled loop calling
+ *      `evaluateAtSampleOffset(out, i)` per sample on the same
+ *      schema + PLL state. Validates: throws when cachedEvalValid is
+ *      false (must call pullEvaluatedLatest first); throws on
+ *      negative / fractional / non-finite sampleCount; sampleCount=0
+ *      no-ops cleanly.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -4546,6 +4554,113 @@ function testPllLanePublicationEncoding(): void {
   ok("pll-lane-publication-encoding");
 }
 
+// ── 80. forEachSampleInQuantum batch eval (0.6.17) ───────────────────────
+function testForEachSampleInQuantum(): void {
+  // Trajectory schema so the per-sample dt arithmetic actually varies
+  // the output (a non-trajectory schema would degenerate to all
+  // samples reading the same raw frame).
+  const schema = defineSchema({
+    seq: u64(),
+    t: u64(),
+    vEff: f64TrajectoryArray(8, { order: 2 }),
+  }).withTimestamps({ tNs: { field: "t", unit: "ns", default: true } });
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+  bridge.setSampleRate(48000);
+
+  // Push a frame with a non-trivial trajectory so dt actually matters.
+  const push = bridge.scratchFrame();
+  push.seq = 1n;
+  push.t = 0n;
+  // Order-2 trajectory: positions at even indices, velocities at odd.
+  // 8 samples × 2 lanes = 16 elements.
+  push.vEff = new Float64Array(16);
+  for (let i = 0; i < 8; i++) {
+    push.vEff[i * 2] = i * 0.1;     // position
+    push.vEff[i * 2 + 1] = i * 0.01; // velocity
+  }
+  assert(bridge.push(push), "push trajectory frame");
+
+  // Pull + observe + set up cache.
+  const evalFrame = bridge.scratchEvaluatedFrame();
+  const baseConsumerNs = 1_000_000;
+  const skipped = bridge.pullEvaluatedLatest(evalFrame, baseConsumerNs);
+  assert(skipped >= 0, "pullEvaluatedLatest succeeds");
+
+  // Hand-rolled reference: evaluateAtSampleOffset per sample.
+  const SAMPLE_COUNT = 32;
+  const reference: number[][] = new Array(SAMPLE_COUNT);
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    bridge.evaluateAtSampleOffset(evalFrame, i);
+    reference[i] = Array.from(evalFrame.vEff);
+  }
+
+  // Re-arm by calling pullEvaluatedLatest again on a NEW base time —
+  // would invalidate any state machine that was advancing during the
+  // reference loop. (None should — both methods are pure heap
+  // computations.) Actually no: pullEvaluatedLatest does pullLatest
+  // internally which would empty the ring. Need to push again.
+  const push2 = bridge.scratchFrame();
+  push2.seq = 2n;
+  push2.t = 0n;
+  push2.vEff = new Float64Array(16);
+  for (let i = 0; i < 8; i++) {
+    push2.vEff[i * 2] = i * 0.1;
+    push2.vEff[i * 2 + 1] = i * 0.01;
+  }
+  bridge.push(push2);
+  const skipped2 = bridge.pullEvaluatedLatest(evalFrame, baseConsumerNs);
+  assert(skipped2 >= 0, "pullEvaluatedLatest second call succeeds");
+
+  // Batch run via forEachSampleInQuantum.
+  const observed: number[][] = new Array(SAMPLE_COUNT);
+  bridge.forEachSampleInQuantum(evalFrame, SAMPLE_COUNT, (sampleIdx, frame) => {
+    observed[sampleIdx] = Array.from(frame.vEff);
+  });
+
+  // Compare bit-exact.
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    const ref = reference[i]!;
+    const obs = observed[i]!;
+    assertEq(obs.length, ref.length, `sample ${i} length matches`);
+    for (let k = 0; k < ref.length; k++) {
+      assertEq(
+        obs[k],
+        ref[k],
+        `sample ${i} lane ${k}: hand-rolled=${ref[k]}, batch=${obs[k]}`,
+      );
+    }
+  }
+
+  // Validation: throws on bad sampleCount.
+  let threw = false;
+  try { bridge.forEachSampleInQuantum(evalFrame, -1, () => {}); } catch { threw = true; }
+  assert(threw, "negative sampleCount throws");
+  threw = false;
+  try { bridge.forEachSampleInQuantum(evalFrame, 1.5, () => {}); } catch { threw = true; }
+  assert(threw, "fractional sampleCount throws");
+  threw = false;
+  try { bridge.forEachSampleInQuantum(evalFrame, NaN, () => {}); } catch { threw = true; }
+  assert(threw, "NaN sampleCount throws");
+
+  // sampleCount = 0: legal, no-op, callback never invoked.
+  let callbackInvoked = false;
+  bridge.forEachSampleInQuantum(evalFrame, 0, () => {
+    callbackInvoked = true;
+  });
+  assertEq(callbackInvoked, false, "sampleCount=0 invokes callback zero times");
+
+  // No prior pullEvaluatedLatest → throws.
+  const { sab: sab2, capacity: cap2 } = Bridge.allocate(4, schema);
+  const bridge2 = new Bridge(sab2, cap2, schema);
+  bridge2.setSampleRate(48000);
+  threw = false;
+  try { bridge2.forEachSampleInQuantum(evalFrame, 4, () => {}); } catch { threw = true; }
+  assert(threw, "no cached frame → throws");
+
+  ok("for-each-sample-in-quantum");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -4627,6 +4742,7 @@ function main(): void {
   testPllDriftEstimatorPhaseLockedTime();
   testPllLanePublicationCrossPeer();
   testPllLanePublicationEncoding();
+  testForEachSampleInQuantum();
   console.log("\nAll Bridge tests passed.");
 }
 

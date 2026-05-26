@@ -4,6 +4,99 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.17] — 2026-05-26
+
+### Added — `forEachSampleInQuantum` batch evaluation API
+
+`Bridge<S>` gains a single new method that wraps the canonical
+"evaluate every sample of an audio quantum" pattern into one call:
+
+```ts
+bridge.forEachSampleInQuantum(evalFrame, sampleCount, (sampleIdx, frame) => {
+  block[sampleIdx] = synth.step(frame.vEff);
+});
+```
+
+Semantically equivalent to:
+
+```ts
+for (let i = 0; i < sampleCount; i++) {
+  bridge.evaluateAtSampleOffset(evalFrame, i);
+  callback(i, evalFrame);
+}
+```
+
+but with the per-sample method-dispatch + cache-validity checks
+hoisted out of the inner loop. The per-sample dt arithmetic is
+inlined directly in the loop body, and all cached state is read
+into locals once outside the loop. For a single-closure callback
+(V8 monomorphic), the engine inline-caches the body so the
+user-side per-sample cost approaches the raw `evaluateInto` time.
+
+### Why
+
+The README + Phase-Locked Extrapolation Plan named this as the
+per-quantum batch API needed to "eliminate the per-sample call
+overhead in the AudioWorklet's hot loop." The existing
+`evaluateAtSampleOffset(out, i)` pattern is correct but pays a
+per-sample method-dispatch + cache-validity check + cached-state
+re-read tax. At 128 samples per quantum and a single
+`Bridge<S>` per worklet, the overhead is a few percent — small but
+real, and at the heart of the audio-rate path where every cycle
+counts.
+
+This patch ships the smaller, simpler scope from the roadmap's
+"EvalMode dispatch + per-quantum batch API" pair: the batch API
+only. EvalMode dispatch (step / alpha / trajectory / catmull) is
+intentionally deferred — the catmull-rom case needs a K=4 history
+ring with new invalidation rules and an interaction story with
+`resetSmoother` / `resetEvalCache` that deserves its own focused
+patch. The step / alpha / trajectory modes are already accessible
+via the existing `pull` / `pullSmoothed` / `pullEvaluatedLatest`
+surface; the API addition of `setEvalMode` is mostly ergonomics
+and can wait until catmull-rom is ready to ship alongside it.
+
+### Wire compatibility
+
+- **No SAB changes.** `forEachSampleInQuantum` is heap-only on
+  `Bridge<S>`. A 0.6.16 peer and a 0.6.17 peer share a SAB
+  transparently.
+- **No public-API break.** The new method is purely additive;
+  existing `evaluateAtSampleOffset` calls continue to work
+  unchanged. The two paths produce bit-identical output for the
+  same inputs (verified by pin #80).
+- **No bench-path change.** The bench's `push` / `pull` /
+  `trajEval` cells don't exercise the per-quantum loop, so
+  medians are unchanged at 1.20 μs / 1.10 μs.
+
+### Tests
+
+One new test pin (#80) in `tests/Bridge.test.ts`:
+
+- **#80 — forEachSampleInQuantum batch eval.** Walks a 32-sample
+  quantum on an order-2 trajectory schema; output values are
+  bit-identical to a hand-rolled loop calling
+  `evaluateAtSampleOffset(out, i)` per sample on the same schema
+  + PLL state. Validates: throws when cachedEvalValid is false
+  (must call `pullEvaluatedLatest` first); throws on negative /
+  fractional / non-finite sampleCount; sampleCount = 0 no-ops
+  cleanly (callback never invoked).
+
+All 7 suites green; bench medians unchanged at 1.20 μs / 1.10 μs.
+
+### Documentation
+
+- `src/Bridge.ts` `forEachSampleInQuantum` carries a self-
+  contained doc-comment covering semantic equivalence to the
+  hand-rolled loop, the cost-model breakdown per iteration, the
+  V8-monomorphic-friendly callback recommendation, and the
+  validation contract.
+- `README.md` §Per-frame evaluator (Pillar 3) gains a paragraph
+  documenting the new batch API alongside the existing
+  `evaluateAtSampleOffset` pattern; the canonical AudioWorklet
+  example collapses by one indentation level using
+  `forEachSampleInQuantum`.
+
 ## [0.6.16] — 2026-05-26
 
 ### Added — PLL lane 4-5 publication (Pillar 2 cross-process observability)

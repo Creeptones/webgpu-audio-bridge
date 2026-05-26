@@ -913,8 +913,83 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Per-quantum batch evaluation (0.6.17). Walks every sample in
+   * `[0, sampleCount)`, evaluates the cached frame into `evalFrame`
+   * with the per-sample dt, and invokes `callback(sampleIdx, evalFrame)`
+   * for each. The cached state (set up by the most recent successful
+   * `pullEvaluatedLatest`) must be valid — throws otherwise.
+   *
+   * Semantically equivalent to the canonical AudioWorklet pattern:
+   *
+   *     for (let i = 0; i < sampleCount; i++) {
+   *       this.bridge.evaluateAtSampleOffset(evalFrame, i);
+   *       callback(i, evalFrame);
+   *     }
+   *
+   * but with the per-sample method-dispatch + cache-validity checks
+   * hoisted out of the inner loop. The per-sample dt arithmetic is
+   * inlined directly; the trajectory evaluator runs once per sample
+   * exactly like the manual loop. The user's `callback` body is the
+   * site where they read from `evalFrame` and write to their output
+   * (typically the AudioWorklet's `block[i]`).
+   *
+   * Cost model. Each iteration does:
+   *   - One scalar multiply + add for sampleNs
+   *   - One phaseLockedTime call (~3 ops in offset-only mode, ~5 in
+   *     drift mode)
+   *   - One evaluateInto call (the heavy lifting — Taylor expansion
+   *     across every trajectory field's lanes)
+   *   - One callback invocation (user-controlled)
+   *
+   * The callback is V8-monomorphic-friendly: pass a single closure
+   * per worklet instance and the engine inline-caches the body. For
+   * maximum throughput, the callback should NOT allocate per call.
+   *
+   * Validation. `sampleCount` must be a positive finite integer. Pass
+   * 0 to legally no-op (no callback invocations). Negative or
+   * fractional values throw.
+   */
+  forEachSampleInQuantum(
+    evalFrame: FrameFor<S>,
+    sampleCount: number,
+    callback: (sampleIdx: number, frame: FrameFor<S>) => void,
+  ): void {
+    if (!this.cachedEvalValid) {
+      throw new Error(
+        `forEachSampleInQuantum: no cached frame; call pullEvaluatedLatest first`,
+      );
+    }
+    if (
+      !Number.isFinite(sampleCount) ||
+      sampleCount < 0 ||
+      sampleCount !== Math.floor(sampleCount)
+    ) {
+      throw new Error(
+        `forEachSampleInQuantum: sampleCount must be a non-negative integer, got ${sampleCount}`,
+      );
+    }
+    if (sampleCount === 0) return;
+    // Hoist all cached state into locals so the inner loop's reads
+    // are register-sourced. The per-sample dt arithmetic uses the
+    // PLL via `phaseLockedTime` so drift-mode extrapolation works
+    // identically to evaluateAtSampleOffset; the explicit base + rate
+    // factor avoids a redundant divide inside the loop.
+    const base = this.cachedBaseConsumerNs;
+    const cachedTs = this.cachedTimestampNs;
+    const nsPerSample = 1e9 / this.cachedSampleRate;
+    const src = this.cachedRawFrame as FrameFor<S>;
+    for (let i = 0; i < sampleCount; i++) {
+      const consumerNs = base + i * nsPerSample;
+      const producerNs = this.pll.phaseLockedTime(consumerNs);
+      const dt_s = (producerNs - cachedTs) * 1e-9;
+      this.evaluateInto(src, dt_s, evalFrame);
+      callback(i, evalFrame);
+    }
+  }
+
+  /**
    * Invalidate the cache shared by `pullEvaluatedLatest` /
-   * `evaluateAtSampleOffset`. (0.6.5)
+   * `evaluateAtSampleOffset` / `forEachSampleInQuantum`. (0.6.5)
    */
   resetEvalCache(): void {
     this.cachedEvalValid = false;
