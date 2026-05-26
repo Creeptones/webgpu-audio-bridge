@@ -500,6 +500,8 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 Both are scoped together because they share the constructor / class surface and should land before 1.0 freezes the API.
 
+> **Versioning policy**: many additional improvements are planned before 1.0 and the version number should reflect maturity, not feature count. Post-0.6.0 the default is **patch bumps** (`0.6.x`); minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking API changes, or batched-patch promotion. The project will NOT race to 1.0 — when it lands, it lands as a deliberate stability commitment. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
+
 ### Beyond 1.0
 
 - **Topology variants** — MPSC (multiple producers → one consumer) and SPMC (one producer → multiple consumers). SPSC stays the canonical case.
