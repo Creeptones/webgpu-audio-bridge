@@ -33,6 +33,13 @@
  *      if none flagged. Spec propagates onto Schema.timestamps and
  *      through describeSchemaLayout for worklet inliners. Composes with
  *      withInvariant in either order. Schema stays frozen.
+ *  13. .withInvariant(fn, { absoluteEpsilon }) opts (0.6.6). Default-omit
+ *      path attaches DEFAULT_INVARIANT_ABSOLUTE_EPSILON (1e-12); explicit
+ *      opt threads through onto Schema.invariant.absoluteEpsilon. Validates
+ *      the value is a finite non-negative number; rejects NaN, Infinity,
+ *      negative, or non-numeric. Opts object itself must be undefined or an
+ *      object (no other primitives). Schema stays frozen and behavior is
+ *      otherwise identical to the no-opts builder.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -40,6 +47,7 @@
 
 import { assert, assertEq, ok } from "./_assert.js";
 import {
+  DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
   defineSchema,
   describeSchemaLayout,
   f32,
@@ -58,6 +66,7 @@ import {
   type Schema,
   type TrajectoryOrder,
   type TrajectorySpec,
+  type WithInvariantOptions,
 } from "../src/schema.js";
 import { evaluateTrajectoryInto } from "../src/trajectory.js";
 
@@ -837,6 +846,108 @@ function testWithTimestamps(): void {
   ok("with-timestamps");
 }
 
+// ── 13. withInvariant({ absoluteEpsilon }) opts (0.6.6) ────────────────────
+//
+// The second-argument opts bag threads `absoluteEpsilon` onto
+// `Schema.invariant.absoluteEpsilon`. Validation rejects NaN / Infinity /
+// negative / non-numeric values; default-omit yields
+// `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` (1e-12). The Bridge-side behavioral
+// half — subnormal-stored invariant accepted under the floor — lives in
+// `tests/Bridge.test.ts` pin 54.
+function testWithInvariantOpts(): void {
+  const base = defineSchema({ x: f64() });
+  const fn = (frame: { x: number }) => frame.x * frame.x;
+
+  // Default — no opts: absoluteEpsilon === DEFAULT_INVARIANT_ABSOLUTE_EPSILON.
+  const a = base.withInvariant(fn);
+  assert(a.invariant !== null, "default-opts: invariant attached");
+  assertEq(
+    a.invariant?.absoluteEpsilon,
+    DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
+    "default opts ⇒ DEFAULT_INVARIANT_ABSOLUTE_EPSILON",
+  );
+  assertEq(
+    DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
+    1e-12,
+    "exported default constant is 1e-12",
+  );
+
+  // Explicit absoluteEpsilon propagates onto the spec.
+  const b = base.withInvariant(fn, { absoluteEpsilon: 1e-9 });
+  assertEq(
+    b.invariant?.absoluteEpsilon,
+    1e-9,
+    "explicit absoluteEpsilon threaded onto spec",
+  );
+
+  // 0 is a permitted value — reproduces pre-0.6.6 pure-ratio behavior.
+  const c = base.withInvariant(fn, { absoluteEpsilon: 0 });
+  assertEq(c.invariant?.absoluteEpsilon, 0, "absoluteEpsilon = 0 accepted");
+
+  // Empty opts object falls through to the default.
+  const d = base.withInvariant(fn, {} as WithInvariantOptions);
+  assertEq(
+    d.invariant?.absoluteEpsilon,
+    DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
+    "empty opts ⇒ default",
+  );
+
+  // explicit `undefined` field also falls through.
+  const e = base.withInvariant(fn, { absoluteEpsilon: undefined });
+  assertEq(
+    e.invariant?.absoluteEpsilon,
+    DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
+    "undefined absoluteEpsilon ⇒ default",
+  );
+
+  // Validation: NaN, Infinity, negative, non-numeric all rejected.
+  const throws = (label: string, fnRun: () => unknown): void => {
+    let threw = false;
+    try { fnRun(); } catch { threw = true; }
+    assert(threw, `withInvariant opts: ${label} should throw`);
+  };
+  throws("NaN", () => base.withInvariant(fn, { absoluteEpsilon: NaN }));
+  throws("Infinity", () => base.withInvariant(fn, { absoluteEpsilon: Infinity }));
+  throws("-Infinity", () => base.withInvariant(fn, { absoluteEpsilon: -Infinity }));
+  throws("negative", () => base.withInvariant(fn, { absoluteEpsilon: -1e-15 }));
+  throws(
+    "non-numeric",
+    () =>
+      (base.withInvariant as unknown as (
+        fn: unknown,
+        opts: unknown,
+      ) => unknown)(fn, { absoluteEpsilon: "1e-12" }),
+  );
+  // Non-object opts (other than undefined) is rejected.
+  throws(
+    "opts = null",
+    () =>
+      (base.withInvariant as unknown as (
+        fn: unknown,
+        opts: unknown,
+      ) => unknown)(fn, null),
+  );
+  throws(
+    "opts = 0",
+    () =>
+      (base.withInvariant as unknown as (
+        fn: unknown,
+        opts: unknown,
+      ) => unknown)(fn, 0),
+  );
+
+  // Schema with explicit opts is still frozen.
+  let frozeThrew = false;
+  try {
+    (b as { frameByteSize: number }).frameByteSize = 99;
+  } catch {
+    frozeThrew = true;
+  }
+  assert(frozeThrew, "schema with absoluteEpsilon is still frozen");
+
+  ok("with-invariant-opts");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -850,6 +961,7 @@ function main(): void {
   testTrajectoryArrays();
   testEvaluateTrajectory();
   testWithTimestamps();
+  testWithInvariantOpts();
   console.log("ALL PASS schema");
 }
 

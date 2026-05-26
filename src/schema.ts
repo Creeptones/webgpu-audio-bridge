@@ -31,15 +31,18 @@
  * `f64Array(n)` returns `FieldSpec<Float64Array>`). The `FrameFor<S>` mapped
  * type extracts those `T`s into the shape `Bridge.push`/`pull` accept.
  *
- * ─── Schema invariants (0.6.0) ─────────────────────────────────────────────
+ * ─── Schema invariants (0.6.0; epsilon floor added in 0.6.6) ──────────────
  *
- * `defineSchema(...).withInvariant(fn)` builds a new schema with a hidden
- * `__invariant: f64` lane appended at the end of each frame slot. The Bridge
- * auto-computes the invariant on push (caller-supplied fn) and verifies on
- * pull; mismatches are classified as soft (smoother recovery) or hard
- * (last-known-good fallback + lane-3 tornFrameCounter increment). See the
- * `Schema invariants` section of `src/Bridge.ts` for the runtime protocol
- * and recovery thresholds.
+ * `defineSchema(...).withInvariant(fn, opts?)` builds a new schema with a
+ * hidden `__invariant: f64` lane appended at the end of each frame slot. The
+ * Bridge auto-computes the invariant on push (caller-supplied fn) and
+ * verifies on pull; mismatches are classified as soft (smoother recovery) or
+ * hard (last-known-good fallback + lane-3 tornFrameCounter increment). See
+ * the `Schema invariants` section of `src/Bridge.ts` for the runtime
+ * protocol and recovery thresholds. `opts.absoluteEpsilon` (0.6.6, default
+ * `1e-12`) sets the lower floor on the OK band so subnormal-zero and tiny
+ * rounding residues classify as OK instead of HARD; see
+ * `WithInvariantOptions`.
  *
  * The invariant fn must be O(payload size), allocation-free, and pure (same
  * input → same output bit-exactly). Sum-of-squares is the canonical choice
@@ -325,12 +328,35 @@ export type InvariantFn<F extends FieldsObject> = (
   frame: { -readonly [K in keyof F]: F[K] extends FieldSpec<infer T> ? T : never },
 ) => number;
 
+/** Optional second argument to `.withInvariant(fn, opts?)` (0.6.6).
+ *
+ *  `absoluteEpsilon` (default `1e-12`) is the lower floor on the OK band used
+ *  by Bridge's invariant classifier. The OK band is
+ *  `max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`; relative error
+ *  stays primary for non-trivial `stored`, the absolute floor catches
+ *  subnormal-zero and near-zero rounding noise that the original pure-ratio
+ *  check misclassified as hard. Must be a finite non-negative number; 0 is
+ *  permitted and reproduces the pre-0.6.6 strict-ratio behavior. */
+export interface WithInvariantOptions {
+  readonly absoluteEpsilon?: number;
+}
+
+/** Default for `WithInvariantOptions.absoluteEpsilon` (0.6.6). Below `2^-40 ≈ 9e-13`
+ *  most f64 sums are dominated by rounding noise, so 1e-12 is the smallest
+ *  band that's still useful as a "treat as zero" floor for typical sum-of-
+ *  squares invariants while staying conservative against real corruption. */
+export const DEFAULT_INVARIANT_ABSOLUTE_EPSILON = 1e-12;
+
 /** Type-erased invariant spec consumed by Bridge. */
 export interface SchemaInvariantSpec {
   /** Type-erased invariant compute fn (Bridge passes Record<string, unknown>). */
   readonly compute: (frame: Record<string, unknown>) => number;
   /** Byte offset of the hidden `__invariant: f64` field within a frame. */
   readonly byteOffset: number;
+  /** Absolute floor on the OK band — see `WithInvariantOptions.absoluteEpsilon`.
+   *  Always finite and non-negative; defaults to
+   *  `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` when the caller passed no opts. */
+  readonly absoluteEpsilon: number;
 }
 
 // ─── Timestamp roles (0.6.5) ───────────────────────────────────────────────
@@ -406,8 +432,13 @@ export interface Schema<
   /** Builder: returns a new Schema with the invariant attached. The frame
    *  byte size grows by 8 to accommodate the hidden `__invariant: f64`
    *  field; the f64 type-family is added to `compiled.typesPresent` if not
-   *  already present. */
-  withInvariant(fn: InvariantFn<F>): Schema<F, T>;
+   *  already present. Optional `opts.absoluteEpsilon` (0.6.6, default `1e-12`)
+   *  sets the lower floor on the classifier's OK band — see
+   *  `WithInvariantOptions`. */
+  withInvariant(
+    fn: InvariantFn<F>,
+    opts?: WithInvariantOptions,
+  ): Schema<F, T>;
   /** Builder: returns a new Schema with one or more named timestamp roles
    *  attached. Validates each role's `field` exists on the schema and is a
    *  scalar numeric kind. At most one role may carry `default: true`; if
@@ -630,6 +661,7 @@ function makeSchema<F extends FieldsObject, T extends TimestampsConfig<F> | null
   fields: F,
   compiled: CompiledLayout,
   invariantFn: InvariantFn<F> | null,
+  invariantAbsoluteEpsilon: number,
   timestamps: SchemaTimestampsSpec | null,
 ): Schema<F, T> {
   const invariant: SchemaInvariantSpec | null =
@@ -640,6 +672,7 @@ function makeSchema<F extends FieldsObject, T extends TimestampsConfig<F> | null
             frame: Record<string, unknown>,
           ) => number,
           byteOffset: compiled.invariantByteOffset,
+          absoluteEpsilon: invariantAbsoluteEpsilon,
         });
   return Object.freeze({
     fields,
@@ -648,11 +681,31 @@ function makeSchema<F extends FieldsObject, T extends TimestampsConfig<F> | null
     _brand: "wab/Schema" as const,
     invariant,
     timestamps,
-    withInvariant(fn: InvariantFn<F>): Schema<F, T> {
+    withInvariant(
+      fn: InvariantFn<F>,
+      opts?: WithInvariantOptions,
+    ): Schema<F, T> {
       if (typeof fn !== "function") {
         throw new TypeError(
           "Schema.withInvariant: argument must be a function (frame → number)",
         );
+      }
+      let epsilon = DEFAULT_INVARIANT_ABSOLUTE_EPSILON;
+      if (opts !== undefined) {
+        if (typeof opts !== "object" || opts === null) {
+          throw new TypeError(
+            "Schema.withInvariant: opts must be an object or undefined",
+          );
+        }
+        if (opts.absoluteEpsilon !== undefined) {
+          const eps = opts.absoluteEpsilon;
+          if (typeof eps !== "number" || !Number.isFinite(eps) || eps < 0) {
+            throw new TypeError(
+              `Schema.withInvariant: opts.absoluteEpsilon must be a finite non-negative number, got ${String(eps)}`,
+            );
+          }
+          epsilon = eps;
+        }
       }
       const newCompiled = compileLayout(fields, { invariant: true });
       // Re-resolve the timestamps spec against the new compiled layout so
@@ -677,11 +730,17 @@ function makeSchema<F extends FieldsObject, T extends TimestampsConfig<F> | null
             fields,
             newCompiled,
           );
-      return makeSchema<F, T>(fields, newCompiled, fn, newTimestamps);
+      return makeSchema<F, T>(fields, newCompiled, fn, epsilon, newTimestamps);
     },
     withTimestamps<U extends TimestampsConfig<F>>(config: U): Schema<F, U> {
       const spec = compileTimestamps(config, fields, compiled);
-      return makeSchema<F, U>(fields, compiled, invariantFn, spec);
+      return makeSchema<F, U>(
+        fields,
+        compiled,
+        invariantFn,
+        invariantAbsoluteEpsilon,
+        spec,
+      );
     },
   }) as Schema<F, T>;
 }
@@ -724,7 +783,13 @@ export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
   }
 
   const compiled = compileLayout(fields, { invariant: false });
-  return makeSchema<F, null>(fields, compiled, null, null);
+  return makeSchema<F, null>(
+    fields,
+    compiled,
+    null,
+    DEFAULT_INVARIANT_ABSOLUTE_EPSILON,
+    null,
+  );
 }
 
 /** Produce a postMessage-safe layout description for worklet inliners. */

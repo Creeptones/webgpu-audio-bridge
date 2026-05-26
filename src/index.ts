@@ -24,7 +24,11 @@
 // ── New (recommended): Bridge<Schema> ──────────────────────────────────────
 
 export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
-export type { BridgeAllocation } from "./Bridge.js";
+export type {
+  BridgeAllocation,
+  SmoothedPullOptions,
+  SmootherSkipPolicy,
+} from "./Bridge.js";
 
 export {
   defineSchema,
@@ -52,7 +56,10 @@ export type {
   SchemaLayoutFieldDescription,
   TrajectoryOrder,
   TrajectorySpec,
+  WithInvariantOptions,
 } from "./schema.js";
+
+export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 
 // Trajectory evaluator — consumer-side Taylor extrapolation helper that
 // reads the f{32,64}TrajectoryArray tag. See src/trajectory.ts header.

@@ -4,6 +4,47 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.6] — 2026-05-26
+
+### Added — invariant epsilon floor + smoother named modes
+
+Two independent heap-only DSP corrections shipped together. Both are wire-compatible and opt-in; every pre-0.6.6 schema and call site is preserved bit-exact on the default code path.
+
+- **`.withInvariant(fn, opts?: { absoluteEpsilon })`** — second-argument opts bag adds an absolute lower floor to the invariant classifier's OK band. The OK comparator becomes `|computed − stored| < max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`; relative error stays primary, the absolute floor catches subnormal-zero and tiny f64 rounding residues that the pre-0.6.6 pure-ratio classifier misclassified as hard. Default `1e-12`. Passing `{ absoluteEpsilon: 0 }` reproduces the pre-0.6.6 strict-ratio behavior. New exports: `DEFAULT_INVARIANT_ABSOLUTE_EPSILON`, type `WithInvariantOptions`.
+
+- **`pullSmoothed` / `pullLatestSmoothed` now accept `opts?: { skipPolicy: 'stall-smooth' | 'catch-up' }`** — picks how `α_eff` responds when the consumer drains a backlog. Default `'stall-smooth'` is the legacy `α_eff = α_base · 2^(−skipped)` formula, bit-identical to 0.4.1..0.6.5 on every skipped value. Opt-in `'catch-up'` uses the closed-form `α_eff = 1 − (1 − α_base)^(skipped + 1)` — the math behind why a compounded EMA "should" use a larger α after a stall. Stall-smooth is click-suppression-first (large skips drive α→0, mostly trust prev); catch-up is chase-latency-first (large skips drive α→1, snap to the new frame). At `skipped = 0` both formulas degenerate to `α_eff = α_base` exactly, so `pullSmoothed` (always `skipped === 0`) accepts the option for API symmetry but it has no behavioral effect there. New exports: types `SmoothedPullOptions`, `SmootherSkipPolicy`.
+
+### Why — two real-world bugs, neither worth a behavior change on the default path
+
+**Invariant epsilon floor.** Pre-0.6.6 `_classifyInvariant` computed `delta = |c − s| / |s|` and treated `stored === 0` as a hard error unless `computed === 0` exactly. The relative-only form misfires in two situations both observed in the wavefunction-synth integration: (1) a schema whose invariant fn happens to return zero for the producer's quiescent state (e.g. `Σ|f|²` on a silence frame) blew up on the first frame where rounding flipped the consumer-side recompute to a subnormal nonzero; (2) a schema with very small but nonzero stored values (radio-band signal amplitudes ≲ 1e-15) classified pure f64 rounding noise (delta ≈ 1) as hard. Adding the absolute floor preserves the relative path for any non-trivial stored value while making the classifier robust on the boundary. The default `1e-12` is conservative: below `2^-40 ≈ 9 · 10^-13` most f64 sums are dominated by rounding, so `1e-12` is the smallest useful "treat as zero" band; users with tighter invariants (CRC32, xxhash) can pass `{ absoluteEpsilon: 0 }` and get the pre-0.6.6 strict behavior.
+
+**Smoother named modes.** The "RFC review" 8/10→10/10 round-trip flagged the `2^(−skipped)` curve as audibly wrong for control surfaces and UI parameter changes — when the producer's post-stall value is a discontinuous correction (a knob turn, a synth voice retrigger), the consumer should snap, not drift. But for the wavefunction-synth use case the curve is right: a 60 Hz physics step stalling under GPU load and catching up at the next frame should NOT click-restart the audio voice envelope. The RFC's proposed unconditional swap to the compounded-EMA form would invert audible behavior for every existing caller. Shipping both formulas as named, opt-in policies — with the legacy formula as the default — lets each caller choose the right curve for their signal without breaking anyone.
+
+### Wire compatibility
+
+- **No SAB changes.** Both fixes are pure heap state on the consumer's Bridge instance. Header lanes 0–3 unchanged from 0.6.0; lanes 4–7 still reserved. A 0.6.5 peer and a 0.6.6 peer share a SAB transparently.
+- **No public-API breakage.** `.withInvariant(fn)` (no opts) still works and yields a schema indistinguishable from one built with `{ absoluteEpsilon: 1e-12 }` — the default. `pullSmoothed(out, α)` and `pullLatestSmoothed(out, α)` still work with the legacy formula. All 0.6.5 call sites compile and execute unchanged.
+- **`SchemaInvariantSpec` gains a non-optional `absoluteEpsilon: number` field.** Any caller reading `schema.invariant.absoluteEpsilon` (none in tree) now sees a numeric value instead of `undefined`. The field is always populated — the `makeSchema` factory defaults it to `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` for schemas without an explicit opt — so this is additive rather than breaking in practice.
+
+### Tests
+
+`tests/schema.test.ts` grows from 12 to 13 pins:
+
+- **`testWithInvariantOpts`** (pin #13) — default-omit yields `DEFAULT_INVARIANT_ABSOLUTE_EPSILON = 1e-12`; explicit values thread onto `Schema.invariant.absoluteEpsilon`; `0` is permitted (reproduces pre-0.6.6 behavior); empty opts and `{ absoluteEpsilon: undefined }` fall back to the default; NaN / Infinity / negative / non-numeric / null opts all reject; schema with opts stays frozen.
+
+`tests/Bridge.test.ts` grows from 53 to 55 pins:
+
+- **`testInvariantEpsilonFloor`** (pin #54) — directly mutates the stored `__invariant` SAB lane to engineer a `(computed = 0, stored = 1e-15)` pair on a schema whose invariant fn returns the constant 0. Under default opts (`1e-12` floor) the pair classifies OK (no tornFrames, raw payload passes through); under `{ absoluteEpsilon: 0 }` the same pair classifies HARD (1 tornFrame, prev fallback) — proves the floor is what's doing the work. A third sub-pin asserts non-trivial-stored cases are unaffected: stored = 100, computed = 0 still classifies HARD because the relative term (`1e-3 · 100 = 0.1`) dominates the OK band over the `1e-12` floor.
+- **`testSmootherCatchUpPolicy`** (pin #55) — sweep `skipped ∈ {0, 1, 5, 10}` against `α_base = 0.25` and assert: (a) explicit `'stall-smooth'` matches the closed form `α_base · 2^(−skipped)`; (b) default-omit (no third arg) is bit-exact equal to explicit `'stall-smooth'` on every skipped value, including the array path; (c) explicit `'catch-up'` matches `1 − (1 − α_base)^(skipped + 1)`; (d) at `skipped = 0` both policies converge exactly; for `skipped > 0` the policies diverge and `α_catch > α_stall`. Adds a parallel-ring assertion that `pullSmoothed` (always `skipped === 0`) produces identical output under both policies.
+
+All 5 test suites green (schema 13 pins / Bridge 55 pins / Float64RingBuffer 9 pins / both concurrent stresses). Bench medians at N=1000 unchanged from 0.6.5: push 1.20 μs, pull 1.20 μs, pullLatest 1.20 μs.
+
+### Documentation
+
+- `src/schema.ts` header `Schema invariants` block updated to advertise the new opts arg; `WithInvariantOptions` and `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` carry JSDoc explaining the 1e-12 default and the `0` escape hatch.
+- `src/Bridge.ts` header `Smoothed pulls` block rewritten to enumerate both policies and their click-vs-chase tradeoffs; `_classifyInvariant` doc spells out the `max(eps, OK · |stored|)` band.
+- README `Schema invariants` and `Smoothed pulls` subsections add per-policy worked examples.
+
 ## [0.6.5] — 2026-05-26
 
 ### Added — timestamp roles + `pullEvaluatedLatest` / `evaluateAtSampleOffset` sugar (Pillar 3 second cut)

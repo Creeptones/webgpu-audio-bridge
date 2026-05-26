@@ -139,6 +139,21 @@
  *      and `tSamples: f64` and the consumer uses each role; resulting
  *      cachedTimestampNs matches the analytic ns conversion through
  *      `dt` evaluations bit-exactly.
+ *  54. Invariant epsilon floor (0.6.6). With stored ≈ 0 (or subnormal-
+ *      tiny) and computed within `absoluteEpsilon` of stored, the
+ *      classifier returns OK instead of HARD. The default 1e-12 catches
+ *      f64 rounding noise; opting opts.absoluteEpsilon = 0 reproduces the
+ *      pre-0.6.6 strict-ratio behavior (HARD on subnormal stored).
+ *      Non-zero stored is unaffected: the relative term INVARIANT_OK *
+ *      |stored| dominates the OK band, so pin 38's boundary assertions
+ *      classify identically. Cross-checks the bridge half of schema.test
+ *      pin 13.
+ *  55. Smoother 'catch-up' policy (0.6.6, opt-in). With explicit
+ *      `opts.skipPolicy = 'catch-up'`, `pullLatestSmoothed` uses
+ *      `α_eff = 1 - (1 - α_base)^(skipped + 1)`. The blended output
+ *      matches the closed form at skipped = 0 / 1 / 5 / 10. Default-omit
+ *      path is bit-exact identical to the pre-0.6.6 `α_base · 2^(-skipped)`
+ *      formula on the same skipped values — preserves all of pins 18..27.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -2766,6 +2781,268 @@ function testTimestampUnitConversion(): void {
   ok("timestamp-unit-conversion");
 }
 
+// ── 54. Invariant epsilon floor (0.6.6) ───────────────────────────────────
+//
+// Schema invariant returning a constant. Mutate the stored __invariant lane
+// to a subnormal-tiny value (1e-15) so |computed - stored| is well below the
+// epsilon floor (1e-12) but the *relative* error vs the stored value is huge
+// (delta = 1.0). Pre-0.6.6 classifier: stored != 0 ⇒ relative path ⇒ delta
+// >= INVARIANT_SOFT_THRESHOLD ⇒ hard. Post-0.6.6: absErr < absoluteEpsilon
+// ⇒ ok. Then `opts.absoluteEpsilon = 0` reproduces the pre-0.6.6 strict
+// behavior on the same fixture — proves the floor is what's doing the work.
+// Cross-checks the schema-side default in schema.test pin 13.
+function testInvariantEpsilonFloor(): void {
+  // Schema whose invariant always returns 0. Lets us mutate the stored
+  // f64 invariant lane independently of payload to engineer (computed,
+  // stored) pairs at any band.
+  const make = (epsilon?: number) =>
+    defineSchema({
+      seq: u64(),
+      payload: f64Array(2),
+    }).withInvariant(
+      () => 0,
+      epsilon === undefined ? undefined : { absoluteEpsilon: epsilon },
+    );
+
+  // The hidden __invariant lane sits at byteOffset = 24 (8 [u64] + 16 [f64×2])
+  // = f64 index 3 within a 4-element slot.
+  const STORE_F64_OFFSET = 3;
+  const SLOT_F64_STRIDE = 4;
+
+  // (a) Default epsilon (1e-12): subnormal-tiny stored is accepted as OK.
+  {
+    const schema = make(); // default opts → 1e-12 floor
+    assertEq(
+      schema.invariant?.absoluteEpsilon,
+      1e-12,
+      "default opts ⇒ absoluteEpsilon = 1e-12",
+    );
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = { seq: 0n, payload: new Float64Array(2) };
+    ring.push({ seq: 7n, payload: new Float64Array([0, 0]) });
+    // Mutate stored invariant to a sub-epsilon value (computed = 0 always).
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * SLOT_F64_STRIDE);
+    f64View[0 * SLOT_F64_STRIDE + STORE_F64_OFFSET] = 1e-15;
+    assertEq(ring.pull(out), true, "epsilon-floor: pull");
+    assertEq(
+      ring.telemetry().tornFrames,
+      0,
+      "epsilon-floor (default): subnormal stored classifies OK (no tornFrames)",
+    );
+    assertEq(out.seq, 7n, "epsilon-floor: raw payload passes through (seq)");
+    assertEq(out.payload[0], 0, "epsilon-floor: payload[0] passes through");
+  }
+
+  // (b) opts.absoluteEpsilon = 0 reproduces pre-0.6.6 strict-ratio behavior
+  // on the *same* fixture: the very same SAB mutation now classifies as
+  // hard because the absolute floor no longer absorbs it.
+  {
+    const schema = make(0);
+    assertEq(
+      schema.invariant?.absoluteEpsilon,
+      0,
+      "explicit absoluteEpsilon = 0 threaded onto spec",
+    );
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = { seq: 0n, payload: new Float64Array(2) };
+    // Seed consumerPrev so we can observe the fallback behavior on the
+    // following corrupt pull.
+    ring.push({ seq: 1n, payload: new Float64Array([0, 0]) });
+    assertEq(ring.pull(out), true, "epsilon-floor (eps=0): seed pull");
+    assertEq(ring.telemetry().tornFrames, 0, "seed: tornFrames still 0");
+
+    // Now the corrupt pull.
+    ring.push({ seq: 2n, payload: new Float64Array([0, 0]) });
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * SLOT_F64_STRIDE);
+    // Slot 1 stored lane.
+    f64View[1 * SLOT_F64_STRIDE + STORE_F64_OFFSET] = 1e-15;
+    assertEq(ring.pull(out), true, "epsilon-floor (eps=0): pull");
+    assertEq(
+      ring.telemetry().tornFrames,
+      1,
+      "epsilon-floor (eps=0): subnormal stored classifies HARD (1 tornFrame)",
+    );
+    // Hard fallback restores prev seq (1), not the corrupt frame's seq (2).
+    assertEq(out.seq, 1n, "epsilon-floor (eps=0): hard fallback returns prev");
+  }
+
+  // (c) Non-zero stored is unaffected by the floor: pin 38's classifier
+  // boundary at delta = 1e-3 still fires the same way. (Repeat that
+  // assertion in miniature so a future refactor of the OK band can't
+  // silently regress non-trivial-stored cases.)
+  {
+    const schema = make(); // default 1e-12 floor, but stored is large
+    const { sab, capacity } = Bridge.allocate(16, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = { seq: 0n, payload: new Float64Array(2) };
+    ring.push({ seq: 9n, payload: new Float64Array([0, 0]) });
+    const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * SLOT_F64_STRIDE);
+    // stored = 100, computed = 0 → absErr = 100, okBand = max(1e-12, 1e-3·100) = 0.1.
+    // delta = 100 / 100 = 1.0 → not < INVARIANT_SOFT_THRESHOLD → hard.
+    f64View[0 * SLOT_F64_STRIDE + STORE_F64_OFFSET] = 100;
+    assertEq(ring.pull(out), true, "epsilon-floor (non-zero stored): pull");
+    assertEq(
+      ring.telemetry().tornFrames,
+      1,
+      "non-trivial stored: floor does NOT absorb a real corruption",
+    );
+  }
+
+  ok("invariant-epsilon-floor");
+}
+
+// ── 55. Smoother 'catch-up' policy + 'stall-smooth' default bit-exact ─────
+//
+// Default-omit / explicit 'stall-smooth' reproduces α_base · 2^(-skipped)
+// bit-exact (preserves pins 18..27). 'catch-up' uses the closed-form
+// 1 - (1 - α_base)^(skipped + 1); both formulas reduce to α_base at
+// skipped = 0. Sweep skipped ∈ {0, 1, 5, 10}.
+function testSmootherCatchUpPolicy(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+
+  // Build one driver fixture that puts the ring at a specific `skipped`
+  // value, then pulls under each policy. Both pulls observe the same
+  // (curr, prev) pair, so we can compare against analytic α_eff.
+  const driveAndPull = (
+    skipped: number,
+    alphaBase: number,
+    opts?: { skipPolicy: "stall-smooth" | "catch-up" } | undefined,
+  ): { out: PhysFrame; A: PhysFrame; Bnewest: PhysFrame } => {
+    const { sab, capacity } = Bridge.allocate(32, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const out = emptyPhysFrame(n);
+
+    const A = makePhysFrame(0, n);
+    ring.push(A);
+    assertEq(
+      ring.pullLatestSmoothed(out, alphaBase),
+      0,
+      "catch-up driver seed (default policy)",
+    );
+
+    // Push (skipped + 1) more frames so newestIdx - readIdx == skipped.
+    let Bnewest: PhysFrame | null = null;
+    for (let i = 0; i < skipped + 1; i++) {
+      const f = makePhysFrame(1 + i, n);
+      ring.push(f);
+      if (i === skipped) Bnewest = f;
+    }
+    assert(Bnewest !== null, "catch-up driver: Bnewest computed");
+
+    // The third arg is intentionally Optional to also cover the default
+    // (no-opts) call.
+    const observed = opts === undefined
+      ? ring.pullLatestSmoothed(out, alphaBase)
+      : ring.pullLatestSmoothed(out, alphaBase, opts);
+    assertEq(observed, skipped, `catch-up driver: skipped = ${skipped}`);
+    return { out, A, Bnewest: Bnewest! };
+  };
+
+  const skippedCases = [0, 1, 5, 10];
+  const alphaBase = 0.25;
+
+  for (const skipped of skippedCases) {
+    // (a) 'stall-smooth' — explicit pick reproduces α_base · 2^(-skipped).
+    const stall = driveAndPull(skipped, alphaBase, { skipPolicy: "stall-smooth" });
+    const alphaStall = alphaBase * Math.pow(2, -skipped);
+    const wantStallVMax =
+      alphaStall * stall.Bnewest.vMax + (1 - alphaStall) * stall.A.vMax;
+    assertEq(
+      stall.out.vMax,
+      wantStallVMax,
+      `stall-smooth skipped=${skipped}: α_eff = ${alphaStall} matches closed form`,
+    );
+
+    // (b) Default-omit yields the same value as explicit 'stall-smooth'.
+    const def = driveAndPull(skipped, alphaBase, undefined);
+    assertEq(
+      def.out.vMax,
+      wantStallVMax,
+      `default-omit skipped=${skipped}: bit-exact equal to 'stall-smooth'`,
+    );
+    // Also check across an array lane to catch any field-loop divergence.
+    for (let k = 0; k < n; k++) {
+      const want =
+        alphaStall * stall.Bnewest.vEff[k]! + (1 - alphaStall) * stall.A.vEff[k]!;
+      assertEq(
+        def.out.vEff[k],
+        want,
+        `default-omit skipped=${skipped} vEff[${k}]: bit-exact closed form`,
+      );
+    }
+
+    // (c) 'catch-up' uses 1 - (1 - α)^(skipped + 1).
+    const catchUp = driveAndPull(skipped, alphaBase, { skipPolicy: "catch-up" });
+    const alphaCatch = 1 - Math.pow(1 - alphaBase, skipped + 1);
+    const wantCatchVMax =
+      alphaCatch * catchUp.Bnewest.vMax + (1 - alphaCatch) * catchUp.A.vMax;
+    assertEq(
+      catchUp.out.vMax,
+      wantCatchVMax,
+      `catch-up skipped=${skipped}: α_eff = ${alphaCatch} matches closed form`,
+    );
+    for (let k = 0; k < n; k++) {
+      const want =
+        alphaCatch * catchUp.Bnewest.vEff[k]! + (1 - alphaCatch) * catchUp.A.vEff[k]!;
+      assertEq(
+        catchUp.out.vEff[k],
+        want,
+        `catch-up skipped=${skipped} vEff[${k}]: closed form`,
+      );
+    }
+
+    // (d) For skipped = 0 both policies must produce identical output.
+    if (skipped === 0) {
+      assertEq(
+        catchUp.out.vMax,
+        wantStallVMax,
+        "skipped=0: catch-up and stall-smooth converge bit-exactly",
+      );
+    } else {
+      // Sanity: for skipped > 0 the policies must diverge (else the test
+      // is vacuous). Catch-up α > stall-smooth α whenever α_base > 0.
+      assert(
+        alphaCatch > alphaStall,
+        `skipped=${skipped}: catch-up α (${alphaCatch}) > stall-smooth α (${alphaStall})`,
+      );
+    }
+  }
+
+  // pullSmoothed (single-frame) accepts the option for API symmetry but
+  // skipped is always 0, so both policies yield the same blend.
+  {
+    const { sab, capacity } = Bridge.allocate(8, schema);
+    const ring = new Bridge(sab, capacity, schema);
+    const outStall = emptyPhysFrame(n);
+    const outCatch = emptyPhysFrame(n);
+    const A = makePhysFrame(11, n);
+    ring.push(A);
+    assertEq(ring.pullSmoothed(outStall, 0.25, { skipPolicy: "stall-smooth" }), true, "pullSmoothed seed (stall)");
+
+    // Build a parallel ring to compare 'catch-up'.
+    const r2 = Bridge.allocate(8, schema);
+    const ring2 = new Bridge(r2.sab, r2.capacity, schema);
+    ring2.push(A);
+    assertEq(ring2.pullSmoothed(outCatch, 0.25, { skipPolicy: "catch-up" }), true, "pullSmoothed seed (catch-up)");
+
+    const B = makePhysFrame(22, n);
+    ring.push(B);
+    ring2.push(B);
+    assertEq(ring.pullSmoothed(outStall, 0.25, { skipPolicy: "stall-smooth" }), true, "pullSmoothed blend (stall)");
+    assertEq(ring2.pullSmoothed(outCatch, 0.25, { skipPolicy: "catch-up" }), true, "pullSmoothed blend (catch-up)");
+    assertEq(
+      outStall.vMax,
+      outCatch.vMax,
+      "pullSmoothed: catch-up degenerates to stall-smooth (skipped always 0)",
+    );
+  }
+
+  ok("smoother-catch-up-policy");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -2821,6 +3098,8 @@ function main(): void {
   testTimestampRoleResolution();
   testSampleRateResolution();
   testTimestampUnitConversion();
+  testInvariantEpsilonFloor();
+  testSmootherCatchUpPolicy();
   console.log("\nAll Bridge tests passed.");
 }
 

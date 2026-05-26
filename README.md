@@ -279,26 +279,57 @@ The full set of field constructors:
 
 `defineSchema({ ... })` validates field names (must be valid JS identifiers, no duplicates), groups fields internally by alignment class (8-aligned first, then 4, then 2, then 1; stable within class) so SAB-backed typed-array views land at legal byte offsets, and pads the frame size up to 8.
 
-#### Schema invariants — `.withInvariant(fn)`
+#### Schema invariants — `.withInvariant(fn, opts?)`
 
-Append a hidden integrity field to the schema (0.6.0):
+Append a hidden integrity field to the schema (0.6.0; epsilon floor opts added in 0.6.6):
 
 ```ts
 const schema = defineSchema({
   seq:  u64(),
   vEff: f64Array(64),
   jEff: f64Array(64),
-}).withInvariant((frame) => {
-  // Σ|f|² is the canonical choice for f64-dominant payloads. xxhash /
-  // CRC32 / any pure, O(payload size), allocation-free function works.
-  let s = 0;
-  for (const x of frame.vEff) s += x * x;
-  for (const x of frame.jEff) s += x * x;
-  return s;
-});
+}).withInvariant(
+  (frame) => {
+    // Σ|f|² is the canonical choice for f64-dominant payloads. xxhash /
+    // CRC32 / any pure, O(payload size), allocation-free function works.
+    let s = 0;
+    for (const x of frame.vEff) s += x * x;
+    for (const x of frame.jEff) s += x * x;
+    return s;
+  },
+  // Optional (0.6.6). Absolute floor on the classifier's OK band so the
+  // |computed − stored| comparator uses max(absoluteEpsilon, 1e-3 · |stored|).
+  // Default 1e-12 catches f64 rounding noise on subnormal-tiny stored values;
+  // pass 0 to reproduce the pre-0.6.6 strict-ratio behavior.
+  { absoluteEpsilon: 1e-12 },
+);
 ```
 
 The bridge auto-computes the invariant at push and verifies at pull, falling back to the last-known-good frame on hard errors and engaging the α-smoother on soft errors. See [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection) for the protocol and recovery behavior.
+
+#### Smoothed pulls — `pullSmoothed` / `pullLatestSmoothed`
+
+Opt-in variants of `pull` / `pullLatest` that blend the freshly-read frame against the previously-returned smoothed frame using a one-pole low-pass `out_i ← α_eff · curr_i + (1 − α_eff) · prev_i`. The skip-scaling of `α_eff` is selected per call via `opts.skipPolicy` (0.6.6, default `'stall-smooth'`):
+
+```ts
+// 'stall-smooth' (default, 0.4.1..present, bit-exact-preserved at 0.6.6):
+//   α_eff = α_base · 2^(−skipped) — large skips drive α → 0, mostly trust prev.
+//   Right when audible click-suppression matters most (audio voice envelopes,
+//   continuous synthesis parameters).
+const skipped = bridge.pullLatestSmoothed(out, 0.25);             // default policy
+const skipped = bridge.pullLatestSmoothed(out, 0.25,
+                                          { skipPolicy: 'stall-smooth' }); // same
+
+// 'catch-up' (opt-in, 0.6.6):
+//   α_eff = 1 − (1 − α_base)^(skipped + 1) — closed form of (skipped+1) one-pole
+//   applications. Large skips drive α → 1, snap to the new frame. Right when the
+//   post-stall value is a discontinuous correction (knob turn, voice retrigger,
+//   UI parameter, control surface).
+const skipped = bridge.pullLatestSmoothed(out, 0.25,
+                                          { skipPolicy: 'catch-up' });
+```
+
+At `skipped = 0` both formulas degenerate to `α_eff = α_base` exactly, so `pullSmoothed` (always `skipped === 0`) accepts the option for API symmetry but it has no behavioral effect there. The α-smoother's `prev` is held heap-side on the Bridge instance, lazily allocated, and persists across calls; any non-smoothed `pull` / `pullLatest` invalidates it. See file header `Smoothed pulls` in `src/Bridge.ts` for the field-type rules (BigInts pass through verbatim; integer-typed numerics blend in float then `Math.round` back; trajectory fields blend only position lanes per the 0.6.4 fix).
 
 #### Trajectory arrays — Pillar 1 of phase-locked extrapolation
 
@@ -613,13 +644,15 @@ if (tel.tornFrames > 0) {
 }
 ```
 
-The classification:
+The classification (post-0.6.6):
 
-| Verdict | `\|ratio − 1\|` | Action |
+| Verdict | OK band: `\|c − s\| < max(absoluteEpsilon, 1e-3 · \|s\|)` ⇒ ok; else use `\|c − s\| / \|s\|` for soft/hard. | Action |
 |---|---|---|
-| ok | `< 1e-3` | Pass through; seed `consumerPrev` (last-known-good). |
-| soft | `< 1.0` | Invoke α-smoother (from 0.4.1) with `α = clamp(0.1 / \|ratio−1\|, 0, 1)`. tornFrames stays 0. |
-| hard | `≥ 1.0` (or NaN/Inf) | Copy `consumerPrev` into `out`; increment `tornFrames`. On the first pull (no prev), the raw payload passes through and `tornFrames` still increments. |
+| ok | `\|c − s\| < max(absoluteEpsilon, 1e-3 · \|stored\|)` | Pass through; seed `consumerPrev` (last-known-good). |
+| soft | OK band failed AND `\|c − s\| / \|s\| < 1.0` | Invoke α-smoother (from 0.4.1) with `α = clamp(0.1 / \|ratio−1\|, 0, 1)`. tornFrames stays 0. |
+| hard | otherwise (`≥ 1.0`, NaN/Inf, or any deviation outside the floor when stored is zero) | Copy `consumerPrev` into `out`; increment `tornFrames`. On the first pull (no prev), the raw payload passes through and `tornFrames` still increments. |
+
+The OK band's absolute floor (`absoluteEpsilon`, default `1e-12`, configurable via `.withInvariant(fn, { absoluteEpsilon })`) catches subnormal-zero and tiny f64 rounding residues that the pre-0.6.6 pure-ratio classifier misclassified as hard. For any non-trivial `stored` the relative term `1e-3 · |stored|` dominates and behavior is bit-identical to 0.6.5; the floor only kicks in when `stored ≲ 1e-9`. Pass `{ absoluteEpsilon: 0 }` to reproduce the pre-0.6.6 strict-ratio classifier exactly.
 
 Hard errors are visible via `bridge.telemetry().tornFrames` — a monotonic counter you can scrape for dashboards, regression tests, or runtime alerting. Soft errors are recovered click-free with no counter bump.
 
@@ -674,7 +707,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 - ✅ **0.3.0 — Schema-driven frames** (`Bridge<Schema>` + `defineSchema({ ... })`). Replaces the hard-coded `Float64RingBuffer` layout with a typed DSL that supports mixed primitive types as scalars or fixed-length arrays.
 - ✅ **0.4.0 — Int32 wrap counters** (ringbuf.js-class atomic floor). `write_index` / `read_index` lanes moved from BigInt64 to Int32 wrapping mod 2^32; isolated atomic load+store+notify drops from ~160 ns to ~100 ns on V8.
-- ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with skip-scaling (`α_eff = α_base · 2⁻ˢᵏⁱᵖᵖᵉᵈ`) on the latest variant.
+- ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with per-call skip-scaling policy (`'stall-smooth'` / `'catch-up'`; see 0.6.6) on the latest variant.
 - ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
 - ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
 - ✅ **0.6.1 — Trajectory arrays (Pillar 1 of phase-locked extrapolation)** (`f64TrajectoryArray(n, { order })`, `f32TrajectoryArray(n, { order })`, and `evaluateTrajectoryInto(...)`). Producers pack interleaved `(p, v, [a])` samples into a frame field; consumers Taylor-extrapolate to a continuous-time signal at audio rate via the helper. Pillars 2 (nanosecond PLL) and 3 (`pullEvaluated`) remain ahead — see [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
@@ -682,6 +715,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.3 — Per-frame evaluator (Pillar 3 of phase-locked extrapolation, first cut)** (`bridge.evaluateInto(srcFrame, dt, outFrame)` + `bridge.scratchEvaluatedFrame()`). Bridge walks every field of the schema in one call, applying the Pillar 1 evaluator to trajectory fields and passing scalars + non-trajectory arrays through. Heap-only; the producer can be writing the next frame while the consumer re-evaluates the current one in private heap memory at audio rate. `pullEvaluated` sugar, `EvalMode` dispatch, and per-quantum batch API remain queued patches — see [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
+- ✅ **0.6.6 — Invariant epsilon floor + smoother named modes**. `.withInvariant(fn, { absoluteEpsilon? })` opts bag adds an absolute lower floor on the classifier's OK band (default `1e-12`) so subnormal-zero and tiny f64 rounding noise no longer misclassify as hard; the relative path is preserved for any non-trivial `stored` so all existing pin behavior is bit-exact. `pullSmoothed` / `pullLatestSmoothed` accept `opts.skipPolicy: 'stall-smooth' | 'catch-up'` (default `'stall-smooth'`, preserves 0.4.1..0.6.5 behavior bit-exact); opt-in `'catch-up'` uses the closed-form `α_eff = 1 − (1 − α_base)^(skipped + 1)` for chase-latency-first behavior on control surfaces. Heap-only; SAB byte layout unchanged from 0.6.5. See [Schema invariants](#schema-invariants--withinvariantfn-opts) and [Smoothed pulls](#smoothed-pulls--pullsmoothed--pulllatestsmoothed).
 
 ### Remaining 1.0 work
 

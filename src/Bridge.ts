@@ -148,10 +148,23 @@
  *
  *   out_i ← α_eff · curr_i + (1 − α_eff) · prev_i
  *
- * For `pullLatestSmoothed`, `α_eff = α_base · 2^(−skipped)` — a big jump
- * (producer stalled then caught up) gets MORE smoothing, the steady-state
- * case with no skips gets `α_eff = α_base`. For `pullSmoothed`, skipped is
- * always 0, so `α_eff = α_base` always.
+ * For `pullLatestSmoothed`, the skip-scaling of `α_eff` is selected per call
+ * by `opts.skipPolicy` (`SmootherSkipPolicy`, default `'stall-smooth'`):
+ *
+ *   'stall-smooth' (default, 0.4.1..present, bit-exact-preserved at 0.6.6):
+ *     `α_eff = α_base · 2^(−skipped)`. A big jump (producer stalled then
+ *     caught up) gets MORE smoothing; the steady-state case with no skips
+ *     gets `α_eff = α_base`. Click-suppression-first.
+ *
+ *   'catch-up' (opt-in, 0.6.6):
+ *     `α_eff = 1 − (1 − α_base)^(skipped + 1)` — closed form of applying
+ *     the one-pole filter (skipped + 1) times in a row. Large skips drive
+ *     α→1, snapping to the new frame. Chase-latency-first. For skipped=0
+ *     this reduces to `α_eff = α_base` exactly (no behavioral change
+ *     unless a stall actually occurred).
+ *
+ * For `pullSmoothed`, skipped is always 0, so both policies yield
+ * `α_eff = α_base` — the option is accepted for API symmetry but is a no-op.
  *
  * Lineage: the wavefunction-synth project's 60 → 48 kHz boundary smoother
  * (`wfEvolve.js:145-146,361-362`); same one-pole shape, lifted into the
@@ -561,6 +574,37 @@ export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
   schema: S;
 }
 
+/** Skip-scaling policy for `pullLatestSmoothed` (0.6.6). Controls how the
+ *  effective α responds when the consumer drains more than one frame in a
+ *  single call (i.e. `skipped > 0`). For `pullSmoothed` (always
+ *  `skipped === 0`) both policies yield `α_eff = α_base`; the option is
+ *  accepted for API symmetry but has no behavioral effect.
+ *
+ *  - `'stall-smooth'` (default — preserves 0.4.1..0.6.5 behavior bit-exact):
+ *    `α_eff = α_base · 2^(-skipped)`. Large skips drive α→0, so the smoother
+ *    mostly trusts `prev` and drifts slowly toward the post-stall value.
+ *    Right when audible click-suppression matters more than chase latency.
+ *
+ *  - `'catch-up'` (0.6.6, opt-in): `α_eff = 1 - (1 - α_base)^(skipped + 1)`,
+ *    the closed form of applying the one-pole filter `skipped + 1` times
+ *    in a row (the math behind why a compounded-EMA "should" use a larger
+ *    α after a stall). Large skips drive α→1, so the smoother snaps to the
+ *    new frame. Right when minimizing chase latency matters more than
+ *    click-suppression, or when the producer's post-stall value is a
+ *    discontinuous correction that should be reflected immediately.
+ *
+ *  See file header "Smoothed pulls" for the per-policy curve rationale and
+ *  the 0.6.6 CHANGELOG for the derivation. */
+export type SmootherSkipPolicy = "stall-smooth" | "catch-up";
+
+/** Optional opts bag accepted by `pullSmoothed` / `pullLatestSmoothed` from
+ *  0.6.6 onward. `skipPolicy` selects how `α_eff` responds to drained
+ *  backlog; omit (or pass `undefined`) for the legacy `'stall-smooth'`
+ *  default that preserves all pre-0.6.6 behavior bit-exact. */
+export interface SmoothedPullOptions {
+  readonly skipPolicy?: SmootherSkipPolicy;
+}
+
 type AnyTypedArray =
   | Float64Array
   | Float32Array
@@ -746,6 +790,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   /** Element offset within a slot of the `__invariant` lane in f64 units.
    *  Used only when `invariantView` is non-null. */
   private readonly invariantElemOffsetF64: number;
+  /** Lower floor on the classifier's OK band — `_classifyInvariant` uses
+   *  `max(invariantAbsoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`. Set
+   *  from `schema.invariant.absoluteEpsilon` at construction (defaulting to
+   *  `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` for no-invariant schemas, where it
+   *  is never read). See file header "Schema invariants" + 0.6.6 CHANGELOG. */
+  private readonly invariantAbsoluteEpsilon: number;
 
   /** Public, frozen recovery thresholds — exported for tests and callers
    *  that want to pin against the exact boundaries. */
@@ -835,10 +885,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       this.invariantView = umbrellas.f64 as Float64Array;
       this.invariantSlotStrideF64 = schema.frameByteSize / 8;
       this.invariantElemOffsetF64 = schema.invariant.byteOffset / 8;
+      this.invariantAbsoluteEpsilon = schema.invariant.absoluteEpsilon;
     } else {
       this.invariantView = null;
       this.invariantSlotStrideF64 = 0;
       this.invariantElemOffsetF64 = 0;
+      this.invariantAbsoluteEpsilon = 0;
     }
 
     // Build per-scalar-field writer / reader closures. Each closure captures
@@ -1164,9 +1216,17 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    *
    * Returns false on empty (no payload read; smoother state untouched).
    *
+   * `opts.skipPolicy` (0.6.6) is accepted for API symmetry with
+   * `pullLatestSmoothed` but has no behavioral effect: `pullSmoothed` always
+   * has `skipped === 0`, where both policies degenerate to `α_eff = α_base`.
+   *
    * Memory ordering matches `pull`. See file header "Smoothed pulls".
    */
-  pullSmoothed(out: FrameFor<S>, alphaBase: number): boolean {
+  pullSmoothed(
+    out: FrameFor<S>,
+    alphaBase: number,
+    _opts?: SmoothedPullOptions,
+  ): boolean {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx === readIdx) return false;
@@ -1195,24 +1255,39 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   /**
    * Consumer-side smoothed drain-to-latest. Equivalent to `pullLatest` but
    * blends the freshly-read newest frame against the previously-returned
-   * smoothed frame using a skip-scaled one-pole low-pass:
+   * smoothed frame using a skip-scaled one-pole low-pass.
    *
-   *   α_eff = α_base · 2^(−skipped)
-   *   out_i ← α_eff · curr_i + (1 − α_eff) · prev_i
+   * `α_eff` is selected by `opts.skipPolicy` (default `'stall-smooth'`,
+   * preserves 0.4.1..0.6.5 behavior bit-exact):
    *
-   * The `2^(−skipped)` scaling means a single-frame catch-up uses
-   * `α_eff = α_base` (steady-state smoothing); a large drain (producer
-   * stalled, consumer caught a backlog) uses an exponentially smaller α_eff
-   * (mostly trust prev, drift slowly toward the catch-up state). This masks
-   * producer hiccups click-free at the cost of lag during big jumps —
-   * appropriate when the producer's recent post-stall values are correct but
-   * the jump itself would audibly click if applied raw.
+   *   'stall-smooth':  α_eff = α_base · 2^(−skipped)
+   *   'catch-up'    :  α_eff = 1 − (1 − α_base)^(skipped + 1)
+   *
+   * Then `out_i ← α_eff · curr_i + (1 − α_eff) · prev_i`.
+   *
+   * Under `'stall-smooth'` a single-frame catch-up uses `α_eff = α_base`
+   * (steady-state smoothing); a large drain (producer stalled, consumer
+   * caught a backlog) uses an exponentially smaller α_eff (mostly trust
+   * prev, drift slowly toward the catch-up state). This masks producer
+   * hiccups click-free at the cost of lag during big jumps — appropriate
+   * when the producer's recent post-stall values are correct but the jump
+   * itself would audibly click if applied raw.
+   *
+   * Under `'catch-up'` the same skipped-frame stall drives α_eff → 1, so
+   * the smoother snaps to the new frame. Right when the producer's post-
+   * stall value is a discontinuous correction that should be reflected
+   * immediately (control surfaces, UI parameter changes), or when chase
+   * latency matters more than click-suppression. See `SmootherSkipPolicy`.
    *
    * Returns -1 on empty, else the number of frames skipped (0 if a single
    * frame was waiting). Same field-type rules as `pullSmoothed`. Memory
    * ordering matches `pullLatest`. See file header "Smoothed pulls".
    */
-  pullLatestSmoothed(out: FrameFor<S>, alphaBase: number): number {
+  pullLatestSmoothed(
+    out: FrameFor<S>,
+    alphaBase: number,
+    opts?: SmoothedPullOptions,
+  ): number {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx === readIdx) return -1;
@@ -1236,10 +1311,20 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       : 0;
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0);
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
-    // 2^(-skipped) via ldexp-style exponent shift; for skipped=0 this is 1.0.
-    // Math.pow(2, -skipped) is cheap (V8 special-cases integer exponents);
-    // we accept the small JS-call overhead in exchange for clarity.
-    const alphaEff = alphaBase * Math.pow(2, -skipped);
+    // Skip-scaling policy (0.6.6 — see SmootherSkipPolicy). Default
+    // 'stall-smooth' is bit-exact equal to the pre-0.6.6 formula on every
+    // skipped value: at skipped=0 both branches yield alphaBase exactly;
+    // for skipped>0 only the explicit 'catch-up' option diverges.
+    let alphaEff: number;
+    if (opts !== undefined && opts.skipPolicy === "catch-up") {
+      // Closed form of (skipped + 1) applications of the one-pole filter.
+      // At skipped=0 this is `1 - (1 - alphaBase)` = alphaBase exactly.
+      alphaEff = 1 - Math.pow(1 - alphaBase, skipped + 1);
+    } else {
+      // 2^(-skipped) via Math.pow; V8 special-cases integer exponents.
+      // For skipped=0 this is 1.0 → alphaEff = alphaBase exactly.
+      alphaEff = alphaBase * Math.pow(2, -skipped);
+    }
     this._invariantHandleSmoothed(frame, invariantStored, alphaEff);
     this._updateFlowScale(writeIdx, readIdx);
     return skipped;
@@ -1785,13 +1870,19 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
 
   /**
    * Classify a stored vs computed invariant ratio into ok / soft / hard +
-   * the soft-recovery α. Numerical-safety: when `stored === 0` we treat any
-   * nonzero `computed` as a hard error (ratio is undefined). A literal
-   * zero-vs-zero invariant matches (ok).
+   * the soft-recovery α.
    *
-   *   ok:    |computed − stored| / max(|stored|, ε) < INVARIANT_OK_THRESHOLD
-   *   soft:  < INVARIANT_SOFT_THRESHOLD
-   *   hard:  ≥ INVARIANT_SOFT_THRESHOLD, or NaN/Infinity on either side
+   * The OK band is `max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`
+   * compared against `|computed − stored|` (0.6.6). For non-trivial `stored`
+   * the relative term dominates and behavior is bit-identical to 0.6.5's
+   * pure-ratio check; the absolute floor only matters when `stored` is
+   * subnormal-tiny or exactly zero, where the old code misclassified rounding
+   * residues as hard. `absoluteEpsilon` is set per-schema via
+   * `.withInvariant(fn, { absoluteEpsilon })` (default `1e-12`).
+   *
+   *   ok:    |computed − stored| < max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)
+   *   soft:  delta < INVARIANT_SOFT_THRESHOLD   (relative; only when stored ≠ 0)
+   *   hard:  otherwise, or NaN/Infinity on either side
    *
    * For soft, α = clamp(INVARIANT_SOFT_ALPHA_BASE / delta, 0, 1) — small
    * deviations get α≈1 (trust curr); deviations near the hard boundary get
@@ -1805,14 +1896,23 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     if (!Number.isFinite(computed) || !Number.isFinite(stored)) {
       return { kind: "hard", alpha: 0 };
     }
+    const absErr = Math.abs(computed - stored);
+    // Bit-identical pre-0.6.6 short-circuit: exact equality is always OK,
+    // even under absoluteEpsilon = 0 (which would otherwise collapse the OK
+    // band to a half-open zero-width interval and miss the 0/0 case).
+    if (absErr === 0) return { kind: "ok", alpha: 1 };
+    const eps = this.invariantAbsoluteEpsilon;
+    const absStored = Math.abs(stored);
+    const okBand = eps > INVARIANT_OK_THRESHOLD * absStored
+      ? eps
+      : INVARIANT_OK_THRESHOLD * absStored;
+    if (absErr < okBand) return { kind: "ok", alpha: 1 };
     if (stored === 0) {
-      // Exact 0/0 is treated as ok; nonzero computed vs 0 stored is hard
-      // (no meaningful ratio).
-      if (computed === 0) return { kind: "ok", alpha: 1 };
+      // OK band failed and stored is zero — relative-ratio classifier
+      // undefined, so anything outside the absolute floor is hard.
       return { kind: "hard", alpha: 0 };
     }
-    const delta = Math.abs(computed - stored) / Math.abs(stored);
-    if (delta < INVARIANT_OK_THRESHOLD) return { kind: "ok", alpha: 1 };
+    const delta = absErr / absStored;
     if (delta < INVARIANT_SOFT_THRESHOLD) {
       const alpha = Math.min(
         1,
