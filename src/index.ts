@@ -36,6 +36,8 @@ export {
   // Array field constructors
   u64Array, i64Array, u32Array, i32Array, u16Array, i16Array,
   u8Array, i8Array, f64Array, f32Array,
+  // Trajectory array constructors (0.6.1 — Pillar 1 scaffolding)
+  f64TrajectoryArray, f32TrajectoryArray,
 } from "./schema.js";
 
 export type {
@@ -48,6 +50,8 @@ export type {
   FrameFor,
   SchemaLayoutDescription,
   SchemaLayoutFieldDescription,
+  TrajectoryOrder,
+  TrajectorySpec,
 } from "./schema.js";
 
 // Canonical schemas — see src/schemas/physics.ts.

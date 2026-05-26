@@ -50,6 +50,44 @@
  * Type erasure: schemas with and without invariants share the `Schema<F>`
  * type. `FrameFor<S>` does NOT include the hidden `__invariant` field — it's
  * bridge-managed, never exposed to user-side reads/writes.
+ *
+ * ─── Trajectory arrays (0.6.1 — Pillar 1 scaffolding) ──────────────────────
+ *
+ * `f64TrajectoryArray(n, { order })` and `f32TrajectoryArray(n, { order })`
+ * are *labeled* array constructors. Byte-wise they are identical to
+ * `f64Array(n * order)` / `f32Array(n * order)` — the underlying storage is
+ * an interleaved typed-array of `n * order` elements laid out as
+ *
+ *     order=1:  [p0, p1, ..., p_{n-1}]                       — position only
+ *     order=2:  [p0, v0, p1, v1, ..., p_{n-1}, v_{n-1}]      — pos + velocity
+ *     order=3:  [p0, v0, a0, p1, v1, a1, ..., p_{n-1}, v_{n-1}, a_{n-1}]
+ *
+ * The interleaved layout (rather than concatenated `[p…, v…, a…]`) keeps
+ * each sample's position and derivatives cache-line adjacent so a downstream
+ * Taylor/Hermite evaluator can walk the trajectory in one pass with minimal
+ * L1 misses for typical N=128–2048 voice grids.
+ *
+ * Trajectory fields carry a `trajectory: { order, sampleCount }` tag on
+ * both the FieldSpec and the CompiledField. The tag is descriptive
+ * metadata — the codec writes/reads the flat element count
+ * (`length = n * order`) like any other array. The metadata is for
+ * downstream consumers (a future `evaluateInto` evaluator, worklet
+ * inliners) to detect that a field is a trajectory and treat its elements
+ * as `(p, v, [a])` tuples instead of opaque samples.
+ *
+ * Order is restricted to 1 | 2 | 3:
+ *   - order=1 is byte-compatible with `f{32,64}Array(n)` (positions only,
+ *     equivalent to today's behavior).
+ *   - order=2 enables linear Taylor extrapolation: `value(dt) = p + v·dt`.
+ *   - order=3 enables quadratic Taylor / cubic Hermite:
+ *     `value(dt) = p + v·dt + ½·a·dt²`.
+ * Higher orders on a unitary stepper are an open research direction —
+ * deferred until there's a concrete consumer for them.
+ *
+ * Wire compatibility: trajectory fields are byte-compatible with the
+ * equivalent plain array. A schema that swaps `f64Array(64)` for
+ * `f64TrajectoryArray(64, { order: 1 })` produces identical SAB bytes;
+ * only the field's compiled metadata changes.
  */
 
 export type FieldKind =
@@ -77,6 +115,22 @@ export function kindTsType(kind: FieldKind): "bigint" | "number" {
   }
 }
 
+/** Trajectory order — number of derivative components stored per sample.
+ *  1 = position only (byte-compatible with a plain array).
+ *  2 = position + velocity (linear Taylor extrapolation).
+ *  3 = position + velocity + acceleration (quadratic Taylor / cubic Hermite). */
+export type TrajectoryOrder = 1 | 2 | 3;
+
+/** Descriptive metadata attached to fields built via
+ *  `f{32,64}TrajectoryArray(n, { order })`. The underlying storage is a flat
+ *  interleaved array of `sampleCount * order` elements; this tag tells
+ *  downstream consumers how to interpret those elements as (p, v, [a]) tuples. */
+export interface TrajectorySpec {
+  readonly order: TrajectoryOrder;
+  /** Number of logical samples. Underlying typed-array length = sampleCount * order. */
+  readonly sampleCount: number;
+}
+
 export interface FieldSpec<T = unknown> {
   readonly kind: FieldKind;
   /** Omitted = scalar; positive integer = fixed-length array. */
@@ -85,6 +139,8 @@ export interface FieldSpec<T = unknown> {
   readonly byteSize: number;
   /** Phantom type tag — drives FrameFor<S> inference; never set at runtime. */
   readonly _t?: T;
+  /** Present iff this field was built via `f{32,64}TrajectoryArray`. */
+  readonly trajectory?: TrajectorySpec;
 }
 
 // ─── Scalar field constructors ─────────────────────────────────────────────
@@ -130,6 +186,55 @@ export const i16Array = (n: number): FieldSpec<Int16Array>     => array<Int16Arr
 export const u8Array  = (n: number): FieldSpec<Uint8Array>     => array<Uint8Array>("u8",  n);
 export const i8Array  = (n: number): FieldSpec<Int8Array>      => array<Int8Array>("i8",  n);
 
+// ─── Trajectory array constructors (0.6.1) ─────────────────────────────────
+//
+// Byte-wise identical to `f{32,64}Array(n * order)`. The `trajectory` tag
+// labels the field so downstream consumers (a future `evaluateInto`
+// evaluator, worklet inliners) can detect that the flat element stream is
+// an interleaved (p, v, [a]) sequence rather than opaque samples. See the
+// "Trajectory arrays" section at the top of this file for the layout.
+
+function trajectoryArray<T>(
+  kind: "f64" | "f32",
+  sampleCount: number,
+  order: TrajectoryOrder,
+): FieldSpec<T> {
+  if (!Number.isInteger(sampleCount) || sampleCount <= 0) {
+    throw new Error(
+      `Schema: trajectory sampleCount must be a positive integer, got ${sampleCount}`,
+    );
+  }
+  if (order !== 1 && order !== 2 && order !== 3) {
+    throw new Error(
+      `Schema: trajectory order must be 1 | 2 | 3, got ${String(order)}`,
+    );
+  }
+  const flatLength = sampleCount * order;
+  const trajectory: TrajectorySpec = Object.freeze({ order, sampleCount });
+  return Object.freeze({
+    kind,
+    length: flatLength,
+    byteSize: kindByteSize(kind) * flatLength,
+    trajectory,
+  }) as FieldSpec<T>;
+}
+
+export const f64TrajectoryArray = (
+  n: number,
+  opts: { order: TrajectoryOrder },
+): FieldSpec<Float64Array> =>
+  trajectoryArray<Float64Array>("f64", n, opts.order);
+
+/** f32 variant — preferred for memory-tight high-order cases (order=3 at
+ *  large N). Loses ~7 decimal digits of precision per sample vs f64; only
+ *  use when the producer's PDE doesn't need double precision in the
+ *  derivatives. */
+export const f32TrajectoryArray = (
+  n: number,
+  opts: { order: TrajectoryOrder },
+): FieldSpec<Float32Array> =>
+  trajectoryArray<Float32Array>("f32", n, opts.order);
+
 // ─── Schema container + inference ──────────────────────────────────────────
 
 export type FieldsObject = Record<string, FieldSpec<unknown>>;
@@ -138,11 +243,15 @@ export type FieldsObject = Record<string, FieldSpec<unknown>>;
 export interface CompiledField {
   readonly name: string;
   readonly kind: FieldKind;
-  /** 1 for scalar, ≥1 for array. */
+  /** Flat element count. 1 for scalar, ≥1 for array. For trajectory fields
+   *  this is `sampleCount * order` — the codec walks the flat stream. */
   readonly length: number;
   readonly isArray: boolean;
   /** Byte offset within a single frame (not within the SAB). */
   readonly byteOffset: number;
+  /** Present iff this field was built via `f{32,64}TrajectoryArray`.
+   *  Descriptive only — does not affect SAB byte layout. */
+  readonly trajectory?: TrajectorySpec;
 }
 
 export interface CompiledLayout {
@@ -199,6 +308,10 @@ export interface SchemaLayoutFieldDescription {
   readonly kind: FieldKind;
   readonly byteOffset: number;
   readonly length?: number;
+  /** Present iff the field was declared as a trajectory. Carried over from
+   *  the FieldSpec so worklet-side inliners can do the same (p, v, [a])
+   *  interpretation as the main-thread Bridge. */
+  readonly trajectory?: TrajectorySpec;
 }
 
 export interface SchemaLayoutDescription {
@@ -258,6 +371,7 @@ function compileLayout(
         length,
         isArray,
         byteOffset: offset,
+        ...(spec.trajectory ? { trajectory: spec.trajectory } : {}),
       }),
     );
     typesPresentSet.add(spec.kind);
@@ -366,9 +480,12 @@ export function defineSchema<F extends FieldsObject>(fields: F): Schema<F> {
 export function describeSchemaLayout(schema: Schema): SchemaLayoutDescription {
   const fields: Record<string, SchemaLayoutFieldDescription> = {};
   for (const f of schema.compiled.fields) {
-    fields[f.name] = f.isArray
+    const base: SchemaLayoutFieldDescription = f.isArray
       ? { kind: f.kind, byteOffset: f.byteOffset, length: f.length }
       : { kind: f.kind, byteOffset: f.byteOffset };
+    fields[f.name] = f.trajectory
+      ? { ...base, trajectory: f.trajectory }
+      : base;
   }
   return Object.freeze({
     headerBytes: 32,

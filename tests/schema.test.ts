@@ -17,6 +17,10 @@
  *      size grows by 8, f64 joins typesPresent, invariantByteOffset is
  *      set to the (8-aligned) userEnd. No invariant → invariantByteOffset
  *      is null. Schema is still frozen.
+ *  10. f{32,64}TrajectoryArray(n, { order }) — Pillar 1 scaffolding (0.6.1).
+ *      Byte-compatible with f{32,64}Array(n * order); trajectory tag
+ *      propagates to FieldSpec, CompiledField, and SchemaLayoutFieldDescription.
+ *      Invalid order / sampleCount rejected; schema stays frozen.
  *
  * These pins cover the DSL/compile surface in isolation — Bridge integration
  * is exercised by tests/Bridge.test.ts.
@@ -27,8 +31,10 @@ import {
   defineSchema,
   describeSchemaLayout,
   f32,
+  f32TrajectoryArray,
   f64,
   f64Array,
+  f64TrajectoryArray,
   i16,
   kindByteSize,
   u32,
@@ -38,6 +44,7 @@ import {
   type FieldSpec,
   type FrameFor,
   type Schema,
+  type TrajectoryOrder,
 } from "../src/schema.js";
 
 // ── 1. Scalar + array constructors ─────────────────────────────────────────
@@ -397,6 +404,142 @@ function testWithInvariant(): void {
   ok("with-invariant");
 }
 
+// ── 10. Trajectory array constructors (0.6.1 — Pillar 1) ───────────────────
+//
+// `f{32,64}TrajectoryArray(n, { order })` is byte-compatible with the
+// equivalent flat `f{32,64}Array(n * order)`. The `trajectory` tag is the
+// only difference: it labels the field so a downstream evaluator can
+// interpret the interleaved stream as (p, v, [a]) tuples.
+function testTrajectoryArrays(): void {
+  // order=1 is byte-compatible with f64Array(n) — same kind, same byteSize,
+  // same length. Only difference is the trajectory tag.
+  const t1 = f64TrajectoryArray(64, { order: 1 });
+  const a1 = f64Array(64);
+  assertEq(t1.kind, a1.kind, "order=1 kind == f64Array");
+  assertEq(t1.byteSize, a1.byteSize, "order=1 byteSize == f64Array(n)");
+  assertEq(t1.length, a1.length, "order=1 length == f64Array(n)");
+  assertEq(t1.trajectory?.order, 1, "order=1 tag.order");
+  assertEq(t1.trajectory?.sampleCount, 64, "order=1 tag.sampleCount");
+  assertEq(a1.trajectory, undefined, "plain f64Array has no trajectory tag");
+
+  // order=2 doubles the storage: 64 samples * 2 components = 128 elements.
+  const t2 = f64TrajectoryArray(64, { order: 2 });
+  assertEq(t2.byteSize, 8 * 64 * 2, "order=2 byteSize = 8 * n * 2");
+  assertEq(t2.length, 128, "order=2 flat length = n * 2");
+  assertEq(t2.trajectory?.order, 2, "order=2 tag.order");
+  assertEq(t2.trajectory?.sampleCount, 64, "order=2 tag.sampleCount");
+
+  // f32 variant + order=3.
+  const t3 = f32TrajectoryArray(32, { order: 3 });
+  assertEq(t3.kind, "f32", "f32 trajectory kind");
+  assertEq(t3.byteSize, 4 * 32 * 3, "f32 order=3 byteSize = 4 * n * 3");
+  assertEq(t3.length, 96, "f32 order=3 flat length = n * 3");
+  assertEq(t3.trajectory?.order, 3, "f32 order=3 tag.order");
+  assertEq(t3.trajectory?.sampleCount, 32, "f32 order=3 tag.sampleCount");
+
+  // Validation: order must be 1 | 2 | 3.
+  let threw = false;
+  try { f64TrajectoryArray(8, { order: 0 as unknown as TrajectoryOrder }); } catch { threw = true; }
+  assert(threw, "order=0 rejected");
+  threw = false;
+  try { f64TrajectoryArray(8, { order: 4 as unknown as TrajectoryOrder }); } catch { threw = true; }
+  assert(threw, "order=4 rejected");
+  threw = false;
+  try { f64TrajectoryArray(8, { order: 2.5 as unknown as TrajectoryOrder }); } catch { threw = true; }
+  assert(threw, "non-integer order rejected");
+
+  // Validation: sampleCount must be a positive integer.
+  threw = false;
+  try { f64TrajectoryArray(0, { order: 2 }); } catch { threw = true; }
+  assert(threw, "sampleCount=0 rejected");
+  threw = false;
+  try { f64TrajectoryArray(-1, { order: 2 }); } catch { threw = true; }
+  assert(threw, "negative sampleCount rejected");
+  threw = false;
+  try { f64TrajectoryArray(1.5, { order: 2 }); } catch { threw = true; }
+  assert(threw, "fractional sampleCount rejected");
+
+  // FieldSpec + trajectory tag are frozen.
+  let mutated = false;
+  try {
+    (t2 as { byteSize: number }).byteSize = 0;
+  } catch {
+    mutated = true;
+  }
+  assert(mutated, "trajectory FieldSpec is frozen");
+  mutated = false;
+  try {
+    (t2.trajectory as { order: number }).order = 99;
+  } catch {
+    mutated = true;
+  }
+  assert(mutated, "trajectory tag is frozen");
+
+  // Round-trip through defineSchema: trajectory tag propagates to
+  // CompiledField, and the schema is byte-identical to the flat equivalent.
+  const N = 128;
+  const traj = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    vEff: f64TrajectoryArray(N, { order: 2 }),
+  });
+  const flat = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    vEff: f64Array(N * 2),
+  });
+  assertEq(
+    traj.frameByteSize,
+    flat.frameByteSize,
+    "trajectory schema is byte-identical to flat f64Array(n*order) equivalent",
+  );
+  const cf = traj.compiled.fields.find((f) => f.name === "vEff")!;
+  assertEq(cf.kind, "f64", "compiled field kind preserved");
+  assertEq(cf.length, N * 2, "compiled field length = sampleCount * order");
+  assertEq(cf.isArray, true, "compiled field marked as array");
+  assertEq(cf.trajectory?.order, 2, "compiled field carries trajectory.order");
+  assertEq(
+    cf.trajectory?.sampleCount,
+    N,
+    "compiled field carries trajectory.sampleCount",
+  );
+
+  // Plain array fields don't grow a trajectory tag.
+  const flatCf = flat.compiled.fields.find((f) => f.name === "vEff")!;
+  assertEq(
+    flatCf.trajectory,
+    undefined,
+    "plain f64Array CompiledField has no trajectory tag",
+  );
+
+  // describeSchemaLayout carries the tag through to worklet-side inliners.
+  const desc = describeSchemaLayout(traj);
+  assertEq(desc.fields.vEff!.kind, "f64", "layout description kind");
+  assertEq(desc.fields.vEff!.length, N * 2, "layout description flat length");
+  assertEq(
+    desc.fields.vEff!.trajectory?.order,
+    2,
+    "layout description carries trajectory.order",
+  );
+  assertEq(
+    desc.fields.vEff!.trajectory?.sampleCount,
+    N,
+    "layout description carries trajectory.sampleCount",
+  );
+
+  // FrameFor<S> infers Float64Array / Float32Array for the trajectory field
+  // (compile-time check — runtime asserts are nominal).
+  type T = typeof traj;
+  const frame: FrameFor<T> = {
+    seq: 0n,
+    tMacroNs: 0n,
+    vEff: new Float64Array(N * 2),
+  };
+  assert(frame.vEff instanceof Float64Array, "FrameFor: vEff is Float64Array");
+
+  ok("trajectory-arrays");
+}
+
 function main(): void {
   testConstructors();
   testValidation();
@@ -407,6 +550,7 @@ function main(): void {
   testFrameForInference();
   testSchemaFrozen();
   testWithInvariant();
+  testTrajectoryArrays();
   console.log("ALL PASS schema");
 }
 
