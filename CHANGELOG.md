@@ -4,6 +4,126 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.13] — 2026-05-26
+
+### Added — observability dashboards (1.0 must-have, item 2 of 2)
+
+The second of the two README-named "Remaining 1.0 work" items, closing
+out the pre-1.0 must-have list. `Bridge<S>.telemetry()` gains six new
+fields, completing the dashboard / DevTools-panel surface that the
+0.6.0 snapshot started:
+
+- **`pushedFrames: number`** — cumulative successful writes since
+  construction. `'drop-newest'` overflows do NOT increment (the frame
+  never made it into the ring); `'drop-oldest'` overflows DO increment
+  (a new frame WAS written, an old one was evicted, both lanes count
+  on their respective counters); `'block'` and `'reject'` succeed-paths
+  do.
+
+- **`pulledFrames: number`** — cumulative successful reads, one per
+  ok=true `pull` / `pullLatest`. Empty pulls do NOT increment.
+
+- **`skippedFrames: number`** — cumulative `pullLatest`-discarded
+  frames, summed across all calls. Separate from `pulledFrames` so
+  dashboards can distinguish "frames consumer received" from "frames
+  the bridge transported" — together they reconstruct total drain.
+
+- **`lastFullWaitNs: number`** — duration of the most recent
+  `waitForSpace` that actually parked, in nanoseconds (rounded from
+  `performance.now()` millisecond resolution; sub-ms precision in
+  modern Node). Zero if `waitForSpace` has never parked since
+  construction or always took the immediate `'not-equal'` fast path.
+
+- **`lastEmptyWaitNs: number`** — mirror of `lastFullWaitNs` for
+  `waitForData`.
+
+- **`maxOccupancyEverSeen: number`** — high-water mark of
+  `(writeIdx - readIdx)` observed at any push or pull moment.
+  Producer push records the post-write buffered count; consumer
+  pull / pullLatest records the pre-pull buffered count. Monotonic
+  from construction. The diagnostic that answers "did the ring's
+  capacity match the traffic?" — if `maxOccupancyEverSeen === capacity`,
+  the ring overflowed at least once and a larger capacity (or a more
+  aggressive flow-scale honor) is indicated.
+
+All six counters are per-instance heap state. Two peers over the same
+SAB each see their own counters (the producer sees its pushes; the
+consumer sees its pulls + wait durations). For cross-process
+aggregation, the recommended pattern is `postMessage` of the
+`telemetry()` snapshot at a sampled cadence — the overhead is
+negligible compared to the 16 ms control-rate budget. The heap-only
+design avoids stealing reserved SAB lanes for an observability
+concern. Lanes 4-5 remain reserved for the PLL publication patch
+landing later in this cohort.
+
+### Why
+
+The README explicitly carves out observability dashboards as one of
+the two remaining 1.0-blocking items. The 0.6.0 telemetry snapshot
+landed the structural surface (six fields covering counters, lanes,
+and PLL state); 0.6.13 completes it with the cumulative + wait-duration
++ high-water-mark fields that turn the snapshot from "current state"
+into "history of behavior." Together with 0.6.12's backpressure
+policies, the pre-1.0 must-have list is now empty — the project is
+free to focus on polish (PLL outlier gate, drift estimator, EvalMode
+dispatch) without an outstanding API-shape contract.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding, torn-frame counter, header / payload boundary — all
+  bit-for-bit identical to 0.6.12. A 0.6.12 peer and a 0.6.13 peer
+  share a SAB transparently. The new telemetry fields are heap-side
+  per-instance counters.
+- **No public-API break.** `telemetry()`'s return type adds six
+  fields, no removed fields; existing destructures continue to
+  work. The six new accessors on `SpscRing` (`pushedCount` /
+  `pulledCount` / `skippedCount` / `lastFullWaitNanos` /
+  `lastEmptyWaitNanos` / `maxOccupancy`) are additive — they don't
+  shadow any pre-0.6.13 surface.
+- **No hot-path change of consequence.** The new counter increments
+  inside `push` / `pull` / `pullLatest` are two scalar adds and one
+  compare each; V8 inlines them into the same monomorphic call
+  shape. Bench medians match the 0.6.12 baseline at 1.20 μs.
+- **Wait-duration timing uses `performance.now()`** rather than
+  `process.hrtime.bigint()` for cross-platform portability (Node +
+  browser). The recorded value is rounded to nanoseconds from a
+  millisecond-resolution float; sub-ms precision in modern V8
+  / SpiderMonkey / JSC is sufficient for the dashboard use case.
+
+### Tests
+
+Three new test pins (#69–71) in `tests/Bridge.test.ts`:
+
+- **#69 — pushed / pulled / skipped counter semantics.** Reject
+  pushes don't bump pushedFrames; empty pulls don't bump pulledFrames;
+  drop-newest doesn't bump pushedFrames on drops; drop-oldest bumps
+  BOTH pushedFrames AND droppedFrames per overflow; pullLatest
+  increments pulledFrames by 1 and skippedFrames by the skipped count.
+- **#70 — wait duration counter semantics.** Fresh Bridge has both
+  at 0; waitForSpace / waitForData on the immediate `'not-equal'`
+  path do NOT touch the counter (stays at previous recorded value);
+  parking calls record nanosecond elapsed within a loose bound (≥ 1 ms,
+  ≤ 250 ms for a 5 ms target — accommodates platform timer jitter).
+- **#71 — maxOccupancyEverSeen monotonicity.** Push/pull cycles drive
+  the high-water mark up; drains do NOT decrement it; pullLatest's
+  pre-pull buffered participates in the observation.
+
+All 7 suites green; bench medians unchanged from 0.6.12 baseline.
+
+### Documentation
+
+- `src/SpscRing.ts` field doc-comments explain each counter's semantics,
+  the per-instance caveat, and the timing-source rationale.
+- `src/Bridge.ts` `telemetry()` return-type comment annotates the
+  0.6.13 additions inline and notes the postMessage-aggregation
+  pattern for cross-process consumers.
+- `README.md` `Remaining 1.0 work` section reflects that BOTH items
+  have shipped — the pre-1.0 must-have list is now empty. The
+  §Adaptive backpressure section gains a sentence pointing at the
+  full observability suite. A new §Observability dashboards section
+  documents the full telemetry surface in one place.
+
 ## [0.6.12] — 2026-05-26
 
 ### Added — backpressure policies (1.0 must-have, item 1 of 2)

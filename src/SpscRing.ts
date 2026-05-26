@@ -494,6 +494,47 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  fact, not a wire-format fact. */
   private droppedFrames: number = 0;
 
+  /** Heap-side telemetry counters (0.6.13). Each is per-instance and
+   *  monotonic from construction until the ring is discarded. Same
+   *  "per-thread, not cross-process" caveat as `droppedFrames`: a
+   *  consumer's separate `SpscRing` over the same SAB sees its own
+   *  (zero) counters for the producer-side ones and vice-versa, which
+   *  is correct — these track a specific peer's behavior, not a
+   *  wire-format fact. */
+  /** Frames successfully written into the ring. `'drop-newest'` does
+   *  NOT increment (the frame never made it in); `'drop-oldest'`
+   *  DOES (a new frame was written + an old one was evicted, both
+   *  counted on their respective lanes); `'block'` DOES on the
+   *  eventual write; `'reject'` DOES on each true-return. */
+  private pushedFrames: number = 0;
+  /** Frames returned to the consumer via `pull` / `pullLatest`. One
+   *  increment per ok=true result, regardless of how many frames
+   *  `pullLatest` skipped past — the skipped frames live on
+   *  `skippedFrames`. */
+  private pulledFrames: number = 0;
+  /** Frames consumed-and-discarded by `pullLatest` (the `skipped`
+   *  count, summed over all calls). Useful as the explicit "freshness
+   *  cost" alongside `pulledFrames` — together they reconstruct the
+   *  total drain rate the consumer is sustaining. */
+  private skippedFrames: number = 0;
+  /** Duration in nanoseconds of the most recent `waitForSpace` call
+   *  that actually parked (`Atomics.wait` returned `'ok'` or
+   *  `'timed-out'`). Zero if `waitForSpace` has not parked since
+   *  construction or always returned the immediate `'not-equal'`
+   *  path (i.e., the queue was never full at the wait moment). */
+  private lastFullWaitNs: number = 0;
+  /** Duration in nanoseconds of the most recent `waitForData` call
+   *  that actually parked. Same semantics as `lastFullWaitNs`. */
+  private lastEmptyWaitNs: number = 0;
+  /** High-water mark of `(writeIdx - readIdx)` observed at any
+   *  push/pull moment since construction. Producer push records the
+   *  post-write buffered count; consumer pull/pullLatest record the
+   *  pre-pull buffered count. The maximum across both observation
+   *  points is the deepest the ring has ever been seen by either
+   *  peer, which is the "did your sizing match your traffic?"
+   *  diagnostic that drives dashboard sizing. */
+  private maxOccupancyEverSeen: number = 0;
+
   /** Reused scratch for pull / pullLatest results. SpscRing mutates this in
    *  place each call; Bridge reads it immediately after the call returns.
    *  No external lifetime — do not retain references across pull calls. */
@@ -751,9 +792,12 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
       ] = this.schema.invariant.compute(frame);
     }
-    Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0); // release
+    const nextWrite = (writeIdx + 1) | 0;
+    Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite); // release
     // Unconditional notify — see file header on the always-notify protocol.
     Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
+    this.pushedFrames = (this.pushedFrames + 1) | 0;
+    this._recordOccupancy((nextWrite - readIdx) | 0);
     return true;
   }
 
@@ -835,10 +879,16 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       ] = this.schema.invariant.compute(frame);
     }
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
-    Atomics.store(this.indices, WRITE_IDX_LANE, (writeIdx + 1) | 0);
+    const nextWrite = (writeIdx + 1) | 0;
+    Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite);
     Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
     this.pendingPushFrame = null;
     this.pendingPushSlot = -1;
+    this.pushedFrames = (this.pushedFrames + 1) | 0;
+    // Re-load readIdx for the high-water mark; the consumer may have
+    // advanced between beginPush and commitPush.
+    const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    this._recordOccupancy((nextWrite - readIdx) | 0);
   }
 
   /** Discard the frame opened by beginPush without publishing. */
@@ -889,6 +939,8 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
     this._updateFlowScale(writeIdx, readIdx);
+    this._recordOccupancy((writeIdx - readIdx) | 0);
+    this.pulledFrames = (this.pulledFrames + 1) | 0;
     r.ok = true;
     r.skipped = 0;
     r.invariantStored = invariantStored;
@@ -936,8 +988,12 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
     // NB: Atomics.notify deliberately omitted — that's the whole point of
     // this shim. Flow-scale tick still runs so the bench compares like for
-    // like on the post-release work.
+    // like on the post-release work; the occupancy + pulled counters also
+    // stay in sync with the public `pull` path so the bench's stats
+    // surface matches.
     this._updateFlowScale(writeIdx, readIdx);
+    this._recordOccupancy((writeIdx - readIdx) | 0);
+    this.pulledFrames = (this.pulledFrames + 1) | 0;
     r.ok = true;
     r.skipped = 0;
     r.invariantStored = invariantStored;
@@ -983,6 +1039,9 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
     Atomics.notify(this.indices, READ_IDX_LANE, 1);
     this._updateFlowScale(writeIdx, readIdx);
+    this._recordOccupancy((writeIdx - readIdx) | 0);
+    this.pulledFrames = (this.pulledFrames + 1) | 0;
+    this.skippedFrames = (this.skippedFrames + skipped) | 0;
     r.ok = true;
     r.skipped = skipped;
     r.invariantStored = invariantStored;
@@ -1101,6 +1160,52 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     return this.droppedFrames;
   }
 
+  /** Successful writes counter (0.6.13). See field doc. */
+  pushedCount(): number {
+    return this.pushedFrames;
+  }
+
+  /** Successful reads counter (0.6.13). One increment per ok=true
+   *  pull/pullLatest, regardless of skipped. See field doc. */
+  pulledCount(): number {
+    return this.pulledFrames;
+  }
+
+  /** Cumulative `pullLatest`-discarded frames (0.6.13). See field doc. */
+  skippedCount(): number {
+    return this.skippedFrames;
+  }
+
+  /** Nanoseconds of the most recent `waitForSpace` that parked. Zero
+   *  if never parked or always took the `'not-equal'` fast path. (0.6.13) */
+  lastFullWaitNanos(): number {
+    return this.lastFullWaitNs;
+  }
+
+  /** Nanoseconds of the most recent `waitForData` that parked. Zero
+   *  if never parked or always took the `'not-equal'` fast path. (0.6.13) */
+  lastEmptyWaitNanos(): number {
+    return this.lastEmptyWaitNs;
+  }
+
+  /** High-water mark of buffered count `(writeIdx - readIdx)` since
+   *  construction. See field doc. (0.6.13) */
+  maxOccupancy(): number {
+    return this.maxOccupancyEverSeen;
+  }
+
+  /** Update the high-water-mark counter. Called inline from push (with
+   *  post-write buffered) and from pull/pullLatest (with pre-pull
+   *  buffered). Wrap-correct: `buffered` here is always the signed
+   *  subtraction `(writeIdx - readIdx) | 0`, which is the true diff
+   *  for any |true_diff| < 2^31 (capped at capacity, so well-bounded).
+   *  (0.6.13) */
+  private _recordOccupancy(buffered: number): void {
+    if (buffered > this.maxOccupancyEverSeen) {
+      this.maxOccupancyEverSeen = buffered;
+    }
+  }
+
   /** Number of frames currently buffered (≤ capacity). */
   available(): number {
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
@@ -1159,7 +1264,14 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
     const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     if (((writeIdx - readIdx) | 0) < this.capacity) return "not-equal";
-    return Atomics.wait(this.indices, READ_IDX_LANE, readIdx, timeoutMs);
+    // 0.6.13 — record the wait duration into `lastFullWaitNs` for
+    // telemetry. `performance.now()` returns milliseconds with sub-ms
+    // precision in both Node and browsers; multiply to get ns. We time
+    // only the paths that actually parked (`'ok'` or `'timed-out'`).
+    const t0 = performance.now();
+    const status = Atomics.wait(this.indices, READ_IDX_LANE, readIdx, timeoutMs);
+    this.lastFullWaitNs = Math.round((performance.now() - t0) * 1e6);
+    return status;
   }
 
   /**
@@ -1175,7 +1287,12 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx !== readIdx) return "not-equal";
-    return Atomics.wait(this.indices, WRITE_IDX_LANE, writeIdx, timeoutMs);
+    // 0.6.13 — mirror of `waitForSpace` timing. Records the actual parked
+    // duration into `lastEmptyWaitNs` for telemetry.
+    const t0 = performance.now();
+    const status = Atomics.wait(this.indices, WRITE_IDX_LANE, writeIdx, timeoutMs);
+    this.lastEmptyWaitNs = Math.round((performance.now() - t0) * 1e6);
+    return status;
   }
 
   /**

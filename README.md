@@ -731,6 +731,42 @@ function tick() {
 
 The controller targets half-full occupancy with `Kp = 0.5, Ki = 0.05` (~10 ms settling time at the canonical 375 Hz consumer cadence). The integrator is bounded to `±20` for anti-windup so a long stall can't trap the controller in permanent over-correction. See the "Adaptive backpressure (CFL-style)" section in `src/Bridge.ts` for the full controller math and the CHANGELOG `[0.5.0]` entry for the design rationale.
 
+### Observability dashboards (0.6.13)
+
+`bridge.telemetry()` returns a frozen snapshot of every counter and state field the bridge tracks. 0.6.13 completes the surface so dashboards / DevTools panels / regression-test harnesses can answer questions about the ring's behavior over time, not just its current state.
+
+```ts
+const t = bridge.telemetry();
+//   t.tornFrames              — cumulative hard-error invariant fallbacks
+//   t.flowScale               — current Q16.16 hint in [0.5, 2.0]
+//   t.available               — current buffered count
+//   t.capacity                — ring capacity
+//   t.writeIndex / readIndex  — current SPSC counters (mod 2^32)
+//   t.pllLocked / pllOffsetNs — current PLL state
+//   t.policy                  — backpressure policy (0.6.12)
+//   t.droppedFrames           — cumulative producer drops (0.6.12)
+//   t.pushedFrames            — cumulative successful writes (0.6.13)
+//   t.pulledFrames            — cumulative successful reads (0.6.13)
+//   t.skippedFrames           — cumulative pullLatest-discarded frames (0.6.13)
+//   t.lastFullWaitNs          — duration of last waitForSpace that parked (0.6.13)
+//   t.lastEmptyWaitNs         — duration of last waitForData that parked (0.6.13)
+//   t.maxOccupancyEverSeen    — high-water mark since construction (0.6.13)
+```
+
+Key dashboard-shaped reads:
+
+| Question | Telemetry field | Interpretation |
+|---|---|---|
+| Is the ring sized right? | `maxOccupancyEverSeen / capacity` | Approaching 1.0 means you're hitting the ceiling — bump capacity or pace harder. |
+| Is the consumer keeping up? | `skippedFrames / pulledFrames` | High ratio means the consumer is dropping past stale frames each pull — reduce producer rate or accept the freshness trade. |
+| Is the producer ever blocked? | `droppedFrames` + `lastFullWaitNs` | Drops mean policy fired; lastFullWaitNs > 0 means producer parked. |
+| Is integrity intact? | `tornFrames` | Should stay at 0 in a clean run; any uptick indicates SAB bit-rot or a `drop-oldest` torn-read race. |
+| Are clocks aligned? | `pllLocked` + `pllOffsetNs` | Locked + small offset means the PLL is tracking; large offset means the consumer's clock differs from the producer's epoch. |
+
+All counters are **per-instance heap state**. A producer and a consumer over the same SAB each hold their own `Bridge` (or `SpscRing` + facades) and each sees their own counters — the producer's `pushedFrames` is its successful writes; the consumer's `pulledFrames` is its successful reads. For cross-process aggregation, `postMessage` the snapshot at a sampled cadence (e.g. once per second) — the overhead is negligible compared to the 16 ms control-rate budget, and the heap-only design avoids stealing reserved SAB lanes for an observability concern.
+
+The wait-duration counters use `performance.now()` for cross-platform portability (Node + browser); the recorded value is nanoseconds rounded from a millisecond-resolution float. Sub-ms precision on modern V8 / SpiderMonkey / JSC is sufficient for dashboard use; for ultra-tight measurement use `process.hrtime.bigint()` (Node only) around your own `waitForSpace` / `waitForData` calls and ignore the bridge's recorded value.
+
 ### Cross-IPC bit-rot detection
 
 0.6.0 adds opt-in payload integrity verification as a protocol concern. Build a schema with `.withInvariant(fn)` and the bridge auto-computes the invariant on push, verifies on pull, and recovers gracefully on mismatch:
@@ -835,6 +871,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.6.13 — Observability dashboards** (six new `telemetry()` fields: `pushedFrames`, `pulledFrames`, `skippedFrames`, `lastFullWaitNs`, `lastEmptyWaitNs`, `maxOccupancyEverSeen`). Second of the two README-named "Remaining 1.0 work" items — closing out the pre-1.0 must-have list. All counters are per-instance heap state (`postMessage` the snapshot for cross-process aggregation). Bench medians unchanged at 1.20 μs (counter increments are two adds + one compare each). SAB byte layout unchanged from 0.6.11. See [Observability dashboards (0.6.13)](#observability-dashboards-0613).
 - ✅ **0.6.12 — Backpressure policies** (`policy: 'reject' | 'drop-newest' | 'drop-oldest' | 'block'` + optional `blockTimeoutMs`). First of two README-named "Remaining 1.0 work" items. `Bridge<S>` + `SpscRing<S>` constructors accept an optional `opts` bag; default `'reject'` preserves 0.4.0..0.6.11 behavior bit-exact. `'drop-newest'` returns true and drops the new frame; `'drop-oldest'` CAS-advances `read_index` to evict the oldest unread frame (multi-thread torn-frame race documented + recommended pairing with `.withInvariant(...)`); `'block'` parks the producer via `waitForSpace` until the consumer drains. `telemetry()` gains `policy` + `droppedFrames`. SAB byte layout unchanged from 0.6.11. See [Overflow policies (0.6.12)](#overflow-policies-0612).
 - ✅ **0.6.10 — Composable consumer / producer + internal primitives exported**. The four heap state machines from 0.6.8 + 0.6.9 (`SpscRing`, `FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`) are now exported from `src/index.ts`. Two new facade classes — `BridgeConsumer<S>` and `BridgeProducer<S>` — wrap them as explicit consumer / producer objects. `Bridge<S>` continues to work unchanged; defaults on `BridgeConsumer` make it bit-identical to `Bridge<S>` on the same SAB. New `onInvariantFailure` policy on `BridgeConsumer` lets callers swap the hard-error behavior (`'fallback-to-previous'` default, `'throw'`, `'pass-through'`, or a custom callback). No public-API break; no wire-format change; SAB protocol identical to 0.6.9 so a facade-built peer interoperates with a `Bridge<S>`-built peer. See [Composable consumer / producer](#composable-consumer--producer-0610).
 - ✅ **0.6.9 — Internal extract: `FrameSmoother` / `ConsumerClockRecovery` / `AdaptiveFlowController`**. Three more heap-state machines lift out of `Bridge<S>` / `SpscRing<S>` into dedicated internal classes (`src/FrameSmoother.ts`, `src/ConsumerClockRecovery.ts`, `src/AdaptiveFlowController.ts`), continuing the seam 0.6.8 carved. The α-smoother prev buffer + trajectory-aware blender + per-field classification tables move to `FrameSmoother`; the PLL offset / integrator / gains move to `ConsumerClockRecovery`; the flow-scale PI loop + Q16.16 encode move to `AdaptiveFlowController`. No public-API change, no wire-format change, no exported symbol additions — every `Bridge<S>` method continues to work bit-identically and the 1 M-frame concurrent SPSC stress passes the new seams unchanged. Preparatory for the 0.6.10 composable exports.
@@ -844,9 +881,9 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 ### Remaining 1.0 work
 
 1. ✅ **0.6.12 — Backpressure policies** — `policy: 'reject' | 'drop-newest' | 'drop-oldest' | 'block'` constructor option, with optional `blockTimeoutMs` for the parking variant. Default `'reject'` preserves the historical contract bit-exact. `telemetry()` gains `policy` + `droppedFrames`. See [Overflow policies (0.6.12)](#overflow-policies-0612).
-2. **Observability dashboards on `telemetry()`** — the snapshot API landed in 0.6.0 with `tornFrames`, `flowScale`, `available`, `capacity`, `writeIndex`, `readIndex`; 0.6.12 added `policy` + `droppedFrames`. Pending: `pushed` / `pulled` counters + last-wait durations + max-depth high-water-mark for full DevTools panel integration. Mostly an additive extension of the existing API surface.
+2. ✅ **0.6.13 — Observability dashboards on `telemetry()`** — the snapshot API now carries the full cumulative + wait-duration + high-water-mark surface needed for DevTools-panel integration. See [Observability dashboards (0.6.13)](#observability-dashboards-0613).
 
-Both are scoped together because they share the constructor / class surface and should land before 1.0 freezes the API.
+Both README-named pre-1.0 must-haves have shipped. The path to 1.0 is now polish + ecosystem (PLL outlier gate / drift estimator, EvalMode dispatch, WebGPU helper), not API gaps.
 
 > **Versioning policy**: many additional improvements are planned before 1.0 and the version number should reflect maturity, not feature count. Post-0.6.0 the default is **patch bumps** (`0.6.x`); minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking API changes, or batched-patch promotion. The project will NOT race to 1.0 — when it lands, it lands as a deliberate stability commitment. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 

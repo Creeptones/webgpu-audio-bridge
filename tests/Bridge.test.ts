@@ -227,6 +227,32 @@
  *      timed-out). The bound is loose to tolerate platform timer
  *      jitter; the point is that the push DOES return rather than
  *      block forever.
+ *  69. Observability counters: pushed / pulled / skipped (0.6.13). On
+ *      a fresh `Bridge`, all counters are 0. After N successful pushes
+ *      and M successful pulls, `pushedFrames === N` and
+ *      `pulledFrames === M`. A `pullLatest` that drains K extra frames
+ *      increments `pulledFrames` by 1 and `skippedFrames` by K. Reject
+ *      pushes do NOT increment pushedFrames; empty pulls do NOT
+ *      increment pulledFrames. drop-newest does NOT increment
+ *      pushedFrames (frame never made it in); drop-oldest DOES
+ *      increment both pushedFrames AND droppedFrames (a new frame was
+ *      written, an old one was evicted).
+ *  70. Observability counters: lastFullWaitNs / lastEmptyWaitNs
+ *      (0.6.13). Fresh Bridge has both at 0. waitForSpace on a
+ *      not-full ring returns 'not-equal' immediately and does NOT
+ *      touch the counter (stays at last recorded value, 0 for a fresh
+ *      ring). waitForSpace on a full ring with a short timeout parks
+ *      until timeout, then records the elapsed ns; same shape for
+ *      waitForData on an empty ring. Bounds are loose (≥ 1 ms below
+ *      the requested timeout, ≤ 50 ms above) to tolerate platform
+ *      timer jitter.
+ *  71. Observability counter: maxOccupancyEverSeen (0.6.13). Fresh
+ *      Bridge has it at 0. Push/pull cycles drive it to the
+ *      high-water mark across all push and pull observation points.
+ *      Filling the ring to capacity drives it to `capacity`; partial
+ *      draining and refilling does NOT decrease it (monotonic).
+ *      `pullLatest` that drains the full ring observes pre-pull
+ *      buffered = capacity, so it's also covered.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -3736,6 +3762,195 @@ function testBackpressurePolicyBlockTimeout(): void {
   ok("backpressure-policy-block-timeout");
 }
 
+// ── 69. Observability counters: pushed / pulled / skipped (0.6.13) ───────
+function testTelemetryPushPullSkipCounters(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+
+  // Fresh Bridge — all counters zero.
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema);
+  const t0 = bridge.telemetry();
+  assertEq(t0.pushedFrames, 0, "fresh pushedFrames = 0");
+  assertEq(t0.pulledFrames, 0, "fresh pulledFrames = 0");
+  assertEq(t0.skippedFrames, 0, "fresh skippedFrames = 0");
+
+  // 4 pushes → pushedFrames = 4.
+  for (let i = 0; i < 4; i++) {
+    assert(bridge.push(makePhysFrame(i, n)), `fill push ${i}`);
+  }
+  assertEq(bridge.telemetry().pushedFrames, 4, "pushedFrames after 4 pushes = 4");
+
+  // Reject push (5th) — pushedFrames does NOT advance.
+  assertEq(bridge.push(makePhysFrame(99, n)), false, "5th push rejects");
+  assertEq(bridge.telemetry().pushedFrames, 4, "reject does not increment pushedFrames");
+
+  // 2 single-frame pulls → pulledFrames = 2, skipped stays 0.
+  const out = emptyPhysFrame(n);
+  assert(bridge.pull(out), "pull #1");
+  assert(bridge.pull(out), "pull #2");
+  let t = bridge.telemetry();
+  assertEq(t.pulledFrames, 2, "pulledFrames after 2 pulls = 2");
+  assertEq(t.skippedFrames, 0, "skippedFrames after non-skipping pulls = 0");
+
+  // Empty pull does NOT increment.
+  while (bridge.pull(out)) {
+    /* drain remaining 2 */
+  }
+  t = bridge.telemetry();
+  assertEq(t.pulledFrames, 4, "pulledFrames after draining = 4");
+  assertEq(bridge.pull(out), false, "empty pull returns false");
+  assertEq(bridge.telemetry().pulledFrames, 4, "empty pull does not increment pulledFrames");
+
+  // pullLatest with skips — counter accounting.
+  // Push 4 frames, then pullLatest. Skipped = 3, pulled++.
+  for (let i = 0; i < 4; i++) bridge.push(makePhysFrame(i + 1000, n));
+  const skipped = bridge.pullLatest(out);
+  assertEq(skipped, 3, "pullLatest skipped 3");
+  t = bridge.telemetry();
+  assertEq(t.pulledFrames, 5, "pulledFrames after pullLatest = 5");
+  assertEq(t.skippedFrames, 3, "skippedFrames after pullLatest = 3");
+
+  // drop-newest accounting — separate Bridge to isolate counters.
+  const allocDN = Bridge.allocate(4, schema);
+  const bridgeDN = new Bridge(allocDN.sab, allocDN.capacity, allocDN.schema, {
+    policy: "drop-newest",
+  });
+  for (let i = 0; i < 4; i++) bridgeDN.push(makePhysFrame(i, n));
+  assertEq(bridgeDN.telemetry().pushedFrames, 4, "drop-newest pushed 4");
+  // Two drops.
+  bridgeDN.push(makePhysFrame(100, n));
+  bridgeDN.push(makePhysFrame(101, n));
+  const tDN = bridgeDN.telemetry();
+  assertEq(tDN.pushedFrames, 4, "drop-newest does NOT increment pushedFrames on drops");
+  assertEq(tDN.droppedFrames, 2, "drop-newest droppedFrames = 2");
+
+  // drop-oldest accounting — both counters advance per overflow.
+  const allocDO = Bridge.allocate(4, schema);
+  const bridgeDO = new Bridge(allocDO.sab, allocDO.capacity, allocDO.schema, {
+    policy: "drop-oldest",
+  });
+  for (let i = 0; i < 4; i++) bridgeDO.push(makePhysFrame(i, n));
+  bridgeDO.push(makePhysFrame(100, n));
+  bridgeDO.push(makePhysFrame(101, n));
+  const tDO = bridgeDO.telemetry();
+  assertEq(tDO.pushedFrames, 6, "drop-oldest pushedFrames = 6 (4 fills + 2 evict-writes)");
+  assertEq(tDO.droppedFrames, 2, "drop-oldest droppedFrames = 2");
+
+  ok("telemetry-push-pull-skip-counters");
+}
+
+// ── 70. Observability counters: wait durations (0.6.13) ──────────────────
+function testTelemetryWaitDurations(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema);
+
+  // Fresh — both at 0.
+  const t0 = bridge.telemetry();
+  assertEq(t0.lastFullWaitNs, 0, "fresh lastFullWaitNs = 0");
+  assertEq(t0.lastEmptyWaitNs, 0, "fresh lastEmptyWaitNs = 0");
+
+  // waitForSpace on a not-full ring → 'not-equal' immediately, no
+  // counter update.
+  const s1 = bridge.waitForSpace(100);
+  assertEq(s1, "not-equal", "waitForSpace on empty returns 'not-equal'");
+  assertEq(bridge.telemetry().lastFullWaitNs, 0, "no-park waitForSpace leaves counter at 0");
+
+  // waitForData on an empty ring → parks until timeout, then records.
+  const targetWaitMs = 5;
+  const s2 = bridge.waitForData(targetWaitMs);
+  assertEq(s2, "timed-out", "waitForData on empty times out");
+  const recordedNs = bridge.telemetry().lastEmptyWaitNs;
+  // Bounds: at least ~1 ms (well below the 5 ms target — timer jitter
+  // can shorten in some scheduling contexts) and at most ~250 ms (well
+  // above any reasonable overshoot).
+  assert(
+    recordedNs >= 1_000_000,
+    `lastEmptyWaitNs ≥ 1 ms (got ${(recordedNs / 1e6).toFixed(2)} ms)`,
+  );
+  assert(
+    recordedNs <= 250_000_000,
+    `lastEmptyWaitNs ≤ 250 ms (got ${(recordedNs / 1e6).toFixed(2)} ms)`,
+  );
+
+  // Fill ring and exercise waitForSpace timeout path.
+  for (let i = 0; i < 4; i++) bridge.push(makePhysFrame(i, n));
+  const s3 = bridge.waitForSpace(targetWaitMs);
+  assertEq(s3, "timed-out", "waitForSpace on full times out");
+  const recordedFullNs = bridge.telemetry().lastFullWaitNs;
+  assert(
+    recordedFullNs >= 1_000_000,
+    `lastFullWaitNs ≥ 1 ms (got ${(recordedFullNs / 1e6).toFixed(2)} ms)`,
+  );
+  assert(
+    recordedFullNs <= 250_000_000,
+    `lastFullWaitNs ≤ 250 ms (got ${(recordedFullNs / 1e6).toFixed(2)} ms)`,
+  );
+
+  // Drain — waitForData on non-empty returns 'not-equal' immediately,
+  // does NOT update the counter (stays at the recorded value).
+  const out = emptyPhysFrame(n);
+  bridge.pull(out);
+  const beforeNoPark = bridge.telemetry().lastEmptyWaitNs;
+  const s4 = bridge.waitForData(100);
+  assertEq(s4, "not-equal", "waitForData on non-empty returns 'not-equal'");
+  assertEq(
+    bridge.telemetry().lastEmptyWaitNs,
+    beforeNoPark,
+    "no-park waitForData leaves counter at last recorded value",
+  );
+
+  ok("telemetry-wait-durations");
+}
+
+// ── 71. Observability counter: maxOccupancyEverSeen (0.6.13) ─────────────
+function testTelemetryMaxOccupancy(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(8, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema);
+
+  assertEq(bridge.telemetry().maxOccupancyEverSeen, 0, "fresh max occupancy = 0");
+
+  // Single push → post-write buffered = 1 → max = 1.
+  bridge.push(makePhysFrame(0, n));
+  assertEq(bridge.telemetry().maxOccupancyEverSeen, 1, "after 1 push, max = 1");
+
+  // Fill to capacity → max = capacity.
+  for (let i = 1; i < 8; i++) bridge.push(makePhysFrame(i, n));
+  assertEq(bridge.telemetry().maxOccupancyEverSeen, 8, "after fill, max = capacity = 8");
+
+  // Drain entirely. Each pull's pre-pull buffered: 8, 7, 6, ..., 1.
+  // max stays at 8 (monotonic).
+  const out = emptyPhysFrame(n);
+  while (bridge.pull(out)) {
+    /* drain */
+  }
+  assertEq(bridge.telemetry().maxOccupancyEverSeen, 8, "drain does NOT decrement max");
+
+  // Partial fill and pullLatest — pre-pull buffered = 5, max stays at 8.
+  for (let i = 0; i < 5; i++) bridge.push(makePhysFrame(200 + i, n));
+  bridge.pullLatest(out);
+  assertEq(
+    bridge.telemetry().maxOccupancyEverSeen,
+    8,
+    "pullLatest on partial fill keeps max at 8",
+  );
+
+  // Fresh Bridge — pullLatest that drains a fuller ring drives max.
+  const alloc2 = Bridge.allocate(4, schema);
+  const bridge2 = new Bridge(alloc2.sab, alloc2.capacity, alloc2.schema);
+  for (let i = 0; i < 4; i++) bridge2.push(makePhysFrame(i, n));
+  // At this point max = 4 (from pushes). pullLatest's pre-pull buffered
+  // is also 4, so max stays at 4.
+  bridge2.pullLatest(out);
+  assertEq(bridge2.telemetry().maxOccupancyEverSeen, 4, "pullLatest path observes capacity");
+
+  ok("telemetry-max-occupancy");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -3806,6 +4021,9 @@ function main(): void {
   testBackpressurePolicyDropOldest();
   testBackpressurePolicyBlockFastPath();
   testBackpressurePolicyBlockTimeout();
+  testTelemetryPushPullSkipCounters();
+  testTelemetryWaitDurations();
+  testTelemetryMaxOccupancy();
   console.log("\nAll Bridge tests passed.");
 }
 

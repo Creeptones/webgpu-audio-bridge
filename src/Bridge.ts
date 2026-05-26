@@ -1045,6 +1045,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     readonly pllOffsetNs: number;
     readonly policy: BackpressurePolicy;
     readonly droppedFrames: number;
+    readonly pushedFrames: number;
+    readonly pulledFrames: number;
+    readonly skippedFrames: number;
+    readonly lastFullWaitNs: number;
+    readonly lastEmptyWaitNs: number;
+    readonly maxOccupancyEverSeen: number;
   } {
     return Object.freeze({
       tornFrames: this.ring.tornFrameCount(),
@@ -1059,11 +1065,23 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       // are still reserved; cross-process observability lands in a follow-up.
       pllLocked: this.pll.locked,
       pllOffsetNs: this.pll.offsetNs,
-      // 0.6.12 — backpressure policy + heap-side drop counter. The full
-      // pushed / pulled / wait-duration / high-water-mark suite is the
-      // 0.6.13 observability dashboards patch.
+      // 0.6.12 — backpressure policy + heap-side drop counter.
       policy: this.ring.policy,
       droppedFrames: this.ring.droppedCount(),
+      // 0.6.13 — observability dashboards. All six fields are per-
+      // instance, heap-side. Two peers over the same SAB each see their
+      // own counters (the producer sees its pushes; the consumer sees
+      // its pulls + wait durations). For cross-process aggregation,
+      // postMessage telemetry across at a sampled cadence — the
+      // overhead is negligible compared to the 16 ms control-rate
+      // budget, and the heap-only design avoids stealing reserved SAB
+      // lanes for an observability concern.
+      pushedFrames: this.ring.pushedCount(),
+      pulledFrames: this.ring.pulledCount(),
+      skippedFrames: this.ring.skippedCount(),
+      lastFullWaitNs: this.ring.lastFullWaitNanos(),
+      lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
+      maxOccupancyEverSeen: this.ring.maxOccupancy(),
     });
   }
 
