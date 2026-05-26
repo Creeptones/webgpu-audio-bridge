@@ -4,6 +4,199 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.9] — 2026-05-26
+
+### Changed — internal extract: `FrameSmoother` + `ConsumerClockRecovery` + `AdaptiveFlowController`
+
+Three more heap-state machines lift out of `Bridge<S>` / `SpscRing<S>` into
+dedicated internal classes, continuing the seam 0.6.8 carved. **No public-API
+change. No wire-format change. No exported symbol additions.** Every
+`Bridge<S>` method continues to work bit-identically; the 1 M-frame
+concurrent SPSC stress passes the new seams unchanged.
+
+- **`src/FrameSmoother.ts`** (~312 lines, new file) owns the unified
+  consumer-side `prev` buffer (used by both `pullSmoothed` /
+  `pullLatestSmoothed` and the schema-invariant hard-error recovery path)
+  + the trajectory-aware one-pole blender + the precomputed per-field
+  classification tables (`scalarIsBigInt`, `scalarIsInteger`,
+  `arrayIsBigInt`, `arrayIsInteger`, `arrayTrajectoryOrder`). API:
+  `observe(out, alpha)` (mutates out in place, updates prev),
+  `seedFrom(src)` (invariant ok-branch), `fallbackInto(out)` →
+  boolean (invariant hard-branch), `reset()`, `currentPrevValid()`.
+  Lazily allocates its prev buffer via a factory passed at construction
+  (Bridge passes `() => this.scratchFrame()`) so the smoother does not
+  duplicate the schema-walk allocator. Schema-driven layout walks live here.
+
+- **`src/ConsumerClockRecovery.ts`** (~134 lines, new file) owns the PLL:
+  `_offsetNs`, `_integral`, `_locked`, plus the `PLL_KP` / `PLL_KI` /
+  `PLL_INT_LIMIT_NS` constants (exposed as `static readonly KP` / `KI` /
+  `INT_LIMIT_NS` for tests). API: `observe(consumerNs, producerNs)`
+  (first call seeds exact offset + flips locked; subsequent calls run the
+  PI math), `phaseLockedTime(consumerNs)` (returns `consumerNs + offsetNs`
+  once locked, else `consumerNs` unchanged), `reset()` + `locked` /
+  `offsetNs` getters for `telemetry()`. Argument validation (`Number.isFinite`)
+  moved into the class.
+
+- **`src/AdaptiveFlowController.ts`** (~131 lines, new file) owns the
+  flow-scale PI loop + the Q16.16 encode that previously lived inline on
+  `SpscRing._updateFlowScale` + the `FLOW_SCALE_KP` / `FLOW_SCALE_KI` /
+  `FLOW_SCALE_INT_LIMIT` / `FLOW_SCALE_MIN` / `FLOW_SCALE_MAX` constants
+  (exposed as `static readonly KP` / `KI` / `INT_LIMIT` / `MIN` / `MAX` /
+  `Q` / `DEFAULT_Q`). API: `tick(buffered, capacity)` → encoded Q16.16
+  value the ring writes into lane 2. The chosen signature passes the
+  pre-computed `buffered` count (avoiding a redundant division at the call
+  site that already has `writeIdx − readIdx` in hand) and lets the
+  controller compute occupancy = `buffered / capacity` internally.
+
+- **`src/Bridge.ts`** slims from ~1,329 to ~1,134 lines. The class continues
+  to hold one `SpscRing<S>` as `this.ring`; it now also holds one
+  `FrameSmoother<S>` as `this.smoother` and one `ConsumerClockRecovery` as
+  `this.pll`. The `consumerPrev` / `consumerPrevValid` fields, the
+  classification tables, the `_applySmoother` / `_seedConsumerPrev` /
+  `_copyFrameInto` private methods, and the `pllOffsetNs` / `pllIntegral`
+  / `pllLocked` fields — all gone, moved to the new classes. The
+  invariant classifier (`_classifyInvariant` + epsilon floor) and the
+  raw / smoothed invariant handlers (`_invariantHandleRaw`,
+  `_invariantHandleSmoothed`) stay on Bridge but now dispatch onto the
+  smoother (`seedFrom` / `observe` / `fallbackInto`). The per-frame
+  trajectory evaluator (`evaluateInto`, `scratchEvaluatedFrame`,
+  `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `setSampleRate`,
+  `resetEvalCache`) stays unchanged. `telemetry()` gathers from Bridge +
+  SpscRing + the new internals via existing accessors (`pll.locked`,
+  `pll.offsetNs`).
+
+- **`src/SpscRing.ts`** slims from ~875 to ~866 lines. `_updateFlowScale`
+  is now a three-line bridge: compute `buffered = (writeIdx − readIdx) | 0`,
+  call `this.flowController.tick(buffered, this.capacity)`, `Atomics.store`
+  the returned encoded value into `FLOW_SCALE_LANE`. The PI gains, the
+  anti-windup limit, and the Q16.16 encode all live on the controller;
+  SpscRing keeps only the lane index and the seed-on-construct
+  `Atomics.compareExchange` (which now reads `AdaptiveFlowController.DEFAULT_Q`).
+
+- **All four extracted classes (SpscRing, FrameSmoother,
+  ConsumerClockRecovery, AdaptiveFlowController) remain internal-only at
+  0.6.9.** Not exported from `src/index.ts`. 0.6.10 is the deliberate
+  promotion patch that lifts them to the public composable API.
+
+### Why — keep slicing the seam ahead of the 0.6.10 promotion
+
+0.6.8 carved Bridge along its largest seam (SpscRing). 0.6.9 takes the
+remaining heap-side machinery out of the orchestrator: an α-smoother with
+its own prev buffer, a PLL with its own integral state, and a flow
+controller with its own integrator. Each is a self-contained heap state
+machine with a small explicit API; each can be unit-tested without
+spinning up a SAB (pins 61–63 do exactly that).
+
+The dispatch shape on Bridge becomes even thinner: `pull` is now seven
+lines (ring pull → either invariant dispatch or `smoother.reset()` →
+return); the smoothed variants are six (ring pull → invariant or smoother
+dispatch → return); the PLL methods are one-line delegators. The
+invariant classifier (`_classifyInvariant` + epsilon floor) and the
+trajectory evaluator stay on Bridge — they're orchestration, not single
+state machines.
+
+A second motivation: surface design. The 0.6.10 promotion needs each
+primitive's API to be small, complete, and tested in isolation. Doing
+the extract first and the public export second lets the API shape settle
+under the existing pin suite before any external caller can pin against
+it.
+
+The 1 M-frame concurrent SPSC stress is again load-bearing. The new
+seams are heap-only (FrameSmoother + ConsumerClockRecovery don't touch
+the SAB; AdaptiveFlowController writes lane 2 via SpscRing the same as
+before), so the SPSC protocol surface area is unchanged from 0.6.8.
+If the seam had a release/acquire bug or a missed integrator update,
+the test's `flow_scale envelope` and `emptyWaitTimeouts === 0`
+assertions would catch it within the first few hundred frames.
+
+### Wire compatibility
+
+- **No SAB changes.** Lane layout, byte offsets, Q16.16 flow-scale
+  encoding (now produced by `AdaptiveFlowController.tick` rather than
+  inline on `SpscRing._updateFlowScale`, but bit-identical), torn-frame
+  counter, header / payload boundary — all bit-for-bit identical to
+  0.6.7 / 0.6.8. A 0.6.8 peer and a 0.6.9 peer share a SAB transparently.
+  Lanes 4–7 remain reserved for the 0.7.0 wait-flag protocol.
+- **No public-API breakage.** Every `Bridge<S>` method signature, return
+  shape, and exported symbol from `src/index.ts` is byte-identical to
+  0.6.8. `telemetry()` still returns the same frozen object with the same
+  field names (`pllLocked` / `pllOffsetNs` are now sourced from
+  `this.pll.locked` / `this.pll.offsetNs` but the public field names are
+  unchanged).
+- **No exported symbol additions.** `FrameSmoother`, `ConsumerClockRecovery`,
+  and `AdaptiveFlowController` are internal-only — Bridge / SpscRing
+  consume them from their respective module files but `src/index.ts` does
+  not re-export them. 0.6.10 is the deliberate promotion patch.
+- **Test-hook seam preserved.** `Bridge._updateFlowScale(writeIdx, readIdx)`
+  → `SpscRing._updateFlowScale(writeIdx, readIdx)` → `flowController.tick(...)`.
+  `tests/Bridge.test.ts#testFlowScalePIStepResponse` continues to pin
+  the gain shape via this hook with no producer-side changes.
+
+### Tests
+
+Test counts grow: `tests/Bridge.test.ts` 60 → 63 pins (one small unit
+test per new internal class). All 6 suites green:
+
+- `tests/schema.test.ts` 14 pins (unchanged).
+- `tests/Bridge.test.ts` 63 pins (every smoothed-pull, invariant,
+  flow-scale, PLL, trajectory, and evaluator pin from 0.6.8 passes
+  through the seam unchanged; three new pins exercise the extracted
+  internals directly).
+  - **`testFrameSmootherUnit`** (pin #61) — direct-construct the smoother
+    against a mixed-kind schema (f64 scalar + u32 scalar + f64 array);
+    first observe seeds prev (no blend); second observe blends per
+    `α·curr + (1−α)·prev` with integer fields rounded; `seedFrom`
+    replaces prev verbatim; `fallbackInto` copies back when valid /
+    returns false when not; `reset` invalidates without freeing buffer.
+  - **`testConsumerClockRecoveryUnit`** (pin #62) — cold start
+    `locked === false`; first observe seeds exact offset and flips
+    locked; second observe runs the PI math verified against the
+    closed-form `KP·residual + KI·integral`; reset returns to cold;
+    non-finite arguments throw on both consumerNs and producerNs.
+  - **`testAdaptiveFlowControllerUnit`** (pin #63) — Q16.16 constants
+    pin; first tick on empty ring matches the closed-form Q16.16-encoded
+    scale; sustained full-ring saturates at MIN clamp after enough
+    cycles; reset zeros integrator so the next tick from empty matches
+    a brand-new controller's first tick.
+- `tests/Bridge.phaseLock.test.ts` (unchanged).
+- `tests/Bridge.concurrent.test.ts` — 1,000,000-frame SPSC stress
+  completes in ~600 ms with `emptyWaitTimeouts === 0` and
+  `flow_scale envelope [0.500, 2.000]`. **Still the load-bearing
+  validation for the seam.** The integrator state moved off SpscRing
+  onto AdaptiveFlowController but the lane-2 writes are bit-identical;
+  a regression would flip the envelope assertion within the first few
+  hundred frames.
+- `tests/Float64RingBuffer.test.ts` 9 pins (unchanged).
+- `tests/Float64RingBuffer.concurrent.test.ts` (unchanged).
+
+Bench medians at N=1000 unchanged from 0.6.8: push 1.20 μs, pull 1.20 μs,
+pullLatest 1.20 μs (p99 1.50–1.90 μs across all three);
+`trajEval (fast)` 1.10 μs / `trajEval (clamp)` 4.80 μs; flow-scale
+recovery 33 cycles (analytic ≈ 46). The extra method calls across the
+new heap seams are below the bench's resolution.
+
+### Documentation
+
+- `src/FrameSmoother.ts`, `src/ConsumerClockRecovery.ts`, and
+  `src/AdaptiveFlowController.ts` each carry a file header documenting
+  the class's invariants, the math (PI gains, anti-windup, Q16.16 encode
+  on the controller; KP / KI / clamp formula on the PLL; trajectory-
+  aware blend rule and field-type classification on the smoother), and
+  the "internal-only this patch, exported in 0.6.10" status.
+- `src/Bridge.ts`'s file header gains a `0.6.8 / 0.6.9 architecture note`
+  describing the composition: Bridge holds one `SpscRing`, one
+  `FrameSmoother`, and one `ConsumerClockRecovery`; the existing
+  Smoothed pulls / Schema invariants / Phase-locked loop sections are
+  updated to point at the new owning classes while the public contract
+  (the method names + signatures) remains unchanged.
+- `src/SpscRing.ts`'s file header updates the 0.6.9-plan paragraph to a
+  0.6.9-done description: `_updateFlowScale` is now a three-line wrapper
+  around `AdaptiveFlowController.tick`.
+- `CHANGELOG.md` — this entry.
+- `README.md` — single roadmap line noting that 0.6.9 ships the internal
+  extract of FrameSmoother / ConsumerClockRecovery / AdaptiveFlowController
+  preparatory for the 0.6.10 composable exports.
+
 ## [0.6.8] — 2026-05-26
 
 ### Changed — internal extract: `SpscRing`

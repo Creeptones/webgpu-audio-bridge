@@ -1,13 +1,15 @@
 /**
  * SpscRing<Schema> — extracted SAB / Atomics core of the bridge (0.6.8).
  *
- * This file is **internal-only** as of 0.6.8. It is not exported from
- * `src/index.ts`; only `Bridge.ts` consumes it. The 0.6.9 patch will widen
- * the surface by extracting the smoother / PLL / flow controller into
- * dedicated heap-state classes that share this ring; 0.6.10 promotes
- * `SpscRing` (and the other internals) to the public composable API. This
- * patch is the seam-only step — every public Bridge<S> method continues to
- * work bit-identically and no exported symbol is added.
+ * This file is **internal-only** as of 0.6.8–0.6.9. It is not exported from
+ * `src/index.ts`; only `Bridge.ts` consumes it. The 0.6.9 patch carved the
+ * heap-side smoother / PLL / flow controller into dedicated state classes
+ * (`FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`) —
+ * SpscRing now composes one `AdaptiveFlowController` for the lane-2 PI
+ * tick and exposes a slim test-hook `_updateFlowScale(writeIdx, readIdx)`
+ * that wraps the controller. 0.6.10 promotes all four primitives to the
+ * public composable API. Through 0.6.9 every public Bridge<S> method
+ * continues to work bit-identically and no exported symbol is added.
  *
  * What lives here vs. what lives on Bridge:
  *
@@ -23,17 +25,23 @@
  *     - `available()`, `flowScaleHint()`, `tornFrameCount()` /
  *       `incrementTornFrameCount()`, `waitForData` / `waitForSpace`,
  *       `describeLayout()`.
- *     - The lane-2 adaptive flow-scale PI controller tick (runs on pull).
+ *     - The lane-2 adaptive flow-scale PI controller tick. The integrator
+ *       state + math live on the composed `AdaptiveFlowController`
+ *       (0.6.9); the ring writes the encoded result into lane 2.
  *
  *   Bridge<S>  (./Bridge.ts):
- *     - α-smoother (`_applySmoother`) + named skip policies.
+ *     - α-smoother dispatch (`pullSmoothed` / `pullLatestSmoothed`,
+ *       `resetSmoother`) and the named skip policies. The blend itself
+ *       lives on the composed `FrameSmoother` (0.6.9).
  *     - Schema-invariant classifier (`_classifyInvariant` + epsilon floor).
- *     - PLL (`observeConsumerTime`, `phaseLockedTime`, `resetPll`).
+ *     - PLL dispatch (`observeConsumerTime`, `phaseLockedTime`,
+ *       `resetPll`). The PI loop + offset state live on the composed
+ *       `ConsumerClockRecovery` (0.6.9).
  *     - Per-frame evaluator (`evaluateInto`, `pullEvaluatedLatest`,
  *       `evaluateAtSampleOffset`, `setSampleRate`, `resetEvalCache`,
  *       `scratchEvaluatedFrame`).
- *     - `telemetry()` snapshot (gathers from both Bridge state and the
- *       inner ring).
+ *     - `telemetry()` snapshot (gathers from Bridge state, the inner ring,
+ *       and the three 0.6.9 internals).
  *
  * Bridge<S> holds one `SpscRing<S>` as `this.ring` and delegates every
  * ring-mechanic call. The pull-family methods on Bridge orchestrate the
@@ -190,9 +198,12 @@
  * too slow" when in fact the consumer hasn't actually consumed).
  * `available()` is a pure observer and never touches the lane.
  *
- * 0.6.9 plan: split this PI loop into a dedicated `AdaptiveFlowController`
- * class so the ring can be reused with a different control strategy. The
- * 0.6.8 patch keeps the inline `_updateFlowScale` for surgical extract.
+ * 0.6.9: the controller math + integrator state moved into a dedicated
+ * `AdaptiveFlowController` class (`./AdaptiveFlowController.ts`). SpscRing
+ * holds one as `this.flowController` and `_updateFlowScale` is now a
+ * three-line bridge: compute `buffered`, call `flowController.tick(...)`,
+ * `Atomics.store` the encoded result into lane 2. The PI gains, the
+ * anti-windup limit, and the Q16.16 encode all live on the controller.
  *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
@@ -223,6 +234,7 @@ import {
   type Schema,
   type SchemaLayoutDescription,
 } from "./schema.js";
+import { AdaptiveFlowController } from "./AdaptiveFlowController.js";
 
 export const RING_HEADER_BYTES = 32;
 /** Active SPSC counter lanes: write_index (Int32 lane 0), read_index (Int32
@@ -244,23 +256,13 @@ export const READ_IDX_LANE = 1;
 export const FLOW_SCALE_LANE = 2;
 export const TORN_FRAME_LANE = 3;
 
-// Flow-scale fixed-point + PI controller constants.
-//
-// Q16.16: store(scale) = floor(scale * 65536). Range [0.5, 2.0] maps to
-// [32768, 131072], all within positive signed-32 → Atomics.load on Int32Array
-// returns the stored value bit-for-bit (no sign weirdness).
-const FLOW_SCALE_Q = 65536;
-const FLOW_SCALE_MIN = 0.5;
-const FLOW_SCALE_MAX = 2.0;
-const FLOW_SCALE_DEFAULT_Q = FLOW_SCALE_Q; // 1.0 * Q
-
-// PI gains. See header "Adaptive backpressure" for the derivation.
-const FLOW_SCALE_KP = 0.5;
-const FLOW_SCALE_KI = 0.05;
-// Anti-windup: cap |integral| so Ki·integral alone covers the full half-extent
-// of scale's range (1.0). Past this, the integrator would saturate the output
-// and recovery from a long stall would be unable to back off.
-const FLOW_SCALE_INT_LIMIT = 20; // = 1.0 / FLOW_SCALE_KI
+// Flow-scale fixed-point constant. Q16.16 encoding lives on
+// AdaptiveFlowController (controller math + encode), but SpscRing keeps a
+// local copy of the Q quantum for the `flowScaleHint()` decode (Atomics
+// load + divide). Range [0.5, 2.0] maps to [32768, 131072], all within
+// positive signed-32 → Atomics.load on Int32Array returns the stored
+// value bit-for-bit (no sign weirdness).
+const FLOW_SCALE_Q = AdaptiveFlowController.Q;
 
 export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
   sab: SharedArrayBuffer;
@@ -376,9 +378,11 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  Used only when `invariantView` is non-null. */
   private readonly invariantElemOffsetF64: number;
 
-  /** PI controller integral state for the flow-scale tick. Persists across
-   *  pull calls; clamped to ±FLOW_SCALE_INT_LIMIT for anti-windup. */
-  private piIntegral: number = 0;
+  /** Adaptive flow-scale PI controller (0.6.9 extract). Owns the integral
+   *  state and the controller math; the ring is responsible only for
+   *  writing the encoded result into lane 2. See AdaptiveFlowController.ts
+   *  for the controller contract. */
+  private readonly flowController: AdaptiveFlowController = new AdaptiveFlowController();
 
   /** Reused scratch for pull / pullLatest results. SpscRing mutates this in
    *  place each call; Bridge reads it immediately after the call returns.
@@ -427,7 +431,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       this.indices,
       FLOW_SCALE_LANE,
       0,
-      FLOW_SCALE_DEFAULT_Q,
+      AdaptiveFlowController.DEFAULT_Q,
     );
 
     // Build one umbrella view per type-family present in the schema. These
@@ -747,42 +751,29 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * pull early-returns skip this so the controller never sees a misleading
    * "occupancy = 0 because nobody pulled" sample.
    *
-   * Pre-pull occupancy = `(writeIdx - readIdx) / capacity`, where readIdx
-   * is the value BEFORE the consumer's increment — i.e. "how full was the
-   * ring when the consumer arrived to take a frame." The wrap-invariant
-   * signed subtraction `(a - b) | 0` is the same trick used throughout for
-   * the SPSC counters.
+   * Pre-pull buffered count = `(writeIdx - readIdx) | 0`, where readIdx is
+   * the value BEFORE the consumer's increment — i.e. "how full was the ring
+   * when the consumer arrived to take a frame." The wrap-invariant signed
+   * subtraction `(a - b) | 0` is the same trick used throughout for the
+   * SPSC counters. The controller's `tick` computes occupancy = buffered /
+   * capacity internally; the ring is responsible only for the wrap-correct
+   * subtraction and the SAB write.
    *
-   * See file header "Adaptive backpressure" for the gain rationale and
-   * anti-windup design. 0.6.9 will split this into a dedicated
-   * `AdaptiveFlowController` class.
+   * See AdaptiveFlowController.ts for the PI math + anti-windup design;
+   * see file header "Adaptive backpressure" for the producer-side
+   * honor semantics. The 0.6.9 extract moves the controller state and
+   * math off SpscRing while preserving this method as the test-hook seam
+   * (`Bridge._updateFlowScale` → `SpscRing._updateFlowScale` →
+   * `AdaptiveFlowController.tick`).
    *
-   * Public on SpscRing only because `SpscRing` is internal-only at 0.6.8;
+   * Public on SpscRing only because `SpscRing` is internal-only at 0.6.9;
    * Bridge delegates the public `_updateFlowScale` private test-hook
    * through to this method. Not exported from `index.ts`.
    */
   _updateFlowScale(writeIdx: number, readIdx: number): void {
     const buffered = (writeIdx - readIdx) | 0;
-    const occupancy = buffered / this.capacity;
-    const err = occupancy - 0.5;
-    let integral = this.piIntegral + err;
-    // Anti-windup: bound the integrator so a long stall can't trap the
-    // controller in permanent over-correction.
-    if (integral > FLOW_SCALE_INT_LIMIT) integral = FLOW_SCALE_INT_LIMIT;
-    else if (integral < -FLOW_SCALE_INT_LIMIT) integral = -FLOW_SCALE_INT_LIMIT;
-    this.piIntegral = integral;
-    // Sign: err > 0 (consumer overfull) → scale < 1 (producer slow down);
-    // err < 0 (consumer starved) → scale > 1 (producer speed up).
-    let scale = 1 - FLOW_SCALE_KP * err - FLOW_SCALE_KI * integral;
-    if (scale < FLOW_SCALE_MIN) scale = FLOW_SCALE_MIN;
-    else if (scale > FLOW_SCALE_MAX) scale = FLOW_SCALE_MAX;
-    // Q16.16 encode. floor not round — preserves the boundary semantics
-    // documented in flowScaleHint().
-    Atomics.store(
-      this.indices,
-      FLOW_SCALE_LANE,
-      Math.floor(scale * FLOW_SCALE_Q),
-    );
+    const encoded = this.flowController.tick(buffered, this.capacity);
+    Atomics.store(this.indices, FLOW_SCALE_LANE, encoded);
   }
 
   /** Number of frames currently buffered (≤ capacity). */

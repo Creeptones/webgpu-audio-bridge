@@ -176,6 +176,27 @@
  *      with no clamps set produces bit-identical output to the inlined
  *      Taylor formula — proving the fast path is preserved and that the
  *      clamped path is engaged only when a clamp field is present.
+ *  61. FrameSmoother unit (0.6.9). Direct-construct the extracted smoother
+ *      against a tiny schema; first observe seeds prev (no blend), second
+ *      observe blends per `α·curr + (1−α)·prev`, `seedFrom` replaces prev
+ *      verbatim, `fallbackInto` copies prev back into out when valid /
+ *      returns false when not. `reset()` invalidates without freeing the
+ *      buffer. Smoother is internal-only at 0.6.9 — imported via the
+ *      `./src/FrameSmoother.js` path the bridge uses.
+ *  62. ConsumerClockRecovery unit (0.6.9). Direct-construct the extracted
+ *      PLL; `locked` starts false; first `observe` seeds exact offset and
+ *      flips `locked`; subsequent observations run the PI math (verified
+ *      against the documented `KP·residual + KI·integral` curve); `reset`
+ *      flips back to unlocked + zero offset; non-finite arguments throw.
+ *      `phaseLockedTime(x)` returns `x` until locked.
+ *  63. AdaptiveFlowController unit (0.6.9). Direct-construct the
+ *      extracted controller; `tick(0, 16)` (empty ring) returns the
+ *      clamped-high Q16.16 hint (since `err = −0.5` drives scale > 1);
+ *      `tick(16, 16)` (full ring) drives scale ≤ 1 then saturates at the
+ *      low clamp after enough cycles; `reset()` zeros the integrator so
+ *      a fresh full-ring tick returns the same value as the first call;
+ *      Q16.16 round-trip matches the documented `floor(scale · 65536)`
+ *      encoding.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -202,6 +223,9 @@ import {
 } from "../src/schemas/physics.js";
 import { evaluateTrajectoryInto } from "../src/trajectory.js";
 import type { TrajectorySpec } from "../src/schema.js";
+import { FrameSmoother } from "../src/FrameSmoother.js";
+import { ConsumerClockRecovery } from "../src/ConsumerClockRecovery.js";
+import { AdaptiveFlowController } from "../src/AdaptiveFlowController.js";
 
 function mulberry32(seed: number): () => number {
   let a = seed | 0;
@@ -3330,6 +3354,150 @@ function testTrajectoryClampFreeBitExact(): void {
   ok("trajectory-clamp-free-bit-exact");
 }
 
+// ── 61. FrameSmoother unit (0.6.9) ─────────────────────────────────────────
+function testFrameSmootherUnit(): void {
+  // Tiny schema: 1 f64 scalar + 1 u32 scalar + 1 f64 array (length 3) so
+  // the smoother walks both scalar and array paths, with integer-round
+  // and float-blend dispatches both active.
+  const schema = defineSchema({
+    x: f64(),
+    n: u32(),
+    arr: f64Array(3),
+  });
+  type Frame = FrameFor<typeof schema>;
+  const alloc = (): Frame => ({
+    x: 0,
+    n: 0,
+    arr: new Float64Array(3),
+  });
+  const smoother = new FrameSmoother(schema, alloc);
+
+  // First observe seeds prev — no blend.
+  const a: Frame = { x: 10.0, n: 100, arr: new Float64Array([1, 2, 3]) };
+  assertEq(smoother.currentPrevValid(), false, "smoother starts with no prev");
+  smoother.observe(a as unknown as Record<string, unknown>, 0.5);
+  assertEq(smoother.currentPrevValid(), true, "first observe seeds prev");
+  assertEq(a.x, 10.0, "first observe leaves out untouched (float)");
+  assertEq(a.n, 100, "first observe leaves out untouched (int)");
+  assertEq(a.arr[0], 1, "first observe leaves out untouched (array)");
+
+  // Second observe blends per α·curr + (1-α)·prev. α = 0.25.
+  const b: Frame = { x: 20.0, n: 200, arr: new Float64Array([10, 20, 30]) };
+  smoother.observe(b as unknown as Record<string, unknown>, 0.25);
+  assertEq(b.x, 0.25 * 20.0 + 0.75 * 10.0, "blend float scalar");
+  // Integer round: 0.25 * 200 + 0.75 * 100 = 125 → Math.round(125) = 125
+  assertEq(b.n, Math.round(0.25 * 200 + 0.75 * 100), "blend integer scalar (rounded)");
+  assertEq(b.arr[0], 0.25 * 10 + 0.75 * 1, "blend array[0]");
+  assertEq(b.arr[1], 0.25 * 20 + 0.75 * 2, "blend array[1]");
+  assertEq(b.arr[2], 0.25 * 30 + 0.75 * 3, "blend array[2]");
+
+  // seedFrom replaces prev verbatim. Subsequent observe should blend
+  // against the new prev, not the previously-blended one.
+  const seed: Frame = { x: 999.0, n: 999, arr: new Float64Array([7, 8, 9]) };
+  smoother.seedFrom(seed as unknown as Record<string, unknown>);
+  const c: Frame = { x: 0.0, n: 0, arr: new Float64Array([0, 0, 0]) };
+  smoother.observe(c as unknown as Record<string, unknown>, 0.5);
+  assertEq(c.x, 0.5 * 0.0 + 0.5 * 999.0, "blend after seedFrom uses new prev");
+
+  // fallbackInto copies prev into out + returns true.
+  const out: Frame = { x: -1, n: 99, arr: new Float64Array([0, 0, 0]) };
+  const ok1 = smoother.fallbackInto(out as unknown as Record<string, unknown>);
+  assertEq(ok1, true, "fallbackInto returns true when prev valid");
+  // After last observe, prev = (0.5 * 0 + 0.5 * 999) = 499.5 for x.
+  assertEq(out.x, 499.5, "fallbackInto copies prev into out");
+
+  // reset invalidates without freeing the buffer; next observe is a fresh seed.
+  smoother.reset();
+  assertEq(smoother.currentPrevValid(), false, "reset invalidates prev");
+  const out2: Frame = { x: -1, n: 99, arr: new Float64Array([0, 0, 0]) };
+  const ok2 = smoother.fallbackInto(out2 as unknown as Record<string, unknown>);
+  assertEq(ok2, false, "fallbackInto returns false when prev invalid");
+  assertEq(out2.x, -1, "fallbackInto leaves out untouched when invalid");
+
+  const d: Frame = { x: 5.0, n: 50, arr: new Float64Array([4, 5, 6]) };
+  smoother.observe(d as unknown as Record<string, unknown>, 0.5);
+  assertEq(d.x, 5.0, "observe after reset seeds verbatim (no blend)");
+  assertEq(smoother.currentPrevValid(), true, "observe re-seeds prev");
+
+  ok("frame-smoother-unit");
+}
+
+// ── 62. ConsumerClockRecovery unit (0.6.9) ─────────────────────────────────
+function testConsumerClockRecoveryUnit(): void {
+  const pll = new ConsumerClockRecovery();
+  // Cold start.
+  assertEq(pll.locked, false, "pll cold start unlocked");
+  assertEq(pll.offsetNs, 0, "pll cold start offset 0");
+  assertEq(pll.phaseLockedTime(12345), 12345, "phaseLockedTime returns x unlocked");
+
+  // First observe seeds exact offset, flips locked, integral=0.
+  pll.observe(1000, 5000);
+  assertEq(pll.locked, true, "first observe locks");
+  assertEq(pll.offsetNs, 4000, "first observe seeds exact offset");
+  assertEq(pll.phaseLockedTime(0), 4000, "phaseLockedTime adds offset");
+
+  // Second observe runs PI: residual = (producer - consumer) - offset.
+  // With producer=5200, consumer=1000 → residual = 4200 - 4000 = 200.
+  // integral = 0 + 200 = 200. offset += KP·200 + KI·200 = 0.2*200 + 0.01*200 = 42.
+  pll.observe(1000, 5200);
+  // Floating-point — assert within epsilon. KP=0.2, KI=0.01 from
+  // ConsumerClockRecovery static constants.
+  const expectedOffset = 4000 + ConsumerClockRecovery.KP * 200 + ConsumerClockRecovery.KI * 200;
+  assert(Math.abs(pll.offsetNs - expectedOffset) < 1e-9, `PI math: got ${pll.offsetNs}, want ${expectedOffset}`);
+
+  // reset returns to cold state.
+  pll.reset();
+  assertEq(pll.locked, false, "reset unlocks");
+  assertEq(pll.offsetNs, 0, "reset zeros offset");
+  assertEq(pll.phaseLockedTime(12345), 12345, "reset restores identity");
+
+  // Non-finite arguments throw.
+  let threw = false;
+  try { pll.observe(NaN, 0); } catch { threw = true; }
+  assert(threw, "non-finite consumerNs throws");
+  threw = false;
+  try { pll.observe(0, Infinity); } catch { threw = true; }
+  assert(threw, "non-finite producerNs throws");
+
+  ok("consumer-clock-recovery-unit");
+}
+
+// ── 63. AdaptiveFlowController unit (0.6.9) ────────────────────────────────
+function testAdaptiveFlowControllerUnit(): void {
+  // Q16.16 encoding sanity.
+  assertEq(AdaptiveFlowController.Q, 65536, "Q quantum is 65536");
+  assertEq(AdaptiveFlowController.DEFAULT_Q, 65536, "default Q = 1.0 * 65536");
+  assertEq(AdaptiveFlowController.MIN, 0.5, "MIN clamp = 0.5");
+  assertEq(AdaptiveFlowController.MAX, 2.0, "MAX clamp = 2.0");
+
+  // First tick on an empty ring (buffered=0, capacity=16) → occupancy=0,
+  // err=-0.5, integral=-0.5; scale = 1 - KP·(-0.5) - KI·(-0.5)
+  //                           = 1 + 0.5·0.5 + 0.05·0.5 = 1 + 0.25 + 0.025 = 1.275.
+  const ctrl = new AdaptiveFlowController();
+  const first = ctrl.tick(0, 16);
+  const expectedScale = 1 + AdaptiveFlowController.KP * 0.5 + AdaptiveFlowController.KI * 0.5;
+  assertEq(first, Math.floor(expectedScale * AdaptiveFlowController.Q), "first tick Q16.16 matches formula");
+
+  // Full ring sustained — controller saturates to MIN.
+  const fresh = new AdaptiveFlowController();
+  let lastScale = 0;
+  for (let i = 0; i < 100; i++) {
+    lastScale = fresh.tick(16, 16);
+  }
+  assertEq(lastScale, Math.floor(AdaptiveFlowController.MIN * AdaptiveFlowController.Q),
+    "sustained full-ring saturates at MIN clamp");
+
+  // Reset zeros integrator; first tick after reset matches the very-first
+  // tick of a brand-new controller.
+  const r = new AdaptiveFlowController();
+  for (let i = 0; i < 50; i++) r.tick(16, 16); // drive into saturation
+  r.reset();
+  const afterReset = r.tick(0, 16);
+  assertEq(afterReset, first, "tick after reset matches fresh first tick");
+
+  ok("adaptive-flow-controller-unit");
+}
+
 function main(): void {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -3392,6 +3560,9 @@ function main(): void {
   testTrajectoryHoldFallback();
   testTrajectoryDeltaSaturate();
   testTrajectoryClampFreeBitExact();
+  testFrameSmootherUnit();
+  testConsumerClockRecoveryUnit();
+  testAdaptiveFlowControllerUnit();
   console.log("\nAll Bridge tests passed.");
 }
 

@@ -6,32 +6,51 @@
  * driven by a user-supplied `Schema` (see ./schema.ts) instead of the
  * hard-coded `[seq, tMacroNs, vMax, jMax] + V_eff[N] + J_eff[N]` frame.
  *
- * ─── 0.6.8 architecture note ─────────────────────────────────────────────
+ * ─── 0.6.8 / 0.6.9 architecture note ─────────────────────────────────────
  *
  * The SAB allocation, header lane layout, push / pull mechanics, park / wake
  * protocol, and the lane-2 adaptive flow-scale PI controller all live in a
- * dedicated `SpscRing<S>` class (`./SpscRing.ts`). Bridge<S> holds one as
- * `this.ring` and delegates every ring-mechanic call. The protocol-level
- * documentation (SAB lane diagram, release/acquire semantics, always-notify
- * protocol, counter representation, adaptive backpressure math) lives at
- * the top of `SpscRing.ts`. Bridge<S> retains the consumer-side state
- * machines that are NOT ring mechanics:
+ * dedicated `SpscRing<S>` class (`./SpscRing.ts`). The 0.6.9 patch further
+ * carved the consumer-side heap state machines into three dedicated
+ * classes:
  *
- *   - α-smoother (`pullSmoothed` / `pullLatestSmoothed`, `_applySmoother`,
- *     `resetSmoother`) and named skip policies (`SmootherSkipPolicy`).
+ *   - `FrameSmoother<S>` (`./FrameSmoother.ts`) — owns the unified
+ *     consumer-side `prev` buffer + the trajectory-aware one-pole blender
+ *     + the per-field classification tables (BigInt / integer / float, and
+ *     `arrayTrajectoryOrder` for the strided derivative-skip). Used by
+ *     both `pullSmoothed`/`pullLatestSmoothed` and the schema-invariant
+ *     hard-error recovery path.
+ *   - `ConsumerClockRecovery` (`./ConsumerClockRecovery.ts`) — owns the
+ *     PLL: gains, integral term, offset estimate.
+ *   - `AdaptiveFlowController` (`./AdaptiveFlowController.ts`) — owns the
+ *     flow-scale PI loop + the Q16.16 encode. Composed by SpscRing, not
+ *     Bridge.
+ *
+ * Bridge<S> holds one `SpscRing<S>` as `this.ring`, one `FrameSmoother<S>`
+ * as `this.smoother`, and one `ConsumerClockRecovery` as `this.pll`. It
+ * orchestrates the ring pull + (optional) invariant dispatch + smoother /
+ * PLL call. The protocol-level documentation lives at the top of each
+ * extracted class.
+ *
+ * Bridge<S> retains the orchestration-only surface that is NOT a single
+ * heap state machine:
+ *
+ *   - The pull-family methods (`pull`, `pullLatest`, `pullSmoothed`,
+ *     `pullLatestSmoothed`) and named skip-policy resolution.
  *   - Schema-invariant classifier (`_classifyInvariant` + epsilon floor)
- *     and the raw / smoothed invariant handlers.
- *   - PLL (`observeConsumerTime`, `phaseLockedTime`, `resetPll`).
+ *     and the raw / smoothed invariant handlers (which dispatch onto
+ *     FrameSmoother).
+ *   - PLL dispatch (`observeConsumerTime`, `phaseLockedTime`, `resetPll`).
  *   - Per-frame trajectory evaluator (`evaluateInto`, `scratchEvaluatedFrame`,
  *     `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `setSampleRate`,
  *     `resetEvalCache`).
- *   - `telemetry()` snapshot (gathers from both Bridge state and the inner
- *     ring).
+ *   - `telemetry()` snapshot (gathers from the ring + the PLL + the
+ *     smoother + the ring's flow controller via existing accessors).
  *
- * SpscRing is **internal-only** at 0.6.8 — not exported from `src/index.ts`.
- * 0.6.9 will split `FrameSmoother` / `ConsumerClockRecovery` /
- * `AdaptiveFlowController` out of Bridge along the same seam; 0.6.10
- * promotes the composable primitives to the public API.
+ * SpscRing, FrameSmoother, ConsumerClockRecovery, and AdaptiveFlowController
+ * are all **internal-only** through 0.6.9 — not exported from `src/index.ts`.
+ * 0.6.10 is the deliberate promotion patch that lifts them to the public
+ * composable API.
  *
  * ─── Smoothed pulls (α-smoother as first-class API) ─────────────────────
  *
@@ -105,33 +124,33 @@
  *
  *   ok:    delta < max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)   pass through
  *   soft:  delta < INVARIANT_SOFT_THRESHOLD · |stored|                       smoother fires with computed α
- *   hard:  otherwise, or NaN/Infinity on either side                         fallback to consumerPrev + tornFrames++
+ *   hard:  otherwise, or NaN/Infinity on either side                         fallback to FrameSmoother's prev + tornFrames++
  *
  * `absoluteEpsilon` is set per-schema via `.withInvariant(fn, { absoluteEpsilon })`
  * (default `1e-12`); relative error stays primary, the absolute floor catches
  * subnormal-zero rounding residues.
  *
- * Soft errors invoke `_applySmoother` against the unified `consumerPrev`
+ * Soft errors invoke `smoother.observe(out, α)` against the unified prev
  * buffer with `α = clamp(INVARIANT_SOFT_ALPHA_BASE / |ratio−1|, 0, 1)`. The
  * curve picks α near the OK boundary so tiny deviations pass through
  * essentially raw, and α near 0 at the hard boundary so the smoother
  * basically trusts prev when the corruption is severe. The smoother is the
- * same primitive as for `pullSmoothed` (lifted from 0.4.1) — single field-
- * type-dispatched blend loop, no extra surface.
+ * same FrameSmoother instance the smoothed-pull family uses (0.6.9 extract)
+ * — single field-type-dispatched blend loop, no extra surface.
  *
- * Hard errors copy `consumerPrev` into `out` (last-known-good fallback) and
- * increment the torn_frame_counter via `ring.incrementTornFrameCount()`. The
- * producer is unaffected; the consumer's downstream sees a stale-but-trusted
- * frame instead of a corrupt one. If `consumerPrev` is not yet valid (first
- * pull ever was a hard error), the raw payload passes through and tornFrames
- * still increments so the failure is visible in telemetry.
+ * Hard errors invoke `smoother.fallbackInto(out)` (copies prev into out
+ * when valid; pass-through when prev not yet seeded) and increment the
+ * torn_frame_counter via `ring.incrementTornFrameCount()`. The producer
+ * is unaffected; the consumer's downstream sees a stale-but-trusted frame
+ * instead of a corrupt one. If prev is not yet valid (first pull ever was
+ * a hard error), the raw payload passes through and tornFrames still
+ * increments so the failure is visible in telemetry.
  *
  * Cost when not opted in. Zero. Schemas without `.withInvariant(...)` have
  * `schema.invariant === null`; the push/pull paths short-circuit the
- * invariant block in a single null-check. The unified `consumerPrev`
- * buffer is also not allocated for no-invariant schemas (raw pulls keep
- * the 0.4.1 "flip valid=false" behavior; the smoother allocates lazily on
- * its own first call as before).
+ * invariant block in a single null-check. The FrameSmoother allocates its
+ * prev buffer lazily on first use, so no-invariant schemas that never call
+ * a smoothed pull never pay the allocation either.
  *
  * ─── Phase-locked loop (0.6.2, Pillar 2 first cut — offset only) ────────
  *
@@ -183,7 +202,6 @@
 
 import {
   kindTsType,
-  type CompiledField,
   type FieldKind,
   type FieldsObject,
   type FrameFor,
@@ -199,6 +217,8 @@ import {
   SpscRing,
   type BridgeAllocation as SpscBridgeAllocation,
 } from "./SpscRing.js";
+import { FrameSmoother } from "./FrameSmoother.js";
+import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 import { evaluateTrajectoryInto } from "./trajectory.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
@@ -222,13 +242,9 @@ const INVARIANT_OK_THRESHOLD = 1e-3;
 const INVARIANT_SOFT_THRESHOLD = 1.0;
 const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
 
-// PLL controller gains. See file header "Phase-locked loop" for the
-// derivation; same anti-windup shape as the ring's flow-scale controller
-// but tuned for the offset signal.
-const PLL_KP = 0.2;
-const PLL_KI = 0.01;
-// Anti-windup: cap |integral| at 1 ms (= 1e6 ns) in residual-units.
-const PLL_INT_LIMIT_NS = 1e6;
+// PLL controller gains + anti-windup constants now live on
+// `ConsumerClockRecovery` (see `./ConsumerClockRecovery.ts`). Bridge holds
+// one as `this.pll` and delegates observe / phaseLockedTime / reset.
 
 /** Skip-scaling policy for `pullLatestSmoothed` (0.6.6). Controls how the
  *  effective α responds when the consumer drains more than one frame in a
@@ -315,58 +331,24 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    *  layers the smoother / PLL / invariant classifier / evaluator on top. */
   private readonly ring: SpscRing<S>;
 
-  /** Compiled array / scalar layouts mirrored locally for the heap-side
-   *  smoother + evaluator + invariant-handler walks. The same arrays live
-   *  on the inner ring; Bridge keeps independent references so the blend
-   *  loops don't need to reach across. */
-  private readonly arrayLayout: ReadonlyArray<CompiledField>;
-  private readonly scalarLayout: ReadonlyArray<CompiledField>;
+  /** Consumer-side α-smoother + unified prev buffer (0.6.9 extract). Owns
+   *  the trajectory-aware blender, the BigInt / integer / float
+   *  classification tables, and the prev frame that backs both the
+   *  smoothed-pull path and the schema-invariant hard-error fallback. See
+   *  `./FrameSmoother.ts`. */
+  private readonly smoother: FrameSmoother<S>;
 
-  /** Unified consumer-side cached prev frame, used by both the α-smoother
-   *  (pullSmoothed / pullLatestSmoothed) and the schema-invariant hard-
-   *  error recovery path (pull-family under `.withInvariant` schemas).
-   *  Lazily allocated on first use; persists across calls.
-   *
-   *  Lifecycle:
-   *   - Raw pull (no invariant): valid → false on every call. Buffer
-   *     retained for the next smoothed call to re-seed without allocation.
-   *   - Raw pull (with invariant): on ok, out is copied into consumerPrev
-   *     (valid=true). On soft error, smoother runs (consumerPrev gets the
-   *     blended output). On hard error, consumerPrev → out, valid unchanged.
-   *   - Smoothed pull: smoother runs every time, consumerPrev = blended
-   *     output. On invariant hard error, consumerPrev → out, valid unchanged.
-   *
-   *  See file headers "Smoothed pulls" + "Schema invariants". */
-  private consumerPrev: FrameFor<S> | null = null;
-  private consumerPrevValid: boolean = false;
-  /** Precomputed per-scalar/per-array smoother classification. Computed in
-   *  the constructor in `scalarLayout` / `arrayLayout` order so the blend
-   *  loops are a tight indexed walk. `isBigInt` ⇒ verbatim pass-through;
-   *  `isInteger` ⇒ Math.round after blend; otherwise float-domain blend. */
-  private readonly scalarIsBigInt: ReadonlyArray<boolean>;
-  private readonly scalarIsInteger: ReadonlyArray<boolean>;
-  private readonly arrayIsBigInt: ReadonlyArray<boolean>;
-  private readonly arrayIsInteger: ReadonlyArray<boolean>;
-  /** Per-array-field trajectory order, in `arrayLayout` order. 0 for
-   *  non-trajectory arrays and order=1 trajectories (both blend every
-   *  element identically — order=1 is byte-compatible with a plain array
-   *  of positions). 2 / 3 for higher-order trajectories: the smoother
-   *  blends only the position lanes (every Nth element starting at 0) and
-   *  copies derivative lanes (velocity, acceleration) verbatim from curr. */
-  private readonly arrayTrajectoryOrder: ReadonlyArray<number>;
-
-  /** PLL state — consumer-side phase-locked loop tracking the offset between
-   *  the producer's `tMacroNs` clock and the consumer's wall clock (typically
-   *  AudioContext.currentTime in ns). Heap-only; lanes 4-7 of the header
-   *  remain reserved in this release. See file header "Phase-locked loop". */
-  private pllOffsetNs: number = 0;
-  private pllIntegral: number = 0;
-  private pllLocked: boolean = false;
+  /** Consumer-side PLL (0.6.9 extract). Owns the offset estimate, the PI
+   *  integrator, and the lock flag. Bridge delegates `observeConsumerTime`,
+   *  `phaseLockedTime`, and `resetPll` here; `telemetry()` reads
+   *  `pll.locked` / `pll.offsetNs` for the snapshot. See
+   *  `./ConsumerClockRecovery.ts`. */
+  private readonly pll: ConsumerClockRecovery = new ConsumerClockRecovery();
 
   /** Cached raw frame for `pullEvaluatedLatest` / `evaluateAtSampleOffset`.
    *  Lazily allocated on first `pullEvaluatedLatest`. Persists across calls.
-   *  Independent of `consumerPrev` — that field has its own lifecycle for
-   *  the α-smoother and invariant fallback. (0.6.5) */
+   *  Independent of the FrameSmoother's prev buffer — that has its own
+   *  lifecycle for the α-smoother and invariant fallback. (0.6.5) */
   private cachedRawFrame: FrameFor<S> | null = null;
   /** True iff `cachedRawFrame` holds a valid pulled frame and the
    *  cachedTimestampNs / cachedBaseConsumerNs / cachedSampleRate triple is
@@ -401,48 +383,16 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     this.schema = this.ring.schema;
     this.frameByteSize = this.ring.frameByteSize;
 
-    // Split compiled fields into scalars and arrays, preserve order. The
-    // inner SpscRing maintains the same partition for its own hot path; we
-    // build an independent mirror so the smoother / evaluator / invariant
-    // handler walk doesn't need to reach across the seam.
-    const scalars: CompiledField[] = [];
-    const arrays: CompiledField[] = [];
-    for (const f of schema.compiled.fields) {
-      if (f.isArray) arrays.push(f);
-      else scalars.push(f);
-    }
-    this.scalarLayout = Object.freeze(scalars);
-    this.arrayLayout = Object.freeze(arrays);
-
     this.invariantAbsoluteEpsilon = schema.invariant !== null
       ? schema.invariant.absoluteEpsilon
       : 0;
 
-    // Precompute smoother classification flags. f64 / f32 ⇒ float-domain
-    // blend; integer-typed numeric kinds ⇒ blend in float then Math.round;
-    // BigInt kinds (u64 / i64) ⇒ skip blending, pass through verbatim.
-    this.scalarIsBigInt = Object.freeze(
-      scalars.map((f) => kindTsType(f.kind) === "bigint"),
-    );
-    this.scalarIsInteger = Object.freeze(
-      scalars.map((f) => f.kind !== "f64" && f.kind !== "f32" && kindTsType(f.kind) !== "bigint"),
-    );
-    this.arrayIsBigInt = Object.freeze(
-      arrays.map((f) => kindTsType(f.kind) === "bigint"),
-    );
-    this.arrayIsInteger = Object.freeze(
-      arrays.map((f) => f.kind !== "f64" && f.kind !== "f32" && kindTsType(f.kind) !== "bigint"),
-    );
-    // Trajectory order per array field. 0 means "blend every element" — used
-    // for non-trajectory arrays and for order=1 trajectories (positions only,
-    // byte-identical to a plain array). ≥2 selects the strided-blend path in
-    // `_applySmoother` so velocity / acceleration lanes pass through verbatim.
-    this.arrayTrajectoryOrder = Object.freeze(
-      arrays.map((f) => {
-        const order = f.trajectory?.order ?? 0;
-        return order >= 2 ? order : 0;
-      }),
-    );
+    // FrameSmoother owns the consumer-side prev buffer + classification
+    // tables + the trajectory-aware blender. Pass `scratchFrame` as the
+    // allocate-factory so the smoother and the rest of the bridge share a
+    // single allocation path (scratchFrame is the canonical heap-side
+    // frame allocator).
+    this.smoother = new FrameSmoother<S>(schema, () => this.scratchFrame());
   }
 
   /** Byte size needed for a ring of `(capacity, schema)`. */
@@ -539,7 +489,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     } else {
       // No invariant: raw pull invalidates the smoother's prev — next
       // smoothed call re-seeds. Allocation-free; prev buffer retained.
-      this.consumerPrevValid = false;
+      this.smoother.reset();
     }
     return true;
   }
@@ -560,7 +510,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     } else {
       // No invariant: raw pullLatest invalidates the smoother's prev — next
       // smoothed call re-seeds. Allocation-free; prev buffer is retained.
-      this.consumerPrevValid = false;
+      this.smoother.reset();
     }
     return r.skipped;
   }
@@ -665,7 +615,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    *     still increments so the failure is visible in `telemetry()`.
    */
   resetSmoother(): void {
-    this.consumerPrevValid = false;
+    this.smoother.reset();
   }
 
   /**
@@ -686,23 +636,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    * from an AudioWorklet's `process()` loop.
    */
   observeConsumerTime(consumerNs: number, producerNs: number): void {
-    if (!Number.isFinite(consumerNs) || !Number.isFinite(producerNs)) {
-      throw new Error(
-        `observeConsumerTime: arguments must be finite (consumerNs=${consumerNs}, producerNs=${producerNs})`,
-      );
-    }
-    if (!this.pllLocked) {
-      this.pllOffsetNs = producerNs - consumerNs;
-      this.pllIntegral = 0;
-      this.pllLocked = true;
-      return;
-    }
-    const residual = (producerNs - consumerNs) - this.pllOffsetNs;
-    let integral = this.pllIntegral + residual;
-    if (integral > PLL_INT_LIMIT_NS) integral = PLL_INT_LIMIT_NS;
-    else if (integral < -PLL_INT_LIMIT_NS) integral = -PLL_INT_LIMIT_NS;
-    this.pllIntegral = integral;
-    this.pllOffsetNs += PLL_KP * residual + PLL_KI * integral;
+    this.pll.observe(consumerNs, producerNs);
   }
 
   /**
@@ -712,8 +646,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    * at least once; before that, returns `consumerNs` unchanged.
    */
   phaseLockedTime(consumerNs: number): number {
-    if (!this.pllLocked) return consumerNs;
-    return consumerNs + this.pllOffsetNs;
+    return this.pll.phaseLockedTime(consumerNs);
   }
 
   /**
@@ -721,9 +654,7 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    * call seeds the offset from scratch.
    */
   resetPll(): void {
-    this.pllLocked = false;
-    this.pllOffsetNs = 0;
-    this.pllIntegral = 0;
+    this.pll.reset();
   }
 
   /**
@@ -934,96 +865,6 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   }
 
   /**
-   * Apply the one-pole blend in-place on `out` and update `consumerPrev`.
-   *
-   * Called by `pullSmoothed` / `pullLatestSmoothed` after the SAB read +
-   * release-store have completed (SpscRing handles both). `out` arrives
-   * holding the raw fresh frame (curr); on exit it holds the blended frame,
-   * and `this.consumerPrev` mirrors it. Allocation-free in steady state;
-   * the first call allocates the prev buffer via `scratchFrame()` (heap
-   * typed arrays + scalar zeros), seeds it with curr, and flips
-   * `consumerPrevValid` true.
-   */
-  private _applySmoother(out: Record<string, unknown>, alpha: number): void {
-    if (!this.consumerPrevValid) {
-      // First smoothed call (or first after invalidation): no blend, just
-      // seed prev with the current fresh frame. Allocate prev if needed.
-      if (this.consumerPrev === null) {
-        this.consumerPrev = this.scratchFrame();
-      }
-      this._copyFrameInto(out, this.consumerPrev as unknown as Record<string, unknown>);
-      this.consumerPrevValid = true;
-      return;
-    }
-    const prev = this.consumerPrev as unknown as Record<string, unknown>;
-    const oneMinusAlpha = 1 - alpha;
-    // Scalars.
-    const sl = this.scalarLayout;
-    const sbi = this.scalarIsBigInt;
-    const sii = this.scalarIsInteger;
-    for (let i = 0; i < sl.length; i++) {
-      const name = sl[i]!.name;
-      if (sbi[i]) {
-        // BigInt — verbatim pass-through. `out` already holds curr; sync prev.
-        prev[name] = out[name];
-      } else {
-        const curr = out[name] as number;
-        const p = prev[name] as number;
-        let blended = alpha * curr + oneMinusAlpha * p;
-        if (sii[i]) blended = Math.round(blended);
-        out[name] = blended;
-        prev[name] = blended;
-      }
-    }
-    // Arrays.
-    const al = this.arrayLayout;
-    const abi = this.arrayIsBigInt;
-    const aii = this.arrayIsInteger;
-    const ato = this.arrayTrajectoryOrder;
-    for (let i = 0; i < al.length; i++) {
-      const name = al[i]!.name;
-      if (abi[i]) {
-        const currArr = out[name] as { set(s: ArrayLike<bigint>): void } & ArrayLike<bigint>;
-        const prevArr = prev[name] as { set(s: ArrayLike<bigint>): void };
-        prevArr.set(currArr);
-      } else {
-        const cA = out[name] as { length: number; [j: number]: number };
-        const pA = prev[name] as { length: number; [j: number]: number };
-        const isInt = aii[i];
-        const L = cA.length;
-        const order = ato[i]!;
-        if (order === 0) {
-          // Plain array (or order=1 trajectory): blend every element.
-          for (let j = 0; j < L; j++) {
-            let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
-            if (isInt) b = Math.round(b);
-            cA[j] = b;
-            pA[j] = b;
-          }
-        } else {
-          // Trajectory order=2 or order=3. Layout is interleaved:
-          //   order=2 → [p, v, p, v, ...]; order=3 → [p, v, a, p, v, a, ...].
-          // Blend positions (`j % order === 0`) and copy derivative slots
-          // verbatim from curr. Velocity and acceleration are snapshots of
-          // the producer's instantaneous state — time-averaging them across
-          // frames corrupts the very signal the trajectory ships to preserve.
-          for (let j = 0; j < L; j++) {
-            if ((j % order) === 0) {
-              let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
-              if (isInt) b = Math.round(b);
-              cA[j] = b;
-              pA[j] = b;
-            } else {
-              // Derivative slot: out already holds curr; sync prev to match.
-              pA[j] = cA[j]!;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /**
    * Classify a stored vs computed invariant ratio into ok / soft / hard +
    * the soft-recovery α.
    *
@@ -1079,8 +920,8 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   /**
    * Invariant handler for raw pulls (`pull` / `pullLatest`) under an
    * invariant-enabled schema. Called after release-store and notify (both
-   * issued by SpscRing). Only touches heap state (`consumerPrev`,
-   * `consumerPrevValid`, the ring's tornFrameCounter lane via
+   * issued by SpscRing). Only touches heap state (the FrameSmoother's prev
+   * buffer, the ring's tornFrameCounter lane via
    * `ring.incrementTornFrameCount`).
    */
   private _invariantHandleRaw(
@@ -1092,30 +933,27 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     const computed = inv.compute(out);
     const { kind, alpha } = this._classifyInvariant(computed, invariantStored);
     if (kind === "ok") {
-      this._seedConsumerPrev(out);
+      this.smoother.seedFrom(out);
     } else if (kind === "soft") {
-      this._applySmoother(out, alpha);
+      this.smoother.observe(out, alpha);
     } else {
       // hard
       this.ring.incrementTornFrameCount();
-      if (this.consumerPrevValid && this.consumerPrev !== null) {
-        this._copyFrameInto(
-          this.consumerPrev as unknown as Record<string, unknown>,
-          out,
-        );
-      }
-      // else: pass through. Don't update consumerPrev (would propagate
-      // corruption). Next ok pull will (re-)seed.
+      // If prev is valid, replace `out` with the last-known-good frame.
+      // If not (first pull ever was a hard error), pass through unchanged
+      // and don't seed prev with corrupt data. The smoother's
+      // `fallbackInto` encapsulates both branches.
+      this.smoother.fallbackInto(out);
     }
   }
 
   /**
    * Invariant handler for smoothed pulls (`pullSmoothed` /
    * `pullLatestSmoothed`). Always runs the smoother on ok / soft / no-
-   * invariant; on hard error, falls back to consumerPrev (or passes through
-   * with smoother seeding when no prev). Soft-error α is the USER's α — the
-   * smoother is already smoothing; layering recovery-α on top is
-   * unnecessary (the smoother's α gate handles minor deviations).
+   * invariant; on hard error, falls back via `smoother.fallbackInto(out)`
+   * (copies prev when valid; pass-through when no prev). Soft-error α is
+   * the USER's α — the smoother is already smoothing; layering recovery-α
+   * on top is unnecessary (the smoother's α gate handles minor deviations).
    */
   private _invariantHandleSmoothed(
     out: Record<string, unknown>,
@@ -1124,53 +962,21 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
   ): void {
     if (this.schema.invariant === null) {
       // No invariant: behavior identical to 0.5.0 smoothed pull.
-      this._applySmoother(out, alpha);
+      this.smoother.observe(out, alpha);
       return;
     }
     const computed = this.schema.invariant.compute(out);
     const { kind } = this._classifyInvariant(computed, invariantStored);
     if (kind === "hard") {
       this.ring.incrementTornFrameCount();
-      if (this.consumerPrevValid && this.consumerPrev !== null) {
-        this._copyFrameInto(
-          this.consumerPrev as unknown as Record<string, unknown>,
-          out,
-        );
-      }
-      // else: pass through; don't seed prev with corrupt data.
+      // If prev is valid, replace `out` with the last-known-good frame.
+      // If not, pass through unchanged. Either way, don't seed prev with
+      // corrupt data.
+      this.smoother.fallbackInto(out);
       return;
     }
     // ok or soft: smoother handles both. Identical to no-invariant path.
-    this._applySmoother(out, alpha);
-  }
-
-  /** Allocate-on-demand seed of `consumerPrev` from `src`. */
-  private _seedConsumerPrev(src: Record<string, unknown>): void {
-    if (this.consumerPrev === null) this.consumerPrev = this.scratchFrame();
-    this._copyFrameInto(
-      src,
-      this.consumerPrev as unknown as Record<string, unknown>,
-    );
-    this.consumerPrevValid = true;
-  }
-
-  /** Copy `src` into `dst` field-by-field. Used to seed `consumerPrev` on
-   *  the first smoothed call or invariant ok-branch. Scalars are plain
-   *  assigns; arrays use typed-array `.set()` so length / element-kind
-   *  validation happens at the runtime layer (`dst` is always a freshly-
-   *  allocated `scratchFrame()`). */
-  private _copyFrameInto(
-    src: Record<string, unknown>,
-    dst: Record<string, unknown>,
-  ): void {
-    for (const f of this.scalarLayout) {
-      dst[f.name] = src[f.name];
-    }
-    for (const f of this.arrayLayout) {
-      (dst[f.name] as { set: (s: ArrayLike<number> | ArrayLike<bigint>) => void }).set(
-        src[f.name] as ArrayLike<number> | ArrayLike<bigint>,
-      );
-    }
+    this.smoother.observe(out, alpha);
   }
 
   /** Number of frames currently buffered (≤ capacity). */
@@ -1232,11 +1038,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       capacity: this.capacity,
       writeIndex: this.ring.writeIndexUnsigned(),
       readIndex: this.ring.readIndexUnsigned(),
-      // PLL fields are heap-only on this Bridge instance — a peer reading
+      // PLL fields are heap-only on this Bridge instance (gathered from
+      // the composed ConsumerClockRecovery as of 0.6.9). A peer reading
       // their own Bridge's telemetry sees their own PLL state. Lanes 4-5
       // are still reserved; cross-process observability lands in a follow-up.
-      pllLocked: this.pllLocked,
-      pllOffsetNs: this.pllOffsetNs,
+      pllLocked: this.pll.locked,
+      pllOffsetNs: this.pll.offsetNs,
     });
   }
 
