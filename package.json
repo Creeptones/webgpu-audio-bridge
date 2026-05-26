@@ -27,6 +27,7 @@
     "test:browser": "playwright test --config tests/browser/playwright.config.ts",
     "bench": "tsx bench/Bridge.bench.ts && tsx bench/Float64RingBuffer.bench.ts",
     "bench:e2e": "node bench/e2e-latency/serve.mjs",
+    "bench:notify-cost": "node bench/notify-cost-browser/serve.mjs",
     "dev:demo": "node examples/minimal/serve.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"

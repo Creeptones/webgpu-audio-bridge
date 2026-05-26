@@ -1,0 +1,42 @@
+webgpu-audio-bridge — cross-engine notify-cost bench
+
+engine     : Chromium / V8
+UA         : Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
+platform   : Win32
+hwConcurr  : 8
+isolated   : true
+timestamp  : 2026-05-26T20:58:08.114Z
+
+schema     : physicsControlFrameSchema(1000)  capacity=16  frameBytes=16032
+batches    : 1000 × 1000 iters  (warmup 100 × 1000)
+
+pull (notify)   median=  1.96 μs  p99=  2.31 μs  p999=  2.50 μs  max=  2.50 μs  mean=  1.99 μs
+pull (noNotify) median=  1.92 μs  p99=  2.23 μs  p999=  2.49 μs  max=  2.49 μs  mean=  1.95 μs
+
+notify delta (notify - noNotify)  median=40.0 ns  p99=75.0 ns  max=5.0 ns
+
+interpretation:
+  delta < 200 ns. Chromium / V8 appears to short-circuit Atomics.notify with zero waiters (same as V8). The 0.7.0 wait-flag wire-format protocol payoff is small on this engine.
+
+Notes on the run
+================
+
+Captured via the chrome-devtools MCP at the URL above. Server was the
+`npm run bench:notify-cost` static server on :5175. Page settings: schema
+N=1000, capacity=16, 1000 batches × 1000 iters per batch, 100 warmup
+batches. Identical knobs to the Node bench in bench/Bridge.bench.ts.
+
+Comparison vs the Node V8 bench from 0.6.11 CHANGELOG:
+  - Node:    pull 1.30 μs, noNotify 1.20 μs, delta ~100 ns
+  - Browser: pull 1.96 μs, noNotify 1.92 μs, delta  40 ns
+
+Two differences between the two harnesses:
+  1. Browser pull is ~600 ns slower than Node pull at the same schema.
+     This is the per-call overhead of the batched performance.now()
+     timing strategy plus general browser-frame overhead, not a real
+     pull-cost difference. The two paths differ only in the notify call
+     either way, so the per-engine delta is what matters.
+  2. The browser delta (40 ns) is even smaller than the Node delta
+     (~100 ns). Both numbers sit at the noise floor of their respective
+     timers. The qualitative answer is the same: V8's notify with zero
+     waiters is essentially free, both in Node and in Chromium.

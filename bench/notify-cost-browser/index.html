@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>webgpu-audio-bridge — cross-engine notify-cost bench</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.45; max-width: 980px; }
+      h1 { font-size: 18px; margin: 0 0 12px; color: #fff; }
+      h2 { font-size: 12px; margin: 22px 0 6px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { margin: 6px 0; font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 8px 14px; font: inherit; font-size: 12px; border-radius: 4px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      pre { background: #15171c; border: 1px solid #21252d; border-radius: 4px; padding: 12px 14px; font-size: 11.5px; margin: 0; overflow-x: auto; white-space: pre; }
+      .controls { margin: 8px 0 16px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+      .controls label { font-size: 12px; color: #9aa3ad; }
+      .controls input, .controls select { background: #15171c; color: #d4d7dc; border: 1px solid #21252d; padding: 4px 8px; font: inherit; font-size: 12px; margin-left: 4px; }
+      code { background: #15171c; padding: 0 4px; border-radius: 2px; }
+      .small { color: #6f7986; font-size: 12px; }
+      .warn { color: #f0a050; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — cross-engine notify-cost bench</h1>
+    <p>
+      Isolates the cost of <code>Atomics.notify(read_index)</code> on the consumer hot
+      path by comparing the public <code>SpscRing.pull()</code> against the dev-only
+      <code>_pullNoNotify()</code> shim (same body, notify call omitted). Reports the
+      <strong>per-engine</strong> delta — the headline input for the 0.7.0 wait-flag
+      wire-format decision.
+    </p>
+    <p class="small">
+      Node bench (V8 on Windows) measures the delta at ~100 ns. This page exists to
+      check whether that generalizes to JavaScriptCore (Safari + iOS) and
+      SpiderMonkey (Firefox). If Safari shows a much larger delta (because JSC
+      doesn't short-circuit empty wait-lists internally), the wait-flag protocol
+      becomes clearly worth it. If all three engines land near ~100 ns, the
+      protocol's payoff is small everywhere and lane 4 stays unmotivated.
+    </p>
+    <p class="warn" id="isoBanner"></p>
+
+    <div class="controls">
+      <label>schema N
+        <input id="n" type="number" value="1000" min="1" max="4096" step="1" />
+      </label>
+      <label>capacity
+        <select id="capacity">
+          <option>4</option><option selected>16</option><option>64</option><option>256</option>
+        </select>
+      </label>
+      <label>batch iters
+        <input id="batchIters" type="number" value="1000" min="100" max="100000" step="100" />
+      </label>
+      <label>batches
+        <input id="batches" type="number" value="1000" min="100" max="10000" step="100" />
+      </label>
+      <label>warmup batches
+        <input id="warmupBatches" type="number" value="100" min="10" max="1000" step="10" />
+      </label>
+    </div>
+
+    <button id="run">Run</button>
+    <button id="copy">Copy report</button>
+    <span id="progress" class="small"></span>
+
+    <h2>Report</h2>
+    <pre id="report">(not running)</pre>
+
+    <h2>How the per-iteration cost is derived</h2>
+    <p class="small">
+      <code>performance.now()</code> has 5 μs resolution in Chromium and 20 μs in
+      Firefox on a crossOriginIsolated origin (and 1 ms in Safari without
+      <code>--enable-features=…</code> overrides). That is far too coarse to
+      measure a 100 ns per-call delta directly. The harness instead times batches
+      of <em>batchIters</em> push+pull pairs each (default 1000, ≈1.2 ms per batch
+      on V8), divides by <em>batchIters</em>, and treats each batch as one
+      sample. Reporting medians + p99 + p999 + max across <em>batches</em> samples
+      gives a stable per-iteration figure even on engines with clamped clocks.
+    </p>
+    <p class="small">
+      The push cost is identical between the two paths, so it cancels in the
+      delta. The reported headline is <code>pull_median − noNotify_median</code>:
+      the per-pull cost of the trailing <code>Atomics.notify(read_index, 1)</code>
+      call on a no-waiter steady state.
+    </p>
+
+    <h2>What to record per engine</h2>
+    <p class="small">
+      Engine string + browser version + OS, then the report block. Paste them
+      into a fresh handoff document or PR description; the comparison across
+      engines is the actual deliverable, not any single engine's number.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

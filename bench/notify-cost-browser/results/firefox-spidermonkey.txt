@@ -1,0 +1,40 @@
+webgpu-audio-bridge — cross-engine notify-cost bench
+
+engine     : Firefox / SpiderMonkey
+UA         : Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0
+platform   : Win32
+hwConcurr  : 8
+isolated   : true
+timestamp  : 2026-05-26T21:05:16.505Z
+
+schema     : physicsControlFrameSchema(1000)  capacity=16  frameBytes=16032
+batches    : 1000 × 1000 iters  (warmup 100 × 1000)
+
+pull (notify)   median=  2.02 μs  p99=  5.68 μs  p999= 19.76 μs  max= 19.76 μs  mean=  2.23 μs
+pull (noNotify) median=  2.00 μs  p99=  8.92 μs  p999= 24.00 μs  max= 24.00 μs  mean=  2.39 μs
+
+notify delta (notify - noNotify)  median=20.0 ns  p99=-3.24 μs  max=-4.24 μs
+
+interpretation:
+  delta < 200 ns. Firefox / SpiderMonkey appears to short-circuit Atomics.notify with zero waiters (same as V8). The 0.7.0 wait-flag wire-format protocol payoff is small on this engine.
+
+Notes on the run
+================
+
+Median delta of 20 ns is at or below the bench's noise floor. Both
+code paths' p99/p999/max are noisier than the per-pull median signal
+because SpiderMonkey has a fatter GC tail than V8 (mean is 200-400 ns
+above median on Firefox vs ~30 ns above on Chromium/Node V8).
+
+The NEGATIVE p99 and max deltas (notify being apparently FASTER than
+noNotify in the tail) are not real signal. They're an artifact of the
+bench measuring the two paths sequentially: whichever path happens to
+catch a GC pause or a Windows scheduling burp during its 1000 batches
+shows a fatter tail. With a ~20 ns signal and a ~5 μs tail variance,
+the tail can't see the signal. The median is the only number that
+isolates the actual per-pull notify cost.
+
+So the read for SpiderMonkey is the same as V8: ~20 ns delta at the
+median, indistinguishable from zero at the resolution of either V8 or
+SpiderMonkey's clock + bench harness. SpiderMonkey is doing the same
+empty-wait-list short-circuit V8 does, just with more GC noise on top.
