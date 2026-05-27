@@ -82,6 +82,22 @@ export { BridgeProducer } from "./BridgeProducer.js";
 
 export { BridgeInputLane } from "./BridgeInputLane.js";
 
+// ── Audio-rate / block-rate consumption (0.7.13 — Track 3) ────────────────
+//
+// `BridgeBlockConsumer<S>` carves AudioWorklet-quantum-sized chunks (128
+// samples by convention) out of producer-side blocks (e.g. 1024 PCM
+// samples per frame from a GPU compute shader). Owns a per-sample cursor
+// inside the currently checked-out frame; pulls the next frame on cursor
+// exhaustion. Three underflow policies select what happens on ring-empty.
+// See src/BridgeBlockConsumer.ts header + README "Audio-rate mode" for
+// the latency floor math.
+
+export { BridgeBlockConsumer } from "./BridgeBlockConsumer.js";
+export type {
+  BlockUnderflowPolicy,
+  BridgeBlockConsumerOptions,
+} from "./BridgeBlockConsumer.js";
+
 // ── GPU readback automation (0.6.18) ──────────────────────────────────────
 //
 // The headline helper that closes the loop from "compute pass on the GPU"

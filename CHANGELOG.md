@@ -4,6 +4,183 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.13] — 2026-05-27
+
+### Added — `BridgeBlockConsumer<S>` (Track 3 of the King roadmap, first patch)
+
+First patch in the Track 3 cohort (audio-rate / block-rate
+consumption mode). Ships a thin consumer-side helper —
+`BridgeBlockConsumer<S>` — that carves AudioWorklet-quantum-sized
+chunks (128 samples by convention) out of larger producer-side
+blocks (e.g. 1024 PCM samples per frame from a GPU compute
+shader). The helper owns the per-sample cursor inside a checked-
+out frame and FIFO-pulls the next frame on cursor exhaustion, so
+a worklet's `process()` callback never has to think about frame
+boundaries:
+
+```ts
+const bridge   = new Bridge(sab, capacity, blockSchema);
+const consumer = new BridgeBlockConsumer(bridge);
+// AudioWorklet:
+process(_, outputs) {
+  consumer.process(outputs[0][0]); // 128-sample quantum
+  return true;
+}
+```
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/BridgeBlockConsumer.ts`** (new, ~200 LOC). Single
+  class `BridgeBlockConsumer<S>` parameterized over any Bridge
+  schema that declares **exactly one** `f32Array` field (the
+  samples block). Block size derives from that field's declared
+  length; zero or multiple `f32Array` fields throw a descriptive
+  error at construction. Multi-channel block schemas are
+  deliberately out of scope for this patch (a future patch may
+  add channel naming or interleaved-stride conventions; today's
+  helper is mono).
+
+  Public surface:
+  - `constructor(bridge, { underflowPolicy? })` — defaults
+    `'zero-fill'`.
+  - `process(out: Float32Array, count?: number): void` — fills
+    `out[0 .. count]` with successive samples (default
+    `out.length`); transparently crosses frame boundaries.
+  - `reset(): void` — discards the in-flight frame, cursor, and
+    telemetry counters.
+  - `framesConsumed(): number`, `underflowSamples(): number`,
+    `remainingInFrame(): number` — diagnostic accessors.
+  - Public readonly fields: `bridge`, `blockSize`,
+    `samplesField`, `underflowPolicy`.
+
+- **`BlockUnderflowPolicy`** is one of three:
+  - `'zero-fill'` (default) — write zeros for the unfilled
+    tail. Matches the AudioWorklet "return true and emit
+    silence" idiom; the worklet survives transient producer
+    stalls without termination.
+  - `'hold-last'` — repeat the most recently produced sample
+    for the unfilled tail. Smoother audible degradation under
+    brief glitches at the cost of a flat-line artifact under
+    prolonged underflow. First-call underflow (no samples
+    produced yet) emits zero.
+  - `'throw'` — throw a descriptive `Error` from the offending
+    `process()` call. Useful in tests / strict development;
+    production worklets should not select this (an unhandled
+    throw from `process()` permanently terminates the
+    AudioWorkletProcessor).
+
+- **`src/index.ts`** gains the new exports:
+  `BridgeBlockConsumer`, `BlockUnderflowPolicy`,
+  `BridgeBlockConsumerOptions`.
+
+- **`tests/BridgeBlockConsumer.test.ts`** (new). 13 pins
+  covering the entire helper surface — construction, schema
+  validation (zero and multiple `f32Array` fields both throw),
+  ramp continuity across 128-quantum boundaries, non-divisor
+  quanta (50-sample), multi-frame spans in a single
+  `process()`, each underflow policy independently, mid-quantum
+  underflow (partial real + zero-fill tail), `reset()`
+  semantics, telemetry counters, bounds validation, and
+  underflow-policy round-trip. The headline pin produces a
+  global integer ramp `0 .. F·blockSize − 1` across F frames
+  and asserts every consumed sample matches its expected ramp
+  value (no drop, no duplicate, no discontinuity).
+
+- **`package.json`** `test` and `test:unit` scripts gain
+  `tsx tests/BridgeBlockConsumer.test.ts` (positioned alongside
+  the other consumer-helper tests).
+
+### Why
+
+The user's "pure GPU synthesis" use case is the flagship for
+Track 3 — a compute shader writes a block of PCM samples per
+producer tick and the AudioWorklet plays them back at audio
+rate. Without this helper, the worklet has to track its own
+cursor inside a checked-out Bridge frame, pull the next frame
+when the cursor exhausts, and decide what to do on ring-empty —
+all on the audio thread, where allocation, branching, and
+exception handling are at their most expensive. The helper
+collapses that cursor + pull + underflow protocol into one
+`process(out)` call.
+
+Underflow policy as a constructor option rather than a
+caller-chosen branch matters: an AudioWorklet's `process()` runs
+in a hot path where adding "if (ringEmpty) … else …" on every
+quantum costs measurable branch-predictor pressure. By moving
+the decision to construction time (and storing it as a single
+enum field), V8's TurboFan can monomorphize the branch out of
+the hot path entirely. The three options cover the canonical
+audio-engine tradeoffs (silence vs. holdover vs. strict) without
+forcing the user to subclass.
+
+The "exactly one `f32Array` field" constraint is deliberate.
+Multi-channel block schemas have non-trivial design questions
+(channels-per-field vs. interleaved-in-one-field vs. per-channel
+ring) that should be decided against a real multi-channel
+consumer, not speculatively. Today's helper makes the
+single-channel case bulletproof; a follow-up patch can extend it
+when a flagship demo asks.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema
+extension, no protocol change. `BridgeBlockConsumer` composes a
+`Bridge<S>` instance through its public API (`bridge.pull` +
+`bridge.scratchFrame`) and uses the SAB layout exactly as the
+bridge does. A bridge driven through `BridgeBlockConsumer` is
+bit-for-bit interoperable with one driven through `bridge.pull`
+directly — useful for hybrid layouts that drive control-rate
+state and audio-rate blocks through separate bridge instances on
+the same audio thread.
+
+### Tests
+
+- `tests/BridgeBlockConsumer.test.ts` — 13 new pins as above.
+  All green first-run.
+- `tests/Bridge.test.ts` (63 single-thread pins) unchanged —
+  no Bridge-level surface this patch touched.
+- `tests/Bridge.concurrent.test.ts` (1M FIFO + 250k
+  drop-oldest cross-thread stresses) unchanged — the helper
+  sits above the SPSC protocol and doesn't move it.
+- `tests/Bridge.wasmEquivalence.test.ts` (15 WASM-vs-JS pins)
+  unchanged — the helper is pure JS, no WASM counterpart this
+  patch (a worklet using the helper instantiates the JS
+  `BridgeBlockConsumer` alongside the WASM decoder it already
+  drives).
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.12 (≈1.20
+μs). trajEval (fast) 1.20 μs < 1.25 μs budget. Notify-on-pull
+delta 100 ns. flow_scale recovery 33 cycles ≤ 100. No new bench
+cell — `BridgeBlockConsumer.process()`'s hot path is a single
+`Float32Array.prototype.set` from an internal subarray view into
+the caller's buffer (one `bridge.pull` per `blockSize` samples,
+amortized over 8 calls at 1024/128); cumulative cost stays well
+inside the audio quantum's ~2.67 ms budget at every realistic
+block size.
+
+### Documentation
+
+CHANGELOG entry above. Comprehensive file header on
+`src/BridgeBlockConsumer.ts` documents the schema constraint,
+the three underflow policies + their audible/operational
+tradeoffs, the cursor + checkout discipline, the latency floor
+math (`D · B / R` worst-case, 64 ms at D=3 / B=1024 / R=48000),
+and the wire-compatibility guarantee. README's "Audio-rate
+mode" section is intentionally deferred to 0.7.14 — the
+production-side `BridgeBlockProducer<S>` adapter + the
+`examples/audio-rate/` demo land there and the README section
+gains a worked end-to-end example alongside the latency table
+in one coherent README change.
+
+This opens Track 3. Next patch (0.7.14) ships the
+`BridgeBlockProducer<S>` adapter for `BridgeGPUSource`-shaped
+GPU readbacks plus the `examples/audio-rate/` demo + README
+"Audio-rate mode" section. Then Track 4 (`WriteTarget`
+scaffolding) and Track 5 (WebNN experimental adapter) close out
+the King roadmap in 0.7.15 → 0.7.17.
+
 ## [0.7.12] — 2026-05-27
 
 ### Added — CAS-aware drop-oldest WASM commits (Track 2 of the King roadmap, eighth patch)
