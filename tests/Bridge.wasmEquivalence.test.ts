@@ -37,8 +37,9 @@ import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/Bridge.js";
 import {
   defineSchema, f64, f32, u64, i64, u32, i32, u16, i16, u8, i8,
-  f64Array, f32Array, u32Array,
+  f64Array, f32Array, u32Array, f64TrajectoryArray,
 } from "../src/schema.js";
+import { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "../src/trajectory.js";
 import {
   allocateWorkletMemory,
   instantiateConsumer,
@@ -616,8 +617,281 @@ function main(): void {
     );
   }
 
+  // ── 9: f64 trajectory evaluator equivalence (0.7.9) ────────────────────
+  // The WASM evaluator exports must produce BIT-IDENTICAL output to
+  // the JS evaluateTrajectoryInto / evaluateHermiteTrajectoryInto
+  // helpers — same operation order, same f64 arithmetic, no FMA
+  // fusion (WebAssembly spec disallows implicit FMA in scalar ops;
+  // V8 honors this). The pin sweeps:
+  //
+  //   - Order 1/2/3 Taylor across multiple dt values to exercise
+  //     the per-order dispatch and the halfDt2 caching on order=3.
+  //   - Hermite at multiple (t, segmentSeconds) pairs to exercise
+  //     the caller-side basis-coefficient resolution.
+  //
+  // Source bytes for the WASM evaluator come from the trajectory's
+  // location inside an actual Bridge SAB slot (drained via the
+  // peek/commit dance), matching the production wiring. The JS
+  // evaluator reads the same bytes via the trajectory's flat
+  // typed-array.
+  {
+    const TRAJ_N = 24; // per-trajectory sample count
+    const trajSchema = defineSchema({
+      seq: u64(),
+      // Three trajectory fields, one per order.
+      tO1: f64TrajectoryArray(TRAJ_N, { order: 1 }),
+      tO2: f64TrajectoryArray(TRAJ_N, { order: 2 }),
+      tO3: f64TrajectoryArray(TRAJ_N, { order: 3 }),
+    });
+    const trajCapacity = 4;
+    const trajSabBytes = Bridge.byteLength(trajCapacity, trajSchema);
+    // Scratch: one dst region per order (n × 8 bytes each).
+    const dstBytesO1 = TRAJ_N * 8;
+    const dstBytesO2 = TRAJ_N * 8;
+    const dstBytesO3 = TRAJ_N * 8;
+    // Plus two Hermite dst regions (order=2 + order=3) for the Hermite sub-pin.
+    const dstBytesHermO2 = TRAJ_N * 8;
+    const dstBytesHermO3 = TRAJ_N * 8;
+    const totalScratch =
+      dstBytesO1 + dstBytesO2 + dstBytesO3 + dstBytesHermO2 + dstBytesHermO3;
+
+    const trajAlloc = allocateWorkletMemory({
+      sabBytes: trajSabBytes,
+      scratchBytes: totalScratch,
+    });
+    const trajBridge = new Bridge(trajAlloc.sab, trajCapacity, trajSchema);
+    const trajConsumer = instantiateConsumer(wasmBytes, trajAlloc.memory);
+
+    const headerBytes = 32;
+    const frameBytes = trajSchema.compiled.frameByteSize;
+    const mask = trajCapacity - 1;
+    const trajOff: Record<string, number> = {};
+    for (const f of trajSchema.compiled.fields) trajOff[f.name] = f.byteOffset;
+
+    // Carve the scratch into per-evaluator partitions.
+    const scratchBase = trajAlloc.scratchByteOffset!;
+    const dstO1Off = scratchBase;
+    const dstO2Off = dstO1Off + dstBytesO1;
+    const dstO3Off = dstO2Off + dstBytesO2;
+    const dstHermO2Off = dstO3Off + dstBytesO3;
+    const dstHermO3Off = dstHermO2Off + dstBytesHermO2;
+    const dstO1View = new Float64Array(trajAlloc.sab, dstO1Off, TRAJ_N);
+    const dstO2View = new Float64Array(trajAlloc.sab, dstO2Off, TRAJ_N);
+    const dstO3View = new Float64Array(trajAlloc.sab, dstO3Off, TRAJ_N);
+    const dstHermO2View = new Float64Array(trajAlloc.sab, dstHermO2Off, TRAJ_N);
+    const dstHermO3View = new Float64Array(trajAlloc.sab, dstHermO3Off, TRAJ_N);
+
+    const pushFrame = trajBridge.scratchFrame();
+    const pullFrame = trajBridge.scratchFrame();
+    // JS-side reference buffers — receive the JS evaluator output.
+    const jsRefO1 = new Float64Array(TRAJ_N);
+    const jsRefO2 = new Float64Array(TRAJ_N);
+    const jsRefO3 = new Float64Array(TRAJ_N);
+    const jsRefHermO2 = new Float64Array(TRAJ_N);
+    const jsRefHermO3 = new Float64Array(TRAJ_N);
+
+    // Helper to fill the trajectory flat arrays with a "physics-shaped"
+    // curve: position = sin(k·θ), velocity = ω·cos(k·θ),
+    // acceleration = −ω²·sin(k·θ). Distinct per-row θ so each
+    // frame's content is unique.
+    function fillTrajectories(row: number): void {
+      const theta = 0.13 + row * 0.041;
+      const omega = 2 * Math.PI * 3; // 3 Hz-equivalent rate
+      // Order 1: positions only
+      for (let k = 0; k < TRAJ_N; k++) {
+        pushFrame.tO1[k] = Math.sin(k * theta);
+      }
+      // Order 2: interleaved (p, v)
+      for (let k = 0; k < TRAJ_N; k++) {
+        const p = Math.sin(k * theta + row);
+        const v = omega * Math.cos(k * theta + row);
+        pushFrame.tO2[k * 2] = p;
+        pushFrame.tO2[k * 2 + 1] = v;
+      }
+      // Order 3: interleaved (p, v, a)
+      for (let k = 0; k < TRAJ_N; k++) {
+        const p = Math.cos(k * theta + row * 0.5);
+        const v = -omega * Math.sin(k * theta + row * 0.5);
+        const a = -omega * omega * Math.cos(k * theta + row * 0.5);
+        pushFrame.tO3[k * 3] = p;
+        pushFrame.tO3[k * 3 + 1] = v;
+        pushFrame.tO3[k * 3 + 2] = a;
+      }
+    }
+
+    // For Hermite we need TWO consecutive frames pre-staged.
+    const prevSlotByteBase = { val: 0 };
+    const currSlotByteBase = { val: 0 };
+
+    // ── 9a: Taylor o1/o2/o3 equivalence across multiple dt values ──────
+    const taylorRows = 5;
+    const dts = [0.0, 0.0008, 0.005, 0.012345, 0.0166667];
+    // Drain anything left in the ring.
+    while (trajBridge.pull(pullFrame)) { /* drain */ }
+
+    for (let r = 0; r < taylorRows; r++) {
+      fillTrajectories(r);
+      assert(trajBridge.push(pushFrame), `pin9a: push row ${r}`);
+
+      const slot = trajConsumer.peekPull(mask);
+      assert(slot >= 0, `pin9a: peekPull row ${r}`);
+      const slotBase = headerBytes + slot * frameBytes;
+
+      for (const dt of dts) {
+        // WASM o1: writes positions verbatim.
+        trajConsumer.evalTaylorF64O1(slotBase + trajOff.tO1!, dstO1Off, TRAJ_N);
+        evaluateTrajectoryInto(
+          pushFrame.tO1 as Float64Array,
+          trajSchema.compiled.fields.find((f) => f.name === "tO1")!.trajectory!,
+          dt,
+          jsRefO1,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(
+            dstO1View[k], jsRefO1[k],
+            `pin9a tO1[${k}] row=${r} dt=${dt}`,
+          );
+        }
+        // WASM o2: linear Taylor.
+        trajConsumer.evalTaylorF64O2(slotBase + trajOff.tO2!, dstO2Off, TRAJ_N, dt);
+        evaluateTrajectoryInto(
+          pushFrame.tO2 as Float64Array,
+          trajSchema.compiled.fields.find((f) => f.name === "tO2")!.trajectory!,
+          dt,
+          jsRefO2,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(
+            dstO2View[k], jsRefO2[k],
+            `pin9a tO2[${k}] row=${r} dt=${dt}`,
+          );
+        }
+        // WASM o3: quadratic Taylor.
+        trajConsumer.evalTaylorF64O3(slotBase + trajOff.tO3!, dstO3Off, TRAJ_N, dt);
+        evaluateTrajectoryInto(
+          pushFrame.tO3 as Float64Array,
+          trajSchema.compiled.fields.find((f) => f.name === "tO3")!.trajectory!,
+          dt,
+          jsRefO3,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(
+            dstO3View[k], jsRefO3[k],
+            `pin9a tO3[${k}] row=${r} dt=${dt}`,
+          );
+        }
+      }
+
+      // Remember this slot's byte base for the upcoming Hermite pin —
+      // shift curr → prev each iteration.
+      prevSlotByteBase.val = currSlotByteBase.val;
+      currSlotByteBase.val = slotBase;
+      trajConsumer.commitPull();
+    }
+    ok(
+      `wasm-taylor-f64-equivalence (${taylorRows} rows × ${dts.length} dts × 3 orders × ${TRAJ_N} samples)`,
+    );
+
+    // ── 9b: Hermite f64 equivalence across multiple (t, segmentSeconds) ──
+    // Push fresh frames so we have two valid slots to Hermite between.
+    // Re-fill the ring with two known rows, then iterate (t,
+    // segmentSeconds) pairs without draining (the two frames stay
+    // in-ring at known slots). Use Bridge.pull to inspect the slot
+    // byte offsets indirectly — we recompute them from the readIdx
+    // immediately after each peek so the consumer's eval call sees
+    // the same bytes the JS reference reads.
+    while (trajBridge.pull(pullFrame)) { /* drain */ }
+    fillTrajectories(100);
+    assert(trajBridge.push(pushFrame), "pin9b: push prev frame");
+    // Snapshot the pushed values for the JS reference (since pushFrame
+    // will be reused for the curr push below).
+    const pushPrevO2 = new Float64Array(pushFrame.tO2 as Float64Array);
+    const pushPrevO3 = new Float64Array(pushFrame.tO3 as Float64Array);
+    fillTrajectories(101);
+    assert(trajBridge.push(pushFrame), "pin9b: push curr frame");
+    const pushCurrO2 = new Float64Array(pushFrame.tO2 as Float64Array);
+    const pushCurrO3 = new Float64Array(pushFrame.tO3 as Float64Array);
+
+    // The first peek returns the slot of the older (prev) frame; the
+    // second peek (after commit) returns the curr frame.
+    const prevSlot = trajConsumer.peekPull(mask);
+    assert(prevSlot >= 0, "pin9b: peek prev");
+    const prevBase = headerBytes + prevSlot * frameBytes;
+    trajConsumer.commitPull();
+    const currSlot = trajConsumer.peekPull(mask);
+    assert(currSlot >= 0, "pin9b: peek curr");
+    const currBase = headerBytes + currSlot * frameBytes;
+
+    // Sweep Hermite eval coefficients over a representative set of
+    // (t, segmentSeconds) pairs.
+    const hermiteCases = [
+      { t: 0.0, segS: 1 / 60 },
+      { t: 0.25, segS: 1 / 60 },
+      { t: 0.5, segS: 1 / 60 },
+      { t: 0.75, segS: 1 / 60 },
+      { t: 1.0, segS: 1 / 60 },
+      { t: 0.3, segS: 0.001 },
+    ];
+    for (const { t, segS } of hermiteCases) {
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const h00 = 2 * t3 - 3 * t2 + 1;
+      const h10 = t3 - 2 * t2 + t;
+      const h01 = -2 * t3 + 3 * t2;
+      const h11 = t3 - t2;
+      const h10s = h10 * segS;
+      const h11s = h11 * segS;
+
+      // WASM Hermite over order=2 trajectory
+      trajConsumer.evalHermiteF64(
+        prevBase + trajOff.tO2!,
+        currBase + trajOff.tO2!,
+        dstHermO2Off,
+        TRAJ_N,
+        2,
+        h00, h10s, h01, h11s,
+      );
+      evaluateHermiteTrajectoryInto(
+        pushPrevO2, pushCurrO2,
+        trajSchema.compiled.fields.find((f) => f.name === "tO2")!.trajectory!,
+        t, segS, jsRefHermO2,
+      );
+      for (let k = 0; k < TRAJ_N; k++) {
+        assertEq(
+          dstHermO2View[k], jsRefHermO2[k],
+          `pin9b hermite-o2[${k}] t=${t} segS=${segS}`,
+        );
+      }
+
+      // WASM Hermite over order=3 trajectory (acceleration lane ignored)
+      trajConsumer.evalHermiteF64(
+        prevBase + trajOff.tO3!,
+        currBase + trajOff.tO3!,
+        dstHermO3Off,
+        TRAJ_N,
+        3,
+        h00, h10s, h01, h11s,
+      );
+      evaluateHermiteTrajectoryInto(
+        pushPrevO3, pushCurrO3,
+        trajSchema.compiled.fields.find((f) => f.name === "tO3")!.trajectory!,
+        t, segS, jsRefHermO3,
+      );
+      for (let k = 0; k < TRAJ_N; k++) {
+        assertEq(
+          dstHermO3View[k], jsRefHermO3[k],
+          `pin9b hermite-o3[${k}] t=${t} segS=${segS}`,
+        );
+      }
+    }
+    trajConsumer.commitPull();
+    ok(
+      `wasm-hermite-f64-equivalence (${hermiteCases.length} (t, segS) × 2 orders × ${TRAJ_N} samples)`,
+    );
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64 Taylor/Hermite trajectories in agreement with JS atomics.",
   );
 }
 

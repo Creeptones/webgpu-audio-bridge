@@ -274,6 +274,65 @@ export interface WorkletConsumer {
    *  not need to police caller layouts. */
   copyArray(srcOffset: number, dstOffset: number, byteCount: number): void;
 
+  /** f64 trajectory evaluators (0.7.9). Read `n` samples from the
+   *  trajectory's interleaved flat array at `srcOffset` and write `n`
+   *  evaluated f64 positions into `dstOffset`. Bit-identical to the
+   *  unclamped path of `evaluateTrajectoryInto` in `src/trajectory.ts`.
+   *
+   *    - `evalTaylorF64O1` — order=1 (positions only). `dt` is
+   *      accepted but ignored, matching the JS evaluator's case 1
+   *      semantics; the body is a `memory.copy` of `n × 8` bytes.
+   *    - `evalTaylorF64O2` — order=2 linear Taylor. `out[i] =
+   *      p_i + v_i · dt` for `i ∈ [0, n)`. Source layout is
+   *      `[p_0, v_0, p_1, v_1, …]` (16 bytes per sample).
+   *    - `evalTaylorF64O3` — order=3 quadratic Taylor. `out[i] =
+   *      p_i + v_i · dt + a_i · (½ · dt²)`. Source layout is
+   *      `[p_0, v_0, a_0, p_1, v_1, a_1, …]` (24 bytes per sample).
+   *
+   *  Canonical wiring per evaluation:
+   *    `srcOffset = RING_HEADER_BYTES + slot * frameByteSize +
+   *     trajectoryField.byteOffset`
+   *    `dstOffset = allocation.scratchByteOffset` (plus per-array
+   *     sub-offset if multiple trajectories share the scratch)
+   *  Caller wraps `dstOffset` in a `Float64Array(sab, dstOffset, n)`
+   *  view for typed reads. */
+  evalTaylorF64O1(srcOffset: number, dstOffset: number, n: number): void;
+  evalTaylorF64O2(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+  evalTaylorF64O3(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+
+  /** f64 cubic Hermite trajectory evaluator (0.7.9). Reads positions
+   *  and velocities from two consecutive trajectory frames at
+   *  `prevOffset` and `currOffset` and writes `n` interpolated f64
+   *  positions into `dstOffset`. Bit-identical to the JS
+   *  `evaluateHermiteTrajectoryInto`.
+   *
+   *  `strideElems` is the trajectory's element stride per sample
+   *  (= 2 for order=2, 3 for order=3 with the acceleration lane
+   *  ignored on the cubic path).
+   *
+   *  The basis coefficients are CALLER-COMPUTED ONCE per call and
+   *  passed in:
+   *     h00  = 2t³ − 3t² + 1
+   *     h10s = (t³ − 2t² + t) · segmentSeconds
+   *     h01  = −2t³ + 3t²
+   *     h11s = (t³ − t²) · segmentSeconds
+   *  Moving the basis-resolution math to JS keeps the WAT loop
+   *  branch-free (no per-call setup beyond pointer init) and lets
+   *  the caller cache coefficients across multiple Hermite evals at
+   *  the same t (e.g., draining several trajectory arrays from the
+   *  same frame pair). */
+  evalHermiteF64(
+    prevOffset: number,
+    currOffset: number,
+    dstOffset: number,
+    n: number,
+    strideElems: number,
+    h00: number,
+    h10s: number,
+    h01: number,
+    h11s: number,
+  ): void;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -324,6 +383,14 @@ export function instantiateConsumer(
     readonly read_i8: (off: number) => number;
     readonly read_u8: (off: number) => number;
     readonly copy_array: (srcOff: number, dstOff: number, byteCount: number) => void;
+    readonly eval_taylor_f64_o1: (srcOff: number, dstOff: number, n: number) => void;
+    readonly eval_taylor_f64_o2: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_taylor_f64_o3: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_hermite_f64: (
+      prevOff: number, currOff: number, dstOff: number,
+      n: number, strideElems: number,
+      h00: number, h10s: number, h01: number, h11s: number,
+    ) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -346,6 +413,10 @@ export function instantiateConsumer(
     "read_i8",
     "read_u8",
     "copy_array",
+    "eval_taylor_f64_o1",
+    "eval_taylor_f64_o2",
+    "eval_taylor_f64_o3",
+    "eval_hermite_f64",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -382,5 +453,13 @@ export function instantiateConsumer(
     readU8: (off) => exports.read_u8(off),
     copyArray: (srcOff, dstOff, byteCount) =>
       exports.copy_array(srcOff, dstOff, byteCount),
+    evalTaylorF64O1: (srcOff, dstOff, n) =>
+      exports.eval_taylor_f64_o1(srcOff, dstOff, n),
+    evalTaylorF64O2: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f64_o2(srcOff, dstOff, n, dt),
+    evalTaylorF64O3: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f64_o3(srcOff, dstOff, n, dt),
+    evalHermiteF64: (prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s) =>
+      exports.eval_hermite_f64(prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s),
   };
 }

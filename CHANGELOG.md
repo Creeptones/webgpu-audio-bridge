@@ -4,6 +4,148 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.9] — 2026-05-27
+
+### Added — WASM f64 trajectory evaluators (Track 2 of the King roadmap, fifth patch)
+
+Third payload-decode patch in the Track 2 cohort. The WASM
+consumer now evaluates `f64TrajectoryArray` fields end-to-end
+— both the single-frame Taylor extrapolation (orders 1, 2, 3)
+and the two-frame cubic Hermite reconstruction the 0.7.4 Track
+1 patch shipped. Output is bit-identical to the JS
+`evaluateTrajectoryInto` / `evaluateHermiteTrajectoryInto`
+helpers; spot-checked across 2088 sample comparisons
+(1800 Taylor + 288 Hermite). With this patch WASM covers every
+shape the public schema DSL declares except `f32`-flavored
+trajectories (mirrored in 0.7.10) and the invariant lane
+(0.7.11). SIMD vectorization of the order=2 paths lands in
+0.7.10 alongside the f32 mirrors.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`wasm/decoder.wat`** gains four new exports:
+  - `eval_taylor_f64_o1(srcOff, dstOff, n)` — order=1
+    position-only. Body is a `memory.copy` of `n × 8` bytes
+    (the source IS the output). The `dt` argument is omitted
+    from the signature since order=1 has no extrapolation;
+    matches the JS evaluator's `case 1` arm semantically.
+  - `eval_taylor_f64_o2(srcOff, dstOff, n, dt)` — order=2
+    linear Taylor `p + v · dt`. Scalar f64 loop over the
+    `[p_0, v_0, p_1, v_1, …]` interleaved layout (16 bytes
+    per sample).
+  - `eval_taylor_f64_o3(srcOff, dstOff, n, dt)` — order=3
+    quadratic Taylor `p + v · dt + a · (½ · dt²)`. Caches
+    `halfDt2 = 0.5 · dt · dt` once per call (matches the JS
+    evaluator). Scalar f64 loop over the
+    `[p_0, v_0, a_0, p_1, v_1, a_1, …]` interleaved layout
+    (24 bytes per sample).
+  - `eval_hermite_f64(prevOff, currOff, dstOff, n, stride,
+    h00, h10s, h01, h11s)` — cubic Hermite
+    `h00 · P_0 + h10s · M_0 + h01 · P_1 + h11s · M_1`. Basis
+    coefficients are CALLER-COMPUTED ONCE per call (JS-side
+    math; lets the caller cache across multiple trajectory
+    evals at the same t). `stride` accommodates both order=2
+    (= 2) and order=3 (= 3, acceleration lane ignored).
+    Scalar f64 loop.
+
+  All loads use `align=1` to handle the schema's tight packing
+  (a trajectory's flat array can land on any 4-byte boundary
+  inside a slot). Order=2 SIMD (process 2 samples per
+  `f64x2.mul` + `f64x2.add` after one shuffle pair) and the
+  f32 4-wide version land in 0.7.10 — bundling them together
+  lets a single patch own the SIMD authoring conventions for
+  the whole evaluator family.
+
+- **`src/worklet/index.ts`** `WorkletConsumer` interface gains
+  four typed methods mirroring the WAT exports:
+  `evalTaylorF64O1`, `evalTaylorF64O2`, `evalTaylorF64O3`,
+  `evalHermiteF64`. The Hermite signature exposes the basis
+  coefficient args (h00, h10s, h01, h11s) so JS callers can
+  precompute them once per (t, segmentSeconds) and reuse
+  across multiple trajectory fields in one frame pair.
+  Instantiation guard now validates all 21 exports.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds Pin 9:
+  - **Sub-pin 9a (Taylor)** — defines a 3-trajectory schema
+    (order 1, 2, 3), pushes 5 rows of physics-shaped curves
+    (`sin(k·θ)` positions with matching `cos` / `−sin`
+    derivatives), evaluates each order at 5 representative
+    `dt` values (0, 0.0008, 0.005, 0.012345, 0.0166667 — the
+    last being the 60 Hz period) and asserts WASM ===
+    `evaluateTrajectoryInto` bit-exactly. 5 × 5 × 3 × 24 =
+    1800 sample comparisons.
+  - **Sub-pin 9b (Hermite)** — pushes two consecutive frames,
+    sweeps 6 (t, segmentSeconds) pairs (covering t = 0, 0.25,
+    0.5, 0.75, 1 plus a tight `segS = 1 ms` case), evaluates
+    cubic Hermite over both order=2 and order=3 trajectory
+    fields, and asserts WASM === `evaluateHermiteTrajectoryInto`
+    bit-exactly. 6 × 2 × 24 = 288 sample comparisons.
+
+  All eight 0.7.8 pins still pass.
+
+### Why
+
+Trajectory evaluation is the deepest schema-decode path in
+the bridge — it's where Track 1 (Hermite) landed audible
+quality wins and where Track 2's eventual end-to-end-WASM
+hot path makes the most sense. Today's JS evaluator pays
+the typed-array-element-access tax 2-3 times per sample
+(loading `flat[2i]` + `flat[2i+1]` + writing `out[i]`); each
+access traverses TypedArray bounds-checking and the V8
+property lookup. The WASM equivalent compiles to direct
+`f64.load align=1` / `f64.store align=1` instructions —
+zero JS bookkeeping, fits in the L1 cache.
+
+The Hermite basis split (coefficients on the call signature
+rather than computed inside WAT) is a deliberate design
+choice: JS callers often hold (t, segmentSeconds) constant
+across multiple trajectory fields in a single frame pair
+(e.g., a `vEff` and `jEff` traj pair from the same physics
+frame), so resolving the basis once and reusing the four
+coefficients across two `evalHermiteF64` calls saves four
+multiplies + three subtracts per second trajectory.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout
+unchanged. The WASM trajectory evaluators read the EXACT
+same bytes the JS evaluator reads via the JS-side flat
+typed-array (`pushFrame.tO2`). A 0.7.8 producer interoperates
+bit-for-bit with a 0.7.9 consumer using the new evaluators,
+and vice-versa.
+
+### Tests
+
+Pin 9 covers 2088 sample comparisons across 5 dt values + 6
+Hermite (t, segS) pairs + all three Taylor orders + both
+Hermite stride values. All eight 0.7.8 pins still green. All
+other suites (Bridge, BridgeFacades, BridgeInputLane, schema,
+environment, Bridge.phaseLock incl. Taylor and Hermite pins,
+two 1 M-frame concurrent stress runs, Float64RingBuffer
+legacy) all green — purely additive.
+
+### Bench
+
+push/pull/pullLatest medians unchanged at 1.20 μs. WASM
+trajectory-eval throughput vs the JS `evaluateTrajectoryInto`
+becomes a meaningful benchmark only once the f32 mirrors +
+SIMD vectorization land (0.7.10) and the bench can A/B both
+implementations cleanly. The scalar WASM path's expected
+speedup vs JS is modest (~1.2-1.5× on interleaved layouts);
+the headline win arrives with the SIMD patches.
+
+### Documentation
+
+`wasm/decoder.wat` gains a section header documenting the
+trajectory layouts the evaluators consume (the `p, v, a`
+interleaving + per-order stride table), the alignment policy,
+and the Hermite basis-coefficient pre-resolution rationale.
+`WorkletConsumer` interface docstrings in
+`src/worklet/index.ts` cross-reference the WAT contract and
+spell out the canonical wiring (srcOff / dstOff math).
+README integration lands once the full pullLatest is
+WASM-backed (post-0.7.11).
+
 ## [0.7.8] — 2026-05-27
 
 ### Added — WASM array field bulk copy (Track 2 of the King roadmap, fourth patch)

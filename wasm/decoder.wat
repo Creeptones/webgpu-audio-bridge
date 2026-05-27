@@ -367,4 +367,261 @@
     local.get $dstOff
     local.get $srcOff
     local.get $byteCount
-    memory.copy))
+    memory.copy)
+
+  ;; ─── f64 trajectory evaluators (0.7.9) ────────────────────────────────
+  ;;
+  ;; Schema layout for `f64TrajectoryArray(n, { order })`:
+  ;;
+  ;;     order=1:  flat = [p_0, p_1, …, p_{n-1}]
+  ;;     order=2:  flat = [p_0, v_0, p_1, v_1, …]
+  ;;     order=3:  flat = [p_0, v_0, a_0, p_1, v_1, a_1, …]
+  ;;
+  ;; The evaluator reconstructs n scalar position samples at elapsed
+  ;; time `dt`. For order=1 this is bit-exact copy (positions only —
+  ;; no extrapolation possible); for order=2 it is the linear Taylor
+  ;; `p + v·dt`; for order=3 it is the quadratic Taylor
+  ;; `p + v·dt + ½·a·dt²`. Bit-identical to
+  ;; `evaluateTrajectoryInto` in src/trajectory.ts (no clamps — the
+  ;; clamped path lives JS-side until a future patch ports the clamp
+  ;; resolution logic into WASM too).
+  ;;
+  ;; All loads use `align=1` to tolerate the interleaved layout's
+  ;; non-natural alignment (vEff fields can land on any 4-byte
+  ;; boundary depending on what precedes them in the schema).
+
+  ;; Order=1: position-only. Output bytes are bit-identical to the
+  ;; input bytes, so this is a memory.copy of n × 8 bytes. The dt
+  ;; argument is accepted for signature consistency with the other
+  ;; orders but ignored — matches the JS evaluator's `case 1` arm.
+  (func $eval_taylor_f64_o1 (export "eval_taylor_f64_o1")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32)
+    local.get $dstOff
+    local.get $srcOff
+    local.get $n
+    i32.const 3
+    i32.shl                    ;; n << 3 = n * 8 (f64 bytes)
+    memory.copy)
+
+  ;; Order=2: linear Taylor. Per sample i, out[i] = flat[2i] + flat[2i+1] * dt.
+  ;; Scalar f64 loop; SIMD vectorization is deferred to 0.7.10 (where
+  ;; the f32 mirrors land too and the f64x2 deinterleave shuffles
+  ;; can be authored in a single self-contained section).
+  (func $eval_taylor_f64_o2 (export "eval_taylor_f64_o2")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $i i32)
+    (local $srcEnd i32)
+    (local $dstP i32)
+    (local $srcP i32)
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    ;; srcEnd = srcOff + n * 16  (two f64s per sample)
+    local.get $srcOff
+    local.get $n
+    i32.const 4
+    i32.shl                    ;; n << 4 = n * 16
+    i32.add
+    local.set $srcEnd
+    block $exit
+      loop $loop
+        ;; if srcP >= srcEnd → exit
+        local.get $srcP
+        local.get $srcEnd
+        i32.ge_u
+        br_if $exit
+        ;; out[i] = flat[2i] + flat[2i+1] * dt
+        local.get $dstP
+        local.get $srcP
+        f64.load align=1            ;; p_i
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f64.load align=1            ;; v_i
+        local.get $dt
+        f64.mul
+        f64.add
+        f64.store align=1
+        ;; advance pointers
+        local.get $srcP
+        i32.const 16
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 8
+        i32.add
+        local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; Order=3: quadratic Taylor. Per sample i,
+  ;;   out[i] = flat[3i] + flat[3i+1] * dt + flat[3i+2] * (0.5 * dt²).
+  ;; Caller-cached halfDt2 = 0.5 * dt * dt would save one multiply per
+  ;; call but force a wider WASM signature; the per-call savings of
+  ;; computing it inside the loop preamble (once, not per sample) is
+  ;; identical to what the JS evaluator does and keeps the export
+  ;; signature compact.
+  (func $eval_taylor_f64_o3 (export "eval_taylor_f64_o3")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcEnd i32)
+    (local $dstP i32)
+    (local $srcP i32)
+    (local $halfDt2 f64)
+    ;; halfDt2 = 0.5 * dt * dt — computed once per call.
+    local.get $dt
+    local.get $dt
+    f64.mul
+    f64.const 0.5
+    f64.mul
+    local.set $halfDt2
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    ;; srcEnd = srcOff + n * 24  (three f64s per sample)
+    local.get $srcOff
+    local.get $n
+    i32.const 8
+    i32.mul                    ;; n * 8 ...
+    i32.const 3
+    i32.mul                    ;; ... * 3 = n * 24
+    i32.add
+    local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP
+        local.get $srcEnd
+        i32.ge_u
+        br_if $exit
+        ;; out[i] = p + v*dt + a*halfDt2
+        local.get $dstP
+        local.get $srcP
+        f64.load align=1            ;; p
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f64.load align=1            ;; v
+        local.get $dt
+        f64.mul
+        f64.add
+        local.get $srcP
+        i32.const 16
+        i32.add
+        f64.load align=1            ;; a
+        local.get $halfDt2
+        f64.mul
+        f64.add
+        f64.store align=1
+        local.get $srcP
+        i32.const 24
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 8
+        i32.add
+        local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; ─── f64 Hermite evaluator (0.7.9) ────────────────────────────────────
+  ;;
+  ;; Two-frame C¹ cubic Hermite reconstruction matching the JS
+  ;; `evaluateHermiteTrajectoryInto` (src/trajectory.ts, 0.7.4). Per
+  ;; sample i with stride = order (= 2 or 3):
+  ;;
+  ;;     P_0 = prev[stride·i]
+  ;;     M_0 = prev[stride·i + 1]
+  ;;     P_1 = curr[stride·i]
+  ;;     M_1 = curr[stride·i + 1]
+  ;;     out[i] = h00·P_0 + h10s·M_0 + h01·P_1 + h11s·M_1
+  ;;
+  ;; Where (h00, h10s, h01, h11s) are the cubic-Hermite basis
+  ;; coefficients (h10s and h11s already include the segmentSeconds
+  ;; tangent scaling — caller-side math, computed ONCE per call rather
+  ;; than once per sample). The stride parameter accommodates order=2
+  ;; vs order=3; the WAT doesn't need order, just the stride.
+  ;;
+  ;; Acceleration lane is ignored on the cubic path (matches the JS
+  ;; cubic Hermite — a future quintic variant could consume it).
+
+  (func $eval_hermite_f64 (export "eval_hermite_f64")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h00 f64) (param $h10s f64) (param $h01 f64) (param $h11s f64)
+    (local $i i32)
+    (local $prevP i32)
+    (local $currP i32)
+    (local $dstP i32)
+    (local $strideBytes i32)
+    ;; strideBytes = strideElems * 8
+    local.get $strideElems
+    i32.const 3
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff
+    local.set $prevP
+    local.get $currOff
+    local.set $currP
+    local.get $dstOff
+    local.set $dstP
+    i32.const 0
+    local.set $i
+    block $exit
+      loop $loop
+        local.get $i
+        local.get $n
+        i32.ge_u
+        br_if $exit
+        ;; out[i] = h00*P0 + h10s*M0 + h01*P1 + h11s*M1
+        local.get $dstP
+        ;; h00 * P0
+        local.get $prevP
+        f64.load align=1
+        local.get $h00
+        f64.mul
+        ;; + h10s * M0
+        local.get $prevP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $h10s
+        f64.mul
+        f64.add
+        ;; + h01 * P1
+        local.get $currP
+        f64.load align=1
+        local.get $h01
+        f64.mul
+        f64.add
+        ;; + h11s * M1
+        local.get $currP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $h11s
+        f64.mul
+        f64.add
+        f64.store align=1
+        ;; advance pointers
+        local.get $prevP
+        local.get $strideBytes
+        i32.add
+        local.set $prevP
+        local.get $currP
+        local.get $strideBytes
+        i32.add
+        local.set $currP
+        local.get $dstP
+        i32.const 8
+        i32.add
+        local.set $dstP
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $loop
+      end
+    end))
