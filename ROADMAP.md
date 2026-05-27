@@ -43,6 +43,7 @@ original plan.
 | 0.8.9 | queued | `examples/wavefunction-mini/` Aubry-André demo |
 | 0.8.10 | ✅ shipped | `interpolationMode` union closed at 1.0 (pre-1.0 prune 1/N) |
 | 0.8.11 | ✅ shipped | Deprecation-soak pass before 0.9.0 cut (pre-1.0 prune 2/N) |
+| 0.8.12 | ✅ shipped | `BridgeWebNNSource` experimental-status warning sharpening (pre-1.0 prune 3/N) |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
@@ -67,7 +68,7 @@ channels, anything non-audio-critical. **Not for audio rate.**
 The minor-bump anchor that ships whenever the wire-format change is
 ready. Timing is flexible relative to 0.8.6–0.8.9.
 
-## Beyond the cohort (speculative, `0.8.12+`)
+## Beyond the cohort (speculative, `0.8.13+`)
 
 Surfaced as a parking lot; none of these is planned in detail yet.
 For the structured path to 1.0 — including the remaining 0.8.x

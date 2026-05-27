@@ -4,6 +4,141 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.12] — 2026-05-27
+
+### Added — `BridgeWebNNSource` experimental-status warning sharpening (pre-1.0 cohort 3/N)
+
+Third patch of the pre-1.0 cohort plan. The WebNN adapter has lived under
+`src/experimental/` since 0.7.16, with the `@experimental` JSDoc tag and a
+file-header stability paragraph as the only signals. The IDE-time tag fires
+in VS Code / WebStorm / etc., but anyone who imported via a non-typed path
+(a transitive workspace dep, a `dist/` artifact, a CDN bundle) never saw
+the warning. This patch adds the runtime backstop and spells out the
+graduation criteria publicly so the experimental status has a clear end
+condition rather than just an open-ended warning.
+
+**Runtime warn.** `BridgeWebNNSource`'s constructor now emits a one-shot
+`console.warn` on first construction per process load. The text:
+
+```
+[webgpu-audio-bridge] BridgeWebNNSource is experimental and outside the
+1.0 stability contract. The adapter's API may break across MINOR version
+bumps — and, while the WebNN spec is still moving, across PATCH releases —
+until WebNN MLTensor ships in ≥ 2 stable browsers (Chrome/Firefox/WebKit)
+and the spec reaches W3C Recommendation status. Track
+https://www.w3.org/TR/webnn/ for spec progress; see README §Experimental
+— WebNN for the full graduation criteria.
+```
+
+The module-global guard pattern matches the 0.8.11 deprecation warns: one
+boolean, set on first fire, branch-skip thereafter. The
+`BridgeWebNNSource.test.ts` suite constructs 15 instances; the suite now
+prints one informational warn per process and no others.
+
+The warn fires unconditionally on construction, including when the
+constructor will subsequently throw the WebNN-unavailable error (the
+`opts.skipAvailabilityCheck !== true && !hasMLTensor()` branch). This is
+deliberate: anyone touching the experimental API at all — even via the
+typed-array fallback or the `skipAvailabilityCheck` opt-out — should hear
+the stability caveat, and centralizing the warn at the constructor top
+keeps the guard logic simple.
+
+**README §Experimental — WebNN rework.** The section gains:
+
+- A **bold warning block at the top** (blockquote with ⚠️ + bold header)
+  instead of an inline paragraph. The blockquote makes the experimental
+  status visually unmissable for anyone skimming.
+- An explicit **"When this graduates"** criteria list (three numbered
+  items). The previous section spelled out the *constraint* (spec is
+  volatile, browsers haven't shipped) without committing to a *trigger*
+  for the experimental tag coming off; the new list closes that loop:
+  1. WebNN spec at W3C Recommendation (not just Candidate Recommendation).
+  2. `MLTensor` shipping unflagged in ≥ 2 of {Chrome, Firefox, WebKit}.
+  3. Byte-read API (`tensor.read()` vs `context.readTensor(tensor)`)
+     settles at one shape in the spec.
+- The "until all three trip, the export stays under `experimental/` and
+  the runtime warn fires" closing line ties the criteria back to the
+  observable artifacts (subpath + warn).
+
+The graduation-criteria language mirrors the bar `BridgeGPUSource` met
+for WebGPU before it landed in the main entry — two browsers shipping
+unflagged was the threshold there too, so the experimental-tag
+graduation policy is consistent across both adapters.
+
+**File-header rework.** `src/experimental/BridgeWebNNSource.ts`'s
+Stability contract section gets two additions: (a) explicit "patch
+releases" inclusion in the breakage window (previously the file said only
+"MINOR version bumps"; the README and the runtime warn now say both, so
+the file header is brought in line), and (b) a "Graduation criteria"
+paragraph mirroring the README list. The class-level JSDoc is unchanged
+(already had `@experimental`).
+
+### Why
+
+The WebNN-experimental story has had three signals (`/experimental`
+subpath + `@experimental` JSDoc + file-header paragraph), but no
+runtime-observable one, and no public statement of when the experimental
+tag would come off. The pre-1.0 audit flagged both gaps:
+
+- The lack of a runtime signal means a consumer who imported via a
+  non-typed path doesn't learn the surface is experimental until it
+  actually breaks in a future patch. The one-shot warn closes that — every
+  process that constructs the class sees the caveat at least once in
+  stderr, the same shape the 0.8.11 deprecation warns landed on.
+- The lack of a public graduation criteria means "experimental forever" is
+  the default reading. Spelling out the three-condition trigger makes the
+  end state visible: someone reading the README in 2027 can check the
+  three boxes themselves and predict the graduation patch.
+
+This is the final 0.8.x patch that adjusts an experimental / deprecated
+surface ahead of the 0.9.0 breaking cut. The next patches (0.8.13 + the
+0.9.0 cohort) shift to bench polish and the actual removals.
+
+### Wire compatibility
+
+100% wire-compatible. No SAB byte layout change, no schema extension, no
+public-API change. The warning is a pure runtime side-effect in the
+constructor; existing code keeps compiling and keeps producing bit-
+identical output. A 0.8.11 producer and a 0.8.12 consumer over the same
+SAB exchange frames bit-identically; same in the reverse direction.
+
+### Tests
+
+All 21 suites green. No test changes — `tests/BridgeWebNNSource.test.ts`
+constructs 15 instances across its 10 pins and now sees one warn per
+process load (instead of zero); the assertion-based test runner ignores
+stderr output. The schema validation paths + the construction gate +
+both push paths all continue to assert bit-identically against the prior
+implementation.
+
+### Bench
+
+Construction-time only effect. Per-instance overhead is one branch on a
+module-private boolean after the first call; not visible in the
+push/pull/pullLatest medians (~1.20 μs at N=1000 unchanged).
+
+### Documentation
+
+- `src/experimental/BridgeWebNNSource.ts` — file-header Stability
+  contract section rewritten with patch-release breakage call-out +
+  graduation criteria + the runtime-warn behavior; module-global guard
+  comment added; constructor warn block added (above).
+- `README.md` — §Experimental — WebNN reworked: bold blockquote
+  disclaimer + numbered graduation criteria + closing tie-back line
+  (above).
+- `ROADMAP.md` — 0.8.12 row appended to the active table; "Beyond the
+  cohort" header bumped from `0.8.12+` to `0.8.13+`.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/experimental/BridgeWebNNSource.ts` — file-header + module-private
+  guard + constructor warn.
+- `README.md` — §Experimental — WebNN rework.
+- `ROADMAP.md` — table + speculative-header bump.
+- `package.json` — version `0.8.11` → `0.8.12`.
+- `CHANGELOG.md` — this entry.
+
 ## [0.8.11] — 2026-05-27
 
 ### Added — deprecation-soak pass before the 0.9.0 breaking cut (pre-1.0 cohort 2/N)

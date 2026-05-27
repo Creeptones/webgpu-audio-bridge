@@ -84,10 +84,29 @@
  * ─── Stability contract ─────────────────────────────────────────────────
  *
  * Outside the 1.0 stability contract. The class may break across
- * MINOR version bumps (e.g. `0.7.x → 0.8.0`) as the WebNN spec
- * stabilizes; patch bumps within a minor preserve compatibility.
- * The export path is `webgpu-audio-bridge/experimental` to make the
- * opt-in explicit.
+ * MINOR version bumps (e.g. `0.7.x → 0.8.0`) — and, while the WebNN
+ * spec is still moving, across PATCH releases as well — as the spec
+ * stabilizes. The export path is `webgpu-audio-bridge/experimental` to
+ * make the opt-in explicit.
+ *
+ * Starting at 0.8.12 the constructor also emits a one-shot
+ * `console.warn` to make the experimental status visible at runtime
+ * (the `@experimental` JSDoc only fires in IDEs). The warn fires at
+ * most once per process load via a module-global guard; the runtime
+ * cost at steady state is one branch on a module-private boolean.
+ *
+ * Graduation criteria (when the experimental tag comes off, see
+ * README §Experimental — WebNN for the canonical list):
+ *
+ *   - WebNN spec reaches W3C Recommendation status (the W3C-level
+ *     stability commitment, beyond the current Candidate Recommendation).
+ *   - At least two of {Chrome, Firefox, Safari/WebKit} ship `MLTensor`
+ *     in a non-flagged stable channel.
+ *   - The byte-read API (`tensor.read()` vs `context.readTensor(tensor)`)
+ *     settles at a single shape in the spec text.
+ *
+ * Until all three trip, the export stays under `experimental/` and
+ * the runtime warn fires.
  */
 
 import type { Bridge } from "../Bridge.js";
@@ -195,6 +214,14 @@ const WEBNN_UNAVAILABLE_MESSAGE =
   "pass { skipAvailabilityCheck: true } to opt out of the gate for " +
   "test code that needs the fallback path without a WebNN runtime.";
 
+/** Module-global one-shot guard for the experimental-status runtime warning.
+ *  Mirrors the pattern used by `Float64RingBuffer` (0.8.11): warn at most
+ *  once per process load so an app that constructs multiple sources doesn't
+ *  drown stderr; the `@experimental` JSDoc provides the IDE-time signal and
+ *  this warn is the runtime backstop for anyone who imported via a
+ *  non-typed path. Added 0.8.12 (pre-1.0 cohort, WebNN warning sharpening). */
+let _bridgeWebNNSourceExperimentalWarned = false;
+
 /**
  * WebNN MLTensor → Bridge<S> adapter. See file header for full docs.
  *
@@ -247,6 +274,19 @@ export class BridgeWebNNSource<S extends Schema<FieldsObject, any>> {
     bridge: Bridge<S> | BridgeProducer<S>,
     opts: BridgeWebNNSourceOptions<S> = {},
   ) {
+    if (!_bridgeWebNNSourceExperimentalWarned) {
+      _bridgeWebNNSourceExperimentalWarned = true;
+      console.warn(
+        "[webgpu-audio-bridge] BridgeWebNNSource is experimental and " +
+        "outside the 1.0 stability contract. The adapter's API may break " +
+        "across MINOR version bumps — and, while the WebNN spec is still " +
+        "moving, across PATCH releases — until WebNN MLTensor ships in " +
+        "≥ 2 stable browsers (Chrome/Firefox/WebKit) and the spec reaches " +
+        "W3C Recommendation status. Track https://www.w3.org/TR/webnn/ " +
+        "for spec progress; see README §Experimental — WebNN for the full " +
+        "graduation criteria.",
+      );
+    }
     if (opts.skipAvailabilityCheck !== true && !hasMLTensor()) {
       throw new Error(WEBNN_UNAVAILABLE_MESSAGE);
     }

@@ -1133,9 +1133,19 @@ The demo's structural choice list is itself the recipe: 1024-sample blocks at 48
 
 ## Experimental — WebNN
 
-`BridgeWebNNSource<S>` is a thin adapter for streaming the output of a [WebNN](https://www.w3.org/TR/webnn/) model into a `Bridge<S>`. Real-time voice cloning, neural reverb, neural EQ matching, physics-modelled instruments — anything where the model output is a block of `f32` samples — gets the same low-jitter audio-thread delivery the WebGPU helpers provide, just from a different producer side.
+> ⚠️ **EXPERIMENTAL — outside the 1.0 stability contract.**
+>
+> `BridgeWebNNSource<S>` is opt-in via the `webgpu-audio-bridge/experimental` subpath. The adapter's API may break across MINOR version bumps **and across PATCH releases** while the WebNN spec is still moving. Constructing the class emits a one-shot `console.warn` (0.8.12) to make this visible at runtime — the `@experimental` JSDoc only fires in IDEs. The warn fires at most once per process load and adds no steady-state cost.
+>
+> **When this graduates.** The experimental tag comes off — the export moves from `webgpu-audio-bridge/experimental` to the main entry, the API gets the same compatibility promise as the rest of the public surface, and the runtime warn is removed — when all three of the following are true:
+>
+> 1. **WebNN spec reaches W3C Recommendation status** (currently Candidate Recommendation as of 2026-05; W3C Recommendation is the W3C-level stability commitment that signals the spec text is done moving).
+> 2. **At least two of {Chrome, Firefox, Safari/WebKit} ship `MLTensor` in a non-flagged stable channel.** Chrome is behind [`chrome://flags/#web-machine-learning-api`](chrome://flags/#web-machine-learning-api), Firefox is in early stages, Safari has not shipped. "Two of three shipping unflagged" is the threshold; it's the same bar `BridgeGPUSource` met for WebGPU before it landed in the main entry.
+> 3. **The byte-read API settles at a single shape in the spec text** — currently the spec text wobbles between `tensor.read()` on the tensor itself and `context.readTensor(tensor)` on the context. The adapter supports both today via the `tensorReader` override; graduation requires the spec to pick one so the adapter can drop the override.
+>
+> Until all three trip, the export stays under `experimental/` and the runtime warn fires.
 
-**This helper lives outside the 1.0 stability contract.** The WebNN spec is W3C Candidate Recommendation, Chrome is behind [`chrome://flags/#web-machine-learning-api`](chrome://flags/#web-machine-learning-api), Safari has not shipped, Firefox is in early stages. The adapter's shape may break across MINOR version bumps as the spec stabilizes. Patch bumps within a minor preserve compatibility. The export path is `webgpu-audio-bridge/experimental` to make the opt-in explicit.
+`BridgeWebNNSource<S>` is a thin adapter for streaming the output of a [WebNN](https://www.w3.org/TR/webnn/) model into a `Bridge<S>`. Real-time voice cloning, neural reverb, neural EQ matching, physics-modelled instruments — anything where the model output is a block of `f32` samples — gets the same low-jitter audio-thread delivery the WebGPU helpers provide, just from a different producer side.
 
 ```ts
 import { Bridge, defineSchema, u64, f32Array, getEnvironmentReport } from "webgpu-audio-bridge";
