@@ -308,9 +308,17 @@ function evaluateClamped(
  *
  * Order=1 trajectories carry no velocity, so 'hermite' is rejected at
  * schema-construction time. Order=3 trajectories carry acceleration; this
- * first cut IGNORES it (standard cubic Hermite is C¹, not C²). A future
- * patch can add a quintic Hermite path that consumes (p, v, a) at both
- * endpoints for full C² continuity.
+ * first cut IGNORES it (standard cubic Hermite is C¹, not C²).
+ *
+ * The `interpolationMode` union is **closed at 1.0**, fixed to
+ * `'taylor' | 'hermite'`. A quintic-Hermite path that consumes (p, v, a) at
+ * both endpoints for full C² continuity is **deferred to 1.x** as a
+ * separate `'quintic-hermite'` value — added via an additive minor bump
+ * (e.g. 1.1.0), not by widening the closed 1.0 union in place. Closing the
+ * union at 1.0 lets consumers `switch` on the mode without a default
+ * branch; the additive-name path keeps that exhaustive-check shape valid
+ * post-1.0 (a new arm is a deliberate compile error, not a silent fall-
+ * through).
  *
  * Allocation-free: the caller owns prev/curr/out buffers. No clamp path
  * yet — clamps land in a follow-up when there's a use case (the linear
@@ -394,8 +402,10 @@ export function evaluateHermiteTrajectoryInto(
   const h11s = h11 * segmentSeconds;
 
   // The per-sample stride is `order`; for order=2 it's (p, v), for order=3
-  // it's (p, v, a). The acceleration lane is ignored on the cubic path —
-  // see the file header note for the future quintic plan.
+  // it's (p, v, a). The acceleration lane is ignored on the cubic path; a
+  // quintic-Hermite path that consumes acceleration at both endpoints is
+  // deferred to 1.x as a separate `'quintic-hermite'` interpolationMode
+  // value (additive minor bump, not a 1.0 union widening).
   const stride = order;
   for (let i = 0; i < sampleCount; i++) {
     const j = i * stride;

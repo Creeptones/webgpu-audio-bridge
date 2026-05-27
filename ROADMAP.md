@@ -26,9 +26,9 @@ past the actual maturity. Each patch is the checkpoint.
 
 ## Currently shipping — the 0.8.x audit cohort
 
-A seven-patch hygiene + product-polish pass before the 1.0 question
-gets serious attention. Internal-only slot labels match the
-ship order, not the original plan.
+A hygiene + product-polish pass before the 1.0 question gets serious
+attention. Internal-only slot labels match the ship order, not the
+original plan.
 
 | Slot | Status | Theme |
 |---|---|---|
@@ -41,12 +41,18 @@ ship order, not the original plan.
 | 0.8.7 | ✅ shipped | First npm publish + `webgpu-audio-bridge dev` CLI |
 | 0.8.8 | queued | Wavefunction consumer migration + flagship telemetry overlay |
 | 0.8.9 | queued | `examples/wavefunction-mini/` Aubry-André demo |
+| 0.8.10 | ✅ shipped | `interpolationMode` union closed at 1.0 (pre-1.0 prune 1/N) |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
 top-level files, library on npm with a one-command dev server, a
 flagship downstream consumer end-to-end, and a self-contained
 example demo that doubles as a regression harness.
+
+0.8.10 ships out of strict numerical order — 0.8.8 + 0.8.9 are scoped
+externally (consumer migration + demo) and continue in parallel; the
+interpolationMode-union closure had no dependencies on either, so it
+landed first as the smallest pre-1.0-prune patch.
 
 ## Reserved slot — 0.8.0 (MessageChannelBridge)
 
@@ -60,9 +66,11 @@ channels, anything non-audio-critical. **Not for audio rate.**
 The minor-bump anchor that ships whenever the wire-format change is
 ready. Timing is flexible relative to 0.8.6–0.8.9.
 
-## Beyond the cohort (speculative, `0.8.10+`)
+## Beyond the cohort (speculative, `0.8.11+`)
 
 Surfaced as a parking lot; none of these is planned in detail yet.
+For the structured path to 1.0 — including the deprecation-soak +
+breaking-cut sequencing — see the internal pre-1.0 cohort plan.
 
 - **`BridgeReader<S>` / typed consumer view** — the inverse of
   `BridgeGPUSource`. A receiver-side helper that owns the

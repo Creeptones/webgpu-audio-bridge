@@ -4,6 +4,115 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.10] — 2026-05-27
+
+### Added — `interpolationMode` union closed at 1.0 (audit cohort, pre-1.0 prune 1/N)
+
+First patch of the **pre-1.0 cohort plan** (see internal plan
+`we-want-you-to-iridescent-reef.md`). This patch is a **commitment**, not a
+code-shape change: the `TrajectoryInterpolationMode` union — `'taylor' |
+'hermite'` — is now declared closed at 1.0. A future quintic-Hermite path
+that consumes acceleration at both endpoints for full C² continuity is
+explicitly deferred to **1.x** as a separate `'quintic-hermite'` value,
+landing via an additive minor bump rather than an in-place widening of the
+1.0 union.
+
+The additive-name shape lets 1.0 consumer `switch` statements stay
+exhaustive without a default branch; a 1.x consumer that fails to handle the
+new arm sees a compile error rather than silent fall-through.
+
+**Documentation updates.**
+
+- `src/schema.ts` — `TrajectoryInterpolationMode` JSDoc gains a "Stability
+  commitment (0.8.10 → 1.0)" paragraph spelling out the closure rule and the
+  rationale (exhaustive `switch` over default branch).
+- `src/schema.ts` — `TrajectoryArrayOptions.overflowFallback` field gains an
+  inline silent-equivalence note: `'linear'` collapses to `'saturate'` on
+  `order=1` and `order=2` (no acceleration term to drop), so the distinction
+  only matters at `order=3`. Audit-surfaced footgun made explicit at the
+  call-site rather than only in the implementation comments.
+- `src/schema.ts` — `TrajectoryArrayOptions.interpolationMode` field gets a
+  matching docstring pointing at the 1.0 closure rule.
+- `src/schema.ts` — `TrajectoryOverflowFallback` type JSDoc reworded to
+  surface the same silent-equivalence note.
+- `src/trajectory.ts` — file-header Hermite section gains the "union closed
+  at 1.0; quintic deferred to 1.x as additive name" paragraph. The
+  cubic-Hermite implementation's "future quintic plan" inline comment is
+  rewritten to point at the additive-minor-bump path explicitly rather than
+  leaving the timing ambiguous.
+- `README.md` — §Trajectory arrays gains a new paragraph documenting the
+  `interpolationMode` field, the closure-at-1.0 commitment, and the
+  rationale. Also folds the silent-equivalence note for
+  `overflowFallback: 'linear'` into the existing fallback-semantics
+  sentence.
+
+### Why
+
+The pre-1.0 audit identified `interpolationMode` as one of the public
+surfaces where the 1.0 stability contract had not been spelled out. The
+union accepts `'taylor' | 'hermite'` today, and the cubic-Hermite
+implementation has a `// future quintic plan` comment in
+`src/trajectory.ts` — but nothing in the public docs or the type-level
+declaration tells a consumer whether quintic would be added by widening the
+current union (which would break exhaustive `switch` statements) or by
+adding a new name (which would not).
+
+Closing the union now, explicitly, makes the answer non-negotiable at 1.0:
+consumer code that does `switch (spec.interpolationMode)` with the two
+current arms is safe forever — a quintic arm lands at a separate name with a
+TypeScript-visible additive bump, so the compiler tells the consumer they
+need to extend their switch.
+
+The silent-equivalence note on `overflowFallback: 'linear'` is the same
+shape of fix: the behavior was correct (the implementation deliberately
+falls through to saturate when there's nothing to drop), but the public docs
+described `'linear'` as "drops the acceleration term" without spelling out
+what happens when there is no acceleration term to drop. Making the
+collapse explicit at the call-site removes a possible "I picked `'linear'`
+on order=2 and got the same result as `'saturate'` — is that a bug?"
+support question.
+
+### Wire compatibility
+
+100% wire-compatible. No SAB byte layout change, no schema extension, no
+public-API change to `Bridge<S>`, the schema DSL, or any composable
+primitive. Pure documentation patch — the type declaration
+`TrajectoryInterpolationMode = "taylor" | "hermite"` was already in this
+exact shape at 0.7.3 (`src/schema.ts:224`); this patch is the public
+commitment that it will stay that shape through 1.0.
+
+### Tests
+
+All 21 suites green (count unchanged from 0.8.7). No test changes — the
+existing trajectory + schema tests already pin the closed-union shape via
+the schema-construction error path (`tests/schema.test.ts` rejects
+unknown `interpolationMode` values) and the cubic-Hermite implementation
+(`tests/Bridge.trajectory.test.ts`).
+
+### Bench
+
+push / pull / pullLatest medians unchanged (~1.20 μs at N=1000). The
+trajectory evaluator's fast + clamped paths are bit-exact equal to 0.8.7;
+no code path moved.
+
+### Documentation
+
+- `src/schema.ts` — type-level docstrings + field docstrings.
+- `src/trajectory.ts` — file-header Hermite section + inline comment.
+- `README.md` — §Trajectory arrays.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/schema.ts` — three docstring edits.
+- `src/trajectory.ts` — two header-comment edits.
+- `README.md` — one paragraph add + one inline note.
+- `ROADMAP.md` — 0.8.10 row promoted to `✅ shipped`; speculative
+  section heading updated `0.8.10+` → `0.8.11+`; one-paragraph note
+  on out-of-order ship vs 0.8.8 / 0.8.9.
+- `package.json` — version `0.8.7` → `0.8.10`.
+- `CHANGELOG.md` — this entry.
+
 ## [0.8.7] — 2026-05-27
 
 ### Added — first npm publish + `webgpu-audio-bridge dev` CLI (audit cohort, product-polish 2/4)

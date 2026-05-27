@@ -201,8 +201,14 @@ export type TrajectoryOrder = 1 | 2 | 3;
  *  exceeded (0.6.7). Only consulted when `maxDeltaPerSample` is set.
  *    'hold'     — use the previous sample's output value (freeze the signal
  *                 when extrapolation goes out of band).
- *    'linear'   — fall back to order-2 (`p + v·dt`) ignoring acceleration; for
- *                 order=2 this collapses to the same fast-path formula.
+ *    'linear'   — fall back to order-2 (`p + v·dt`) ignoring acceleration.
+ *                 **Silent-equivalence note:** on `order=1` (no velocity)
+ *                 and `order=2` (no acceleration term to drop) `'linear'`
+ *                 has nothing to drop and collapses to `'saturate'`. The
+ *                 distinction only matters at `order=3`. Pick `'linear'`
+ *                 deliberately when you want the order-3 evaluator to
+ *                 degrade to its order-2 result on band violations rather
+ *                 than to a flat saturate clamp.
  *    'saturate' — clamp the would-be output into
  *                 `[out[i-1] - maxDelta, out[i-1] + maxDelta]`. */
 export type TrajectoryOverflowFallback = "hold" | "linear" | "saturate";
@@ -220,7 +226,16 @@ export type TrajectoryOverflowFallback = "hold" | "linear" | "saturate";
  *               Tightens the spectral rolloff of the reconstructed signal
  *               (continuous tangent at frame boundaries → no first-derivative
  *               step), eliminating the "zipper" sound on slowly-varying
- *               envelopes. */
+ *               envelopes.
+ *
+ *  **Stability commitment (0.8.10 → 1.0):** this union is **closed at
+ *  1.0** at `'taylor' | 'hermite'`. A future quintic-Hermite path that
+ *  consumes acceleration at both endpoints for full C² continuity will
+ *  land in 1.x as a separate `'quintic-hermite'` value — an **additive**
+ *  minor bump, not an in-place widening. This keeps consumer `switch`
+ *  statements exhaustive at 1.0 (no default branch needed; a 1.x consumer
+ *  that gates on the new arm sees a compile error rather than silent
+ *  fall-through). */
 export type TrajectoryInterpolationMode = "taylor" | "hermite";
 
 /** Descriptive metadata attached to fields built via
@@ -332,9 +347,17 @@ export interface TrajectoryArrayOptions {
   readonly velocityClamp?: number;
   readonly accelerationClamp?: number;
   readonly maxDeltaPerSample?: number;
+  /** See `TrajectoryOverflowFallback` for semantics. Note: `'linear'`
+   *  collapses to `'saturate'` on `order=1` and `order=2` (there is no
+   *  acceleration term to drop); the distinction only matters at
+   *  `order=3`. */
   readonly overflowFallback?: TrajectoryOverflowFallback;
   /** Reconstruction strategy passed through to the consumer-side evaluator
-   *  (0.7.3). 'hermite' requires `order >= 2`. Default 'taylor'. */
+   *  (0.7.3). The union is **closed at 1.0** at `'taylor' | 'hermite'`; a
+   *  future `'quintic-hermite'` arm is deferred to 1.x as an additive
+   *  minor bump (so consumer `switch` statements can stay exhaustive
+   *  without a default branch). `'hermite'` requires `order >= 2`.
+   *  Default `'taylor'`. */
   readonly interpolationMode?: TrajectoryInterpolationMode;
 }
 
