@@ -344,6 +344,23 @@
  *      counter increments (pushed / dropped) match the sequence.
  *      The decoder + bridge round-trip end-to-end with the mock
  *      GPU producing deterministic bytes.
+ *  82. Drop-oldest CAS-commit pull — bit-exact equivalence with reject
+ *      on the no-overflow happy path (0.7.2). Two Bridges on
+ *      independent SABs, same schema, same N frames pushed
+ *      (N < capacity, no overflow). Pulls from the drop-oldest
+ *      bridge (which now runs `_pullOverrunAware`) and the reject
+ *      bridge must produce bit-exact frames, equal sequence, and
+ *      equal telemetry available counts. Guards against regression
+ *      of the new CAS-commit path on the common case.
+ *  83. Drop-oldest pullLatest with skipped > 0 (0.7.2). Exercises
+ *      `_pullLatestOverrunAware`: fills ring (4 frames), pushes 3
+ *      more under drop-oldest (drops original 0-2), then calls
+ *      pullLatest. Asserts (a) newest frame seq=6 is returned
+ *      bit-exact, (b) skipped count = 3 (drained seqs 3,4,5 below
+ *      the newest), (c) droppedFrames = 3 (producer-side drops
+ *      independent of pullLatest's drain). Validates the
+ *      CAS-commit-from-R0-straight-to-W advance pattern matches
+ *      the reject-policy semantics on the happy path.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -4855,6 +4872,116 @@ async function testBridgeGpuSourceOrchestration(): Promise<void> {
   ok("bridge-gpu-source-orchestration");
 }
 
+// ── 82. Drop-oldest CAS-commit pull — bit-exact equivalence with reject ──
+//      (0.7.2). Two Bridges on independent SABs, same schema, same N
+//      pushes (N < capacity, no overflow). The drop-oldest bridge runs
+//      through `_pullOverrunAware` while the reject bridge runs the
+//      classic fast path. The two pulled-frame sequences must be
+//      bit-exact; any regression in the new CAS-commit code path would
+//      surface as a divergence here on the happy path.
+function testDropOldestPullBitExactVsReject(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+
+  const allocReject = Bridge.allocate(8, schema);
+  const allocDrop   = Bridge.allocate(8, schema);
+  const reject = new Bridge(allocReject.sab, allocReject.capacity, allocReject.schema, {
+    policy: "reject",
+  });
+  const drop   = new Bridge(allocDrop.sab,   allocDrop.capacity,   allocDrop.schema, {
+    policy: "drop-oldest",
+  });
+
+  // Push 5 frames into each — well under capacity 8, so no overflow,
+  // no producer-side _dropOldest, no race for the consumer-side CAS.
+  // This is purely the no-race happy path through the new code.
+  const N = 5;
+  for (let i = 0; i < N; i++) {
+    assertEq(reject.push(makePhysFrame(i, n)), true, `reject push ${i}`);
+    assertEq(drop.push(makePhysFrame(i, n)),   true, `drop-oldest push ${i}`);
+  }
+  assertEq(reject.telemetry().droppedFrames, 0, "reject: no drops");
+  assertEq(drop.telemetry().droppedFrames,   0, "drop-oldest: no drops on happy path");
+  assertEq(reject.telemetry().available, drop.telemetry().available, "available equal");
+
+  // Pull both and assert bit-exact frame equality.
+  const outR = emptyPhysFrame(n);
+  const outD = emptyPhysFrame(n);
+  for (let i = 0; i < N; i++) {
+    assertEq(reject.pull(outR), true, `reject pull ${i}`);
+    assertEq(drop.pull(outD),   true, `drop-oldest pull ${i}`);
+    assert(framesEqual(outR, outD), `pull ${i} bit-exact between policies`);
+  }
+  assertEq(reject.pull(outR), false, "reject ring drained");
+  assertEq(drop.pull(outD),   false, "drop-oldest ring drained");
+
+  // pullLatest with no-overflow / no-skipped path — drop-oldest's
+  // `_pullLatestOverrunAware` should match reject's fast-path output
+  // bit-for-bit when nothing was skipped.
+  assertEq(reject.push(makePhysFrame(42, n)), true, "reject re-push");
+  assertEq(drop.push(makePhysFrame(42, n)),   true, "drop-oldest re-push");
+  assertEq(reject.pullLatest(outR), 0, "reject pullLatest skipped=0");
+  assertEq(drop.pullLatest(outD),   0, "drop-oldest pullLatest skipped=0");
+  assert(framesEqual(outR, outD), "pullLatest bit-exact between policies (skipped=0)");
+
+  ok("drop-oldest-pull-bit-exact-vs-reject");
+}
+
+// ── 83. Drop-oldest pullLatest with skipped > 0 (0.7.2) ──────────────────
+//      Fill the ring to capacity, then push past capacity under
+//      drop-oldest so the producer-side `_dropOldest` evicts the
+//      oldest unread frames. Consumer's pullLatest drains down to
+//      the newest in one go via `_pullLatestOverrunAware`. Asserts:
+//        - newest frame seq returned bit-exact,
+//        - skipped count reflects the in-ring older drain (not the
+//          producer-side drops, which are separately accounted),
+//        - droppedFrames matches the producer-side eviction count,
+//        - pulledFrames increments by exactly 1, skippedFrames by
+//          the drain count.
+function testDropOldestPullLatestSkippedAccounting(): void {
+  const n = 4;
+  const schema = physicsControlFrameSchema(n);
+  const alloc = Bridge.allocate(4, schema);
+  const bridge = new Bridge(alloc.sab, alloc.capacity, alloc.schema, {
+    policy: "drop-oldest",
+  });
+
+  // Fill ring with seqs 0..3 (capacity = 4).
+  for (let i = 0; i < 4; i++) {
+    assertEq(bridge.push(makePhysFrame(i, n)), true, `fill push ${i}`);
+  }
+  assertEq(bridge.telemetry().droppedFrames, 0, "no drops during fill");
+
+  // Push 3 more under drop-oldest — producer's _dropOldest evicts
+  // seqs 0,1,2. Ring after: seqs 3,4,5,6 (oldest→newest).
+  for (let i = 4; i <= 6; i++) {
+    assertEq(bridge.push(makePhysFrame(i, n)), true, `evicting push ${i}`);
+  }
+  const tPostEvict = bridge.telemetry();
+  assertEq(tPostEvict.droppedFrames, 3, "3 producer-side drops");
+  assertEq(tPostEvict.available,     4, "ring still full after evictions");
+
+  // pullLatest under drop-oldest runs _pullLatestOverrunAware — advances
+  // READ_IDX from R0 straight to W via CAS. The drain skips the older 3
+  // (seqs 3,4,5) and surfaces only seq 6.
+  const out = emptyPhysFrame(n);
+  const skipped = bridge.pullLatest(out);
+  assertEq(skipped, 3, "pullLatest skipped = 3 (drained seqs 3,4,5)");
+  assertEq(out.seq, 6n, "pullLatest returned newest seq=6");
+  assert(framesEqual(out, makePhysFrame(6, n)), "newest frame bit-exact");
+
+  const tPostPull = bridge.telemetry();
+  assertEq(tPostPull.droppedFrames, 3, "droppedFrames unchanged by pullLatest");
+  assertEq(tPostPull.skippedFrames, 3, "skippedFrames += 3 from the drain");
+  assertEq(tPostPull.pulledFrames,  1, "pulledFrames += 1 for the surfaced frame");
+  assertEq(tPostPull.available,     0, "ring drained");
+
+  // Ring is empty — next pullLatest reports -1.
+  assertEq(bridge.pullLatest(out), -1, "pullLatest -1 on empty ring");
+
+  ok("drop-oldest-pullLatest-skipped-accounting");
+}
+
 async function main(): Promise<void> {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -4938,6 +5065,8 @@ async function main(): Promise<void> {
   testPllLanePublicationEncoding();
   testForEachSampleInQuantum();
   await testBridgeGpuSourceOrchestration();
+  testDropOldestPullBitExactVsReject();
+  testDropOldestPullLatestSkippedAccounting();
   console.log("\nAll Bridge tests passed.");
 }
 

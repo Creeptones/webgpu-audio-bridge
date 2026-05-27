@@ -4,6 +4,151 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.2] — 2026-05-27
+
+### Hardened — drop-oldest is race-free by construction
+
+The 0.6.12 `policy: 'drop-oldest'` shipped with a documented race
+window: under multi-thread use, a consumer mid-pull on a slot the
+producer's `_dropOldest` was simultaneously stealing could observe
+torn payload bytes (the producer's new write overlapping the
+consumer's read). The 0.6.12 mitigation was "pair drop-oldest with
+`.withInvariant(...)`" — the invariant classifier surfaces the
+torn read as a hard error and falls back to last-known-good. That
+worked but pushed correctness onto the user.
+
+**0.7.2 closes the race in the protocol itself.** The consumer's
+`pull` / `pullLatest` paths under `policy === 'drop-oldest'` now
+use a CAS-commit pattern (`_pullOverrunAware` /
+`_pullLatestOverrunAware`):
+
+1. Capture `R0 = Atomics.load(READ_IDX_LANE)` and
+   `W = Atomics.load(WRITE_IDX_LANE)`. The plain index read used in
+   the reject hot path becomes an `Atomics.load` because the
+   producer is now also a writer of `read_index`.
+2. Read the payload (scalars + arrays + invariant) into `out` from
+   slot `R0 & mask`.
+3. `Atomics.compareExchange(READ_IDX_LANE, R0, R0 + 1)` to commit
+   the read (or `Atomics.compareExchange(READ_IDX_LANE, R0, W)` for
+   `pullLatest`'s drain-to-newest variant). On CAS success → no one
+   advanced `read_index` between our capture and our commit, so the
+   bytes we read correspond to the slot we accounted for: return
+   success. On CAS failure → the producer's `_dropOldest`
+   overran us mid-read; discard the (potentially torn) `out` and
+   retry the whole loop with fresh `R0` / `W`.
+
+Bounded retries. Under SPSC, only the producer can advance
+`read_index` other than us. Each producer advance is paired with a
+slot eviction that opens space, so the loop terminates within
+~`capacity` iterations even under adversarial racing.
+
+`.withInvariant(...)` pairing is no longer required for correctness
+under drop-oldest — the invariant lane remains useful for cross-IPC
+bit-rot detection (separate concern; see §Cross-IPC bit-rot
+detection), but the drop-oldest race itself no longer needs it as
+a defense.
+
+### Why
+
+A correctness gate on the 1.0 readiness checklist: drop-oldest
+should be safe by construction, not by user vigilance. The 0.6.12
+documentation explicitly told users "pair with `.withInvariant(...)`
+to detect + recover these via the existing torn-frame classifier"
+— effectively an admission that drop-oldest alone was insufficient.
+Closing the race in the consumer-side pull means a user picking
+drop-oldest for "freshness wins" semantics gets exactly that, with
+no protocol footgun.
+
+Cost: the overrun-aware pull pays one extra Atomics op per call
+vs the reject hot path (plain index read → `Atomics.load`; plain
+`Atomics.store` → `compareExchange`). The dispatch is a single
+boolean check on `this._needsOverrunAware` at the top of `pull` /
+`pullLatest`; V8 constant-folds the branch per-instance, so the
+reject / drop-newest / block fast paths are byte-identical to
+0.7.1. Bench medians on the reject path stay at ~1.20 μs across
+push / pull / pullLatest — verified by `npm run bench`.
+
+### Wire compatibility
+
+- **No SAB changes.** Bit-exact protocol with 0.7.1.
+- **No public-API break.** Constructor signature unchanged;
+  `policy: 'drop-oldest'` already shipped at 0.6.12.
+- **No exported symbol changes.** The new behavior is purely a
+  consumer-side hot-path swap that the construct-time boolean
+  dispatches into.
+- The shipped `_dropOldest` producer-side mechanic is unchanged
+  (CAS-advance on full, bounded retry, heap drop counter); the
+  patch only adds the matching consumer-side CAS-commit.
+
+### Tests
+
+Two new single-threaded pins in `tests/Bridge.test.ts` (now 83
+pins total):
+
+- **#82 drop-oldest CAS-commit pull — bit-exact equivalence with
+  reject.** Two Bridges on independent SABs, same schema, same N
+  pushes (N < capacity, no overflow → no race). Pulls from the
+  drop-oldest bridge (now running `_pullOverrunAware`) and the
+  reject bridge must produce bit-exact frames, equal sequence,
+  equal telemetry. Guards against regression of the new code path
+  on the no-race happy path.
+- **#83 drop-oldest pullLatest with skipped > 0.** Fills the ring,
+  pushes past capacity under drop-oldest so the producer evicts
+  the original oldest frames; consumer's `pullLatest` then drains
+  to newest in one CAS-commit step. Asserts newest seq bit-exact,
+  `skipped` count reflects the in-ring older drain (not the
+  producer-side drops, which are separately accounted), and
+  telemetry counters update correctly.
+
+One new cross-thread sub-suite in `tests/Bridge.concurrent.test.ts`:
+
+- **`bridge-concurrent-drop-oldest-stress`** — 250k-frame stress
+  under aggressive contention. A new inline-eval worker mirrors
+  `SpscRing._dropOldest` (CAS-advance with bounded retry +
+  capacity recheck). The main-thread consumer is deliberately
+  throttled (`setImmediate` per pull chunk) so the ring saturates
+  and the drop branch fires repeatedly. Typical run: ~250k pushed,
+  ~9k consumed, ~241k dropped, ~600 producer-side CAS retries,
+  ~3k consumer-observed seq gaps, ~85ms wall time. Pins:
+    1. `consumed + dropped === pushed === 250_000` (no frame
+       lost-track).
+    2. Every consumed frame bit-exact against the producer recipe
+       at its seq — the correctness pin for CAS-commit. Any torn
+       read slipping through trips the bit-exact assertion
+       immediately.
+    3. `totalSkippedBySeq === producer.dropped` exactly (the
+       consumer's observed seq gaps account for every producer
+       eviction).
+    4. `producer.dropped > 0` (the run actually exercised the
+       race window — sanity that the throttle is working).
+    5. `tornFrames === 0` on the no-invariant schema (CAS-commit
+       caught every overrun; no need for the `.withInvariant`
+       pathway).
+
+All 9 tsx-script suites green; bench medians at 1.20 μs across
+push / pull / pullLatest.
+
+### Documentation
+
+- `src/SpscRing.ts`:
+    - `BackpressurePolicy.'drop-oldest'` JSDoc updated to reflect
+      the closed race window — the "pair with `.withInvariant`"
+      paragraph is replaced with the CAS-commit explanation.
+    - `_dropOldest` private method JSDoc updated similarly.
+    - New `_pullOverrunAware` and `_pullLatestOverrunAware`
+      methods carry full JSDoc on the CAS-commit pattern,
+      bounded-retry argument, and the correctness pin reference.
+    - New `_needsOverrunAware` private field documented as a
+      construct-time boolean cache, with the V8
+      constant-folding rationale.
+- `README.md`:
+    - §Overflow policies (0.6.12) gains a 0.7.2 callout noting
+      drop-oldest is now race-free without `.withInvariant`; the
+      invariant pairing is now framed as useful for cross-IPC
+      bit-rot detection only (separate concern).
+    - Roadmap → Shipped gets a new 0.7.2 bullet above the 0.7.1
+      entry.
+
 ## [0.7.1] — 2026-05-26
 
 ### Added — `getEnvironmentReport()` core

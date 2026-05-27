@@ -305,25 +305,34 @@ export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
  *    Useful for freshness-wins streams where the newest update matters
  *    most.
  *
- *    Multi-thread safety note. SPSC's normal invariant — only the consumer
+ *    Multi-thread safety. SPSC's normal invariant — only the consumer
  *    writes `read_index` — is relaxed: under drop-oldest the producer
- *    also CAS-writes `read_index` on overflow. The CAS guarantees atomicity
- *    of the index advance, but there is still a narrow window where a
- *    concurrent consumer pull on the just-stolen slot can read torn
- *    payload bytes (the producer writes the new payload at the same slot).
- *    Pair drop-oldest with `.withInvariant(...)` to detect + recover
- *    these via the existing torn-frame classifier: the slot's `__invariant`
- *    lane is overwritten by the new producer's write, so a consumer
- *    reading torn bytes computes a mismatched invariant and falls back to
- *    the previous frame via the existing soft/hard error pathway. Without
- *    an invariant schema, the race is theoretically observable as a single
- *    torn frame per drop event under simultaneous pull; with an invariant
- *    schema, it is caught and surfaces in `tornFrames` telemetry instead
- *    of corrupt output.
+ *    also CAS-writes `read_index` on overflow. **As of 0.7.2, the
+ *    consumer-side pull path under drop-oldest is overrun-aware**: it
+ *    captures `R0 = Atomics.load(READ_IDX_LANE)` before reading the
+ *    slot, then commits the read via `Atomics.compareExchange(R0,
+ *    R0+1)`. On CAS failure the producer overran us mid-read; the
+ *    consumer discards the (potentially torn) payload and retries. No
+ *    torn frame reaches the caller. Pairing with `.withInvariant(...)`
+ *    is no longer required for correctness under drop-oldest — the
+ *    invariant lane remains useful for cross-IPC bit-rot detection
+ *    (separate concern; see §Cross-IPC bit-rot detection in the
+ *    README), but is no longer a defensive bolt-on against this race.
  *
- *    Single-thread use (test code, sequential producer/consumer alternation)
- *    has no race at all; drop-oldest behaves exactly as documented with
- *    the new frame replacing the oldest unread one.
+ *    Cost: the overrun-aware pull pays one extra Atomics op per call
+ *    vs the reject hot path (plain index read → Atomics.load; plain
+ *    Atomics.store → compareExchange). Per-policy bench in
+ *    `bench/Bridge.bench.ts` keeps drop-oldest's medians honest;
+ *    reject / drop-newest / block fast paths are byte-identical to
+ *    0.7.1 (the variant is selected via a construct-time boolean
+ *    check that V8 constant-folds per-instance).
+ *
+ *    Single-thread use (test code, sequential producer/consumer
+ *    alternation) has no race at all; drop-oldest behaves exactly as
+ *    documented with the new frame replacing the oldest unread one.
+ *    The CAS-commit branch in the consumer is taken in both single-
+ *    and multi-thread settings — there's no producer/consumer alternation
+ *    optimization, just one consistent code path.
  *
  *  - `'block'`: push parks the producer via `waitForSpace(blockTimeoutMs)`
  *    when full, then retries once. If `waitForSpace` returns `'ok'` or
@@ -506,6 +515,20 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  (matches `Atomics.wait` default). */
   private readonly blockTimeoutMs: number | undefined;
 
+  /** True iff the consumer-side pull path must use the CAS-commit
+   *  overrun-aware variant (0.7.2). Set at construction from
+   *  `policy === 'drop-oldest'`. Frozen for the ring's lifetime so V8
+   *  can constant-fold the branch per-instance: a reject / drop-newest
+   *  / block ring's `pull` sees `if (false)` and the existing fast path
+   *  inlines unchanged.
+   *
+   *  Why a boolean cache rather than `this.policy === 'drop-oldest'`
+   *  inline: the field is monomorphic-shape friendly. V8 can read it
+   *  as a single Smi/oddball compare instead of a string equality
+   *  on the policy enum. The bench gate (10 μs hard budget, ~1.2 μs
+   *  reject median) catches any deopt either way. */
+  private readonly _needsOverrunAware: boolean;
+
   /** Heap-side counter of frames the policy dropped at the producer
    *  (`'drop-newest'` increments on every overflow; `'drop-oldest'`
    *  increments on every successful CAS advance of `read_index`). Read
@@ -622,6 +645,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       );
     }
     this.policy = policy;
+    this._needsOverrunAware = policy === "drop-oldest";
     const t = opts.blockTimeoutMs;
     if (t !== undefined && !(Number.isFinite(t) && t >= 0)) {
       throw new Error(
@@ -939,6 +963,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * the classifier; SpscRing itself never inspects the value.
    */
   pull(out: FrameFor<S>): SpscPullResult {
+    if (this._needsOverrunAware) return this._pullOverrunAware(out);
     const r = this.pullResult;
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
@@ -1040,6 +1065,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * macro-rate frame, drop staleness, minimize control→audio lag.
    */
   pullLatest(out: FrameFor<S>): SpscPullResult {
+    if (this._needsOverrunAware) return this._pullLatestOverrunAware(out);
     const r = this.pullResult;
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
@@ -1076,6 +1102,172 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     r.preWriteIdx = writeIdx;
     r.preReadIdx = readIdx;
     return r;
+  }
+
+  /**
+   * `pull` variant that survives the producer racing the same `read_index`
+   * lane (0.7.2). Selected at construction when `policy === 'drop-oldest'`.
+   *
+   * Under drop-oldest, the producer's `_dropOldest` advances `read_index`
+   * itself to evict the oldest unread frame. That breaks the strict-SPSC
+   * "only the consumer writes `read_index`" invariant — a consumer mid-read
+   * on the slot the producer just stole would observe torn bytes (the
+   * producer's new payload write overlaps the consumer's read).
+   *
+   * The CAS-commit pattern detects exactly that race and recovers:
+   *
+   *   1. `R0 = Atomics.load(READ_IDX_LANE)` — must be Atomics (not the
+   *      plain index read used in the reject hot path) because the
+   *      producer is now also a writer of this lane.
+   *   2. Snapshot `W = Atomics.load(WRITE_IDX_LANE)`; empty-check.
+   *   3. Read payload (scalars + arrays + invariant) into `out` from
+   *      slot `R0 & mask`.
+   *   4. `Atomics.compareExchange(READ_IDX_LANE, R0, R0+1)` to commit
+   *      the read. If the CAS succeeds, no one advanced `read_index`
+   *      between our `R0` capture and the commit — the bytes we read
+   *      correspond to the slot we accounted for, return success.
+   *      If the CAS fails, the producer advanced `R0` past our slot
+   *      while we were mid-read — discard `out` (potentially torn)
+   *      and retry the whole loop.
+   *
+   * Bounded retries. Under SPSC, only the producer can advance
+   * `read_index` other than us; each advance is paired with a slot
+   * eviction that opens space. So the producer's CAS-advance rate is
+   * bounded by its push rate. Even under pathological contention, the
+   * loop terminates within ~`capacity` iterations (after which the
+   * producer has cycled the entire ring and must wait for genuine
+   * pull progress).
+   *
+   * Correctness pin: the concurrent stress test under drop-oldest
+   * (added in 0.7.2 — see `tests/Bridge.concurrent.test.ts`) asserts
+   * every consumed frame is bit-exact against the producer's recipe
+   * AND `pushed === consumed + dropped`. Any torn frame slipping
+   * through trips that bit-exact gate immediately.
+   *
+   * Cost: roughly one extra Atomics op per pull vs the reject hot
+   * path (the plain index read becomes an Atomics.load; the plain
+   * Atomics.store becomes a compareExchange). The bench separates
+   * this in its 0.7.2 per-policy section.
+   */
+  private _pullOverrunAware(out: FrameFor<S>): SpscPullResult {
+    const r = this.pullResult;
+    // Bounded retry — see method header. capacity + 1 is the worst-case
+    // bound under SPSC; in practice the loop body runs once per pull.
+    for (let attempt = 0; attempt <= this.capacity; attempt++) {
+      const readIdx = Atomics.load(this.indices, READ_IDX_LANE);  // acquire
+      const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
+      if (writeIdx === readIdx) {
+        r.ok = false; // empty
+        return r;
+      }
+      const slot = (readIdx >>> 0) & this.mask;
+      const frame = out as unknown as Record<string, unknown>;
+      const sr = this.scalarReaders;
+      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+      const al = this.arrayLayout;
+      const av = this.arrayViews;
+      for (let i = 0; i < al.length; i++) {
+        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+        dst.set(av[i]![slot]!);
+      }
+      const invariantStored = this.invariantView !== null
+        ? this.invariantView[
+            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+          ]!
+        : 0;
+      // CAS-commit: claim slot `readIdx` only if no one (i.e. the
+      // producer's `_dropOldest`) advanced READ_IDX past us mid-read.
+      const prev = Atomics.compareExchange(
+        this.indices,
+        READ_IDX_LANE,
+        readIdx,
+        (readIdx + 1) | 0,
+      );
+      if (prev !== readIdx) continue; // producer overran — retry whole pull
+      Atomics.notify(this.indices, READ_IDX_LANE, 1);
+      this._updateFlowScale(writeIdx, readIdx);
+      this._recordOccupancy((writeIdx - readIdx) | 0);
+      this.pulledFrames = (this.pulledFrames + 1) | 0;
+      r.ok = true;
+      r.skipped = 0;
+      r.invariantStored = invariantStored;
+      r.preWriteIdx = writeIdx;
+      r.preReadIdx = readIdx;
+      return r;
+    }
+    // Unreachable under SPSC for the same reason as `_dropOldest`'s
+    // defensive return: the producer cannot infinitely advance
+    // `read_index` without the consumer also advancing it. Defensive
+    // return surfaces any future protocol change as `ok = false`.
+    const r2 = this.pullResult;
+    r2.ok = false;
+    return r2;
+  }
+
+  /**
+   * `pullLatest` variant matching `_pullOverrunAware` (0.7.2). Same
+   * CAS-commit shape, advancing `read_index` from the snapshotted
+   * `R0` to the snapshotted `W` (consuming everything up to writeIdx
+   * at once), and discarding torn reads via CAS failure → retry.
+   *
+   * The `skipped` counter is computed inside the loop from the
+   * snapshotted `R0` and `W` so it stays consistent with the read
+   * that actually succeeded — if the CAS fails and we retry with
+   * fresh values, the new iteration's skipped count is recomputed
+   * against the new snapshot.
+   */
+  private _pullLatestOverrunAware(out: FrameFor<S>): SpscPullResult {
+    const r = this.pullResult;
+    for (let attempt = 0; attempt <= this.capacity; attempt++) {
+      const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+      const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+      if (writeIdx === readIdx) {
+        r.ok = false;
+        return r;
+      }
+      const newestIdx = (writeIdx - 1) | 0;
+      const skipped = ((newestIdx - readIdx) | 0);
+      const slot = (newestIdx >>> 0) & this.mask;
+      const frame = out as unknown as Record<string, unknown>;
+      const sr = this.scalarReaders;
+      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+      const al = this.arrayLayout;
+      const av = this.arrayViews;
+      for (let i = 0; i < al.length; i++) {
+        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+        dst.set(av[i]![slot]!);
+      }
+      const invariantStored = this.invariantView !== null
+        ? this.invariantView[
+            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+          ]!
+        : 0;
+      // CAS-commit advances READ_IDX from `readIdx` straight to
+      // `writeIdx` — drains everything older than the newest in one
+      // atomic step, matching the reject-path semantics. On CAS
+      // failure, retry the whole drain.
+      const prev = Atomics.compareExchange(
+        this.indices,
+        READ_IDX_LANE,
+        readIdx,
+        writeIdx | 0,
+      );
+      if (prev !== readIdx) continue;
+      Atomics.notify(this.indices, READ_IDX_LANE, 1);
+      this._updateFlowScale(writeIdx, readIdx);
+      this._recordOccupancy((writeIdx - readIdx) | 0);
+      this.pulledFrames = (this.pulledFrames + 1) | 0;
+      this.skippedFrames = (this.skippedFrames + skipped) | 0;
+      r.ok = true;
+      r.skipped = skipped;
+      r.invariantStored = invariantStored;
+      r.preWriteIdx = writeIdx;
+      r.preReadIdx = readIdx;
+      return r;
+    }
+    const r2 = this.pullResult;
+    r2.ok = false;
+    return r2;
   }
 
   /**
@@ -1132,18 +1324,22 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * adversarial racing — long before that the consumer has drained the
    * ring entirely and we have free space without needing to drop.
    *
-   * Multi-thread race window. Documented on `BackpressurePolicy` for
-   * `'drop-oldest'`. The CAS guarantees readIdx atomicity, but a
-   * consumer mid-pull on the just-stolen slot can observe torn bytes
-   * because the producer's subsequent payload write overlaps the
-   * consumer's read. With `.withInvariant(...)`, the slot's invariant
-   * lane is overwritten too, and the consumer's classifier surfaces the
-   * torn read as a hard error (fallback to prev + tornFrames++) rather
-   * than as corrupt output. Without an invariant schema, the torn frame
-   * is theoretically observable; in practice the race window is in the
-   * tens-to-hundreds of nanoseconds against control-rate cadences (16 ms
-   * at 60 Hz), so the per-push probability is tiny — but the schema
-   * pairing is the honest fix and is recommended in the README.
+   * Multi-thread race window — closed in 0.7.2. The CAS guarantees
+   * readIdx atomicity. A consumer mid-pull on the just-stolen slot
+   * would historically observe torn bytes because the producer's
+   * subsequent payload write overlaps the consumer's read. As of
+   * 0.7.2 the consumer-side pull under drop-oldest uses the CAS-commit
+   * pattern (`_pullOverrunAware` / `_pullLatestOverrunAware`): the
+   * consumer captures `R0 = Atomics.load(READ_IDX_LANE)` before
+   * reading the slot, then `Atomics.compareExchange(R0, R0+1)` to
+   * commit. If the producer's `_dropOldest` advanced READ_IDX past
+   * `R0` while the consumer was mid-read, the CAS fails and the
+   * consumer discards the (potentially torn) payload and retries.
+   * No torn frame ever reaches the caller. `.withInvariant(...)`
+   * pairing is no longer required for correctness — the invariant
+   * lane remains useful for cross-IPC bit-rot detection (separate
+   * concern), but the drop-oldest race itself no longer needs it
+   * as a defense.
    *
    * Caller contract. Only invoked from the `push` / `beginPush` overflow
    * branches under `policy === 'drop-oldest'`. Returns the post-CAS

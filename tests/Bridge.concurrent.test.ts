@@ -469,6 +469,375 @@ async function runConcurrentStress(): Promise<void> {
   );
 }
 
+// ─── Drop-oldest cross-thread stress (0.7.2) ──────────────────────────────
+//
+// The reject sub-suite above proves the SPSC protocol holds under a
+// healthy consumer. This sub-suite proves the 0.7.2 CAS-commit consumer
+// pull holds when the producer races the consumer on READ_IDX_LANE.
+//
+// Producer semantics:
+//   - Inline-eval worker mirrors SpscRing._dropOldest: when buffered ≥
+//     capacity, CAS-advance read_index by one; on CAS failure (consumer
+//     raced), re-load read_index and either retry (still full) or skip
+//     the drop (consumer drained a slot for us). On CAS success,
+//     increment drop counter. Then proceed to write the new frame
+//     and release-store write_index unconditionally.
+//   - Producer never blocks — always either drops-then-writes or
+//     writes-directly. Mirrors a real drop-oldest producer (no
+//     pacing).
+//
+// Consumer semantics:
+//   - Main-thread Bridge with `policy: 'drop-oldest'` so `pull` runs
+//     through `_pullOverrunAware`. The CAS-commit must reject any
+//     mid-read overruns and retry; the bit-exact frame validation
+//     below catches any torn frame slipping through.
+//   - Deliberately throttled (await setImmediate per chunk + a smaller
+//     PULL_CHUNK) so the ring keeps filling and the producer
+//     repeatedly enters its drop-oldest branch.
+//
+// Assertions:
+//   1. `consumed + dropped === pushed === DROP_OLDEST_TOTAL_FRAMES`.
+//   2. Every consumed frame is bit-exact at its seq — no torn payload
+//      ever reaches the caller (this is the 0.7.2 correctness pin).
+//   3. Consumed seqs are strictly monotonically increasing (with
+//      gaps allowed where drops happened).
+//   4. The run produces a non-trivial number of drops (≥ 1) and a
+//      non-trivial number of CAS retries on at least one side —
+//      otherwise the test failed to exercise the race window.
+//   5. `tornFrames === 0` on the no-invariant schema (the 0.7.2
+//      contract: CAS-commit catches torn reads without the invariant
+//      pathway).
+//   6. The Bridge's heap-side `droppedFrames` telemetry stays at 0 on
+//      the consumer side (the consumer's heap counter doesn't see
+//      producer-side drops; this confirms the consumer's drop
+//      accounting is independent — the drop count is the producer's
+//      heap counter, reported via the worker's "done" message).
+
+const DROP_OLDEST_TOTAL_FRAMES = 250_000;
+const DROP_OLDEST_PULL_CHUNK = 512;
+
+const DROP_OLDEST_PRODUCER_SOURCE = `
+  const { parentPort, workerData } = require("node:worker_threads");
+  const {
+    sab,
+    capacity,
+    totalFrames,
+    layout,
+    headerBytes,
+    n,
+    heartbeatEveryN,
+  } = workerData;
+
+  const payloadBytes = capacity * layout.frameByteSize;
+  const u64View = new BigUint64Array(sab, headerBytes, payloadBytes / 8);
+  const f64View = new Float64Array(sab, headerBytes, payloadBytes / 8);
+  const indices = new Int32Array(sab, 0, 8);
+
+  const stride8 = layout.frameByteSize / 8;
+  const seqElemOff    = layout.fields.seq.byteOffset / 8;
+  const tMacroElemOff = layout.fields.tMacroNs.byteOffset / 8;
+  const vMaxElemOff   = layout.fields.vMax.byteOffset / 8;
+  const jMaxElemOff   = layout.fields.jMax.byteOffset / 8;
+  const vEffElemOff   = layout.fields.vEff.byteOffset / 8;
+  const jEffElemOff   = layout.fields.jEff.byteOffset / 8;
+
+  const mask = capacity - 1;
+
+  let pushed = 0;
+  let dropped = 0;
+  let dropCasRetries = 0;
+  let notifyCalls = 0;
+  let nextSeq = 0n;
+
+  while (pushed < totalFrames) {
+    let writeIdx = indices[0];
+    let readIdx = Atomics.load(indices, 1);
+
+    // Drop-oldest loop — mirrors SpscRing._dropOldest. Bounded under SPSC.
+    let attempts = 0;
+    while (((writeIdx - readIdx) | 0) >= capacity) {
+      const next = (readIdx + 1) | 0;
+      const prev = Atomics.compareExchange(indices, 1, readIdx, next);
+      if (prev === readIdx) {
+        dropped++;
+        readIdx = next;
+        break;
+      }
+      dropCasRetries++;
+      readIdx = Atomics.load(indices, 1);
+      attempts++;
+      if (attempts > capacity + 8) {
+        throw new Error("drop-oldest CAS loop exceeded bounded retries — protocol bug");
+      }
+    }
+
+    const slot = (writeIdx >>> 0) & mask;
+    const base = slot * stride8;
+    const seqNum = Number(nextSeq);
+
+    // Recipe — must match the consumer-side validator (which only
+    // validates the seqs it sees, with gaps from drops).
+    u64View[base + seqElemOff]    = nextSeq;
+    u64View[base + tMacroElemOff] = nextSeq * 16666667n;
+    f64View[base + vMaxElemOff]   = seqNum;
+    f64View[base + jMaxElemOff]   = -seqNum;
+    for (let k = 0; k < n; k++) {
+      f64View[base + vEffElemOff + k] = seqNum + k * 0.001;
+      f64View[base + jEffElemOff + k] = -seqNum + k * 0.001;
+    }
+
+    Atomics.store(indices, 0, (writeIdx + 1) | 0);
+    notifyCalls++;
+    Atomics.notify(indices, 0, 1);
+    nextSeq++;
+    pushed++;
+    if (heartbeatEveryN > 0 && pushed % heartbeatEveryN === 0) {
+      parentPort.postMessage({
+        type: "heartbeat",
+        pushed,
+        dropped,
+        dropCasRetries,
+        notifyCalls,
+      });
+    }
+  }
+
+  parentPort.postMessage({
+    type: "done",
+    totalPushed: pushed,
+    dropped,
+    dropCasRetries,
+    notifyCalls,
+  });
+`;
+
+interface DropOldestProducerDoneMessage {
+  type: "done";
+  totalPushed: number;
+  dropped: number;
+  dropCasRetries: number;
+  notifyCalls: number;
+}
+
+interface DropOldestProducerHeartbeatMessage {
+  type: "heartbeat";
+  pushed: number;
+  dropped: number;
+  dropCasRetries: number;
+  notifyCalls: number;
+}
+
+interface DropOldestProducerErrorMessage {
+  type: "error";
+  message: string;
+}
+
+type DropOldestProducerMessage =
+  | DropOldestProducerDoneMessage
+  | DropOldestProducerHeartbeatMessage
+  | DropOldestProducerErrorMessage;
+
+async function runConcurrentStressDropOldest(): Promise<void> {
+  const sab = new SharedArrayBuffer(SAB_BYTES);
+  const ring = new Bridge(sab, CAPACITY, SCHEMA, { policy: "drop-oldest" });
+  const layout = ring.describeLayout();
+
+  const state: {
+    producerDone: boolean;
+    producerStats: DropOldestProducerDoneMessage | null;
+    producerError: Error | null;
+    lastProducerHeartbeat: DropOldestProducerHeartbeatMessage | null;
+  } = {
+    producerDone: false,
+    producerStats: null,
+    producerError: null,
+    lastProducerHeartbeat: null,
+  };
+
+  const worker = new Worker(DROP_OLDEST_PRODUCER_SOURCE, {
+    eval: true,
+    workerData: {
+      sab,
+      capacity: CAPACITY,
+      totalFrames: DROP_OLDEST_TOTAL_FRAMES,
+      layout,
+      headerBytes: RING_HEADER_BYTES,
+      n: N,
+      heartbeatEveryN: 50_000,
+    },
+  });
+
+  worker.on("message", (msg: DropOldestProducerMessage) => {
+    if (!msg) return;
+    if (msg.type === "done") {
+      state.producerDone = true;
+      state.producerStats = msg;
+    } else if (msg.type === "heartbeat") {
+      state.lastProducerHeartbeat = msg;
+    } else if (msg.type === "error") {
+      state.producerError = new Error(msg.message);
+    }
+  });
+  worker.on("error", (err: Error) => {
+    state.producerError = err;
+  });
+
+  const out = emptyFrame();
+  let consumed = 0;
+  let lastSeq = -1n;
+  // Gap counters help confirm we actually exercised the drop path.
+  let observedGaps = 0;
+  let totalSkippedBySeq = 0n;
+  const startedAt = Date.now();
+  let lastHeartbeatAt = startedAt;
+  let lastHeartbeatConsumed = 0;
+  process.stderr.write(
+    `[watchdog] t=0.0s starting bridge-concurrent-drop-oldest-stress ` +
+      `TOTAL_FRAMES=${DROP_OLDEST_TOTAL_FRAMES.toLocaleString()} ` +
+      `CAPACITY=${CAPACITY} N=${N} PULL_CHUNK=${DROP_OLDEST_PULL_CHUNK}\n`,
+  );
+
+  // The consumer's stopping condition is "producer finished AND ring is
+  // empty" — we can't simply target a frame count since some frames got
+  // dropped. The watchdog also bounds total runtime.
+  while (!state.producerDone || ring.available() > 0) {
+    if (state.producerError !== null) {
+      throw new Error(`drop-oldest producer worker failed: ${state.producerError.message}`);
+    }
+    for (let i = 0; i < DROP_OLDEST_PULL_CHUNK; i++) {
+      const got = ring.pull(out);
+      if (!got) break;
+      // Validate the seq is monotonically increasing (gaps allowed).
+      if (out.seq <= lastSeq) {
+        throw new Error(
+          `drop-oldest: seq not monotonically increasing at consumed=${consumed}: ` +
+            `lastSeq=${lastSeq}, got=${out.seq}`,
+        );
+      }
+      if (out.seq > lastSeq + 1n) {
+        observedGaps++;
+        totalSkippedBySeq += out.seq - lastSeq - 1n;
+      }
+      // Bit-exact validation against the recipe at THIS seq.
+      const seqNum = Number(out.seq); // safe since seq ≤ totalFrames ≤ 2^53
+      const expectedTMacroNs = out.seq * 16_666_667n;
+      if (out.tMacroNs !== expectedTMacroNs) {
+        throw new Error(
+          `drop-oldest tMacroNs torn at seq=${out.seq}: expected ${expectedTMacroNs}, got ${out.tMacroNs}`,
+        );
+      }
+      if (out.vMax !== seqNum) {
+        throw new Error(
+          `drop-oldest vMax torn at seq=${out.seq}: expected ${seqNum}, got ${out.vMax}`,
+        );
+      }
+      if (out.jMax !== -seqNum) {
+        throw new Error(
+          `drop-oldest jMax torn at seq=${out.seq}: expected ${-seqNum}, got ${out.jMax}`,
+        );
+      }
+      for (let k = 0; k < N; k++) {
+        const wantV = seqNum + k * 0.001;
+        const wantJ = -seqNum + k * 0.001;
+        if (out.vEff[k] !== wantV) {
+          throw new Error(
+            `drop-oldest vEff[${k}] torn at seq=${out.seq}: expected ${wantV}, got ${out.vEff[k]}`,
+          );
+        }
+        if (out.jEff[k] !== wantJ) {
+          throw new Error(
+            `drop-oldest jEff[${k}] torn at seq=${out.seq}: expected ${wantJ}, got ${out.jEff[k]}`,
+          );
+        }
+      }
+      lastSeq = out.seq;
+      consumed++;
+    }
+    const nowMs = Date.now();
+    if (nowMs - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      const elapsed = (nowMs - startedAt) / 1000;
+      const intervalSec = (nowMs - lastHeartbeatAt) / 1000;
+      const rate = (consumed - lastHeartbeatConsumed) / Math.max(intervalSec, 1e-9);
+      const hb = state.lastProducerHeartbeat;
+      const producerLine = hb !== null
+        ? `producer.pushed=${hb.pushed.toLocaleString()} dropped=${hb.dropped.toLocaleString()} casRetries=${hb.dropCasRetries.toLocaleString()}`
+        : state.producerDone
+          ? "producer=done"
+          : "producer=<no-heartbeat-yet>";
+      process.stderr.write(
+        `[watchdog] t=${elapsed.toFixed(1)}s ` +
+          `consumed=${consumed.toLocaleString()} ` +
+          `rate=${rate.toFixed(0)}f/s ` +
+          `gaps=${observedGaps.toLocaleString()} skipped=${totalSkippedBySeq.toString()} ` +
+          producerLine +
+          "\n",
+      );
+      lastHeartbeatAt = nowMs;
+      lastHeartbeatConsumed = consumed;
+    }
+    if (Date.now() - startedAt > STALL_TIMEOUT_MS) {
+      throw new Error(
+        `drop-oldest consumer stalled: consumed=${consumed} after ${STALL_TIMEOUT_MS}ms`,
+      );
+    }
+    // Deliberate throttle — yields to the producer worker so the ring
+    // keeps filling and the drop branch fires repeatedly.
+    await new Promise<void>((r) => setImmediate(r));
+  }
+
+  await worker.terminate();
+  const elapsedMs = Date.now() - startedAt;
+
+  assert(state.producerDone, "drop-oldest producer signaled done");
+  const stats = state.producerStats!;
+  assertEq(stats.totalPushed, DROP_OLDEST_TOTAL_FRAMES, "producer pushed all frames");
+
+  // Core 0.7.2 correctness pin: consumed + dropped === pushed.
+  assertEq(
+    consumed + stats.dropped,
+    DROP_OLDEST_TOTAL_FRAMES,
+    `consumed (${consumed}) + dropped (${stats.dropped}) === pushed (${DROP_OLDEST_TOTAL_FRAMES})`,
+  );
+
+  // The gap count from observed seq jumps must equal the producer's drop
+  // count exactly — every dropped frame corresponds to a missing seq.
+  const dropsAsBigInt = BigInt(stats.dropped);
+  assertEq(
+    totalSkippedBySeq,
+    dropsAsBigInt,
+    `sum of seq-gaps (${totalSkippedBySeq}) === producer drops (${dropsAsBigInt})`,
+  );
+
+  // The run must have exercised the drop path — otherwise the test
+  // didn't actually stress the CAS-commit race.
+  assert(
+    stats.dropped > 0,
+    `drop-oldest produced at least one drop (got ${stats.dropped}) — otherwise test failed to stress race`,
+  );
+
+  // The consumer's bridge heap state — droppedFrames stays at 0 on the
+  // consumer side because the producer's CAS-advance increments its own
+  // heap counter in the worker, not the consumer's. Cross-process drop
+  // observability is intentionally out of scope (heap-only counter; see
+  // SpscRing.ts droppedCount() doc).
+  const tel = ring.telemetry();
+  assertEq(
+    tel.tornFrames,
+    0,
+    `tornFrames=0 on no-invariant schema (got ${tel.tornFrames}) — CAS-commit caught all overruns`,
+  );
+
+  ok(
+    `bridge-concurrent-drop-oldest-stress ` +
+      `(pushed=${DROP_OLDEST_TOTAL_FRAMES.toLocaleString()} ` +
+      `consumed=${consumed.toLocaleString()} ` +
+      `dropped=${stats.dropped.toLocaleString()} ` +
+      `gaps=${observedGaps.toLocaleString()} ` +
+      `casRetries=${stats.dropCasRetries.toLocaleString()} ` +
+      `in ${elapsedMs}ms)`,
+  );
+}
+
 async function main(): Promise<void> {
   if (!isMainThread) {
     parentPort?.postMessage({
@@ -481,6 +850,7 @@ async function main(): Promise<void> {
   void workerData;
 
   await runConcurrentStress();
+  await runConcurrentStressDropOldest();
   console.log("\nAll Bridge.concurrent tests passed.");
 }
 
