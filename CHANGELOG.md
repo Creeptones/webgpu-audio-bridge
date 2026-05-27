@@ -4,6 +4,154 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.4] — 2026-05-27
+
+### Added — fast-check property pins for FrameSmoother / trajectory / PLL (audit cohort, testing-infra 2/3)
+
+Fourth patch of the audit cohort, second slice of the testing-
+infrastructure sub-cohort (0.8.3 was the concurrent flake fix;
+0.8.5 will be the 92-pin `Bridge.test.ts` 8-way split). Adds a
+property-based test layer for the three extracted math units that
+the 0.6.9 seam split out of `Bridge.ts`.
+
+**New devDep.** `fast-check ^4.8.0` — the first new devDep since
+`wabt` in 0.7.5. Adds 2 transitive packages and ~150 KB to the dev
+install footprint. No runtime dep change.
+
+**New file.** `tests/Bridge.properties.test.ts` (9 property pins,
+~530 LOC). Each pin states an algebraic invariant the unit must
+satisfy and lets fast-check sweep a large random input space for
+counterexamples. fast-check shrinks failing cases to a minimal
+counterexample, which is the headline reason for adding a
+property-based layer alongside the existing example-based pins —
+when (not if) a regression hits, the counterexample surfaces at
+human-readable size rather than buried inside a long fuzz log.
+
+Pin layout (P1–P9 locally; numbered separately from `Bridge.test.ts`
+1–92 so the two files' pin spaces don't collide):
+
+- **FrameSmoother (P1–P3):**
+  - P1. `α = 1 ⇒ out === curr` (float-lane idempotence). For any
+    random `curr` frame and any prev state, observing at α = 1
+    leaves the float fields bit-identical to curr (the
+    `(1 − α) · prev = 0` term is exactly 0 for any finite prev in
+    IEEE 754, so `1 · curr + 0 = curr` exact). BigInt + integer
+    lanes also bit-exact.
+  - P2. Monotonic convergence at α ∈ (0, 1). Observing a constant
+    `curr` repeatedly through a smoother seeded with a different
+    prev drives `|out − curr|` monotonically toward 0 across 50
+    iterations. Per-iter slack is `1e-9 · |curr − prev| + 1e-12`
+    to absorb single-ulp rounding.
+  - P3. `seedFrom(s) + observe(s, α) ≈ s` for any α. The blend
+    `α · s + (1 − α) · s` algebraically equals `s`, but the float
+    path carries ~4 ulps of rounding error (each multiply rounds
+    independently; the sum rounds once more). Integer + BigInt
+    lanes are bit-exact. Pin uses an `ulpClose` helper:
+    `tolerance = 4 · 2^-52 · |s| + 1e-300` so subnormal inputs
+    also pass.
+
+- **Trajectory evaluator (P4–P6):**
+  - P4. order = 1 ignores dt. For any flat positions array and
+    any finite dt, `out[i] === flat[i]` bit-exact.
+  - P5. order = 2 is linear in dt. For any flat `[p, v, ...]` and
+    any dt1, dt2 in [0, 1e3]:
+    `eval(dt1 + dt2) − eval(0) === (eval(dt1) − eval(0)) + (eval(dt2) − eval(0))`
+    within a ~1e-6 relative slack on the per-sample products.
+    Inputs bounded to [-1e3, 1e3] so the products stay in safe
+    f64 precision range.
+  - P6. order = 3 matches the documented closed form
+    `out[i] = p + v · dt + 0.5 · a · dt²` element-wise. The
+    evaluator hoists `halfDt2 = 0.5 · dt · dt` and the test
+    computes the closed form inline; both shapes carry the same
+    three multiplies in different orders, so a 1-ulp relative
+    slack is allowed.
+
+- **ConsumerClockRecovery (P7–P9):**
+  - P7. First observe seeds offset exactly. For any finite
+    (consumerNs, producerNs), a fresh PLL's
+    `observe(c, p)` sets `offsetNs === p − c` bit-exactly,
+    `locked === true`, and `phaseLockedTime(x) === x + (p − c)`
+    for any x.
+  - P8. `phaseLockedTime` is identity when unlocked. Two paths
+    covered: fresh PLL (never observed) and observed-then-reset.
+    Both must return the consumerNs argument unchanged.
+  - P9. Bounded jitter ⇒ bounded offset estimate. With true
+    offset T and uniformly-distributed producer-side jitter
+    `|ε| ≤ J`, after 200 observations at 60 Hz cadence the
+    estimate stays within `5 · J + 1e-6` of T (KP^-1 = 5
+    establishes the envelope; the 1e-6 floor covers the J = 0
+    case). Sweeps T ∈ [-1e9, 1e9] ns and J ∈ [0, 1e6] ns. A
+    deterministic mulberry32 PRNG seeded by a fast-check input
+    so each (T, J) reproduces its jitter sequence.
+
+**Patch surface (testing infrastructure only):**
+
+- `package.json` — `fast-check ^4.8.0` added to devDependencies;
+  `test` + `test:unit` scripts updated to run
+  `tests/Bridge.properties.test.ts` immediately after
+  `tests/Bridge.test.ts` so a property-level regression surfaces
+  before the suites that compose them.
+- `tests/Bridge.properties.test.ts` — new file (9 pins).
+
+### Why
+
+Property-based pins complement the hand-rolled example pins
+`testFrameSmootherUnit` / `testConsumerClockRecoveryUnit` (#61–63
+in `Bridge.test.ts`) and the trajectory pins #44–#46 / #56–#60.
+The example pins assert specific numeric values at specific
+inputs and catch regressions in those exact cases; the property
+pins assert algebraic invariants and catch regressions in input
+ranges the example pins don't reach. Both layers stay — the
+property layer is purely additive.
+
+A practical example surfaced during landing: P3's first iteration
+asserted bit-exact equality of `seedFrom(s) + observe(s, α)`
+against `s` on the float lane. fast-check shrunk to a 4-input
+counterexample with a subnormal-tiny `s` (1.66e-17) where the
+two-multiply blend differs from `s` by a single ulp — the example
+pins had never exercised subnormals so this drift was invisible.
+The property-pin tightening (allowing 4 ulps of slack) makes the
+behavior contract explicit.
+
+This is the second of three testing-infra patches. 0.8.5 splits
+the 92-pin `Bridge.test.ts` into 8 feature files. The split is
+mechanical but large; landing the property layer first means the
+split inherits both a flake-free and an algebraically-pinned
+gate.
+
+### Wire compatibility
+
+**100% wire-compatible.** No production code touched; no SAB
+layout, schema, or public-API change. A 0.8.3 consumer and a
+0.8.4 consumer over the same SAB exchange frames bit-identically.
+
+### Tests
+
+14 suites green (previously 13 — `Bridge.properties.test.ts`
+added). Pin counts in `Bridge.test.ts` (92) and
+`BridgeInputLane.test.ts` (11) unchanged.
+
+`Bridge.properties.test.ts` pin counts: 9 property pins, each
+running fast-check's default 100 random inputs (~900 total
+randomized cases per CI run). Default seed-and-shrink path —
+failing inputs auto-shrink to a minimal counterexample, which is
+the headline benefit of the property layer over hand-rolled
+fuzzes.
+
+### Bench
+
+No production code touched; no bench changes. Push 1.20 μs, pull
+1.20 μs, pullLatest 1.20 μs medians unchanged from the 0.8.3
+baseline.
+
+### Documentation
+
+CHANGELOG entry above. README untouched (the property pins
+exercise documented public behavior, not new API). Each pin
+header in `tests/Bridge.properties.test.ts` documents the exact
+invariant + rationale so a future contributor reading the file
+cold can pick up the property layer's design intent.
+
 ## [0.8.3] — 2026-05-27
 
 ### Added — concurrent-test `emptyWaitTimeouts` flake fix (audit cohort, third patch — testing infra, 1 of 3)
