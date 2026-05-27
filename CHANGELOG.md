@@ -4,6 +4,152 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.17] — 2026-05-27
+
+### Added — WebNN capability flags + README "Experimental — WebNN" section (Track 5, closeout patch)
+
+Closes the Track 5 cohort and the broader 5-track planning effort
+that started in 0.7.4. 0.7.16 shipped the experimental
+`BridgeWebNNSource<S>` adapter under the
+`webgpu-audio-bridge/experimental` subpath; this patch lands the
+matching capability-detection surface on `getEnvironmentReport()`
+plus the user-facing README section so callers can probe the
+platform without throwing and find the documented opt-in import
+pattern.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/environment.ts`** — adds two flags to `EnvironmentReport`:
+  - `webnn: boolean` — `typeof navigator?.ml?.createContext === 'function'`.
+    Interface-presence sniff for the W3C WebNN root entry point.
+    Does NOT call `createContext`. Pairs with `mlTensor` below.
+  - `mlTensor: boolean` — `typeof globalThis.MLTensor === 'function'`.
+    Interface-presence sniff for the WebNN tensor primitive. Mirrors
+    the static `BridgeWebNNSource.isAvailable()` probe — callers who
+    prefer the report-style API can read this instead.
+
+  Both return `false` everywhere today (WebNN is W3C Candidate
+  Recommendation, Chrome flag-gated, Safari absent, Firefox in early
+  stages). The two flags are independent so callers can distinguish
+  "root API shipped" from "tensor class shipped" — some
+  implementations may roll one out before the other.
+
+- **`tests/environment.test.ts`** — adds pin #14 (`WebNN + MLTensor
+  interface-presence sniffs`). Five branches:
+
+  1. Bare environment → both flags false.
+  2. `navigator.ml.createContext` present → `webnn` true,
+     `mlTensor` false (split-state assertion).
+  3. `globalThis.MLTensor` present → `webnn` false, `mlTensor` true.
+  4. Both surfaces present → both true (the WebNN-enabled-Chrome
+     case).
+  5. Defensive: `navigator.ml` present but `createContext` not a
+     function → `webnn` stays false (only counts when callable).
+
+  Adds `MLTensor` to the test's mutable-global harness `KEYS` and
+  `BARE_SHAPE`. Extends `fakeNavigator()` with a `webnn?: boolean`
+  option that installs `ml.createContext` as a non-throwing stub.
+  The bare-environment pin (#1) also asserts both new flags read
+  false; the `JSON round-trip` pin (#10) implicitly covers them via
+  the report-shape preservation pattern.
+
+- **`README.md`** — new `## Experimental — WebNN (0.7.16 / 0.7.17)`
+  section under the existing Audio-rate mode section, above
+  Use cases. Documents:
+
+  - The opt-in import from `webgpu-audio-bridge/experimental`.
+  - The "outside the 1.0 stability contract" callout — MINOR-bump
+    breakage permitted as the spec stabilizes; patch bumps preserve
+    compatibility.
+  - A code skeleton showing capability check → schema definition →
+    `BridgeWebNNSource` construction → `pushFromTensor` /
+    `pushFromTypedArray` round-trip.
+  - The construction-gate semantics + the `skipAvailabilityCheck`
+    opt-out for test code.
+  - The two new capability flags and how to use them
+    pre-construction.
+  - Spec-tracking links: W3C CR, WebNN explainer,
+    Chrome implementation status page.
+
+### Why
+
+Two reasons for landing the closeout patch separately from 0.7.16
+(rather than bundling everything into one):
+
+1. **Cohort discipline.** The 0.7.13 / 0.7.14 split applied the
+   same pattern (one patch for the helper, the next for the
+   capability flags + README + final docs). Mirroring that here
+   keeps each patch focused and reviewable, and keeps the audit
+   cohort's expected gate at a specific commit (`0.7.17 — `
+   subject prefix) cleanly identifiable.
+
+2. **Independent value.** Callers building production code against
+   experimental APIs need a non-throwing capability check more than
+   they need the helper itself (they may not import the helper at
+   all if the flags return false). Landing the flags on
+   `getEnvironmentReport()` makes the report-shape API the
+   authoritative platform-introspection surface — additions to it
+   don't churn the helper's signature.
+
+The 5-track planning effort that started in 0.7.4 is now complete:
+
+- Track 1 (Hermite cubic reconstruction) — shipped 0.7.4 as a single
+  patch.
+- Track 2 (WASM-SIMD AudioWorklet consumer) — shipped 0.7.5 through
+  0.7.12 as an 8-patch cohort, plus CI hardening at the back end.
+- Track 3 (audio-rate / block-rate consumption) — shipped 0.7.13 +
+  0.7.14 (`BridgeBlockConsumer` + `BridgeBlockProducer` +
+  `examples/audio-rate/`).
+- Track 4 (zero-copy WebGPU scaffolding) — shipped 0.7.15 as the
+  `WriteTarget` strategy + `webgpuZeroCopy` capability flag.
+- Track 5 (WebNN experimental adapter) — shipped 0.7.16 + 0.7.17
+  (this cohort).
+
+What lands next is the audit cohort's reservation — the docstring
++ header-stamp + pin-#91 edits staged in the working tree
+(`src/Bridge.ts`, `src/SpscRing.ts`, `tests/Bridge.test.ts`) gate
+on `0.7.17` being the current commit, and become unblocked the
+moment this patch ships. Their cohort owns the 0.8.x line; the
+0.7.x cohort ends here.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema extension,
+no protocol change. `webnn` and `mlTensor` are additive on
+`EnvironmentReport`; the existing 13 environment-report pins
+(1 through 13) stay green unchanged. JSON round-trip preserves
+the new fields cleanly.
+
+### Tests
+
+13 suites stay green. `tests/environment.test.ts` is now 14 pins
+(the new pin #14 + the bare-pin extension cover the new flags
+across all five branches). The 0.7.16 `BridgeWebNNSource.test.ts`
+10 pins remain green unchanged — they exercise the helper's
+internal `hasMLTensor()` sniff which is intentionally duplicated
+between the helper and `environment.ts` (no cross-module
+dependency).
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.16 (≈1.20 μs).
+No new bench cell — `getEnvironmentReport()` is a one-shot
+synchronous call at module load; not part of any hot-path
+microbench measurement window.
+
+### Documentation
+
+CHANGELOG entry above. README's new
+"Experimental — WebNN (0.7.16 / 0.7.17)" section is the user-facing
+reference for the cohort; the inline docstrings on `webnn` /
+`mlTensor` in `src/environment.ts` document the field-level sniff
+discipline and the pairing-with-`BridgeWebNNSource` rationale.
+
+This is the **closeout patch** for the 5-track plan and the
+0.7.x cohort overall. After it pushes, the working-tree reservations
+(`src/Bridge.ts`, `src/SpscRing.ts`, `tests/Bridge.test.ts`)
+become unblocked for the next cohort working on 0.8.x.
+
 ## [0.7.16] — 2026-05-27
 
 ### Added — `BridgeWebNNSource<S>` experimental WebNN adapter (Track 5, first patch)

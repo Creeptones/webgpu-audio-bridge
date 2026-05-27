@@ -129,6 +129,33 @@ export interface EnvironmentReport {
   readonly webgpuZeroCopy: boolean;
   /** `typeof navigator?.requestMIDIAccess === 'function'`. Does NOT request access. */
   readonly webMidi: boolean;
+  /**
+   * `typeof navigator?.ml?.createContext === 'function'` (0.7.17).
+   * Interface-presence sniff for the W3C WebNN root entry point. Does
+   * NOT create a context. Returns `false` everywhere today — WebNN is
+   * W3C Candidate Recommendation, Chrome behind
+   * `chrome://flags/#web-machine-learning-api`, Safari absent, Firefox
+   * in early stages. Pairs with `mlTensor` below: `webnn` says "the
+   * root surface is present"; `mlTensor` says "the tensor primitive
+   * specifically is present."
+   *
+   * Consumers building against the experimental
+   * `BridgeWebNNSource` (under the
+   * `webgpu-audio-bridge/experimental` subpath) should read these
+   * flags pre-construction rather than catching the helper's
+   * "WebNN not available" throw. The helper's static
+   * `BridgeWebNNSource.isAvailable()` reports the same as
+   * `mlTensor` here.
+   */
+  readonly webnn: boolean;
+  /**
+   * `typeof globalThis.MLTensor === 'function'` (0.7.17).
+   * Interface-presence sniff for the WebNN `MLTensor` global class —
+   * the tensor primitive `BridgeWebNNSource` accepts. Some WebNN
+   * impls may expose the root `navigator.ml` API without
+   * `MLTensor` yet; this flag captures that split.
+   */
+  readonly mlTensor: boolean;
   /** `navigator?.userActivation` present. Predicts whether AudioContext.resume will succeed. */
   readonly userActivation: boolean;
   /** `globalThis.isSecureContext === true`. */
@@ -185,6 +212,7 @@ function hasSecureContext(g: typeof globalThis): boolean {
 
 interface NavigatorLike {
   gpu?: { requestAdapter?: unknown };
+  ml?: { createContext?: unknown };
   requestMIDIAccess?: unknown;
   userActivation?: unknown;
   userAgent?: string;
@@ -215,6 +243,26 @@ function hasWebGpuZeroCopy(g: typeof globalThis): boolean {
   return "mapShared" in proto;
 }
 
+/**
+ * Interface-presence sniff for the W3C WebNN root entry point
+ * `navigator.ml.createContext` (0.7.17). Does NOT create a context.
+ * Returns `false` everywhere today — WebNN is W3C Candidate
+ * Recommendation, Chrome behind a flag, Safari absent.
+ */
+function hasWebNN(nav: NavigatorLike | undefined): boolean {
+  return !!nav && !!nav.ml && typeof nav.ml.createContext === "function";
+}
+
+/**
+ * Interface-presence sniff for the WebNN `MLTensor` global class
+ * (0.7.17) — the tensor primitive `BridgeWebNNSource` accepts.
+ * Returns `false` everywhere today; flips `true` when a browser
+ * exposes `MLTensor` on the thread's global.
+ */
+function hasMLTensor(g: typeof globalThis): boolean {
+  return typeof (g as { MLTensor?: unknown }).MLTensor === "function";
+}
+
 function hasWebMidi(nav: NavigatorLike | undefined): boolean {
   return !!nav && typeof nav.requestMIDIAccess === "function";
 }
@@ -239,6 +287,8 @@ interface FeatureFlags {
   readonly webgpu: boolean;
   readonly webgpuZeroCopy: boolean;
   readonly webMidi: boolean;
+  readonly webnn: boolean;
+  readonly mlTensor: boolean;
   readonly userActivation: boolean;
   readonly secureContext: boolean;
 }
@@ -457,6 +507,8 @@ export function getEnvironmentReport(): EnvironmentReport {
     webgpu: hasWebGpu(nav),
     webgpuZeroCopy: hasWebGpuZeroCopy(g),
     webMidi: hasWebMidi(nav),
+    webnn: hasWebNN(nav),
+    mlTensor: hasMLTensor(g),
     userActivation: hasUserActivation(nav),
     secureContext: hasSecureContext(g),
   };
@@ -474,6 +526,8 @@ export function getEnvironmentReport(): EnvironmentReport {
     webgpu: flags.webgpu,
     webgpuZeroCopy: flags.webgpuZeroCopy,
     webMidi: flags.webMidi,
+    webnn: flags.webnn,
+    mlTensor: flags.mlTensor,
     userActivation: flags.userActivation,
     secureContext: flags.secureContext,
     suggestedMode,

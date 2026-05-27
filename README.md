@@ -1141,6 +1141,54 @@ npm run build && npm run dev:audio-rate
 
 The demo's structural choice list is itself the recipe: 1024-sample blocks at 48 kHz, capacity 4 (≈85 ms floor), producer at 50 Hz, consumer zero-fills on underflow.
 
+## Experimental — WebNN (0.7.16 / 0.7.17)
+
+`BridgeWebNNSource<S>` is a thin adapter for streaming the output of a [WebNN](https://www.w3.org/TR/webnn/) model into a `Bridge<S>`. Real-time voice cloning, neural reverb, neural EQ matching, physics-modelled instruments — anything where the model output is a block of `f32` samples — gets the same low-jitter audio-thread delivery the WebGPU helpers provide, just from a different producer side.
+
+**This helper lives outside the 1.0 stability contract.** The WebNN spec is W3C Candidate Recommendation, Chrome is behind [`chrome://flags/#web-machine-learning-api`](chrome://flags/#web-machine-learning-api), Safari has not shipped, Firefox is in early stages. The adapter's shape may break across MINOR version bumps as the spec stabilizes. Patch bumps within a minor preserve compatibility. The export path is `webgpu-audio-bridge/experimental` to make the opt-in explicit.
+
+```ts
+import { Bridge, defineSchema, u64, f32Array, getEnvironmentReport } from "webgpu-audio-bridge";
+import { BridgeWebNNSource } from "webgpu-audio-bridge/experimental";
+
+// Capability check (non-throwing) before construction:
+const env = getEnvironmentReport();
+if (!env.webnn || !env.mlTensor) {
+  // Fall back to a CPU-side model or `pushFromTypedArray` only.
+}
+
+const schema = defineSchema({
+  blockIndex: u64(),
+  samples:    f32Array(1024),
+});
+const { sab, capacity } = Bridge.allocate(4, schema);
+const bridge = new Bridge(sab, capacity, schema);
+const source = new BridgeWebNNSource(bridge, { blockIndexField: 'blockIndex' });
+
+// Async path — push an MLTensor through the bridge:
+await source.pushFromTensor(modelOutputTensor);
+
+// Sync fallback — push a CPU Float32Array. Works on any host (no WebNN
+// runtime required on this code path; useful for CPU-side models or
+// transitional code while WebNN matures):
+source.pushFromTypedArray(cpuFloat32Samples);
+```
+
+The adapter takes a `Bridge<S>` whose schema declares exactly one `f32Array` field (the samples block; mirrors `BridgeBlockProducer`'s schema constraint). Additional scalar fields are honored: an optional `u64` block index auto-increments on every successful push (resolves `'blockIndex'` by default if present), and an optional `fillScalars` hook runs once per push for caller-side metadata (timestamp, frame id, etc.).
+
+**Construction gate.** The default constructor throws `"WebNN not available"` when `globalThis.MLTensor` is not a function. The error message names the Chrome flag and points at the non-throwing probe (`BridgeWebNNSource.isAvailable()`); test code that wants only the typed-array fallback path can pass `skipAvailabilityCheck: true`.
+
+**Capability detection.** `getEnvironmentReport()` (0.7.17) exposes two flags so callers can distinguish "browser ships the WebNN root API" from "browser ships the `MLTensor` primitive specifically":
+
+- `report.webnn` — `typeof navigator?.ml?.createContext === 'function'`. The W3C entry point.
+- `report.mlTensor` — `typeof globalThis.MLTensor === 'function'`. The tensor class.
+
+Both are interface-presence sniffs; neither calls anything. Both return `false` on current Chrome stable / Node / Safari / Firefox.
+
+**Where this fits.** WebNN is positioned as the standard for AI inference in the browser. As models like real-time voice cloning and neural reverb mature, their outputs will need to land in the audio thread with low jitter — exactly the `Bridge<S>` story. Today the adapter is a positioning move: a working surface that lets you wire WebNN through the bridge as soon as the spec stabilizes, with the typed-array fallback as a useful transitional path for CPU-side models. Future patches will harden the adapter (context-side read variants, multi-channel splitting, telemetry parity with `BridgeGPUSource`) as real consumers materialize.
+
+**Spec tracking.** [W3C WebNN Candidate Recommendation](https://www.w3.org/TR/webnn/), [WebNN explainer](https://webmachinelearning.github.io/webnn-intro/), [Chrome implementation status](https://chromestatus.com/feature/5466739056508928). Issues + design feedback welcome on the project's GitHub.
+
 ## Use cases
 
 The pattern this library implements unblocks browser projects that previously had no clean answer:

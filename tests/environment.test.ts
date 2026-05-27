@@ -47,6 +47,12 @@
  *       placeholder `mapShared` method — the W3C zero-copy / shared-
  *       memory readback surface that hasn't shipped in any browser
  *       yet. Interface-presence sniff, NOT UA version.
+ *  14.  (0.7.17) webnn is false on current Node, flips to true when
+ *       `navigator.ml.createContext` is a function. Does NOT call the
+ *       method.
+ *  15.  (0.7.17) mlTensor is false on current Node, flips to true
+ *       when `globalThis.MLTensor` is a function. Interface-presence
+ *       sniff; pairs with `BridgeWebNNSource.isAvailable()`.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -73,6 +79,9 @@ const KEYS = [
   // 0.7.15 — added for the webgpuZeroCopy pin so test bodies can
   // install / delete GPUBuffer to drive the interface-presence sniff.
   "GPUBuffer",
+  // 0.7.17 — added for the mlTensor pin so test bodies can install /
+  // delete MLTensor to drive the WebNN tensor-class sniff.
+  "MLTensor",
 ] as const;
 
 type GlobalKey = (typeof KEYS)[number];
@@ -133,6 +142,7 @@ function fakeNavigator(opts: {
   userActivation?: boolean;
   userAgent?: string;
   midiThrower?: () => unknown;
+  webnn?: boolean;
 } = {}): unknown {
   const nav: Record<string, unknown> = {
     userAgent: opts.userAgent ?? "tsx-test-runner/0.7.1",
@@ -146,6 +156,14 @@ function fakeNavigator(opts: {
   }
   if (opts.userActivation) {
     nav.userActivation = { hasBeenActive: false, isActive: false };
+  }
+  if (opts.webnn) {
+    // 0.7.17 — installing `navigator.ml.createContext` as a function
+    // makes the WebNN sniff flip true. The function is never invoked;
+    // pure feature detection.
+    nav.ml = {
+      createContext: () => { throw new Error("ml.createContext must not be called"); },
+    };
   }
   return nav;
 }
@@ -163,6 +181,9 @@ const BARE_SHAPE: MockShape = {
   // 0.7.15 — ensure pins start from a no-GPUBuffer baseline so
   // `webgpuZeroCopy` reads as false regardless of host defaults.
   GPUBuffer: SENTINEL_DELETE,
+  // 0.7.17 — ensure pins start from a no-MLTensor baseline so
+  // `mlTensor` reads as false regardless of host defaults.
+  MLTensor: SENTINEL_DELETE,
 };
 
 // ── 1. Vanilla / no-browser shape → 'unsupported' ────────────────────────
@@ -179,6 +200,8 @@ function testBareEnvironment(): void {
   assertEq(report.webgpu, false, "bare: webgpu false");
   assertEq(report.webgpuZeroCopy, false, "bare: webgpuZeroCopy false");
   assertEq(report.webMidi, false, "bare: webMidi false");
+  assertEq(report.webnn, false, "bare: webnn false");
+  assertEq(report.mlTensor, false, "bare: mlTensor false");
   assertEq(report.userActivation, false, "bare: userActivation false");
   assertEq(report.suggestedMode, "unsupported", "bare → unsupported");
   assertEq(report.userAgent, "", "bare: userAgent ''");
@@ -528,6 +551,67 @@ function testWebGpuZeroCopySniff(): void {
   ok("13. webgpuZeroCopy interface-presence sniff");
 }
 
+// ── 14. WebNN + MLTensor sniffs (0.7.17) ────────────────────────────────
+function testWebNNAndMLTensorSniff(): void {
+  // (a) Bare — both flags false.
+  const bare = withMockedGlobal(BARE_SHAPE, () => getEnvironmentReport());
+  assertEq(bare.webnn, false, "bare: webnn false");
+  assertEq(bare.mlTensor, false, "bare: mlTensor false");
+
+  // (b) navigator with ml.createContext function → webnn true,
+  // mlTensor still false (the two are independent — some impls may
+  // expose the root API without the tensor class).
+  withMockedGlobal(
+    { ...BARE_SHAPE, navigator: fakeNavigator({ webnn: true }) },
+    () => {
+      const r = getEnvironmentReport();
+      assertEq(r.webnn, true, "navigator.ml.createContext present: webnn true");
+      assertEq(r.mlTensor, false, "still no MLTensor: mlTensor false");
+    },
+  );
+
+  // (c) navigator without ml.createContext but globalThis.MLTensor
+  // present → webnn false, mlTensor true. Captures the
+  // "tensor primitive exposed, root API not" split.
+  const MLTensorShim = function (this: object): void { /* never new'd */ };
+  withMockedGlobal(
+    { ...BARE_SHAPE, MLTensor: MLTensorShim },
+    () => {
+      const r = getEnvironmentReport();
+      assertEq(r.webnn, false, "no navigator.ml: webnn false");
+      assertEq(r.mlTensor, true, "globalThis.MLTensor present: mlTensor true");
+    },
+  );
+
+  // (d) Both surfaces present → both true (the WebNN-enabled-Chrome
+  // case the experimental BridgeWebNNSource targets).
+  withMockedGlobal(
+    {
+      ...BARE_SHAPE,
+      navigator: fakeNavigator({ webnn: true }),
+      MLTensor: MLTensorShim,
+    },
+    () => {
+      const r = getEnvironmentReport();
+      assertEq(r.webnn, true, "full WebNN: webnn true");
+      assertEq(r.mlTensor, true, "full WebNN: mlTensor true");
+    },
+  );
+
+  // (e) Defensive: `navigator.ml` present but `createContext` is not a
+  // function — sniff stays false (only counts when the method is
+  // callable-shaped).
+  withMockedGlobal(
+    { ...BARE_SHAPE, navigator: { userAgent: "test", ml: {} } },
+    () => {
+      const r = getEnvironmentReport();
+      assertEq(r.webnn, false, "navigator.ml without createContext: webnn false");
+    },
+  );
+
+  ok("14. WebNN + MLTensor interface-presence sniffs");
+}
+
 function main(): void {
   testBareEnvironment();
   testIndividualFlags();
@@ -542,6 +626,7 @@ function main(): void {
   testPureReflection();
   testCoopCoepSeverityDowngrade();
   testWebGpuZeroCopySniff();
+  testWebNNAndMLTensorSniff();
   console.log("\nAll environment.test.ts pins passed.");
 }
 
