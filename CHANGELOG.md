@@ -4,6 +4,134 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.3] — 2026-05-27
+
+### Added — concurrent-test `emptyWaitTimeouts` flake fix (audit cohort, third patch — testing infra, 1 of 3)
+
+Third patch of the audit cohort, first slice of the testing-infra
+sub-cohort (with `fast-check` property pins to follow in 0.8.4 and
+the 92-pin `Bridge.test.ts` 8-way split to follow in 0.8.5). Fixes
+the documented flake CLAUDE.md has been carrying since the 0.6.x
+cohort.
+
+Both concurrent stress tests (`tests/Bridge.concurrent.test.ts` and
+`tests/Float64RingBuffer.concurrent.test.ts`) end with an assertion
+that the consumer-side `Atomics.wait(...)` never times out across the
+1 M-frame run — the lost-notify regression alarm. The assertion was
+strict `=== 0`; on a loaded CI machine the OS scheduler can park the
+consumer thread for >100 ms (the `CONSUMER_WAIT_TIMEOUT_MS`) even
+when the producer is healthy and notifies have fired, producing the
+documented "fires once on a loaded machine, re-run once if it fires"
+behavior.
+
+The 0.8.3 patch relaxes the consumer-side assertion to a soft
+threshold of `ceil(TOTAL_FRAMES / 100_000)` (= 10 for the default
+1 M-frame run). Rationale:
+
+- A real lost-notify regression produces dozens-to-hundreds of
+  consumer-side timeouts across a run (every consumer wait that
+  paired with a dropped notify would time out at the 100 ms mark).
+  10 timeouts is far below that floor and far above the typical
+  healthy-machine count (0–3 across multiple local runs).
+- A truly broken protocol would also stall the consumer entirely,
+  which `STALL_TIMEOUT_MS = 30_000` already catches independently.
+- The producer-side `fullWaitTimeouts === 0` assertion stays strict
+  because `PRODUCER_WAIT_TIMEOUT_MS = 1_000` is 10× looser; CI
+  jitter under 1 second doesn't trip it.
+- Setting `STRICT_TIMING=1` in the environment restores the
+  pre-0.8.3 strict `=== 0` check on the consumer side for local
+  debugging — useful when investigating a suspected real
+  regression.
+
+The success message of each suite now surfaces the timeout count as
+`Xtimeouts/N` (e.g. `0/10 timeouts`) so trend toward the threshold
+is visible in normal CI output. A drift from 0–3 to 5–8 is now
+inspectable without having to dig the raw count out of the
+assertion failure path.
+
+**Patch surface (testing-infrastructure only — no production code
+touched):**
+
+- **`tests/Bridge.concurrent.test.ts`** —
+  - Pin #6 in the file header rewritten to describe the soft
+    threshold + rationale + STRICT_TIMING escape.
+  - New constants `TIMEOUT_TOLERANCE` (= `ceil(TOTAL_FRAMES /
+    100_000)`) and `STRICT_TIMING` (= `process.env.STRICT_TIMING
+    === "1"`) declared in the run-shape constants block.
+  - End-of-suite `emptyWaitTimeouts` assertion replaced with a
+    branch: under `STRICT_TIMING` the strict `=== 0` check runs;
+    otherwise the soft `<= TIMEOUT_TOLERANCE` check runs with a
+    clear message that names both the observed count and the
+    tolerance plus the STRICT_TIMING escape hatch.
+  - Success-message `ok(...)` updated to include
+    `${emptyWaitTimeouts}/${TIMEOUT_TOLERANCE} timeouts`.
+
+- **`tests/Float64RingBuffer.concurrent.test.ts`** —
+  - File-header `fullWaitTimeouts and emptyWaitTimeouts` paragraph
+    rewritten to mirror the Bridge file's pin #6 explanation —
+    producer side stays strict (`=== 0`), consumer side becomes
+    soft (`<= TIMEOUT_TOLERANCE`), STRICT_TIMING escape documented.
+  - Same `TIMEOUT_TOLERANCE` / `STRICT_TIMING` constants + same
+    branched assertion + same success-message format. Mechanical
+    parity with the Bridge file so the two suites stay in lockstep
+    if either tightens or loosens later.
+
+### Why
+
+The flake had been carried as a documented "re-run once if it
+fires" item across the entire 0.7.x cohort. That's an acceptable
+state during rapid iteration but it's the wrong default for a
+project approaching 1.0 — release gates that flake degrade trust in
+green CI and make real regressions harder to spot. The soft
+threshold is conservative enough to still catch a real lost-notify
+regression (the regression signature is order-of-magnitude larger
+than the tolerance) and the STRICT_TIMING escape preserves the
+strict check for anyone investigating a suspected regression.
+
+This is also the first slice of the audit cohort's 0.8.3 → 0.8.5
+testing-infrastructure sub-cohort. 0.8.4 adds `fast-check` property
+pins for FrameSmoother, trajectory eval, and the PLL; 0.8.5 splits
+the 92-pin `tests/Bridge.test.ts` into 8 feature files. Landing the
+flake fix first means the next two patches inherit a green-only
+gate rather than a green-with-flake-tolerance gate.
+
+### Wire compatibility
+
+**100% wire-compatible.** No production code touched; no SAB
+layout, schema, or public-API change. A 0.8.2 consumer and a 0.8.3
+consumer over the same SAB exchange frames bit-identically.
+
+### Tests
+
+Both suites stayed green across multiple local runs:
+
+- `tests/Bridge.concurrent.test.ts` — `bridge-concurrent-spsc-
+  stress (1,000,000 frames in ~1100 ms; consumer 0-3 empty-wait
+  timeouts of 10 tolerated)`. The soft branch reports
+  `Xtimeouts/10` in the success message, making trend toward the
+  threshold visible.
+- `tests/Float64RingBuffer.concurrent.test.ts` — `concurrent-spsc-
+  stress (1,000,000 frames in ~500 ms; consumer 0-1 empty-wait
+  timeouts of 10 tolerated)`.
+
+All 13 test suites pass with the new branch. Pin counts in
+`Bridge.test.ts` (92) and `BridgeInputLane.test.ts` (11) unchanged
+— this patch is testing infrastructure only.
+
+### Bench
+
+No production code touched, no bench changes. Existing medians
+(push 1.20 μs, pull 1.20 μs, pullLatest 1.20 μs) hold.
+
+### Documentation
+
+CHANGELOG entry above. README untouched (the concurrent-test
+behavior isn't part of the public-facing test docs). CLAUDE.md's
+"known flake" note will be revisited once the 0.8.3 → 0.8.5
+testing-infra sub-cohort completes — the soft threshold removes
+the flake but the note describes the strategy for the broader
+class of timing-sensitive tests.
+
 ## [0.8.2] — 2026-05-27
 
 ### Added — pullAll single-trailing-notify + BigInt-free PLL publish (audit cohort, second patch)

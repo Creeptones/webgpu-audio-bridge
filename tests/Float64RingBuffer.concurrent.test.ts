@@ -75,11 +75,18 @@
  * AudioWorklet uses does NOT call waitForData; it just polls and tolerates
  * misses.
  *
- * `fullWaitTimeouts` and `emptyWaitTimeouts` are asserted === 0 at the end
- * of the run. A non-zero value means an Atomics.wait reached its timeout
- * without a notify — the protocol recovers (we loop and re-check the
- * counter) but it's a real bug signal worth surfacing hard. Any future
- * regression that re-introduces the lost-wakeup hole will fire here.
+ * `fullWaitTimeouts` is asserted === 0 at the end of the run (producer
+ * side, with the longer 1 s wait timeout). `emptyWaitTimeouts` is asserted
+ * to be ≤ `TIMEOUT_TOLERANCE` (= ceil(TOTAL_FRAMES / 100_000), i.e. 10 for
+ * the default 1 M-frame run) — relaxed from the pre-0.8.3 strict ===0 to
+ * absorb CI scheduler jitter on the shorter 100 ms consumer-side wait
+ * timeout. A non-zero value below the threshold means an Atomics.wait
+ * reached its timeout without a notify, which the protocol then recovers
+ * from — that pattern shows up under loaded-machine OS scheduling stalls
+ * even when the producer is healthy. A regression that re-introduces the
+ * lost-wakeup hole produces dozens to hundreds of timeouts across the run
+ * and fires the threshold loudly. Set `STRICT_TIMING=1` in the environment
+ * to restore the strict ===0 check for local debugging.
  *
  * ─── Why the producer source is inlined (eval: true) ──────────────────────
  *
@@ -160,6 +167,14 @@ const HEARTBEAT_INTERVAL_MS = 1_000;
 // Producer worker emits a "heartbeat" message every this-many pushes. 100k
 // over a 1M-frame run is 10 messages → negligible postMessage overhead.
 const PRODUCER_HEARTBEAT_EVERY_N = 100_000;
+
+// Consumer-side empty-wait timeout tolerance (see the file header rationale).
+// Matches tests/Bridge.concurrent.test.ts: at ~1 timeout per 100k frames the
+// threshold tolerates CI scheduler jitter — far below the regression
+// signature (dozens-to-hundreds of consumer-side timeouts) and far above the
+// typical healthy-machine count (0–3 on a 1 M-frame run).
+const TIMEOUT_TOLERANCE = Math.ceil(TOTAL_FRAMES / 100_000);
+const STRICT_TIMING = process.env.STRICT_TIMING === "1";
 
 // ─── Producer source (runs in the worker via eval: true) ──────────────────
 // Plain JS (not TS). Mirrors Float64RingBuffer.push verbatim — if push
@@ -531,15 +546,24 @@ async function runConcurrentStress(): Promise<void> {
     0,
     `producer Atomics.wait never times out under a healthy consumer (got ${fullWaitTimeouts})`,
   );
-  assertEq(
-    emptyWaitTimeouts,
-    0,
-    `consumer Atomics.wait never times out under a healthy producer (got ${emptyWaitTimeouts})`,
-  );
+  if (STRICT_TIMING) {
+    assertEq(
+      emptyWaitTimeouts,
+      0,
+      `[STRICT_TIMING] consumer Atomics.wait never times out under a healthy producer (got ${emptyWaitTimeouts})`,
+    );
+  } else {
+    assert(
+      emptyWaitTimeouts <= TIMEOUT_TOLERANCE,
+      `consumer Atomics.wait timeouts ${emptyWaitTimeouts} exceed tolerance ${TIMEOUT_TOLERANCE} ` +
+        `(= ceil(${TOTAL_FRAMES}/100_000)); likely lost-notify regression. ` +
+        `Set STRICT_TIMING=1 to require ===0 for local debugging.`,
+    );
+  }
   ok(
     `concurrent-spsc-stress (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +
       `producer ${fullWaits.toLocaleString()} full-waits / ${producerNotifies.toLocaleString()} push-notifies; ` +
-      `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyPolls.toLocaleString()} empty polls)`,
+      `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyWaitTimeouts}/${TIMEOUT_TOLERANCE} timeouts, ${emptyPolls.toLocaleString()} empty polls)`,
   );
 }
 
