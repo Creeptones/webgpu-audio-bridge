@@ -38,6 +38,7 @@ import { Bridge } from "../src/Bridge.js";
 import {
   defineSchema, f64, f32, u64, i64, u32, i32, u16, i16, u8, i8,
   f64Array, f32Array, u32Array, f64TrajectoryArray, f32TrajectoryArray,
+  describeSchemaLayout,
 } from "../src/schema.js";
 import { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "../src/trajectory.js";
 import {
@@ -1208,8 +1209,145 @@ function main(): void {
     );
   }
 
+  // ── 12: Invariant lane decode equivalence (0.7.11) ──────────────────────
+  // The final shape in the Track 2 cohort. Schemas built with
+  // `.withInvariant(fn)` (0.6.0) carry a hidden `__invariant: f64` lane
+  // at the end of each frame slot — the producer writes it on push
+  // BEFORE the release-store on write_index; the consumer reads it on
+  // pull BEFORE the release-store on read_index. Bridge runs the
+  // heap-side classifier (raw or smoothed handler) AFTER the release-
+  // store to decide ok / soft / hard.
+  //
+  // The WASM consumer already has `readF64` (0.7.7) sufficient to read
+  // the f64 invariant from any byte offset. The missing piece was
+  // visibility: `describeLayout()` did not expose
+  // `invariantByteOffset`, so a worklet that only sees the layout JSON
+  // (the canonical cross-thread descriptor) couldn't find the lane.
+  // 0.7.11 surfaces `invariantByteOffset` on `SchemaLayoutDescription`
+  // — additive, no SAB format change. This pin proves end-to-end that:
+  //
+  //   (a) `describeLayout().invariantByteOffset` is the same offset
+  //       the JS Bridge writes/reads through.
+  //   (b) A WASM `readF64` at that offset returns the value the
+  //       schema's invariant fn computed on the producer side.
+  //   (c) The agreement holds across multiple frames with varied
+  //       payloads, exercising the invariant fn's full range.
+  //
+  // Test invariant: sum-of-squares of the f64 array field — a typical
+  // shape for physical conservation-law checks (matches the existing
+  // physicsControlFrameSchema invariant). Predictable, deterministic.
+  {
+    const N_ELEMS = 8;
+    const invariantFn = (frame: { samples: Float64Array }): number => {
+      let s = 0;
+      for (let k = 0; k < N_ELEMS; k++) {
+        const v = frame.samples[k]!;
+        s += v * v;
+      }
+      return s;
+    };
+    const invSchema = defineSchema({
+      seq: u64(),
+      samples: f64Array(N_ELEMS),
+    }).withInvariant(invariantFn);
+
+    // The schema MUST have a non-null invariantByteOffset in its layout.
+    // (`describeSchemaLayout` is the schema-side helper; Bridge exposes
+    // the same shape via `bridge.describeLayout()` once constructed.)
+    const layout = describeSchemaLayout(invSchema);
+    assert(
+      layout.invariantByteOffset !== null,
+      "pin12: layout exposes invariantByteOffset for invariant-bearing schema",
+    );
+    assertEq(
+      layout.invariantByteOffset! % 8,
+      0,
+      "pin12: invariantByteOffset is 8-aligned",
+    );
+
+    // Layout offset MUST match the compiled offset (the source of truth
+    // the JS Bridge writes through). This is the cross-channel agreement
+    // that lets a worklet trust the describeLayout JSON.
+    assertEq(
+      layout.invariantByteOffset,
+      invSchema.compiled.invariantByteOffset,
+      "pin12: layout offset === compiled offset",
+    );
+
+    const cap = 4;
+    const sabBytes = Bridge.byteLength(cap, invSchema);
+    const alloc = allocateWorkletMemory(sabBytes);
+    const bridge = new Bridge(alloc.sab, cap, invSchema);
+    const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+    const frameBytes = invSchema.compiled.frameByteSize;
+    const headerBytes = 32;
+    const mask = cap - 1;
+    const invariantOff = layout.invariantByteOffset!;
+
+    // Drive several frames with varied payloads so the invariant takes
+    // varied values (including 0 — empty payload — which exercises the
+    // absolute-epsilon floor path on the classifier side).
+    const rows: ReadonlyArray<readonly number[]> = [
+      [0, 0, 0, 0, 0, 0, 0, 0],                   // invariant = 0
+      [1, 0, 0, 0, 0, 0, 0, 0],                   // invariant = 1
+      [1, 1, 1, 1, 1, 1, 1, 1],                   // invariant = 8
+      [0.5, -0.5, 2, -2, 3, -3, 0.1, -0.1],       // invariant = 0.5 + 0.5 + 4 + 4 + 9 + 9 + 0.01 + 0.01 = 27.02
+      [1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7], // invariant ≈ 8e-14 (subnormal-ish)
+      [1e6, -1e6, 1e6, -1e6, 1e6, -1e6, 1e6, -1e6],     // invariant = 8e12
+    ];
+
+    const push = bridge.scratchFrame();
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r]!;
+      push.seq = BigInt(r);
+      for (let k = 0; k < N_ELEMS; k++) push.samples[k] = row[k]!;
+      assert(bridge.push(push), `pin12: push row ${r}`);
+
+      // WASM peek + invariant read at the layout offset.
+      const slot = consumer.peekPull(mask);
+      assert(slot >= 0, `pin12: peekPull row ${r}`);
+      const slotBase = headerBytes + slot * frameBytes;
+      const wasmInvariant = consumer.readF64(slotBase + invariantOff);
+
+      // JS-side oracle — recompute the invariant from the row payload.
+      // The schema's invariant fn must produce this exact value (no
+      // smoothing, no recovery — the producer's stored value is just
+      // `compute(frame)` at push time).
+      let expected = 0;
+      for (let k = 0; k < N_ELEMS; k++) expected += row[k]! * row[k]!;
+      assertEq(
+        wasmInvariant,
+        expected,
+        `pin12: WASM invariant read row ${r} (expected sum-of-squares=${expected})`,
+      );
+
+      // Commit before next push so the ring doesn't fill (cap=4, rows=6).
+      consumer.commitPull();
+    }
+
+    ok(
+      `wasm-invariant-decode-equivalence (${rows.length} rows × N=${N_ELEMS} sum-of-squares; offset from describeLayout)`,
+    );
+  }
+
+  // ── 13: Invariant lane returns null on no-invariant schema (0.7.11) ─────
+  // The other half of the layout-API contract: a schema with NO
+  // `.withInvariant(...)` MUST surface `invariantByteOffset: null` so
+  // worklet callers can branch on presence without falling back to
+  // checking the Schema object.
+  {
+    const plainSchema = defineSchema({ a: f64(), b: f64() });
+    const plainLayout = describeSchemaLayout(plainSchema);
+    assertEq(
+      plainLayout.invariantByteOffset,
+      null,
+      "pin13: no-invariant schema layout exposes invariantByteOffset=null",
+    );
+    ok(`wasm-invariant-layout-null-for-plain-schema`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode in agreement with JS atomics.",
   );
 }
 

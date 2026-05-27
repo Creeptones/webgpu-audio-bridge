@@ -622,6 +622,18 @@ export interface SchemaLayoutDescription {
    *  names without re-importing the Schema object. Null when no
    *  `.withTimestamps(...)` was attached. (0.6.5) */
   readonly timestamps: SchemaTimestampsSpec | null;
+  /** Byte offset of the hidden `__invariant: f64` lane within a frame slot,
+   *  or null if the schema has no `.withInvariant(...)` attached. Exposed
+   *  in the layout description (0.7.11) so worklet-side inliners — the
+   *  WASM consumer in particular — can resolve the invariant offset from
+   *  the postMessage-friendly `describeLayout()` JSON alone, without
+   *  needing access to the `Schema` object. A WASM consumer pulls the
+   *  stored f64 via `readF64(slotBase + invariantByteOffset)` BEFORE the
+   *  release-store on `read_index`, then the Bridge's heap-side
+   *  classifier compares it against `schema.invariant.compute(frame)`
+   *  AFTER. See `src/Bridge.ts` "Schema invariants". Always 8-aligned
+   *  when non-null. */
+  readonly invariantByteOffset: number | null;
 }
 
 // ─── Validation + compile ──────────────────────────────────────────────────
@@ -954,5 +966,8 @@ export function describeSchemaLayout(
     frameByteSize: schema.frameByteSize,
     fields: Object.freeze(fields),
     timestamps: schema.timestamps,
+    invariantByteOffset: schema.invariant !== null
+      ? schema.invariant.byteOffset
+      : null,
   });
 }

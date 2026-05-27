@@ -4,6 +4,135 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.11] — 2026-05-27
+
+### Added — Invariant lane visibility in `describeLayout()` (Track 2 of the King roadmap, seventh patch)
+
+Seventh patch in the Track 2 cohort. Surfaces the hidden
+`__invariant: f64` lane's byte offset on `SchemaLayoutDescription`
+so worklet-side inliners — the WASM consumer in particular — can
+resolve the invariant offset from the postMessage-friendly
+`describeLayout()` JSON alone, without needing access to the
+`Schema` object on the audio thread.
+
+Nothing about the SAB byte layout changes (the lane has been there
+since 0.6.0; the producer writes it on push, the JS consumer reads
+it on pull). The patch is purely a visibility cut: one new field
+on the layout descriptor, two new test pins, no new WAT exports,
+no new shim methods. After this patch the WASM consumer can drive
+every lane the JS Bridge supports (scalars, arrays, trajectories,
+invariants) using exports that already shipped in 0.7.5 → 0.7.10.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/schema.ts`** `SchemaLayoutDescription` interface gains a
+  new readonly field:
+  - `invariantByteOffset: number | null` — the byte offset of the
+    hidden `__invariant: f64` lane within a frame slot, or `null`
+    when the schema has no `.withInvariant(...)` attached. Always
+    8-aligned when non-null. Mirrors the existing
+    `schema.compiled.invariantByteOffset` value through the
+    layout-descriptor channel.
+
+  `describeSchemaLayout(schema)` (and the `bridge.describeLayout()`
+  delegator on Bridge) populates the new field from
+  `schema.invariant?.byteOffset ?? null`. Existing callers that
+  ignore the field are unaffected — additive.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds Pins 12 and 13:
+  - **Pin 12 (invariant-lane decode equivalence)** — builds a
+    schema with `.withInvariant(sum-of-squares)`, pushes 6 rows
+    covering a 14-order-of-magnitude invariant range (0, 1, 8,
+    27.02, ≈8e-14, 8e12) including the subnormal-ish band that
+    exercises the absolute-epsilon floor on the classifier side.
+    For each row, the WASM consumer's `readF64` at
+    `layout.invariantByteOffset` MUST equal the JS-side oracle
+    `Σ sample[k]²`. Also asserts the layout offset equals
+    `schema.compiled.invariantByteOffset` (cross-channel
+    agreement: a worklet trusting the layout JSON sees the same
+    bytes the JS Bridge writes through).
+  - **Pin 13 (no-invariant layout null)** — a plain
+    `defineSchema({ a: f64(), b: f64() })` schema MUST surface
+    `invariantByteOffset: null` so callers can branch on presence
+    without inspecting the `Schema` object directly.
+
+  All eleven 0.7.10 pins still pass.
+
+### Why
+
+The WASM consumer already had `read_f64` (0.7.7) sufficient to
+decode any f64 in the SAB at any byte offset. What it didn't have
+— through the canonical cross-thread descriptor channel — was a
+way to find where the invariant lane lives. `schema.invariant.
+byteOffset` is on the `Schema` object, but the standard worklet
+hand-off pattern (postMessage `describeLayout()` JSON, reconstruct
+on the audio thread) deliberately doesn't ship the `Schema` —
+the layout descriptor is intentionally the only contract the two
+ends share.
+
+Without this patch a worklet using `.withInvariant`-bearing
+schemas had to either (a) reach into the producer-side `Schema`
+out-of-band (couples the worklet to the producer's import graph,
+defeating the layout-descriptor pattern's whole point) or (b)
+re-implement the invariant offset arithmetic from
+`describeLayout().fields` (`max(byteOffset + byteSize) + padding`
+— fragile and not actually publicly documented).
+
+Exposing the offset as a single optional field on the layout
+descriptor is the smallest correct fix. After 0.7.11 a worklet
+can drive the full invariant lane through `describeLayout()` +
+`readF64()` alone:
+
+```ts
+const layout = bridge.describeLayout();
+// ... peek slot, compute slotBase ...
+if (layout.invariantByteOffset !== null) {
+  const stored = consumer.readF64(slotBase + layout.invariantByteOffset);
+  // Bridge's heap-side classifier compares `stored` vs schema.invariant.compute(frame) AFTER release-store.
+}
+```
+
+The pre-release-store read discipline (the invariant must be read
+BEFORE the consumer's release-store on `read_index` so the slot
+bytes are still the consumer's to read) is unchanged from 0.6.0
+— the WASM peek/commit dance already enforces it.
+
+### Wire compatibility
+
+100%. No SAB byte change, no schema compile-pass change, no WAT
+binary change (still 1883 bytes from 0.7.10), no new exports on
+`WorkletConsumer`. Only the `SchemaLayoutDescription` shape
+gains a new optional field, which is additive at the type level
+(existing destructuring code is unaffected; existing JSON
+serialization gains a new key the old reader simply ignores).
+
+### Tests
+
+- `tests/Bridge.wasmEquivalence.test.ts` Pins 12 & 13 (above).
+  Total pins in the file: 13.
+- Existing 63 single-thread pins in `tests/Bridge.test.ts` still
+  pass (no API surface they touched changed).
+- Concurrent stress + drop-oldest stress (`tests/Bridge.concurrent.test.ts`)
+  still pass — neither was sensitive to the layout descriptor
+  shape.
+
+### Bench
+
+Unchanged from 0.7.10 — no hot-path code moved. Confirmed
+locally: push / pull / pullLatest medians stable at 1.20 μs;
+trajEval (fast) median 1.10 μs < 1.25 μs budget; SIMD
+trajectory cells unaffected.
+
+### Documentation
+
+CHANGELOG entry above. The new field is documented on the
+`SchemaLayoutDescription` interface with a JSDoc block describing
+the read discipline + the cross-channel agreement. No README cut
+yet — the worklet subpath is still undocumented in the
+user-facing README; the broader cohort docs cut is deferred per
+the King roadmap handoff doc's note (probably 0.7.14 once the
+end-to-end `pullLatestComplete` helper is also in).
+
 ## [0.7.10] — 2026-05-27
 
 ### Added — f32 trajectory mirrors + SIMD-vectorized order=2 paths (Track 2 of the King roadmap, sixth patch)
