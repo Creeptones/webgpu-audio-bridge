@@ -194,6 +194,44 @@
  * the canonical pull + observe + per-sample dt + evaluate loop into two
  * method calls per quantum. See README §Per-frame evaluator.
  *
+ * ─── Per-instance heap state (0.8.1) ─────────────────────────────────────
+ *
+ * Several pieces of consumer-side state live on the heap, per Bridge
+ * instance, and are NOT synchronized across other Bridges constructed over
+ * the same SAB. Each instance maintains its own copy and reasons about its
+ * own observations:
+ *
+ *   - `this.smoother.prev` (FrameSmoother) — the previous smoothed-call
+ *     output, retained across `pullSmoothed` / `pullLatestSmoothed` and
+ *     also used as the schema-invariant hard-error fallback target. A
+ *     `resetSmoother()` on one Bridge does NOT invalidate any other
+ *     Bridge's smoother prev.
+ *   - `this.cachedRawFrame` + `this.cachedTimestampNs` +
+ *     `this.cachedBaseConsumerNs` + `this.cachedSampleRate` (eval cache,
+ *     0.6.5) — the most recent `pullEvaluatedLatest` result, retained so
+ *     `evaluateAtSampleOffset` and `forEachSampleInQuantum` can walk the
+ *     quantum without re-pulling. Per-instance; another Bridge calling
+ *     `pullEvaluatedLatest` does not seed this Bridge's cache.
+ *   - `this.pll.offsetNs` / `this.pll.integral` / `this.pll.locked`
+ *     (ConsumerClockRecovery) — the PLL's PI state. Per-instance. The
+ *     SAB lane publication (lanes 4-7) is the cross-instance observability
+ *     channel; the heap state IS the PLL, and two Bridges observing the
+ *     same producer will each converge their own estimate independently.
+ *   - `this.pll.outlierGate` σ̂ + consecutive-rejection counter
+ *     (0.6.14) — per-instance EWMA + counter. Two Bridges will admit /
+ *     gate observations independently; a sustained-step on one's
+ *     observation stream does not pre-charge the other's counter.
+ *   - `this._softFrames` + `this._stallRecoveries` (0.7.3 telemetry
+ *     counters) — per-instance.
+ *
+ * Cross-instance observability is the SAB-published surface: the lane 2
+ * `flow_scale` hint (read by `flowScaleHint()`), the lane 3
+ * `torn_frame_counter` (`tornFrameCount()`), and the lane 4-7 PLL state
+ * (`readPublishedPllState`). Anything else — including the smoother
+ * blend, the evaluator cache, and the PLL gate decisions — is local to
+ * the Bridge that produced it. Two Bridges over the same SAB are
+ * peers, not replicas.
+ *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
  * Same lineage as Float64RingBuffer — Paul Adenot's `ringbuf.js` (2018) is

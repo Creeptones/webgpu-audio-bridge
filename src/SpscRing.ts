@@ -1430,7 +1430,22 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     }
   }
 
-  /** Number of frames currently buffered (≤ capacity). */
+  /** Number of frames currently buffered (≤ capacity).
+   *
+   *  Two individually-atomic Int32 loads. The pair is NOT a mutually-atomic
+   *  snapshot: under live producer/consumer contention the writeIdx and
+   *  readIdx readings can land on either side of a peer's release-store, so
+   *  the returned count may be off by ±1 from any single instantaneous state.
+   *  This is harmless for the documented uses (occupancy hints, dashboards,
+   *  loose backpressure) but inadequate as a basis for synchronization.
+   *
+   *  Callers that need a coherent multi-field snapshot of ring state should
+   *  use `telemetry()` instead, which gathers writeIndex / readIndex /
+   *  available / flowScale via the same individually-atomic loads but bundles
+   *  them into a single frozen object so downstream consumers can reason
+   *  about "what was true at one observation point" without re-loading. The
+   *  bundled snapshot has the same atomicity caveats as the underlying loads
+   *  but at least guarantees the fields agree with each other in the result. */
   available(): number {
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
@@ -1475,6 +1490,27 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *
    * Three atomic stores total. Allocation-free. Safe to call from an
    * AudioWorklet's `process()` body.
+   *
+   * ─── Store order contract (0.8.1) ─────────────────────────────────────
+   *
+   * The status lane (7) is ALWAYS written last. This is load-bearing for
+   * the matching `readPublishedPllState` contract: readers gate on `locked`
+   * first, so once they observe `locked === true` they can trust that the
+   * offset + drift lanes belong to a publish point where the producer had
+   * locked = true. The protocol is not a full seqlock — a publish in flight
+   * concurrently with a read can still produce a snapshot stitched across
+   * two publishes — but the documented invariant ("status changes only on
+   * lock/unlock transitions; offset/drift change every observe") makes the
+   * stitched snapshot a valid publish point in practice, not a synthesis of
+   * incompatible halves.
+   *
+   * 0.8.2 will split the offset Int64 into two Int32 stores to remove the
+   * BigInt allocation on the publish path. That widens the write window
+   * across the offset itself, which is precisely why the status-last
+   * ordering matters: readers that gate on `locked === true` first will
+   * observe an offset from either the most recent fully-committed publish
+   * or a publish whose status-store has already landed. Both are valid
+   * publish points; neither is a torn synthesis.
    */
   publishPllState(offsetNs: number, driftPpm: number, locked: boolean): void {
     // Round to nearest ns to convert the f64 offset to Int64. The
@@ -1508,9 +1544,30 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * For cross-process observability: a second worker / DevTools panel
    * constructs its own `SpscRing` / `Bridge` over the SAME SAB the
    * consumer Bridge is using, and calls this method to inspect the
-   * consumer's PLL state without postMessage or other IPC. Returns the
-   * point-in-time snapshot; under live observer activity the three
-   * fields are individually atomic but not mutually atomic.
+   * consumer's PLL state without postMessage or other IPC.
+   *
+   * ─── Read order contract (0.8.1) ──────────────────────────────────────
+   *
+   * The status lane is read FIRST, then offset, then drift. This pairs
+   * with `publishPllState`'s status-last write order to form a one-bit
+   * gate: a reader that observes `locked === false` knows the
+   * offset/drift fields may be stale or zero (no PLL has published yet,
+   * or the producer just reset) and should ignore them; a reader that
+   * observes `locked === true` knows the offset/drift fields belong to a
+   * publish point where the producer had locked. The protocol does NOT
+   * implement a full seqlock — concurrent publish/read interleaving can
+   * still produce a snapshot stitched across two publishes — but the
+   * documented invariants (status changes only on lock/unlock
+   * transitions; offset/drift change every observe) ensure the stitched
+   * snapshot is a valid publish point in practice, not a synthesis of
+   * incompatible halves.
+   *
+   * The three fields are individually atomic; the tuple is not mutually
+   * atomic. Live observer activity that needs sample-accurate
+   * coherence should instead call `bridge.telemetry()` on the consumer
+   * Bridge directly (same-thread loads, gated against the heap state).
+   * The published-lane path exists for the cross-thread / cross-process
+   * case where direct Bridge access isn't available.
    *
    * Three atomic loads + one ppm decode. Allocation-free.
    */

@@ -390,6 +390,22 @@
  *      `lastReadbackUs()` returns 0 before any cycle completes, then
  *      a positive fractional microsecond count after a mapAsync →
  *      decode cycle. Both methods are safe to call after `destroy()`.
+ *  91. Per-instance heap state — smoother prev is per-Bridge (0.8.1).
+ *      Documents the "Per-instance heap state" contract added to the
+ *      Bridge.ts file header in 0.8.1. Two `Bridge<S>` instances over
+ *      the same SAB each maintain their own `smoother.prev`: a
+ *      `resetSmoother()` on one Bridge does NOT invalidate the other
+ *      Bridge's prev buffer. Pin sets up A and B as alternating
+ *      consumers, seeds each with a distinct first frame, drives one
+ *      smoothed-blend pull through each, resets A's smoother, then
+ *      drives a second smoothed-blend pull through B and asserts B's
+ *      output reflects B's original prev (frame2) — proving A's
+ *      reset did not leak into B's heap state. The pull-counter / SAB
+ *      protocol is shared (that's what SAB-co-residence means); the
+ *      heap-side smoother / PLL / eval-cache / outlier-gate state is
+ *      not. Cross-instance observability is the published SAB lanes
+ *      (lane 2 flow_scale, lane 3 tornFrames, lanes 4-7 PLL state)
+ *      and NOT these heap-side state machines.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -5434,6 +5450,73 @@ async function testBridgeGpuSourceIntrospection(): Promise<void> {
   ok("bridge-gpu-source-introspection");
 }
 
+// ── 91. Per-instance heap state — smoother prev is per-Bridge (0.8.1) ──
+function testPerInstanceHeapStateSmoother(): void {
+  const N = 4;
+  const schema = physicsControlFrameSchema(N);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+
+  // Two `Bridge<S>` over the same SAB. The SPSC counters in the SAB header
+  // are shared (that's the whole point of co-residence), but every heap-side
+  // state machine on each Bridge — smoother prev, PLL state, eval cache,
+  // outlier gate — is independent per the 0.8.1 contract documented in
+  // src/Bridge.ts §"Per-instance heap state".
+  const a = new Bridge(sab, capacity, schema);
+  const b = new Bridge(sab, capacity, schema);
+
+  const frame1 = makePhysFrame(10, N);
+  const frame2 = makePhysFrame(20, N);
+  const frame3 = makePhysFrame(30, N);
+  const frame4 = makePhysFrame(40, N);
+
+  // Seed A's smoother with frame1 (first smoothed call returns curr
+  // verbatim — no prev to blend with yet).
+  a.push(frame1);
+  const outA1 = emptyPhysFrame(N);
+  assertEq(a.pullLatestSmoothed(outA1, 0.5), 0, "A first pull, skipped=0");
+  assertEq(outA1.vEff[0], frame1.vEff[0], "A first smoothed pull returns frame1.vEff[0] verbatim");
+
+  // Seed B's smoother with frame2. The SAB read counter has already
+  // advanced past frame1 (A consumed it); frame2 is the next slot B will
+  // see. B's smoother prev starts uninitialized, so first call seeds.
+  b.push(frame2);
+  const outB1 = emptyPhysFrame(N);
+  assertEq(b.pullLatestSmoothed(outB1, 0.5), 0, "B first pull, skipped=0");
+  assertEq(outB1.vEff[0], frame2.vEff[0], "B first smoothed pull returns frame2.vEff[0] verbatim (B's prev was independently uninitialized)");
+
+  // Push frame3; A's second smoothed pull blends frame3 with A's prev
+  // (frame1). α=0.5 → expected output = 0.5·frame3 + 0.5·frame1.
+  a.push(frame3);
+  const outA2 = emptyPhysFrame(N);
+  assertEq(a.pullLatestSmoothed(outA2, 0.5), 0, "A second pull, skipped=0");
+  const expectedA2 = 0.5 * frame3.vEff[0]! + 0.5 * frame1.vEff[0]!;
+  assert(
+    Math.abs(outA2.vEff[0]! - expectedA2) < 1e-12,
+    `A second pull blends frame3 against A.prev (=frame1): expected ${expectedA2}, got ${outA2.vEff[0]}`,
+  );
+
+  // Reset A's smoother. If the heap state were shared, this would zero
+  // out B's prev too — making B's next smoothed pull return its curr
+  // frame verbatim instead of blending against frame2.
+  a.resetSmoother();
+
+  // Push frame4; B's second smoothed pull. If A's resetSmoother leaked,
+  // outB2.vEff[0] would equal frame4.vEff[0] (first-call verbatim);
+  // if heap state is properly per-instance, B blends frame4 against its
+  // own prev (=frame2) and outB2.vEff[0] = 0.5·frame4 + 0.5·frame2.
+  b.push(frame4);
+  const outB2 = emptyPhysFrame(N);
+  assertEq(b.pullLatestSmoothed(outB2, 0.5), 0, "B second pull, skipped=0");
+  const expectedB2 = 0.5 * frame4.vEff[0]! + 0.5 * frame2.vEff[0]!;
+  const leakedValue = frame4.vEff[0]!;
+  assert(
+    Math.abs(outB2.vEff[0]! - expectedB2) < 1e-12,
+    `B second pull blends frame4 against B.prev (=frame2) — A.resetSmoother did NOT leak into B. expected ${expectedB2}, got ${outB2.vEff[0]}, leak-failure value would be ${leakedValue}`,
+  );
+
+  ok("per-instance-heap-state-smoother");
+}
+
 async function main(): Promise<void> {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -5526,6 +5609,7 @@ async function main(): Promise<void> {
   testSoftFramesCounter();
   testStallRecoveriesCounter();
   await testBridgeGpuSourceIntrospection();
+  testPerInstanceHeapStateSmoother();
   console.log("\nAll Bridge tests passed.");
 }
 

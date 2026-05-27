@@ -4,6 +4,182 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.1] — 2026-05-27
+
+### Added — Concurrency hardening + observability docstrings (audit cohort, first patch)
+
+First patch of the audit cohort, which owns the 0.8.x line per the
+[plan](.claude/plans/please-draft-a-comprehensive-logical-waffle.md)
+(externally, in `~/.claude/plans/`). Pure documentation + a single
+new test pin — **no behavior change, no API change, no SAB byte
+change**. Documents two cross-thread / cross-process contracts that
+were previously implicit in the code:
+
+1. The `publishPllState` / `readPublishedPllState` **status-last
+   store / status-first load** ordering — the one-bit gate that lets
+   cross-process observers (a DevTools panel constructing its own
+   `SpscRing` over the same SAB) distinguish "publish in flight, may
+   be torn" from "publish committed, fields coherent."
+2. The **per-instance heap state** contract — two `Bridge<S>`
+   instances over the same SAB share only the SAB-resident pull /
+   notify / lane-publication state. Smoother prev, eval cache, PLL
+   PI state, outlier-gate σ̂, and the soft / stall telemetry counters
+   are heap-local and NOT synchronized across Bridges. Cross-instance
+   observability is the published SAB lanes (lane 2 `flow_scale`,
+   lane 3 `tornFrames`, lanes 4-7 PLL state) — anything else is the
+   local Bridge's own observation.
+
+Also tightens the `available()` docstring to make the
+"individually-atomic, not mutually-atomic" caveat explicit and
+cross-references `telemetry()` as the coherent-snapshot path.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/Bridge.ts`** — new file-header section
+  `─── Per-instance heap state (0.8.1) ───` (between the existing
+  per-frame evaluator section and the Attribution block). Lists
+  every piece of per-instance heap state by name + line cross-
+  reference, and explicitly calls out the SAB-resident lanes as the
+  canonical cross-instance observability channel. ~38 LOC of
+  comment, no code change.
+
+- **`src/SpscRing.ts`** — three docstring tightenings, no body changes:
+
+  - `available()` (lane-counter occupancy) — expanded from one
+    sentence to a five-sentence paragraph documenting the
+    individually-atomic-but-not-mutually-atomic semantics and
+    pointing callers needing a coherent multi-field snapshot at
+    `telemetry()` instead.
+  - `publishPllState` — new `─── Store order contract (0.8.1) ───`
+    subsection documenting the status-last write ordering as
+    load-bearing for the matching read contract. The body already
+    wrote status last; this patch makes the contract a documented
+    invariant rather than incidental implementation order. Includes
+    a forward reference to 0.8.2 (the BigInt-free split-offset
+    patch) explaining why widening the write window across the
+    offset stores preserves the gate semantics.
+  - `readPublishedPllState` — new `─── Read order contract (0.8.1)
+    ───` subsection documenting the status-first / offset / drift
+    load order that pairs with the publish contract. The body
+    already loaded status first; this patch makes the contract
+    explicit. Also points cross-thread observers needing
+    sample-accurate coherence at `bridge.telemetry()` on the
+    consumer Bridge directly as the same-thread alternative.
+
+- **`tests/Bridge.test.ts`** — new pin #91
+  (`testPerInstanceHeapStateSmoother`): two `Bridge<S>` instances
+  over one SAB, alternating producer/consumer pattern. Seeds each
+  with a distinct first frame, drives smoothed-blend pulls through
+  both, calls `resetSmoother()` on one, and proves the other's
+  `smoother.prev` is untouched by checking the next smoothed pull
+  blends against the other's original prev (not against the reset
+  side). Header comment block updated above the file's pin list.
+
+### Why
+
+Two cross-thread / cross-process invariants were previously
+documented only in CHANGELOG entries from earlier patches (0.6.x for
+the lane layout, 0.6.16 for `readPublishedPllState` itself) — anyone
+auditing the SAB read/write paths today would have to infer the
+ordering contract from the code rather than read it as a documented
+guarantee. The 0.7.10 audit flagged this as the
+highest-leverage concurrency-category improvement: the cost is
+purely documentation, but the invariants are load-bearing for any
+external worker / DevTools panel building on the published-lane
+surface.
+
+The per-instance heap state contract was similarly implicit. The
+0.6.x PLL extraction, the 0.6.5 evaluator cache, the 0.6.14 outlier
+gate, and the 0.7.3 soft-frame / stall telemetry counters each
+introduced new heap-local state without explicitly documenting that
+two Bridges over the same SAB do not synchronize on it. Pin #91 is
+the executable form of that contract — if a future patch were to
+hoist any of those pieces into the SAB by accident, the pin would
+catch it.
+
+This patch opens the 0.8.x line. The 0.7.x cohort ended at 0.7.17
+deliberately (that subject prefix was the audit cohort's gate); 0.8.0
+is reserved for the upcoming `MessageChannelBridge` minor (second
+transport tier, postMessage-based, ~5-50 ms latency, no
+cross-origin-isolation requirement). Shipping the docstring +
+pin-#91 patch as 0.8.1 leaves the 0.8.0 slot intact for that future
+minor while letting the audit-cohort hygiene work land as patches in
+its own version space. Per CLAUDE.md's extended-slowdown rule,
+0.8.x is expected to go deep into the patch space (not race to
+0.9.0) — every patch is a 1.0-readiness checkpoint.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema extension, no
+protocol change. The `publishPllState` body is unchanged
+byte-for-byte (status was already written last); this patch only
+elevates the existing store order to a documented contract.
+`readPublishedPllState` is similarly unchanged. The
+`getEnvironmentReport()` shape is unchanged. The `Bridge<S>` /
+`SpscRing<S>` public surfaces are unchanged.
+
+A consumer linking against 0.7.17 and a consumer linking against
+0.8.1 over the same SAB exchange frames bit-identically.
+
+### Tests
+
+13 suites stay green. `tests/Bridge.test.ts` is now 91 pins (the new
+pin #91 is the only addition). Pre-existing pins 1-90 unchanged.
+
+The 0.7.17 base count was 90 pins; 0.8.1 brings the file to 91. The
+file's `main()` runner picks up `testPerInstanceHeapStateSmoother`
+at the tail end of the new-Bridge-feature block. Suite run time
+delta is negligible (the new pin allocates two Bridges over one
+8-slot SAB, pushes 4 frames, pulls 4 frames — sub-millisecond
+overhead).
+
+The known `tests/Bridge.concurrent.test.ts`
+`emptyWaitTimeouts === 0` flake is documented in CLAUDE.md and is
+the audit cohort's 0.8.3 patch's target; not addressed here.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.17 (≈1.20 μs).
+`publishPllState` / `readPublishedPllState` are not on any
+microbench hot path; the docstring expansion has zero runtime cost.
+No new bench cell.
+
+### Documentation
+
+CHANGELOG entry above. The cross-thread / cross-process contracts
+are now reachable from inline TSDoc on the affected methods +
+the Bridge.ts file header, so editor hover surfaces them at the
+point of use. README is unchanged for this patch — the audit
+cohort's 0.8.4 patch is the documentation-polish slot for QUICKSTART
++ ROADMAP + the README diagram rework.
+
+### Audit cohort context
+
+This is the first patch of the audit cohort plan
+(`~/.claude/plans/please-draft-a-comprehensive-logical-waffle.md`).
+Remaining audit-cohort patches in order:
+
+- **0.8.2** — pullAll single-trailing-notify + BigInt-free PLL
+  publish (heap-only encoding change; SAB byte representation stays
+  bit-identical).
+- **0.8.3** — testing infrastructure (`fast-check` property pins +
+  Bridge.test.ts feature-file split + concurrent flake fix).
+- **0.8.4** — documentation polish (QUICKSTART.md + ROADMAP.md +
+  README diagram + cheat-sheet callouts).
+- **0.8.5** — npm publish + `webgpu-audio-bridge dev` CLI subcommand.
+- **0.8.0** — (reserved, ships when ready) MessageChannelBridge<S>
+  + PLL offset wire-format normalization.
+- **0.8.6** — wavefunction migration completion + flagship telemetry
+  overlay.
+- **0.8.7** — `examples/wavefunction-mini/` Aubry-André demo.
+
+The deferred-polish items the user flagged on the 0.7.15 / 0.7.17
+patches (JSDoc `@experimental` tags, `EnvironmentReport` grouping
+comment, README scaffold suffixes) slot in after the audit cohort
+ships at least its first patch — see the
+`WebsitePlans/WebAudioBridge - Post-0.7.17 Handoff.md`
+"Queued — deferred polish" section.
+
 ## [0.7.17] — 2026-05-27
 
 ### Added — WebNN capability flags + README "Experimental — WebNN" section (Track 5, closeout patch)
