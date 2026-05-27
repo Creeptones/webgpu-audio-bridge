@@ -17,6 +17,15 @@
  *      drains. The reverse: BridgeInputLane pushes, BridgeConsumer drains.
  *   8. scratchEventBuffer argument validation.
  *   9. pullAll argument validation (non-array, sparse-array slot).
+ *  10. Single-trailing-notify contract (0.8.2): empty pullAll skips
+ *      notify entirely; non-empty pullAll issues exactly one notify
+ *      regardless of how many frames the burst drained. Successive
+ *      bursts each pay one notify. Validates the amortized-notify
+ *      fast path on the read-index lane.
+ *  11. Drop-oldest interop via pullAll (0.8.2): exercises the new
+ *      `_pullOverrunAwareNoNotify` dispatch path under
+ *      `policy: 'drop-oldest'`. Producer fills the ring, kicks out an
+ *      old frame, then pullAll drains the surviving frames bit-exact.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -325,6 +334,112 @@ function testPullAllValidation(): void {
   ok("pullAll-validation");
 }
 
+// ── 10. Single-trailing-notify contract (0.8.2) ───────────────────────────
+function testPullAllSingleTrailingNotify(): void {
+  const { ring } = makeRing(16);
+  const lane = new BridgeInputLane(ring);
+  const buf = lane.scratchEventBuffer(8);
+
+  // Instrument the ring's _notifyReadAdvance to count invocations. The
+  // method is the SAB-level wake call pullAll's success branch issues
+  // exactly once per non-empty burst. We replace it with a counting
+  // wrapper that still calls through to the original so SAB state stays
+  // coherent for any concurrent observer.
+  let notifyCalls = 0;
+  const ringAny = ring as unknown as { _notifyReadAdvance: () => void };
+  const orig = ringAny._notifyReadAdvance.bind(ring);
+  ringAny._notifyReadAdvance = () => {
+    notifyCalls++;
+    orig();
+  };
+
+  try {
+    // (a) Empty pullAll skips notify entirely.
+    notifyCalls = 0;
+    assertEq(lane.pullAll(buf), 0, "empty pullAll returns 0");
+    assertEq(notifyCalls, 0, "empty pullAll issues zero notifies");
+
+    // (b) N=5 push, single pullAll → exactly one trailing notify.
+    for (let i = 0; i < 5; i++) {
+      lane.push(makeEvent(i + 1, BigInt(i), i & 0x3, 60 + i, 100 - i, i * 0.1));
+    }
+    notifyCalls = 0;
+    assertEq(lane.pullAll(buf), 5, "pullAll drains 5");
+    assertEq(notifyCalls, 1, "5-frame pullAll issues exactly one notify");
+
+    // (c) Successive pullAll bursts each pay one notify on success.
+    for (let i = 0; i < 3; i++) {
+      lane.push(makeEvent(i + 10, BigInt(i + 10), 0, 0, 0, 0));
+    }
+    notifyCalls = 0;
+    assertEq(lane.pullAll(buf), 3, "second pullAll drains 3");
+    assertEq(notifyCalls, 1, "3-frame pullAll issues exactly one notify");
+
+    // (d) Drained-empty pullAll skips notify again.
+    notifyCalls = 0;
+    assertEq(lane.pullAll(buf), 0, "drained-empty pullAll returns 0");
+    assertEq(notifyCalls, 0, "drained-empty pullAll issues zero notifies");
+
+    // (e) Buffer-cap path: 10 events buffered, drain into 4-event buffer.
+    // The cap exits the loop before exhausting the ring; success branch
+    // still issues exactly one notify (count > 0).
+    for (let i = 0; i < 10; i++) {
+      lane.push(makeEvent(i + 20, BigInt(i + 20), 0, 0, 0, 0));
+    }
+    const smallBuf = lane.scratchEventBuffer(4);
+    notifyCalls = 0;
+    assertEq(lane.pullAll(smallBuf), 4, "buffer-cap pullAll drains 4");
+    assertEq(notifyCalls, 1, "buffer-cap pullAll issues exactly one notify");
+  } finally {
+    // Restore the original method so subsequent pins don't see the spy.
+    ringAny._notifyReadAdvance = orig;
+  }
+
+  ok("pullAll-single-trailing-notify");
+}
+
+// ── 11. Drop-oldest interop via pullAll (0.8.2) ───────────────────────────
+function testPullAllDropOldestInterop(): void {
+  const schema = makeInputEventSchema();
+  // capacity=4 so we can easily provoke the drop-oldest CAS path.
+  const { sab } = SpscRing.allocate(4, schema);
+  const ring = new SpscRing(sab, 4, schema, { policy: "drop-oldest" });
+  const lane = new BridgeInputLane(ring);
+  const buf = lane.scratchEventBuffer(8);
+
+  // Fill the ring (capacity=4).
+  for (let i = 0; i < 4; i++) {
+    assertEq(
+      lane.push(makeEvent(i + 1, BigInt(i + 1), 0, 60 + i, 100, 0)),
+      true,
+      `push #${i}`,
+    );
+  }
+  assertEq(lane.available(), 4, "ring full");
+
+  // One more push under drop-oldest kicks out seq=1 (oldest), seq=2..5
+  // survive (4 frames buffered).
+  assertEq(
+    lane.push(makeEvent(5, 5n, 0, 65, 100, 0)),
+    true,
+    "drop-oldest push #5",
+  );
+  assertEq(lane.available(), 4, "still 4 buffered after drop-oldest");
+
+  // pullAll under drop-oldest dispatches to _pullOverrunAwareNoNotify
+  // internally. Each pulled frame is verified bit-exact; FIFO order is
+  // preserved from seq=2 (oldest survivor) to seq=5 (newest).
+  const count = lane.pullAll(buf);
+  assertEq(count, 4, "pullAll drains 4 surviving frames");
+  for (let i = 0; i < 4; i++) {
+    const expectedSeq = BigInt(i + 2);
+    assertEq(buf[i]!.seq, expectedSeq, `drop-oldest FIFO seq[${i}] = ${expectedSeq}`);
+  }
+  assertEq(lane.available(), 0, "ring drained");
+
+  ok("pullAll-drop-oldest-interop");
+}
+
 function main(): void {
   testConstructionAndScratch();
   testEmptyPullAll();
@@ -335,6 +450,8 @@ function main(): void {
   testCrossFacadeInterop();
   testScratchEventBufferValidation();
   testPullAllValidation();
+  testPullAllSingleTrailingNotify();
+  testPullAllDropOldestInterop();
   console.log("\nBridgeInputLane: all pins passed.");
 }
 

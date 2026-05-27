@@ -406,6 +406,20 @@
  *      not. Cross-instance observability is the published SAB lanes
  *      (lane 2 flow_scale, lane 3 tornFrames, lanes 4-7 PLL state)
  *      and NOT these heap-side state machines.
+ *  92. BigInt-free PLL publish + 2^32-boundary round-trip (0.8.2).
+ *      Documents the BigInt-free encoding of `publishPllState`'s
+ *      offset lane added in 0.8.2. Two assertions:
+ *      (a) Monkey-patches `globalThis.BigInt` with a counting wrapper,
+ *          runs a 10k-publish loop, and asserts the constructor was
+ *          never invoked from inside publishPllState — pinning the
+ *          allocation-free contract on the consumer hot path.
+ *      (b) Round-trips a battery of offset values near and across the
+ *          2^32 boundary (where the two-Int32 split matters for sign
+ *          / carry correctness) plus the legacy edge cases — every
+ *          value reads back exact via readPublishedPllState. Sibling
+ *          to pin #79's broader encoding check; this pin's job is
+ *          specifically the new BigInt-free path's carry math at the
+ *          2^32 ledge.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -5517,6 +5531,108 @@ function testPerInstanceHeapStateSmoother(): void {
   ok("per-instance-heap-state-smoother");
 }
 
+// ── 92. BigInt-free PLL publish + 2^32-boundary round-trip (0.8.2) ────────
+function testPllPublishBigIntFreeAndBoundaryRoundTrip(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+
+  // (a) Allocation-free pin. Monkey-patch globalThis.BigInt with a
+  // counting wrapper, run a 10k-publish loop, then restore. The 0.8.1
+  // path called `BigInt(Math.round(offsetNs))` once per publish; the
+  // 0.8.2 path replaces it with a pure-Number decomposition into two
+  // Int32 halves. Counting BigInt invocations across the publish loop
+  // pins the allocation-free contract directly. Note this catches any
+  // EXPLICIT `BigInt(...)` constructor call; engine-internal BigInt
+  // operations on existing BigInt values (which there are none of in
+  // publishPllState's body) wouldn't go through globalThis.BigInt
+  // either way.
+  const { sab } = Bridge.allocate(16, schema);
+  const ring = new SpscRing(sab, 16, schema);
+
+  const originalBigInt = globalThis.BigInt;
+  let bigIntCallCount = 0;
+  const counting = function (this: unknown, value: unknown): bigint {
+    bigIntCallCount++;
+    return originalBigInt(value as never);
+  } as unknown as BigIntConstructor;
+  // Preserve the static surface so unrelated callers that touch
+  // BigInt.asIntN / .asUintN don't break during the spied window.
+  counting.asIntN = originalBigInt.asIntN;
+  counting.asUintN = originalBigInt.asUintN;
+  Object.defineProperty(counting, "prototype", {
+    value: originalBigInt.prototype,
+    writable: false,
+  });
+  Object.defineProperty(globalThis, "BigInt", {
+    value: counting,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    for (let i = 0; i < 10_000; i++) {
+      // Sweep across the 2^32 boundary so the publish hits both
+      // positive and negative carry cases.
+      const offsetNs = (i - 5_000) * 1_000_001;
+      ring.publishPllState(offsetNs, (i % 7) * 0.01, (i & 1) === 0);
+    }
+  } finally {
+    Object.defineProperty(globalThis, "BigInt", {
+      value: originalBigInt,
+      configurable: true,
+      writable: true,
+    });
+  }
+  assertEq(
+    bigIntCallCount,
+    0,
+    `publishPllState should be BigInt-free; observed ${bigIntCallCount} BigInt() calls in 10k-publish loop`,
+  );
+
+  // (b) Round-trip pin for the new BigInt-free carry math. The two-Int32
+  // split is where sign and carry bugs would surface; this exercises
+  // both halves of the 2^32 boundary plus 0/±1/±2^53.
+  const boundaryOffsets = [
+    0,
+    1,
+    -1,
+    2 ** 32,
+    -(2 ** 32),
+    2 ** 32 - 1,
+    -(2 ** 32) + 1,
+    2 ** 32 + 1,
+    -(2 ** 32) - 1,
+    2 ** 31,         // exactly Int32 max boundary
+    -(2 ** 31),      // exactly Int32 min boundary
+    2 ** 31 - 1,
+    -(2 ** 31) - 1,
+    2 ** 53,         // Number-precision ceiling
+    -(2 ** 53),
+    1_234_567_890_123,
+    -1_234_567_890_123,
+  ];
+  for (const target of boundaryOffsets) {
+    const { sab: sabB } = Bridge.allocate(16, schema);
+    const writer = new SpscRing(sabB, 16, schema);
+    const reader = new SpscRing(sabB, 16, schema);
+    // Direct ring.publishPllState so the test controls the exact value
+    // hitting the encoder — Bridge.observeConsumerTime would route via
+    // the live PLL and re-shape the value.
+    writer.publishPllState(target, 0, true);
+    const got = reader.readPublishedPllState();
+    assertEq(
+      got.locked,
+      true,
+      `locked round-trips for target=${target}`,
+    );
+    assert(
+      got.offsetNs === target,
+      `offset round-trips bit-exact: target=${target}, read=${got.offsetNs}`,
+    );
+  }
+
+  ok("pll-publish-bigint-free-boundary-round-trip");
+}
+
 async function main(): Promise<void> {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -5610,6 +5726,7 @@ async function main(): Promise<void> {
   testStallRecoveriesCounter();
   await testBridgeGpuSourceIntrospection();
   testPerInstanceHeapStateSmoother();
+  testPllPublishBigIntFreeAndBoundaryRoundTrip();
   console.log("\nAll Bridge tests passed.");
 }
 

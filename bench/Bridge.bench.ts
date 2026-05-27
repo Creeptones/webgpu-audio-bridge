@@ -66,6 +66,7 @@
 import { hrtime } from "node:process";
 import { Bridge } from "../src/Bridge.js";
 import { SpscRing } from "../src/SpscRing.js";
+import { BridgeInputLane } from "../src/BridgeInputLane.js";
 import {
   physicsControlFrameSchema,
   type PhysicsControlFrameSchema,
@@ -75,6 +76,7 @@ import {
   f32,
   f64,
   i32,
+  u32,
   u64,
   type FrameFor,
   type TrajectorySpec,
@@ -480,6 +482,95 @@ function runNotifyOnPullBench(): {
   return { pullSamples, noNotifySamples };
 }
 
+/**
+ * 0.8.2 cell. `BridgeInputLane.pullAll` notify-cost amortization.
+ *
+ * Goal: demonstrate that the 0.8.2 single-trailing-notify rewrite of
+ * `pullAll` cuts the per-burst notify cost from O(N) to O(1). Drives a
+ * fixed-size input-event schema (mirror of the README's MIDI-shaped
+ * example) with bursts of `INPUT_BURST_SIZE` events queued at a time,
+ * then measures:
+ *
+ *   - `pullAll (1 notify)` — the new 0.8.2 path. One `_pullNoNotify`
+ *     per frame inside the loop, ONE trailing `_notifyReadAdvance` on
+ *     the success branch. The median is the per-burst cost.
+ *
+ *   - `pull-loop (N notify)` — the pre-0.8.2 path, simulated by calling
+ *     `ring.pull(out)` `INPUT_BURST_SIZE` times in a loop. Same payload
+ *     traffic, but N trailing notifies instead of 1.
+ *
+ * The delta `pull-loop - pullAll` is the amortized notify savings per
+ * burst (≈ `(N-1) × notifyCost` from the per-frame `runNotifyOnPullBench`
+ * cell). At realistic input-rate bursts (handful of events per quantum)
+ * this is sub-microsecond per pullAll but accumulates: the lifted notify
+ * cost is the reason the BridgeInputLane file header used to flag a
+ * future fast-path; that fast-path is what this patch ships.
+ *
+ * Not gated. Documented in CHANGELOG[0.8.2].
+ */
+const INPUT_BURST_SIZE = 10;
+const INPUT_LANE_CAPACITY = 32;
+const inputEventSchema = defineSchema({
+  seq: u64(),
+  tInputNs: u64(),
+  eventType: u32(),
+  noteOrCc: u32(),
+  velocityI: u32(),
+  value: f32(),
+});
+
+function runPullAllAmortizationBench(): {
+  pullAllSamples: number[];
+  pullLoopSamples: number[];
+} {
+  const { sab } = SpscRing.allocate(INPUT_LANE_CAPACITY, inputEventSchema);
+  const ring = new SpscRing(sab, INPUT_LANE_CAPACITY, inputEventSchema);
+  const lane = new BridgeInputLane(ring);
+  const evBuf = lane.scratchEventBuffer(INPUT_BURST_SIZE);
+  const outFrame = lane.scratchFrame();
+  const pushFrame = lane.scratchFrame();
+
+  function fillBurst(): void {
+    for (let i = 0; i < INPUT_BURST_SIZE; i++) {
+      pushFrame.seq = BigInt(i);
+      pushFrame.tInputNs = BigInt(i) * 1_000_000n;
+      pushFrame.eventType = i & 0x3;
+      pushFrame.noteOrCc = 60 + i;
+      pushFrame.velocityI = 100 - i;
+      pushFrame.value = i * 0.1;
+      lane.push(pushFrame);
+    }
+  }
+
+  // Warmup: both branches.
+  for (let it = 0; it < WARMUP_ITERS / INPUT_BURST_SIZE; it++) {
+    fillBurst();
+    lane.pullAll(evBuf);
+    fillBurst();
+    for (let i = 0; i < INPUT_BURST_SIZE; i++) ring.pull(outFrame);
+  }
+
+  // Measure. Iterate one burst at a time so each sample reflects one
+  // `pullAll(N)` call vs one `pull × N` loop.
+  const ITERS = MEASURE_ITERS / INPUT_BURST_SIZE | 0;
+  const pullAllSamples = new Array<number>(ITERS);
+  const pullLoopSamples = new Array<number>(ITERS);
+  for (let it = 0; it < ITERS; it++) {
+    fillBurst();
+    const t0 = hrtime.bigint();
+    lane.pullAll(evBuf);
+    const t1 = hrtime.bigint();
+    pullAllSamples[it] = Number(t1 - t0);
+
+    fillBurst();
+    const t2 = hrtime.bigint();
+    for (let i = 0; i < INPUT_BURST_SIZE; i++) ring.pull(outFrame);
+    const t3 = hrtime.bigint();
+    pullLoopSamples[it] = Number(t3 - t2);
+  }
+  return { pullAllSamples, pullLoopSamples };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -588,6 +679,19 @@ function main(): void {
   console.log(
     `  notify-on-pull delta (pull - noNotify) = ${fmt(notifyDelta)}  ` +
       `(sizes the 0.7.0 wait-flag payoff)`,
+  );
+  console.log();
+
+  // 0.8.2 cell — pullAll notify-cost amortization via single trailing
+  // notify. Burst of `INPUT_BURST_SIZE` events per call; delta is the
+  // (N-1)× notify savings per burst.
+  const amort = runPullAllAmortizationBench();
+  const pullAllMed = summarize("pullAll (1 notify)", amort.pullAllSamples);
+  const pullLoopMed = summarize("pull-loop (N notify)", amort.pullLoopSamples);
+  const amortDelta = pullLoopMed - pullAllMed;
+  console.log(
+    `  pullAll notify-cost delta (pull-loop - pullAll) = ${fmt(amortDelta)}  ` +
+      `(${INPUT_BURST_SIZE}-event burst; ≈ (N-1)× notify saved)`,
   );
   console.log();
 

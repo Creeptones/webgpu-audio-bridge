@@ -391,6 +391,8 @@ process(_inputs, outputs) {
 }
 ```
 
+**Notify cost (0.8.2).** `pullAll` is **amortized-notify**: regardless of how many frames the burst drained, it issues exactly **one** trailing `Atomics.notify` on the read-index lane. Empty pulls skip the notify entirely. At a 10-event burst the per-call cost is ~2.1 µs (vs ~2.5 µs for the pre-0.8.2 per-frame-notify loop); see `bench/Bridge.bench.ts`'s `pullAll notify-cost` cell. Bursts of 5-30 events per quantum save 200 ns - 1.5 µs each. The wake protocol is bit-equivalent under SPSC because `Atomics.wait` waiters take any notify count ≥ 1 as the wake-up signal.
+
 Wire-compatible with every other facade — the SAB layout, SPSC counter protocol, Q16.16 flow-scale lane, and `__invariant` lane format are unchanged. A `BridgeInputLane` peer interoperates bit-for-bit with a `Bridge<S>` / `BridgeProducer` / `BridgeConsumer` peer over the same SAB.
 
 `BridgeInputLane` is the consumer-side specialization for the **fast-lane pattern** that reaches pro-audio tracking latency. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619) for the architecture, latency math, and worked end-to-end example.

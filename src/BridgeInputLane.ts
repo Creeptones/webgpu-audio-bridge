@@ -86,12 +86,23 @@
  *
  * ─── Notify protocol ─────────────────────────────────────────────────────
  *
- * `pullAll` calls `ring.pull` in a loop, so each consumed frame still
- * issues one `Atomics.notify` on the read-index lane. At realistic input
- * rates (a few events per quantum) the cumulative cost is ~10 µs per
- * `pullAll` call, well below the 2.67 ms audio quantum budget. A future
- * patch may add a "single trailing notify" fast path; the current loop is
- * correct + minimal.
+ * 0.8.2 switched `pullAll` to a single-trailing-notify fast path. The
+ * inner loop calls `ring._pullNoNotify` per frame and the method issues
+ * ONE `ring._notifyReadAdvance()` at burst end on the success branch
+ * (count > 0). Empty-pull early returns skip the notify entirely —
+ * there's no state change to signal.
+ *
+ * Effect: at a 10-event burst the per-call notify cost drops from ~10× to
+ * 1× the single-notify cost (measured ~30 ns/notify at the 0.6.11
+ * baseline). Visible in the bench's `pullAll notify-cost` cell.
+ *
+ * Correctness: the parked-producer wake protocol is the same — a single
+ * `Atomics.notify(read_index, 1)` is sufficient under SPSC because the
+ * parked producer is unique. The deferred wake-up means the producer
+ * sees the burst-drain in a single batch rather than incrementally, which
+ * is exactly the right semantic for input lanes (consumer always drains
+ * everything it can per quantum; the producer's next push decides whether
+ * it needs to park).
  */
 
 import {
@@ -221,9 +232,12 @@ export class BridgeInputLane<S extends Schema<FieldsObject, any>> {
    *     `'drop-oldest'` / etc.) applies on the producer side if the
    *     consumer chronically under-drains.
    *
-   * Notify cost: one `Atomics.notify` per consumed frame (inherited from
-   * `ring.pull`). At realistic input rates this is invisible (~10 µs for a
-   * 10-event burst); see the file header for the future-fast-path note.
+   * Notify cost: ONE trailing `Atomics.notify` per `pullAll` call,
+   * regardless of how many frames the burst drained (0.8.2). Empty-pull
+   * early returns skip the notify entirely. Previously the loop issued one
+   * notify per consumed frame; the amortized version cuts the cost from
+   * O(N) to O(1) per burst. See the file header §Notify protocol for the
+   * pairing contract.
    *
    * Invariant note: if the schema was declared with `.withInvariant(...)`,
    * the stored invariant value is read but NOT classified. The input-lane
@@ -250,10 +264,13 @@ export class BridgeInputLane<S extends Schema<FieldsObject, any>> {
             `(use scratchEventBuffer to construct a dense array of frame views)`,
         );
       }
-      const r = this.ring.pull(slot);
+      const r = this.ring._pullNoNotify(slot);
       if (!r.ok) break;
       count++;
     }
+    // Single trailing notify on the success branch (0.8.2). Empty-pull
+    // early returns skip — there's no state change to publish.
+    if (count > 0) this.ring._notifyReadAdvance();
     return count;
   }
 

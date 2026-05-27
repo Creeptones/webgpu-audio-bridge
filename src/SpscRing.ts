@@ -454,19 +454,6 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   private readonly indices: Int32Array;
   private readonly mask: number;
 
-  /** BigInt64 view aliased over lanes 4-5 (bytes 16-23) of the header.
-   *  Used for atomic 8-byte publication / read of the PLL offset
-   *  (`Atomics.store` / `Atomics.load` on a BigInt64Array is a single
-   *  atomic operation, avoiding the torn-read window of reading lanes 4
-   *  and 5 separately as Int32). Lanes 4 and 5 alias the same memory,
-   *  so the Int32 reads in `tornFrameCount` etc. don't conflict — the
-   *  spec guarantees the BigInt64 write is atomic at the 8-byte
-   *  granularity, but a concurrent Int32 read of the low or high 4
-   *  bytes returns the old-or-new 4-byte half without intra-half
-   *  tearing. The BigInt64 view's only use is the PLL lane 4-5
-   *  publication path (0.6.16). */
-  private readonly indicesI64: BigInt64Array;
-
   /** Per array field per slot: a typed-array view pointing at that slot's
    *  bytes for that field. Used for zero-alloc .set() on push/pull. */
   private readonly arrayViews: AnyTypedArray[][];
@@ -625,10 +612,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.frameByteSize = schema.frameByteSize;
     this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
     this.mask = capacity - 1;
-    // PLL offset lanes 4-5 live at bytes 16-23. 8-byte aligned ✓ since
-    // 16 is divisible by 8. One element of BigInt64 = 8 bytes covering
-    // lanes 4+5 atomically. (0.6.16)
-    this.indicesI64 = new BigInt64Array(sab, 16, 1);
+    // PLL offset lanes 4-5 live at bytes 16-23 of the same Int32Array
+    // header. As of 0.8.2 the publish path writes them as two Int32 stores
+    // (BigInt-free); the legacy aliased BigInt64 view was retired then.
+    // SAB byte layout unchanged.
 
     // Policy + block-timeout from opts. Validated here so invalid configs
     // surface at construction rather than as a confusing branch-miss later.
@@ -1003,19 +990,42 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
-   * Dev-only bench shim. Mirrors `pull` exactly minus the trailing
-   * `Atomics.notify(this.indices, READ_IDX_LANE, 1)`. NOT part of the public
-   * API — the underscore prefix marks it as internal-only (same convention
-   * as `_updateFlowScale`). Bridge does NOT delegate to it; nothing on a
-   * user-visible code path calls it. Existence is purely so
-   * `bench/Bridge.bench.ts` can isolate the notify cost from the rest of
-   * the pull path. Skipping the notify here means a parked consumer would
-   * miss the wake — that's exactly why this is bench-only and never on a
-   * real consumer's path.
+   * Internal helper. Mirrors `pull` exactly minus the trailing
+   * `Atomics.notify(this.indices, READ_IDX_LANE, 1)`. The underscore prefix
+   * marks it as internal-only (same convention as `_updateFlowScale`) — it
+   * is NOT part of the public surface and is not re-exported from
+   * `index.ts`.
    *
-   * Added in 0.6.11. See CHANGELOG for the measured notify delta.
+   * Two intentional callers:
+   *
+   *   1. `bench/Bridge.bench.ts` uses this to isolate the per-pull notify
+   *      cost from the rest of the pull path (the 0.6.11 measurement cell).
+   *
+   *   2. `BridgeInputLane.pullAll` uses this as the inner-loop primitive
+   *      (0.8.2): the loop drains N frames via `_pullNoNotify`, then on the
+   *      success branch (count > 0) the caller issues ONE
+   *      `_notifyReadAdvance()` to wake any parked producer. The
+   *      cumulative per-frame notify cost ~10 µs/burst that the
+   *      BridgeInputLane file header used to flag as future work is now
+   *      folded into a single trailing notify — empty-pull early returns
+   *      skip the notify entirely.
+   *
+   * Both callers are SAFE because the caller takes responsibility for
+   * waking the producer. **Direct external use without a matching trailing
+   * notify on the success branch is unsafe**: a parked producer would
+   * miss the wake. Use `pull` (which bundles the notify) for everything
+   * else.
+   *
+   * Dispatches to `_pullOverrunAwareNoNotify` when `_needsOverrunAware`
+   * is true (drop-oldest policy) so the no-notify primitive remains
+   * correct under every overflow policy. Mirrors the dispatch shape of
+   * `pull`.
+   *
+   * Added in 0.6.11 as a bench shim; promoted to documented internal
+   * helper in 0.8.2 when `BridgeInputLane.pullAll` adopted it.
    */
   _pullNoNotify(out: FrameFor<S>): SpscPullResult {
+    if (this._needsOverrunAware) return this._pullOverrunAwareNoNotify(out);
     const r = this.pullResult;
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
@@ -1271,6 +1281,93 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * `_pullNoNotify` variant for the drop-oldest CAS-commit path (0.8.2).
+   * Selected at construction when `policy === 'drop-oldest'` via the same
+   * `_needsOverrunAware` flag that gates `_pullOverrunAware` / `_pullLatestOverrunAware`.
+   *
+   * Identical to `_pullOverrunAware` minus the trailing
+   * `Atomics.notify(READ_IDX_LANE, 1)` — caller (`BridgeInputLane.pullAll`)
+   * issues ONE notify at burst end via `_notifyReadAdvance()` on the
+   * success branch. The CAS-commit retry loop is preserved verbatim from
+   * `_pullOverrunAware`; only the per-frame notify is elided.
+   *
+   * Same correctness pin applies: the concurrent stress test under
+   * drop-oldest (`tests/Bridge.concurrent.test.ts`) asserts every consumed
+   * frame is bit-exact against the producer's recipe. The retry-on-CAS-
+   * failure shape protects against the producer racing the same
+   * `read_index` lane while the consumer is mid-read; the omitted notify
+   * doesn't widen that window — it just defers the wake-up signal.
+   */
+  private _pullOverrunAwareNoNotify(out: FrameFor<S>): SpscPullResult {
+    const r = this.pullResult;
+    for (let attempt = 0; attempt <= this.capacity; attempt++) {
+      const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+      const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
+      if (writeIdx === readIdx) {
+        r.ok = false;
+        return r;
+      }
+      const slot = (readIdx >>> 0) & this.mask;
+      const frame = out as unknown as Record<string, unknown>;
+      const sr = this.scalarReaders;
+      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
+      const al = this.arrayLayout;
+      const av = this.arrayViews;
+      for (let i = 0; i < al.length; i++) {
+        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
+        dst.set(av[i]![slot]!);
+      }
+      const invariantStored = this.invariantView !== null
+        ? this.invariantView[
+            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+          ]!
+        : 0;
+      const prev = Atomics.compareExchange(
+        this.indices,
+        READ_IDX_LANE,
+        readIdx,
+        (readIdx + 1) | 0,
+      );
+      if (prev !== readIdx) continue;
+      // Notify deliberately omitted — caller pairs N pulls with one
+      // `_notifyReadAdvance()` on the success branch.
+      this._updateFlowScale(writeIdx, readIdx);
+      this._recordOccupancy((writeIdx - readIdx) | 0);
+      this.pulledFrames = (this.pulledFrames + 1) | 0;
+      r.ok = true;
+      r.skipped = 0;
+      r.invariantStored = invariantStored;
+      r.preWriteIdx = writeIdx;
+      r.preReadIdx = readIdx;
+      return r;
+    }
+    const r2 = this.pullResult;
+    r2.ok = false;
+    return r2;
+  }
+
+  /**
+   * Trailing notify primitive for amortized-notify consumer patterns
+   * (0.8.2). Pairs with `_pullNoNotify`: the caller drains N frames via
+   * `_pullNoNotify` in a loop, then issues ONE `_notifyReadAdvance()` at
+   * burst end on the success branch (count > 0) to wake any parked
+   * producer. Empty-pull early returns must NOT call this — there's no
+   * state change to signal.
+   *
+   * Equivalent to the per-frame trailing
+   * `Atomics.notify(this.indices, READ_IDX_LANE, 1)` that the regular
+   * `pull` path issues on every successful frame, lifted to a standalone
+   * helper so the inner-loop primitive can be paired with a single
+   * trailing notify across N pulls. Wake-count = 1: under SPSC the parked
+   * producer is unique, one wake is sufficient.
+   *
+   * The underscore prefix marks this as internal-only. Not re-exported.
+   */
+  _notifyReadAdvance(): void {
+    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+  }
+
+  /**
    * Run one PI controller cycle against the pre-pull occupancy and publish
    * the new flow_scale on lane 2. Called from `pull` / `pullLatest` after
    * the release-store on read_index, only on the successful branch — empty-
@@ -1481,17 +1578,21 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * panel can read these lanes via `readPublishedPllState()` on its own
    * `SpscRing` instance over the same SAB without IPC.
    *
-   * - Lanes 4-5 are written as one atomic 8-byte BigInt64 store via the
-   *   aliased view — no torn-read window between the low/high halves
-   *   for cross-thread readers using `readPublishedPllState`.
+   * - Lanes 4-5 are written as two Int32 atomic stores carrying the low
+   *   and high halves of the signed Int64 ns offset, little-endian (low at
+   *   lane 4, high at lane 5). SAB byte representation stays bit-identical
+   *   to the legacy single-Int64 BigInt store the 0.6.16-0.8.1 path used
+   *   — both write the same 8 bytes in the same order; only the writer's
+   *   allocation profile changed.
    * - Lane 6 (drift) is an Int32 atomic store of the Q16.16-encoded
    *   ppm value.
    * - Lane 7 (status) is an Int32 atomic store with bit 0 = locked.
    *
-   * Three atomic stores total. Allocation-free. Safe to call from an
-   * AudioWorklet's `process()` body.
+   * Four atomic stores total. Allocation-free (no BigInt boxing; see the
+   * "BigInt-free" section below). Safe to call from an AudioWorklet's
+   * `process()` body.
    *
-   * ─── Store order contract (0.8.1) ─────────────────────────────────────
+   * ─── Store order contract (0.8.1, widened in 0.8.2) ───────────────────
    *
    * The status lane (7) is ALWAYS written last. This is load-bearing for
    * the matching `readPublishedPllState` contract: readers gate on `locked`
@@ -1504,21 +1605,52 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * stitched snapshot a valid publish point in practice, not a synthesis of
    * incompatible halves.
    *
-   * 0.8.2 will split the offset Int64 into two Int32 stores to remove the
-   * BigInt allocation on the publish path. That widens the write window
-   * across the offset itself, which is precisely why the status-last
-   * ordering matters: readers that gate on `locked === true` first will
-   * observe an offset from either the most recent fully-committed publish
-   * or a publish whose status-store has already landed. Both are valid
-   * publish points; neither is a torn synthesis.
+   * In 0.8.2 the single Int64 offset store became two Int32 stores (low at
+   * lane 4, high at lane 5). That widens the write window across the
+   * offset itself — readers that load lane 4 between the low and high
+   * stores observe an inconsistent (lo_new, hi_old) pair. The status-last
+   * ordering remains the same one-bit gate: a reader that observes
+   * `locked === true` AFTER the status store landed observes an offset
+   * from either the most recent fully-committed publish OR a publish
+   * whose status-store has already landed (and whose hi-store therefore
+   * landed before it, since stores are released in program order on every
+   * mainstream JS engine for atomic stores). Both are valid publish
+   * points; neither is a torn synthesis. Pre-status-store snapshots
+   * read `locked === false` and are correctly discarded by the reader
+   * contract.
+   *
+   * ─── BigInt-free (0.8.2) ──────────────────────────────────────────────
+   *
+   * Pre-0.8.2 publish allocated one BigInt per call
+   * (`BigInt(Math.round(offsetNs))`) which V8 boxes on the heap. At
+   * audio-rate observe cadence (~700 Hz on a 16-sample quantum at 48 kHz,
+   * or higher for shorter quanta) the BigInt allocations were the
+   * dominant heap traffic on the consumer thread — a documented hot spot
+   * since 0.6.16 that the 0.6.11 notify bench flagged tangentially.
+   *
+   * 0.8.2 decomposes the integer offset into low/high halves via
+   * `Math.floor(offset / 2^32)` (high) and `(offset - hi*2^32) | 0` (low).
+   * The two halves store via two `Atomics.store(indices, lane, ...)` calls
+   * on the Int32Array — no BigInt object is ever materialized. Heap
+   * snapshots before/after a 10k-publish loop show zero growth (pinned by
+   * the 0.8.2 test). Within ±2^53 ns (≈ 104 days), the decomposition is
+   * exact; offsets larger than that lose precision the same way the old
+   * BigInt path did when converting back to Number on the read side.
    */
   publishPllState(offsetNs: number, driftPpm: number, locked: boolean): void {
-    // Round to nearest ns to convert the f64 offset to Int64. The
-    // offset's f64 precision (~15 sig figs) is sub-ns at any realistic
-    // wall-clock scale, so Math.round here is essentially a no-op for
-    // typical inputs — it just makes the BigInt conversion lossless.
-    const offsetI64 = BigInt(Math.round(offsetNs));
-    Atomics.store(this.indicesI64, 0, offsetI64);
+    // Round to nearest ns. The offset's f64 precision (~15 sig figs) is
+    // sub-ns at any realistic wall-clock scale, so Math.round here is
+    // essentially a no-op for typical inputs.
+    const offsetRounded = Math.round(offsetNs);
+    // Decompose to signed Int32 halves (BigInt-free, no heap allocation).
+    // Math.floor handles negative offsets correctly: e.g. for offsetNs = -1,
+    // hi = -1 and lo = (-1 - (-1)*2^32) | 0 = (2^32-1) | 0 = -1, which
+    // reconstructs to (-1)*2^32 + (-1 >>> 0) = -1 on read. Exact within
+    // ±2^53 ns (≈ 104 days).
+    const hi = Math.floor(offsetRounded / 0x100000000);
+    const lo = (offsetRounded - hi * 0x100000000) | 0;
+    Atomics.store(this.indices, PLL_OFFSET_LANE_LOW, lo);
+    Atomics.store(this.indices, PLL_OFFSET_LANE_HIGH, hi | 0);
     // Drift as signed Q16.16 ppm. Range ±32768 ppm clamped — any
     // realistic clock drift (single-digit to tens of ppm) sits well
     // inside this envelope.
@@ -1562,25 +1694,30 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * snapshot is a valid publish point in practice, not a synthesis of
    * incompatible halves.
    *
-   * The three fields are individually atomic; the tuple is not mutually
-   * atomic. Live observer activity that needs sample-accurate
-   * coherence should instead call `bridge.telemetry()` on the consumer
-   * Bridge directly (same-thread loads, gated against the heap state).
-   * The published-lane path exists for the cross-thread / cross-process
-   * case where direct Bridge access isn't available.
+   * The four lanes (status / offset-low / offset-high / drift) are
+   * individually atomic; the tuple is not mutually atomic. Live observer
+   * activity that needs sample-accurate coherence should instead call
+   * `bridge.telemetry()` on the consumer Bridge directly (same-thread
+   * loads, gated against the heap state). The published-lane path exists
+   * for the cross-thread / cross-process case where direct Bridge access
+   * isn't available.
    *
-   * Three atomic loads + one ppm decode. Allocation-free.
+   * Four atomic loads + one ppm decode + one offset reconstruction.
+   * Allocation-free (no BigInt boxing; see `publishPllState` for the
+   * 0.8.2 BigInt-free encoding).
    */
   readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
     const status = Atomics.load(this.indices, PLL_STATUS_LANE);
     const locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
-    const offsetI64 = Atomics.load(this.indicesI64, 0);
-    // BigInt → Number conversion: offsets are bounded to ±2^53 in
-    // practice (offset is wall-clock difference in ns; 2^53 ns ≈ 104
-    // days, way past any realistic mismatched-epoch case), so the
-    // Number(BigInt) conversion is exact. We accept loss of precision
-    // beyond 2^53 ns — it's a hard limit but well outside production.
-    const offsetNs = Number(offsetI64);
+    // Two Int32 loads + Number reconstruction (0.8.2). Bit-equivalent to
+    // reading the same 8 bytes as a BigInt64 then converting to Number,
+    // but allocation-free on the hot reader path. `(lo >>> 0)` casts the
+    // low half from signed Int32 to its unsigned interpretation; the
+    // signed high half multiplies by 2^32 to reconstruct the full Int64
+    // as a JavaScript Number. Within ±2^53 ns this is exact.
+    const lo = Atomics.load(this.indices, PLL_OFFSET_LANE_LOW);
+    const hi = Atomics.load(this.indices, PLL_OFFSET_LANE_HIGH);
+    const offsetNs = hi * 0x100000000 + (lo >>> 0);
     const driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
     const driftPpm = driftQ / PLL_DRIFT_Q16_16;
     return { locked, offsetNs, driftPpm };

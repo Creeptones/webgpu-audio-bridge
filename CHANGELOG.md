@@ -4,6 +4,232 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.2] — 2026-05-27
+
+### Added — pullAll single-trailing-notify + BigInt-free PLL publish (audit cohort, second patch)
+
+Second patch of the audit cohort. Two heap-only performance wins,
+both wire-compatible with 0.8.1. **No SAB byte change, no schema
+extension, no public-API change.**
+
+1. `BridgeInputLane.pullAll` adopts a single-trailing-notify fast
+   path. Where the 0.6.19 → 0.8.1 implementation called `ring.pull`
+   in a loop and paid one `Atomics.notify(read_index, 1)` per
+   consumed frame, the 0.8.2 path calls a no-trailing-notify primitive
+   per frame and issues **exactly one** trailing notify on the
+   success branch at burst end. Empty pulls skip the notify entirely.
+2. `SpscRing.publishPllState` becomes BigInt-free. The 0.6.16 →
+   0.8.1 path materialized one BigInt per call
+   (`BigInt(Math.round(offsetNs))`) for the atomic 8-byte offset
+   store on the aliased `BigInt64Array` view. The 0.8.2 path
+   decomposes the integer offset into low / high Int32 halves via
+   `Math.floor(offset / 2^32)` + `(offset - hi * 2^32) | 0` and
+   writes two `Atomics.store(indices, lane, ...)` calls instead.
+   **SAB byte layout stays bit-identical** — little-endian Int64 is
+   the same as two little-endian Int32s at lanes 4 and 5.
+   `readPublishedPllState` matches with two Int32 loads + Number
+   reconstruction. The aliased `indicesI64` BigInt64 view is retired.
+
+The two changes pair: the BigInt-free split widens the offset write
+window across two stores rather than one atomic 8-byte write, which
+is exactly the case the 0.8.1 status-last store-order contract
+already anticipated and documented. Cross-process readers that gate
+on `locked === true` first observe a coherent (offset, drift)
+publish point under both write shapes.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/SpscRing.ts`** —
+  - `_pullNoNotify` (line ~1018) promoted from a bench-only shim to
+    a documented internal helper. New header explains the two
+    intentional callers (the existing 0.6.11 bench cell + the new
+    `BridgeInputLane.pullAll` path) and the caller's responsibility
+    to pair N pulls with one trailing notify. Body now dispatches to
+    `_pullOverrunAwareNoNotify` when `_needsOverrunAware` is true,
+    mirroring the `pull` dispatch shape so the no-notify primitive
+    is correct under every overflow policy (including `drop-oldest`).
+  - New private `_pullOverrunAwareNoNotify` (line ~1207) — the
+    CAS-aware drop-oldest variant of `_pullNoNotify`, parallel to
+    the existing `_pullOverrunAware`. Same retry-on-CAS-failure
+    shape; only the trailing notify is elided.
+  - New `_notifyReadAdvance` (line ~1275) — the trailing notify
+    primitive `BridgeInputLane.pullAll` pairs with `_pullNoNotify`.
+    Equivalent to the per-frame `Atomics.notify(this.indices,
+    READ_IDX_LANE, 1)` the regular `pull` path issues, lifted to a
+    standalone helper so the loop primitive can amortize the notify
+    across N pulls.
+  - `publishPllState` rewritten BigInt-free; docstring expanded
+    with a `─── BigInt-free (0.8.2) ───` subsection explaining the
+    decomposition + the 0.8.1 status-last contract is preserved.
+  - `readPublishedPllState` matched with two Int32 loads +
+    `hi * 0x100000000 + (lo >>> 0)` reconstruction. Allocation-free.
+  - `indicesI64` field + constructor assignment retired. The
+    constructor comment notes the aliased view is gone and the
+    publish/read paths now use the existing Int32Array header view
+    directly.
+
+- **`src/BridgeInputLane.ts`** —
+  - File-header `─── Notify protocol ───` section rewritten. The
+    previous text flagged the per-frame notify cost as a future
+    fast-path; this patch ships that fast-path, so the section now
+    documents the single-trailing-notify contract explicitly +
+    cross-references the empty-pull skip.
+  - `pullAll` body switched to `ring._pullNoNotify` as the loop
+    primitive + one `ring._notifyReadAdvance()` on the success
+    branch (count > 0). Empty-pull early returns skip the notify.
+
+- **`bench/Bridge.bench.ts`** — new 0.8.2 cell
+  `pullAll notify-cost amortization`. Drives a 6-field
+  input-event schema with bursts of 10 events queued at a time and
+  measures `pullAll` (one notify) vs `pull-loop × 10` (ten
+  notifies). Surfaces the per-burst delta as `pullAll notify-cost
+  delta (pull-loop - pullAll) = X ns (10-event burst; ≈ (N-1)×
+  notify saved)`. Not gated; documented in this CHANGELOG entry.
+
+- **`tests/BridgeInputLane.test.ts`** — two new pins:
+  - Pin #10 `testPullAllSingleTrailingNotify`: monkey-patches
+    `ring._notifyReadAdvance` with a counting wrapper and exercises
+    every branch — empty pull (zero notifies), 5-event drain (one
+    notify), 3-event drain (one notify), drained-empty pull (zero
+    notifies again), buffer-cap drain (one notify). Restores the
+    original method in `finally`.
+  - Pin #11 `testPullAllDropOldestInterop`: fills a capacity-4
+    `drop-oldest` ring, kicks out the oldest frame with an extra
+    push, then drains via `pullAll` and asserts the 4 surviving
+    frames are bit-exact and FIFO. Exercises the new
+    `_pullOverrunAwareNoNotify` dispatch.
+
+- **`tests/Bridge.test.ts`** — new pin #92
+  `testPllPublishBigIntFreeAndBoundaryRoundTrip`:
+  - Monkey-patches `globalThis.BigInt` with a counting wrapper,
+    runs a 10k-publish loop that sweeps offsets across the 2^32
+    boundary, then asserts the BigInt constructor was never invoked
+    from inside `publishPllState`. Pins the allocation-free
+    contract directly.
+  - Round-trips a battery of offset values near and across the
+    2^32 boundary (where the two-Int32 carry math matters) plus
+    legacy edge cases (0, ±1, ±2^31, ±2^53). Every value reads back
+    bit-exact via `readPublishedPllState`.
+
+### Why
+
+The two improvements pair naturally and were earmarked together at
+audit time. The `BridgeInputLane.pullAll` per-frame notify cost was
+flagged in the 0.6.19 file header as future work — at a 10-event
+burst the cumulative cost was ~10× a single notify, which
+disappears in absolute terms (~1 µs/burst on the 0.6.11 bench
+baseline) but stands out on the visible bench output once you add a
+single-trailing-notify alternative to compare against. The
+BigInt-free publish path removes the only known per-publish BigInt
+allocation on the consumer thread — at audio-rate observe cadence
+(~700 Hz on a 64-sample quantum at 48 kHz, higher for shorter
+quanta) those BigInt allocations were the dominant heap traffic
+from `publishPllState`. The 0.8.2 path is pure Number math, sized
+to the same ±2^53 ns precision envelope the BigInt path had after
+Number conversion on the reader side.
+
+The pairing matters for the store-order contract. The 0.8.1 patch
+elevated the status-last store ordering to a documented invariant
+specifically anticipating the 0.8.2 split — its CHANGELOG entry
+forward-referenced this patch by version number. Splitting the
+offset into two stores widens the write window across the offset
+itself, which is precisely why the status-last gate matters:
+readers that load lane 4 between the offset-low and offset-high
+stores observe an inconsistent (lo_new, hi_old) pair, but the
+status lane is still old, so the reader's `locked === true` check
+correctly discards the snapshot.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema extension,
+no protocol change.
+
+- `BridgeInputLane.pullAll` produces the same observable
+  before/after state on the SAB (read_index advances by the same
+  count; payload bytes are unchanged) and the same return value
+  (frames pulled). The trailing notify is wire-equivalent to N
+  individual notifies for the parked-producer wake protocol —
+  `Atomics.wait` waiters take any notify count ≥ 1 as a wake-up
+  signal, so collapsing N notifies to 1 is correct under SPSC.
+- `publishPllState` writes the same 8 bytes at lanes 4-5 (offset)
+  + the same 4 bytes at lane 6 (drift) + the same 4 bytes at lane
+  7 (status) in the same order (offset-low → offset-high → drift →
+  status). A 0.8.1 reader running against a 0.8.2 publisher reads
+  the same bytes via the aliased BigInt64 view and reconstructs the
+  same Number, bit-for-bit.
+- `readPublishedPllState` returns the same `{ locked, offsetNs,
+  driftPpm }` shape, bit-for-bit, against any publisher 0.6.16
+  onward.
+
+A 0.7.x / 0.8.1 consumer linking against this SAB sees identical
+frames and identical PLL state.
+
+### Tests
+
+13 suites stay green. Two suites grow:
+
+- `tests/BridgeInputLane.test.ts` from 9 pins to 11 pins (new pins
+  #10 and #11 — see Patch surface above).
+- `tests/Bridge.test.ts` from 91 pins to 92 pins (new pin #92 —
+  see Patch surface above).
+
+Pre-existing pins unchanged. The known
+`tests/Bridge.concurrent.test.ts` `emptyWaitTimeouts === 0` flake
+(documented in CLAUDE.md) did not fire during the 0.8.2 gate run;
+the audit cohort's 0.8.3 patch is still the documented fix target.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.8.1 (≈ 1.20 µs).
+The new 0.8.2 cell shows:
+
+```
+  pullAll (1 notify) median= 2.10 μs  p99=10.20 μs  ...
+  pull-loop (N notify) median= 2.50 μs  p99=11.00 μs  ...
+  pullAll notify-cost delta (pull-loop - pullAll) = 400 ns
+    (10-event burst; ≈ (N-1)× notify saved)
+```
+
+≈ 400 ns saved per 10-event burst is consistent with the existing
+0.6.11 single-notify cell's ~100 ns/notify measurement (9 notifies
+collapsed × ~50 ns/notify amortized through the loop dispatch ≈
+400 ns). At realistic input-rate bursts of 5-30 events per quantum
+the savings range from ~200 ns to ~1.5 µs per pullAll call.
+
+### Documentation
+
+CHANGELOG entry above. `BridgeInputLane.ts` file-header §Notify
+protocol now documents the new contract; `SpscRing.ts`
+`publishPllState` docstring's BigInt-free subsection documents the
+encoding change + the store-order pairing with 0.8.1. README is
+unchanged for this patch — the audit cohort's 0.8.4 patch remains
+the QUICKSTART + ROADMAP + diagram-rework slot, and the deferred
+0.7.15 / 0.7.17 polish items still default to folding into 0.8.4
+per the Post-0.8.1 handoff doc.
+
+### Audit cohort context
+
+Second patch of the audit cohort plan
+(`~/.claude/plans/please-draft-a-comprehensive-logical-waffle.md`).
+Remaining patches in order:
+
+- **0.8.3** — testing infrastructure (`fast-check` property pins +
+  `Bridge.test.ts` feature-file split + concurrent flake fix).
+- **0.8.4** — documentation polish (QUICKSTART.md + ROADMAP.md +
+  README diagram + cheat-sheet callouts; default landing slot for
+  the deferred 0.7.15 / 0.7.17 polish items).
+- **0.8.5** — npm publish + `webgpu-audio-bridge dev` CLI
+  subcommand.
+- **0.8.0** — (reserved, ships when ready) `MessageChannelBridge<S>`
+  + PLL offset wire-format normalization.
+- **0.8.6** — wavefunction migration completion + flagship
+  telemetry overlay.
+- **0.8.7** — `examples/wavefunction-mini/` Aubry-André demo.
+
+The pairing of `pullAll` single-trailing-notify + BigInt-free PLL
+publish in one patch reflects the plan's groupings; each remaining
+patch lands separately per CLAUDE.md's extended-slowdown rule.
+
 ## [0.8.1] — 2026-05-27
 
 ### Added — Concurrency hardening + observability docstrings (audit cohort, first patch)
