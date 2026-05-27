@@ -4,6 +4,180 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.7] — 2026-05-27
+
+### Added — first npm publish + `webgpu-audio-bridge dev` CLI (audit cohort, product-polish 2/4)
+
+Seventh patch of the audit cohort, second slice of the product-
+polish sub-cohort. The cohort's ship moment: the package is on npm
+as `webgpu-audio-bridge@0.8.7`, and the bundled CLI gives downstream
+consumers a one-command zero-config dev server with the COOP/COEP
+headers SharedArrayBuffer requires. No production library code
+change — additive only.
+
+**New CLI: `npx webgpu-audio-bridge dev`.**
+
+- `bin/webgpu-audio-bridge.mjs` — new file (~180 lines). Node ESM,
+  shebang, no transpile, zero runtime deps beyond Node core
+  (`node:http`, `node:fs/promises`, `node:path`). Wired into npm's
+  bin shim via `package.json` `"bin"`; available as
+  `npx webgpu-audio-bridge dev` after install.
+- Arguments: optional positional `path` (default `process.cwd()`),
+  `-p` / `--port` (default `5173`, also `--port=N`), `-h` / `--help`,
+  `-v` / `--version`. The leading `dev` subcommand is accepted (so
+  both `npx webgpu-audio-bridge dev .` and `npx webgpu-audio-bridge
+  .` work) — `dev` is the only subcommand and it's the default, but
+  keeping the keyword reserves room for future siblings (`build`,
+  `verify`, etc.) without a breaking change.
+- Every response carries the three-header set used by the existing
+  `examples/*/serve.mjs` files:
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+  - `Cross-Origin-Resource-Policy: same-origin`
+  Plus `Cache-Control: no-store` so the dev cycle never serves a
+  stale file. Path-traversal safety: requests are normalized and
+  containment-checked against the resolved root before any `stat` /
+  `readFile`. Missing files yield 404; non-directory roots, missing
+  roots, and `EADDRINUSE` exit with a clear message and a non-zero
+  exit code.
+- MIME table covers the file types the bridge's own demos serve
+  (`html` / `js` / `mjs` / `css` / `json` / `wgsl` / `map` / `wasm`
+  / image kinds / `txt`); unknowns fall through to
+  `application/octet-stream`.
+
+**`package.json` updates.**
+
+- Version `0.8.6` → `0.8.7`.
+- New `"bin": { "webgpu-audio-bridge": "./bin/webgpu-audio-bridge.mjs" }`.
+- `"files"` array gains three entries: `bin`, `QUICKSTART.md`,
+  `ROADMAP.md`. The two MD files were a 0.8.6 oversight (the docs
+  patch added the files but didn't update `"files"`); fixed here so
+  the npm tarball ships them — otherwise README's relative-link
+  cross-references would silently degrade on the npm package page.
+- `"prepublishOnly"` (already present) ensures the publish is gated
+  on `typecheck && test && build`.
+
+**Documentation updates.**
+
+- `QUICKSTART.md` — `npm install webgpu-audio-bridge` line drops the
+  `(once 0.8.7 publishes)` gloss; new four-line snippet at the
+  AudioWorklet section shows the CLI usage
+  (`npx webgpu-audio-bridge dev .`, `-p 8080`).
+- `README.md` — §Quick start line rewritten: install is now the
+  plain `npm install`, and a one-sentence CLI mention is folded in.
+  §Enabling Turbo mode's CLI paragraph is updated from the
+  speculative "(lands at 0.8.7)" form to the present-tense `npx
+  webgpu-audio-bridge dev [path] [--port N]` description.
+- `ROADMAP.md` — 0.8.7 slot flipped from `queued` to `✅ shipped`.
+
+### Why
+
+Three converging concerns:
+
+1. **npm publish is the ship moment.** The audit cohort has been
+   building toward "the package is `npm install`-able" since 0.8.0;
+   `prepublishOnly`, the `"main"` / `"types"` / `"exports"`
+   triple-entry shape, the `"files"` allowlist, and the polished
+   README + QUICKSTART + ROADMAP were all in place by end of 0.8.6.
+   What was missing was (a) the bin script the README had been
+   promising since 0.7.1, and (b) the npm-side push of the bits.
+   Bundling them into one patch keeps the public surface coherent:
+   the first version a `npm view webgpu-audio-bridge` returns is the
+   version that has the CLI it advertises.
+
+2. **CLI removes the COOP/COEP friction point.** New users
+   following the QUICKSTART hit a wall the first time they try to
+   construct a `Bridge<S>` in the browser without isolation
+   headers — `crossOriginIsolated` returns false and SAB either
+   throws or silently degrades. The existing
+   `examples/*/serve.mjs` files solve this for the bundled demos
+   but downstream consumers had to copy-paste the boilerplate.
+   Shipping it as a bin script means "I tried it and it didn't
+   work" becomes a 30-second fix (`npx webgpu-audio-bridge dev`)
+   instead of an hour spent learning the COOP/COEP / CORP /
+   isolation triangle.
+
+3. **The CLI shape is a public commitment.** `npx
+   webgpu-audio-bridge dev [path] [--port N]` is the public
+   contract from this version forward. The argument shape was
+   chosen to match the existing serve.mjs conventions (port 5173
+   default to mirror Vite + the existing `dev:demo`), to accept
+   both short + long flags (`-p` / `--port`) per CLI ergonomics
+   norms, and to reserve the subcommand keyword (`dev`) for future
+   non-breaking additions. The implementation is intentionally
+   minimal — argument parsing is a hand-rolled walk, no
+   `commander` / `yargs` / `serve-static` dependencies — so the
+   tarball stays lean and there's no transitive supply-chain
+   surface.
+
+### Wire compatibility
+
+100% wire-compatible. No SAB byte layout change, no schema
+extension, no public-API change to `Bridge<S>` or the composable
+primitives. The CLI is a separate ESM script that never imports
+the library; it's an out-of-process static server. A 0.8.6
+producer and a 0.8.7 consumer over the same SAB exchange frames
+bit-identically.
+
+### Tests
+
+All 21 suites green (count unchanged from 0.8.6):
+
+- `tests/schema.test.ts`
+- `tests/Bridge.core.test.ts` / `Bridge.smoother.test.ts` /
+  `Bridge.invariant.test.ts` / `Bridge.pll.test.ts` /
+  `Bridge.trajectory.test.ts` / `Bridge.backpressure.test.ts` /
+  `Bridge.observability.test.ts` / `Bridge.facades.test.ts` /
+  `Bridge.properties.test.ts`
+- `tests/BridgeFacades.test.ts` / `BridgeInputLane.test.ts` /
+  `BridgeBlockConsumer.test.ts` /
+  `BridgeGPUSource.writeTarget.test.ts` /
+  `BridgeWebNNSource.test.ts`
+- `tests/environment.test.ts` / `Bridge.phaseLock.test.ts` /
+  `Bridge.wasmEquivalence.test.ts`
+- Concurrent: `Bridge.concurrent.test.ts` /
+  `Float64RingBuffer.test.ts` / `Float64RingBuffer.concurrent.test.ts`
+
+No new test files. The CLI is a separate ESM script that runs in
+its own Node process; it is exercised through a smoke test (start
+the server, fetch `localhost:<port>`, confirm 200 + the three
+isolation headers) rather than through the unit-test runner. A
+future patch may add a Playwright cell that drives a real demo
+end-to-end through the CLI for regression coverage; the current
+patch leaves that to the consumer-side wavefunction migration
+(0.8.8) which exercises the same path.
+
+### Bench
+
+push / pull / pullLatest medians unchanged (~1.20 μs at N=1000;
+~67 ns / ~67 ns / ~69 ns per op). The CLI does not touch library
+code, so no perf delta is expected; the bench is run as a sanity
+check, not because the patch can plausibly regress it.
+
+### Documentation
+
+- `QUICKSTART.md` — install + CLI usage updated (above).
+- `README.md` — §Quick start + §Enabling Turbo mode lines updated
+  to present-tense CLI mentions (above).
+- `ROADMAP.md` — 0.8.7 slot flipped to shipped (above).
+- **Website twin migration follow-up (recommended, not required).**
+  Once 0.8.7 is on npm, the website twin at
+  `..\NewProject\website\package.json` can switch its dep from
+  `"webgpu-audio-bridge": "file:../../webgpu-audio-bridge"` to
+  `"webgpu-audio-bridge": "^0.8.7"`. That's a one-line change in
+  the website repo, not part of this patch; it can land alongside
+  the 0.8.8 wavefunction migration which is the next cross-repo
+  patch in the cohort.
+
+### Patch surface
+
+- `bin/webgpu-audio-bridge.mjs` — new.
+- `package.json` — version + `bin` + `files`.
+- `QUICKSTART.md` — two edits.
+- `README.md` — two edits.
+- `ROADMAP.md` — one edit.
+- `CHANGELOG.md` — this entry.
+
 ## [0.8.6] — 2026-05-27
 
 ### Added — documentation polish (audit cohort, product-polish 1/4)

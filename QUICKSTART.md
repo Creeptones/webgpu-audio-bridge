@@ -8,8 +8,7 @@ browser, no AudioWorklet yet. For the full AudioWorklet pattern see
 ## 1. Install
 
 ```bash
-npm install webgpu-audio-bridge        # once 0.8.7 publishes
-# until then, vendor it: git clone + npm install && npm run build && npm link
+npm install webgpu-audio-bridge
 ```
 
 No runtime dependencies. Node 18+.
@@ -87,6 +86,14 @@ importing the library on the audio thread. Walkthrough lives at
 [README §Consumer (AudioWorklet, audio side)](./README.md#consumer-audioworklet-audio-side);
 working demo at [`examples/minimal/`](./examples/minimal/) (`npm run
 dev:demo`, port 5173).
+
+To serve your own page with the COOP/COEP headers SAB needs (without
+spinning up a bundler), use the bundled dev CLI:
+
+```bash
+npx webgpu-audio-bridge dev .          # serve cwd on http://localhost:5173
+npx webgpu-audio-bridge dev . -p 8080  # custom port
+```
 
 For pro-audio tracking latency (sub-5 ms input-to-audible), see
 [README §Achieving pro-audio tracking latency](./README.md#achieving-pro-audio-tracking-latency).

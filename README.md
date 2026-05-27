@@ -100,7 +100,7 @@ For headless browser smoke tests against the demo, `npm run test:browser` (Playw
 
 ## Quick start
 
-For a 5-minute hello-frame walkthrough, see [`QUICKSTART.md`](./QUICKSTART.md). Vendor today (`git clone && npm link`); `npm install webgpu-audio-bridge` lands at 0.8.7. No runtime dependencies.
+For a 5-minute hello-frame walkthrough, see [`QUICKSTART.md`](./QUICKSTART.md). Install with `npm install webgpu-audio-bridge`. No runtime dependencies. Zero-config local dev: `npx webgpu-audio-bridge dev .` serves the current directory with the COOP/COEP headers Turbo mode needs (default port 5173, override with `-p`).
 
 A schema describes the byte layout of one frame; the library ships `physicsControlFrameSchema(n)` as a ready-made example matching the historical V/J shape. `defineSchema({ seq: u64(), vMax: f64(), vEff: f64Array(1000), ... })` covers any shape you need; `FrameFor<typeof S>` gives full TS inference without `as const`.
 
@@ -150,7 +150,7 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Check `crossOriginIsolated === true` at runtime before constructing a `Bridge<S>`. If it returns `false` you're in Standard-mode territory (`MessageChannelBridge<S>`, reserved at 0.8.0) — explicit second tier, documented latency, never a silent fallback.
 
-For zero-config local development, `npx webgpu-audio-bridge dev` (lands at 0.8.7) ships a static server with COOP/COEP/CORP headers wired up correctly, a browser-side probe that reports environment status to the terminal, and actionable error messages for blocked third-party assets. Production hosts: `headers` arrays on Vercel, Netlify, Cloudflare Pages; `add_header` directives on nginx; static server config equivalents elsewhere — the two headers are universal.
+For zero-config local development, `npx webgpu-audio-bridge dev [path] [--port N]` ships a static server with COOP/COEP/CORP headers wired up correctly. Default path is the current directory; default port is 5173. Production hosts: `headers` arrays on Vercel, Netlify, Cloudflare Pages; `add_header` directives on nginx; static server config equivalents elsewhere — the two headers are universal.
 
 The legacy single-file [`Float64RingBuffer`](./src/Float64RingBuffer.ts) is frozen at the v0.1.x byte format and still vendorable as one file (`curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts`); the [v0.1.1 Zenodo tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact for that form. New code should prefer `Bridge<Schema>`.
 

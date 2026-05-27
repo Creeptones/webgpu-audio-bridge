@@ -38,7 +38,7 @@ ship order, not the original plan.
 | 0.8.4 | ✅ shipped | fast-check property pins for FrameSmoother / trajectory / PLL |
 | 0.8.5 | ✅ shipped | `tests/Bridge.test.ts` 8-way feature-file split |
 | 0.8.6 | ✅ shipped | Documentation polish (this file + `QUICKSTART.md` + README rework) |
-| 0.8.7 | queued | First npm publish + `webgpu-audio-bridge dev` CLI |
+| 0.8.7 | ✅ shipped | First npm publish + `webgpu-audio-bridge dev` CLI |
 | 0.8.8 | queued | Wavefunction consumer migration + flagship telemetry overlay |
 | 0.8.9 | queued | `examples/wavefunction-mini/` Aubry-André demo |
 
