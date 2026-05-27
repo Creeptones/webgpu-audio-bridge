@@ -16,6 +16,27 @@
  *     and commits the push,
  *   - cycles the staging buffers back to IDLE for the next readback.
  *
+ * ─── WriteTarget strategy (0.7.15) ────────────────────────────────────────
+ *
+ * The GPU → CPU byte-transport step is factored behind a `WriteTarget`
+ * strategy interface. Today the only shipped implementation is
+ * `MapAsyncWriteTarget` — the existing `copyBufferToBuffer` + `mapAsync`
+ * + `getMappedRange` + `unmap` path, byte-for-byte unchanged from 0.6.18.
+ * The abstraction exists so callers don't have to migrate when the W3C
+ * lands a true zero-copy / shared-memory readback interface (tracked at
+ * `gpuweb#4432`).
+ *
+ * The constructor accepts `writeTarget: 'auto' | 'map-async' | 'shared'`,
+ * defaulting to `'auto'`. Today `'auto'` deterministically resolves to
+ * `'map-async'` because no browser exposes the shared-memory interface
+ * yet AND this build doesn't ship a `SharedMemoryWriteTarget`. Explicit
+ * `'shared'` throws with a descriptive error. The capability sniff is
+ * surfaced as `getEnvironmentReport().webgpuZeroCopy: boolean` (also
+ * 0.7.15) — interface-presence detection on `GPUBuffer.prototype`, not
+ * UA version sniffing. No behavior change in 0.7.15; this is pure
+ * forward-compat scaffolding so users don't rewrite call sites when the
+ * spec lands.
+ *
  * The point of the staging-buffer ring is **overlap**. Naive
  * "submit, await mapAsync, push, repeat" serializes the GPU and the
  * readback — the next compute pass has to wait for the previous readback
@@ -123,23 +144,215 @@ const GPU_BUFFER_USAGE_COPY_DST = 0x0008;
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
 const GPU_MAP_MODE_READ = 0x0001;
 
-/** Per-staging-buffer state machine. See class header lifecycle. */
+/**
+ * Selection token for the GPU → CPU byte-transport strategy (0.7.15).
+ *
+ *   - `'auto'` (default) — read the platform capability and pick. Today
+ *     deterministically resolves to `'map-async'`: no browser exposes a
+ *     shared-memory readback interface, AND this build does not ship a
+ *     `SharedMemoryWriteTarget` implementation. The selection logic
+ *     updates in a future patch when the W3C lands the interface.
+ *
+ *   - `'map-async'` — the `copyBufferToBuffer` + `mapAsync` +
+ *     `getMappedRange` path; the only implementation in 0.7.15.
+ *
+ *   - `'shared'` — reserved for the future zero-copy / shared-memory
+ *     write target. Throws on construction in 0.7.15. Inspect
+ *     `getEnvironmentReport().webgpuZeroCopy` before passing this.
+ */
+export type WriteTargetKind = "auto" | "map-async" | "shared";
+
+/**
+ * Strategy interface for moving bytes from a producer-side GPU buffer
+ * into a CPU-readable `ArrayBuffer` the decoder can consume (0.7.15).
+ *
+ * Today the only shipped implementation is `MapAsyncWriteTarget` —
+ * the existing `copyBufferToBuffer` + `mapAsync` + `getMappedRange`
+ * + `unmap` path. The interface is exported so callers can read the
+ * shape; user-supplied implementations are not accepted by
+ * `BridgeGPUSource`'s constructor in 0.7.15 (the `writeTarget` option
+ * is enum-only). A future patch may add a pluggable strategy-object
+ * variant if there's demand.
+ *
+ * The host (`BridgeGPUSource`) owns the per-slot state machine
+ * (`idle / scheduled / in-flight / ready`), the `_lastReadbackUs`
+ * timing, and the bridge-push orchestration. The `WriteTarget`
+ * implementation owns only the I/O: how to encode the copy, how to
+ * await readability, how to read the bytes, how to release the slot,
+ * and how to destroy. This keeps the host code identical across
+ * future strategies.
+ */
+export interface WriteTarget {
+  /** Bytes per readback slot. Matches the host's `stagingBufferSize`. */
+  readonly slotByteSize: number;
+  /** Number of slots in the ring. Matches the host's `slots.length`. */
+  readonly slotCount: number;
+  /** Encode the copy from the producer's GPU buffer into the slot's
+   *  storage, into the user-provided command encoder. Called from
+   *  `scheduleReadback`. */
+  encodeCopy(
+    slotIndex: number,
+    src: GpuBufferLike,
+    srcOffset: number,
+    encoder: GpuCommandEncoderLike,
+  ): void;
+  /** Begin the async wait for the slot's bytes to be CPU-readable.
+   *  Called from `flushPending` AFTER `device.queue.submit()`. */
+  beginMap(slotIndex: number): Promise<undefined>;
+  /** Synchronously read the slot's bytes after `beginMap` has resolved.
+   *  Returns an `ArrayBuffer` view into the slot's CPU-side region. */
+  readMapped(slotIndex: number): ArrayBuffer;
+  /** Release the read access on the slot. Called from `pollCompleted`
+   *  after the decoder finishes; cycles the slot back to `idle`. */
+  releaseMap(slotIndex: number): void;
+  /** Destroy all underlying GPU resources. Best-effort; subsequent
+   *  calls should become no-ops. */
+  destroy(): void;
+}
+
+/**
+ * The `mapAsync` write target — the only shipped implementation in
+ * 0.7.15. Owns the ring of staging buffers, encodes
+ * `copyBufferToBuffer` into the user's encoder, calls `mapAsync` /
+ * `getMappedRange` / `unmap` per slot. Behavior is byte-for-byte
+ * unchanged from the 0.6.18-through-0.7.14 path; this class is a pure
+ * relocation of those statements behind the `WriteTarget` interface
+ * so future strategies can replace just the I/O.
+ */
+class MapAsyncWriteTarget implements WriteTarget {
+  public readonly slotByteSize: number;
+  public readonly slotCount: number;
+  private readonly buffers: GpuBufferLike[];
+
+  constructor(
+    device: GpuDeviceLike,
+    slotCount: number,
+    slotByteSize: number,
+    labelPrefix: string,
+  ) {
+    this.slotByteSize = slotByteSize;
+    this.slotCount = slotCount;
+    this.buffers = new Array(slotCount);
+    for (let i = 0; i < slotCount; i++) {
+      this.buffers[i] = device.createBuffer({
+        label: `${labelPrefix}-${i}`,
+        size: slotByteSize,
+        usage: GPU_BUFFER_USAGE_COPY_DST | GPU_BUFFER_USAGE_MAP_READ,
+      });
+    }
+  }
+
+  encodeCopy(
+    slotIndex: number,
+    src: GpuBufferLike,
+    srcOffset: number,
+    encoder: GpuCommandEncoderLike,
+  ): void {
+    encoder.copyBufferToBuffer(
+      src,
+      srcOffset,
+      this.buffers[slotIndex]!,
+      0,
+      this.slotByteSize,
+    );
+  }
+
+  beginMap(slotIndex: number): Promise<undefined> {
+    return this.buffers[slotIndex]!.mapAsync(
+      GPU_MAP_MODE_READ,
+      0,
+      this.slotByteSize,
+    );
+  }
+
+  readMapped(slotIndex: number): ArrayBuffer {
+    return this.buffers[slotIndex]!.getMappedRange(0, this.slotByteSize);
+  }
+
+  releaseMap(slotIndex: number): void {
+    this.buffers[slotIndex]!.unmap();
+  }
+
+  destroy(): void {
+    for (let i = 0; i < this.buffers.length; i++) {
+      try {
+        this.buffers[i]!.destroy();
+      } catch {
+        // best-effort; device-lost / already-destroyed buffers are fine.
+      }
+    }
+  }
+}
+
+/**
+ * Resolve a user-supplied `WriteTargetKind` to a concrete implementation
+ * choice for this build. `'auto'` deterministically resolves to
+ * `'map-async'` in 0.7.15 — the day a future patch lands
+ * `SharedMemoryWriteTarget`, this function will start preferring
+ * `'shared'` when `getEnvironmentReport().webgpuZeroCopy` is true.
+ *
+ * Kept private to the module: callers go through `BridgeGPUSource`'s
+ * `writeTarget` option, which delegates here.
+ */
+function resolveWriteTargetKind(kind: WriteTargetKind): "map-async" | "shared" {
+  if (kind !== "auto") return kind;
+  // 0.7.15: only 'map-async' is implemented. When a future patch ships
+  // `SharedMemoryWriteTarget`, gate this on
+  // `detectZeroCopyWriteTargetAvailable()` (the interface-presence sniff
+  // mirrored by `getEnvironmentReport().webgpuZeroCopy`).
+  return "map-async";
+}
+
+/**
+ * Construct the strategy implementation for a resolved kind. `'shared'`
+ * throws in 0.7.15 — the implementation hasn't shipped. Kept private to
+ * the module; callers go through `BridgeGPUSource`'s constructor.
+ */
+function buildWriteTarget(
+  kind: WriteTargetKind,
+  device: GpuDeviceLike,
+  slotCount: number,
+  slotByteSize: number,
+  labelPrefix: string,
+): WriteTarget {
+  const resolved = resolveWriteTargetKind(kind);
+  if (resolved === "map-async") {
+    return new MapAsyncWriteTarget(device, slotCount, slotByteSize, labelPrefix);
+  }
+  if (resolved === "shared") {
+    throw new Error(
+      "BridgeGPUSource: writeTarget 'shared' is not available in this build. " +
+        "The W3C zero-copy / shared-memory readback interface has not shipped " +
+        "in any browser as of 2026-05; once it lands, this library will ship a " +
+        "SharedMemoryWriteTarget implementation. Use 'map-async' (or the default " +
+        "'auto', which resolves to 'map-async' today). Inspect " +
+        "getEnvironmentReport().webgpuZeroCopy for the platform capability sniff.",
+    );
+  }
+  // Defensive: TypeScript narrows `resolved` to never here, but the
+  // runtime cast can still hit this if a caller bypasses the type.
+  throw new Error(
+    `BridgeGPUSource: unknown writeTarget kind '${String(resolved)}'`,
+  );
+}
+
+/** Per-slot state machine. See class header lifecycle. */
 type StagingState = "idle" | "scheduled" | "in-flight" | "ready";
 
 interface StagingSlot {
-  buffer: GpuBufferLike;
   state: StagingState;
-  /** Set when `mapAsync` resolves. Cleared in `pollCompleted` after
+  /** Set when `beginMap` resolves. Cleared in `pollCompleted` after
    *  the decoder runs. */
   mapped: boolean;
-  /** The pending `mapAsync` Promise, captured at `flushPending` time.
+  /** The pending `beginMap` Promise, captured at `flushPending` time.
    *  The `then` handler flips `mapped` to true so `pollCompleted` can
-   *  pick it up synchronously without blocking. */
+   *  pick it up synchronously without blocking. Held for retention only;
+   *  not read elsewhere. */
   pending: Promise<undefined> | null;
   /** `performance.now()` (milliseconds, fractional) captured the moment
-   *  `flushPending` started `mapAsync` on this slot. 0 if no mapAsync
-   *  is in flight on the slot. Read by `pollCompleted` to compute the
-   *  cycle duration into `_lastReadbackUs`. (0.7.3) */
+   *  `flushPending` started `beginMap` on this slot. 0 if no map is in
+   *  flight on the slot. Read by `pollCompleted` to compute the cycle
+   *  duration into `_lastReadbackUs`. (0.7.3) */
   mapStartedAtMs: number;
 }
 
@@ -158,6 +371,11 @@ export interface BridgeGPUSourceOptions {
   /** Optional label prefix for the staging buffers (appears in
    *  Chrome DevTools' GPU memory panel as `<prefix>-<index>`). */
   readonly bufferLabelPrefix?: string;
+  /** GPU → CPU byte-transport strategy (0.7.15). Default `'auto'`,
+   *  which deterministically picks `'map-async'` today. Explicit
+   *  `'shared'` throws — the W3C interface has not shipped. See
+   *  `WriteTargetKind` for the contract. */
+  readonly writeTarget?: WriteTargetKind;
 }
 
 /** Decoder callback shape (0.6.18). Receives the mapped staging-buffer
@@ -179,11 +397,20 @@ export type GpuReadbackDecoder<S extends Schema<FieldsObject, any>> = (
  * WebGPU typing approach.
  */
 export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
-  private readonly device: GpuDeviceLike;
   private readonly bridge: Bridge<S> | BridgeProducer<S>;
   private readonly decoder: GpuReadbackDecoder<S>;
   private readonly slots: StagingSlot[];
-  private readonly stagingBufferSize: number;
+  /** The strategy implementation owning the GPU staging buffers + the
+   *  byte-transport mechanics (0.7.15). `'map-async'` today; `'shared'`
+   *  reserved for a future zero-copy path. The host's per-slot state
+   *  machine is identical across strategies. The slot byte size lives
+   *  on this object (`writeTarget.slotByteSize`); the host no longer
+   *  caches it. */
+  private readonly writeTarget: WriteTarget;
+  /** The resolved write-target kind ('map-async' | 'shared'). Exposed via
+   *  `writeTargetKind()` for callers / dashboards. 0.7.15: always
+   *  `'map-async'`. */
+  private readonly _writeTargetKind: "map-async" | "shared";
   /** Cumulative readback success counter (decoder ran + push succeeded).
    *  Heap-only; read via `pushedCount()` for telemetry. */
   private _pushedCount: number = 0;
@@ -219,20 +446,18 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         `BridgeGPUSource: stagingBufferSize must be a positive integer (got ${size})`,
       );
     }
-    this.device = device;
+    const kind = opts.writeTarget ?? "auto";
     this.bridge = bridge;
     this.decoder = decoder;
-    this.stagingBufferSize = size;
     const labelPrefix = opts.bufferLabelPrefix ?? "BridgeGPUSource";
+    // Build the strategy AFTER validation so a `stagingBufferCount: 1`
+    // or `stagingBufferSize: 0` rejection doesn't leak partial
+    // device.createBuffer() side effects.
+    this.writeTarget = buildWriteTarget(kind, device, count, size, labelPrefix);
+    this._writeTargetKind = resolveWriteTargetKind(kind);
     this.slots = new Array(count);
     for (let i = 0; i < count; i++) {
-      const buffer = this.device.createBuffer({
-        label: `${labelPrefix}-${i}`,
-        size,
-        usage: GPU_BUFFER_USAGE_COPY_DST | GPU_BUFFER_USAGE_MAP_READ,
-      });
       this.slots[i] = {
-        buffer,
         state: "idle",
         mapped: false,
         pending: null,
@@ -257,16 +482,10 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     encoder: GpuCommandEncoderLike,
     srcOffset: number = 0,
   ): boolean {
-    const slot = this._acquireIdleSlot();
-    if (slot === null) return false;
-    encoder.copyBufferToBuffer(
-      srcBuffer,
-      srcOffset,
-      slot.buffer,
-      0,
-      this.stagingBufferSize,
-    );
-    slot.state = "scheduled";
+    const slotIndex = this._acquireIdleSlotIndex();
+    if (slotIndex < 0) return false;
+    this.writeTarget.encodeCopy(slotIndex, srcBuffer, srcOffset, encoder);
+    this.slots[slotIndex]!.state = "scheduled";
     return true;
   }
 
@@ -295,18 +514,14 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         // Capture the promise + arrange a then-handler that flips
         // `mapped` to true. `pollCompleted` then synchronously sees
         // the flag; the user never `await`s on us.
-        const p = slot.buffer.mapAsync(
-          GPU_MAP_MODE_READ,
-          0,
-          this.stagingBufferSize,
-        );
+        const p = this.writeTarget.beginMap(i);
         slot.pending = p;
         p.then(
           () => {
             slot.mapped = true;
           },
           (_err: unknown) => {
-            // mapAsync rejected — treat as if the readback was lost.
+            // beginMap rejected — treat as if the readback was lost.
             // Mark the slot ready so pollCompleted can release it.
             slot.mapped = true;
           },
@@ -341,7 +556,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       // The readback is ready. Try to acquire a push slot on the bridge.
       const frame = this.bridge.beginPush();
       if (frame !== null) {
-        const range = slot.buffer.getMappedRange(0, this.stagingBufferSize);
+        const range = this.writeTarget.readMapped(i);
         this.decoder(range, frame);
         this.bridge.commitPush();
         this._pushedCount = (this._pushedCount + 1) | 0;
@@ -361,7 +576,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (slot.mapStartedAtMs > 0) {
         this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
       }
-      slot.buffer.unmap();
+      this.writeTarget.releaseMap(i);
       slot.state = "idle";
       slot.mapped = false;
       slot.pending = null;
@@ -430,23 +645,26 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   /** Destroy all staging buffers + release resources. Subsequent
    *  calls become no-ops; do not reuse the instance after destroy. */
   destroy(): void {
-    for (let i = 0; i < this.slots.length; i++) {
-      try {
-        this.slots[i]!.buffer.destroy();
-      } catch {
-        // best-effort; some implementations may have already destroyed
-        // the buffer (e.g., device lost).
-      }
-    }
+    this.writeTarget.destroy();
   }
 
-  /** Internal: find a slot in IDLE state, return it (and leave it
-   *  in IDLE — caller transitions it). Returns null if all in flight. */
-  private _acquireIdleSlot(): StagingSlot | null {
+  /** The resolved write-target kind for this instance (0.7.15). Always
+   *  `'map-async'` in 0.7.15; future patches may return `'shared'` once a
+   *  `SharedMemoryWriteTarget` ships. Exposed for telemetry / dashboards.
+   *  Note: `'auto'` is a constructor *selector*, not a resolved value —
+   *  this method always returns a concrete implementation kind. */
+  writeTargetKind(): "map-async" | "shared" {
+    return this._writeTargetKind;
+  }
+
+  /** Internal: find a slot in IDLE state, return its index. Returns -1
+   *  if all slots are in flight. (Slot index, not object — the slot's
+   *  storage lives in the WriteTarget; the host only owns the state
+   *  machine.) */
+  private _acquireIdleSlotIndex(): number {
     for (let i = 0; i < this.slots.length; i++) {
-      const slot = this.slots[i]!;
-      if (slot.state === "idle") return slot;
+      if (this.slots[i]!.state === "idle") return i;
     }
-    return null;
+    return -1;
   }
 }

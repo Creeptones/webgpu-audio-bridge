@@ -112,6 +112,13 @@ export type {
   GpuCommandEncoderLike,
   GpuReadbackDecoder,
   BridgeGPUSourceOptions,
+  // Zero-copy WriteTarget scaffold (0.7.15 — Track 4). The strategy
+  // interface and the kind selector are exported as types so callers
+  // see the shape; today only the `'map-async'` resolution path is
+  // implemented. See `getEnvironmentReport().webgpuZeroCopy` for the
+  // platform capability sniff.
+  WriteTarget,
+  WriteTargetKind,
 } from "./BridgeGPUSource.js";
 
 // ── Block-shaped GPU readback adapter (0.7.14 — Track 3) ──────────────────

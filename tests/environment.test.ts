@@ -42,6 +42,11 @@
  *  12.  enable-coop-coep fix downgrades to 'info' when the host is
  *       already in turbo (so existing crossOriginIsolated guidance is
  *       not blown up to 'degraded' for a working page).
+ *  13.  (0.7.15) webgpuZeroCopy is false on current Chrome / Node, and
+ *       flips to true only when GPUBuffer.prototype exposes the
+ *       placeholder `mapShared` method — the W3C zero-copy / shared-
+ *       memory readback surface that hasn't shipped in any browser
+ *       yet. Interface-presence sniff, NOT UA version.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -65,6 +70,9 @@ const KEYS = [
   "crossOriginIsolated",
   "isSecureContext",
   "navigator",
+  // 0.7.15 — added for the webgpuZeroCopy pin so test bodies can
+  // install / delete GPUBuffer to drive the interface-presence sniff.
+  "GPUBuffer",
 ] as const;
 
 type GlobalKey = (typeof KEYS)[number];
@@ -152,6 +160,9 @@ const BARE_SHAPE: MockShape = {
   crossOriginIsolated: SENTINEL_DELETE,
   isSecureContext: SENTINEL_DELETE,
   navigator: SENTINEL_DELETE,
+  // 0.7.15 — ensure pins start from a no-GPUBuffer baseline so
+  // `webgpuZeroCopy` reads as false regardless of host defaults.
+  GPUBuffer: SENTINEL_DELETE,
 };
 
 // ── 1. Vanilla / no-browser shape → 'unsupported' ────────────────────────
@@ -166,6 +177,7 @@ function testBareEnvironment(): void {
   assertEq(report.crossOriginIsolated, false, "bare: crossOriginIsolated false");
   assertEq(report.secureContext, false, "bare: secureContext false");
   assertEq(report.webgpu, false, "bare: webgpu false");
+  assertEq(report.webgpuZeroCopy, false, "bare: webgpuZeroCopy false");
   assertEq(report.webMidi, false, "bare: webMidi false");
   assertEq(report.userActivation, false, "bare: userActivation false");
   assertEq(report.suggestedMode, "unsupported", "bare → unsupported");
@@ -478,6 +490,44 @@ function testCoopCoepSeverityDowngrade(): void {
   ok("12. enable-coop-coep severity downgrade + silent-success");
 }
 
+// ── 13. webgpuZeroCopy interface-presence sniff (0.7.15) ────────────────
+function testWebGpuZeroCopySniff(): void {
+  // (a) Bare environment: no GPUBuffer at all → webgpuZeroCopy false.
+  const bare = withMockedGlobal(BARE_SHAPE, () => getEnvironmentReport());
+  assertEq(bare.webgpuZeroCopy, false, "bare: webgpuZeroCopy false");
+
+  // (b) Today's Chrome / Node-with-@webgpu/dawn shape: `GPUBuffer` exists
+  // but `mapShared` is NOT on its prototype. Still false — this is the
+  // expected real-world reading today.
+  const TodayGpuBuffer = function (this: object): void { /* never new'd */ };
+  (TodayGpuBuffer as unknown as { prototype: object }).prototype = {};
+  withMockedGlobal({ ...BARE_SHAPE, GPUBuffer: TodayGpuBuffer }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.webgpuZeroCopy, false, "today's GPUBuffer (no mapShared): false");
+  });
+
+  // (c) Future-proof: when `GPUBuffer.prototype.mapShared` appears, the
+  // sniff flips to true. This is the day-the-spec-lands assertion —
+  // exercises the `'mapShared' in proto` predicate path.
+  const FutureGpuBuffer = function (this: object): void { /* never new'd */ };
+  (FutureGpuBuffer as unknown as { prototype: object }).prototype = {
+    mapShared(): void { /* spec-shaped stub; never invoked */ },
+  };
+  withMockedGlobal({ ...BARE_SHAPE, GPUBuffer: FutureGpuBuffer }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.webgpuZeroCopy, true, "GPUBuffer.prototype.mapShared present: true");
+  });
+
+  // (d) Defensive: `GPUBuffer` present but with `prototype: null`-ish —
+  // shouldn't throw, just reads false.
+  withMockedGlobal({ ...BARE_SHAPE, GPUBuffer: {} }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.webgpuZeroCopy, false, "GPUBuffer without prototype: false");
+  });
+
+  ok("13. webgpuZeroCopy interface-presence sniff");
+}
+
 function main(): void {
   testBareEnvironment();
   testIndividualFlags();
@@ -491,6 +541,7 @@ function main(): void {
   testJsonRoundTrip();
   testPureReflection();
   testCoopCoepSeverityDowngrade();
+  testWebGpuZeroCopySniff();
   console.log("\nAll environment.test.ts pins passed.");
 }
 

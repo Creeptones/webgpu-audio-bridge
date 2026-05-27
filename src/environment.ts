@@ -111,6 +111,22 @@ export interface EnvironmentReport {
   readonly audioContext: boolean;
   /** `typeof navigator?.gpu?.requestAdapter === 'function'`. Does NOT request an adapter. */
   readonly webgpu: boolean;
+  /**
+   * Interface-presence sniff for the future W3C zero-copy / shared-memory
+   * readback surface on `GPUBuffer.prototype` (0.7.15). Returns `false`
+   * everywhere today — no browser exposes the interface yet
+   * (tracked at `gpuweb#4432` and the shared-buffer / external-memory
+   * follow-up issues). Flips to `true` the day the canonical method
+   * appears on `GPUBuffer.prototype`; sniffs purely by interface
+   * presence, NOT UA version.
+   *
+   * Pairs with `BridgeGPUSource`'s `WriteTarget` strategy: callers can
+   * read this before passing `writeTarget: 'shared'`. Today `'auto'`
+   * deterministically resolves to `'map-async'`; the day this flag
+   * flips, a future patch will land `SharedMemoryWriteTarget` and the
+   * auto resolution will follow.
+   */
+  readonly webgpuZeroCopy: boolean;
   /** `typeof navigator?.requestMIDIAccess === 'function'`. Does NOT request access. */
   readonly webMidi: boolean;
   /** `navigator?.userActivation` present. Predicts whether AudioContext.resume will succeed. */
@@ -182,6 +198,23 @@ function hasWebGpu(nav: NavigatorLike | undefined): boolean {
   return !!nav && !!nav.gpu && typeof nav.gpu.requestAdapter === "function";
 }
 
+/**
+ * Interface-presence sniff for a WebGPU zero-copy / shared-memory readback
+ * surface (0.7.15). The W3C spec for this hasn't landed; the placeholder
+ * method name `mapShared` on `GPUBuffer.prototype` is what we sniff for
+ * today. When the canonical method name is fixed by the spec, update this
+ * function's predicate (NOT the public field name on `EnvironmentReport`,
+ * which is the stable capability label).
+ *
+ * Returns `false` everywhere today — no browser exposes the surface yet.
+ */
+function hasWebGpuZeroCopy(g: typeof globalThis): boolean {
+  const GB = (g as { GPUBuffer?: { prototype?: object } }).GPUBuffer;
+  const proto = GB?.prototype;
+  if (!proto || typeof proto !== "object") return false;
+  return "mapShared" in proto;
+}
+
 function hasWebMidi(nav: NavigatorLike | undefined): boolean {
   return !!nav && typeof nav.requestMIDIAccess === "function";
 }
@@ -204,6 +237,7 @@ interface FeatureFlags {
   readonly audioWorklet: boolean;
   readonly audioContext: boolean;
   readonly webgpu: boolean;
+  readonly webgpuZeroCopy: boolean;
   readonly webMidi: boolean;
   readonly userActivation: boolean;
   readonly secureContext: boolean;
@@ -421,6 +455,7 @@ export function getEnvironmentReport(): EnvironmentReport {
     audioWorklet: hasAudioWorklet(g),
     audioContext: hasAudioContext(g),
     webgpu: hasWebGpu(nav),
+    webgpuZeroCopy: hasWebGpuZeroCopy(g),
     webMidi: hasWebMidi(nav),
     userActivation: hasUserActivation(nav),
     secureContext: hasSecureContext(g),
@@ -437,6 +472,7 @@ export function getEnvironmentReport(): EnvironmentReport {
     audioWorklet: flags.audioWorklet,
     audioContext: flags.audioContext,
     webgpu: flags.webgpu,
+    webgpuZeroCopy: flags.webgpuZeroCopy,
     webMidi: flags.webMidi,
     userActivation: flags.userActivation,
     secureContext: flags.secureContext,

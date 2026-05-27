@@ -868,6 +868,34 @@ The helper exposes simple counters:
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
 
+### Zero-copy roadmap (0.7.15)
+
+The headline `mapAsync` cost on the GPU readback path is **5–15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)) — a hardware/driver-bound floor on what we can deliver today, NOT a library overhead we can optimize away. The WebGPU working group is tracking a future zero-copy / shared-memory readback path (loosely "external memory" / "mapped shared buffer"); when that lands and a browser ships it, `mapAsync` stops being the floor.
+
+0.7.15 ships the **abstraction** for that future path so callers don't have to rewrite their `BridgeGPUSource` integrations the day the spec arrives. The plumbing today:
+
+- **`WriteTarget` strategy** — `BridgeGPUSource`'s internal "move bytes from a GPU buffer into a CPU `ArrayBuffer`" step is factored behind a strategy interface. The only shipped implementation is `MapAsyncWriteTarget` (the `copyBufferToBuffer` + `mapAsync` + `getMappedRange` + `unmap` path — byte-for-byte unchanged from 0.6.18). A future `SharedMemoryWriteTarget` will slot in here when the W3C interface ships.
+- **`writeTarget` constructor option** — `BridgeGPUSource` accepts `writeTarget: 'auto' | 'map-async' | 'shared'`, defaulting to `'auto'`. Today `'auto'` deterministically resolves to `'map-async'` because no browser exposes the shared-memory interface AND this build doesn't ship a `SharedMemoryWriteTarget`. Explicit `'shared'` throws with a descriptive error pointing at the capability sniff.
+- **`getEnvironmentReport().webgpuZeroCopy: boolean`** — interface-presence sniff on `GPUBuffer.prototype` (NOT a UA version check). Returns `false` everywhere today; flips to `true` the day a browser exposes the canonical method. Callers can read this before passing `writeTarget: 'shared'` if they want to opt in to the zero-copy path explicitly when it becomes available.
+
+```ts
+import { BridgeGPUSource, getEnvironmentReport } from "webgpu-audio-bridge";
+
+const env = getEnvironmentReport();
+console.log("zero-copy readback:", env.webgpuZeroCopy); // false today
+
+const source = new BridgeGPUSource(device, bridge, decoder, {
+  writeTarget: "auto",  // default — picks 'map-async' today, 'shared' the
+                        // day a future patch ships SharedMemoryWriteTarget
+                        // AND the platform exposes it.
+});
+console.log("active write target:", source.writeTargetKind()); // 'map-async'
+```
+
+**0.7.15 is pure forward-compat scaffolding — there is no behavior change today.** The existing `mapAsync` path is the only thing that runs; the staging-buffer ring, the `flushPending` / `pollCompleted` cycle, and the `_lastReadbackUs` timing all behave identically to 0.7.14. The point is that a 2026-era code base written against 0.7.15 won't need migrating when the spec lands — the call site stays `writeTarget: 'auto'`, the resolution flips under the hood.
+
+Spec tracking: [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432) (`mappedAtCreation` zero-copy semantics — closest existing thread); a dedicated shared-buffer / external-memory follow-up is expected as the working group's externally-managed memory discussion matures. The capability flag's sniff name (`'mapShared' in GPUBuffer.prototype` today) is a placeholder pending the canonical method name from the spec; the public field on `EnvironmentReport` (`webgpuZeroCopy`) is the stable label and will not change when the underlying predicate updates.
+
 ## Achieving pro-audio tracking latency (0.6.19)
 
 `BridgeGPUSource` lands GPU → AudioWorklet at typical web-audio latency (~15–25 ms input-to-audible) — comfortable for ambient, generative, WebXR, non-tracking DAW use. It does **not** reach **pro-audio tracking latency** (<5 ms), because `mapAsync`'s 5–15 ms cost is a hardware/driver limit on the WebGPU readback path. The "input → speakers" pipeline today, decomposed:
@@ -1449,7 +1477,7 @@ Both README-named pre-1.0 must-haves have shipped. The path to 1.0 is now polish
 - **Topology variants** — MPSC (multiple producers → one consumer) and SPMC (one producer → multiple consumers). SPSC stays the canonical case.
 - **Lane-width variants** — `f16` / quantized lanes for control buses where `f64` is overkill; ~4× bandwidth savings on mobile / Apple Silicon.
 - **`Int32` wrapping-index variant** for use cases that want Adenot-grade push/pull speed and can tolerate a bounded session length.
-- **Zero-copy producer path** — let the GPU write directly into the SAB-backed buffer via `mappedAtCreation` semantics, avoiding the CPU memcpy.
+- **Zero-copy producer path** — let the GPU write directly into the SAB-backed buffer via `mappedAtCreation` / `mapShared` semantics, avoiding the CPU memcpy. **0.7.15** shipped the forward-compat scaffolding (`WriteTarget` strategy + `webgpuZeroCopy` capability sniff); the actual `SharedMemoryWriteTarget` implementation lands the day a browser exposes the W3C shared-memory readback interface (tracked alongside [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). See [Zero-copy roadmap (0.7.15)](#zero-copy-roadmap-0715) for the scaffold today.
 
 Issues and contributions welcome.
 

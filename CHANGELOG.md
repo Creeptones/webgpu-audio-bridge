@@ -4,6 +4,188 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.15] — 2026-05-27
+
+### Added — `WriteTarget` strategy scaffold + `webgpuZeroCopy` capability flag (Track 4 of the King roadmap)
+
+Forward-compat scaffolding for a future zero-copy / shared-memory
+WebGPU readback path. **No behavior change today** — the only
+shipped `WriteTarget` implementation is the existing `mapAsync`
+path, byte-for-byte unchanged from 0.7.14. The point of this patch
+is to land the abstraction now so adopters writing against 0.7.15
+won't need to rewrite their `BridgeGPUSource` call sites the day
+the W3C lands `GPUBuffer.mapShared` (or whatever the canonical
+method name turns out to be).
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/BridgeGPUSource.ts`** — factors the GPU → CPU byte-transport
+  step behind a `WriteTarget` strategy interface. The existing
+  `copyBufferToBuffer` + `mapAsync` + `getMappedRange` + `unmap`
+  statements are relocated into a `MapAsyncWriteTarget` class
+  (internal). The state machine (`idle / scheduled / in-flight / ready`),
+  the `_lastReadbackUs` timing, and the bridge-push orchestration all
+  stay on the host class. A future `SharedMemoryWriteTarget` slots in
+  here when the W3C interface ships.
+
+  New constructor option: `writeTarget: 'auto' | 'map-async' | 'shared'`.
+  Default `'auto'`. Today `'auto'` deterministically resolves to
+  `'map-async'` because no browser exposes the shared-memory interface
+  AND this build does not ship a `SharedMemoryWriteTarget`. Explicit
+  `'shared'` throws on construction with a descriptive error
+  pointing at the capability sniff.
+
+  New method: `BridgeGPUSource#writeTargetKind(): 'map-async' | 'shared'`.
+  Returns the resolved kind (never `'auto'` — that's a selector). Today
+  always `'map-async'`. Exposed for telemetry / dashboards.
+
+  Removed unused private field `stagingBufferSize` (now owned by
+  `WriteTarget.slotByteSize`). Internal-only — not on the public
+  surface; no externally visible change.
+
+- **`src/index.ts`** — exports the new types `WriteTarget` and
+  `WriteTargetKind`. The strategy class itself (`MapAsyncWriteTarget`)
+  remains internal; user-supplied strategy instances are not accepted
+  by the constructor in 0.7.15 (enum-only `writeTarget` option). A
+  future patch may add a pluggable strategy-object variant if there's
+  demand.
+
+- **`src/environment.ts`** — adds `webgpuZeroCopy: boolean` to
+  `EnvironmentReport`. Interface-presence sniff on `GPUBuffer.prototype`
+  (placeholder name `mapShared`); returns `false` everywhere today, no
+  UA version checks. Pairs with `BridgeGPUSource`'s `WriteTarget`
+  scaffold: callers can read this before passing `writeTarget: 'shared'`
+  if they want to opt in to the zero-copy path explicitly when it
+  becomes available. The field name is the stable label; the
+  underlying predicate's sniff string is allowed to evolve to track the
+  canonical W3C method name.
+
+- **`tests/BridgeGPUSource.writeTarget.test.ts`** (new, 6 pins). The
+  audit-cohort-reserved `tests/Bridge.test.ts` is left untouched per the
+  Track-4 handoff; this new file covers only the new selection logic:
+
+  1. Default `writeTarget` selects `'map-async'`.
+  2. Explicit `'auto'` resolves to `'map-async'`.
+  3. Explicit `'map-async'` constructs cleanly and destroys cleanly.
+  4. Explicit `'shared'` throws with a descriptive error; no GPU
+     buffers leaked.
+  5. Validation runs before `WriteTarget` construction —
+     `stagingBufferCount: 1` and `stagingBufferSize: 0` throw without
+     any `device.createBuffer` side effects.
+  6. `getEnvironmentReport().webgpuZeroCopy === false` on current Node.
+
+  The pre-existing `bridge-gpu-source-orchestration` pin (#81) in
+  `tests/Bridge.test.ts` covers the end-to-end mapAsync state machine
+  with a mock device; it stays green after the refactor (the host
+  delegates byte-by-byte to the new `MapAsyncWriteTarget`, no
+  observable behavior change).
+
+- **`tests/environment.test.ts`** — adds pin #13 (`webgpuZeroCopy`
+  interface-presence sniff). Mocks `globalThis.GPUBuffer` to drive
+  three branches: (a) no `GPUBuffer` → `false`; (b) `GPUBuffer` with
+  empty prototype (today's Chrome shape) → `false`; (c) `GPUBuffer`
+  with `mapShared` on the prototype (future-proof) → `true`. Adds the
+  `GPUBuffer` key to the test's mutable-global harness so existing
+  pins save+restore it across runs. Bare-environment pin also asserts
+  `webgpuZeroCopy === false`.
+
+- **`package.json`** — `test` and `test:unit` scripts gain
+  `tsx tests/BridgeGPUSource.writeTarget.test.ts` (alongside the
+  existing 11 / 10 entries).
+
+- **`README.md`** — new `### Zero-copy roadmap (0.7.15)` section under
+  the existing `## BridgeGPUSource (0.6.18)` heading. Documents the
+  `WriteTarget` strategy, the `writeTarget` constructor option with
+  its three values, the capability sniff via `webgpuZeroCopy`, and
+  the no-behavior-change-today contract. Cites
+  [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432) as
+  the existing tracking thread; explicitly flags that a dedicated
+  shared-buffer / external-memory follow-up issue is expected as the
+  working group's externally-managed memory discussion matures. The
+  existing "Beyond 1.0" roadmap line about the zero-copy producer
+  path now points back at this new section as the shipped scaffold.
+
+### Why
+
+The `mapAsync` cost on the WebGPU readback path is **5–15 ms**
+([Chromium 41487454](https://issues.chromium.org/issues/41487454),
+[gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)) — the
+single largest remaining floor on `BridgeGPUSource`'s end-to-end
+latency, and the only piece of the pipeline the library can't
+optimize today. When the W3C lands the shared-memory readback
+interface and a browser ships it, the floor drops materially and
+adopters' existing `BridgeGPUSource` call sites should "just work"
+with the new fast path — that's the design goal of this patch.
+
+Shipping the abstraction now (rather than waiting for the spec)
+costs almost nothing: the `MapAsyncWriteTarget` class is a pure
+relocation of the 0.6.18-through-0.7.14 statements, the
+`writeTarget: 'auto'` default reproduces 0.7.14 behavior exactly,
+and the `webgpuZeroCopy` flag returns `false` on every current
+environment. The cost is one `WriteTarget` indirection on the
+allocation-free steady-state path — a few additional `this.x`
+loads per readback, negligible against `mapAsync`'s 5–15 ms cost.
+The benefit is that the day the spec lands, the upgrade is a single
+patch (drop in `SharedMemoryWriteTarget`, flip the `'auto'`
+resolution logic) instead of an API-breaking minor bump.
+
+Track 4 of the King roadmap is "ship the scaffold for spec-blocked
+work so adopters don't get caught flat-footed." 0.7.15 is the
+entirety of that track in one patch — Track 5 (0.7.16 + 0.7.17)
+closes out the roadmap with the experimental WebNN adapter.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema extension, no
+protocol change. The `WriteTarget` refactor is purely heap-side; a
+bridge fed by `BridgeGPUSource` with `writeTarget: 'auto'` is
+bit-for-bit interoperable with a bridge fed by any pre-0.7.15
+consumer (or producer). The `getEnvironmentReport().webgpuZeroCopy`
+field is additive on the report shape — JSON round-trip preserves
+it cleanly, and the existing 12 environment-report pins (1 through
+12) remain green unchanged.
+
+### Tests
+
+12 suites stay green. The new `tests/BridgeGPUSource.writeTarget.test.ts`
+adds 6 pins covering the selection-path logic; `tests/environment.test.ts`
+gains pin #13 (and the bare-environment pin asserts
+`webgpuZeroCopy === false`, so pins #1 + #13 together pin both the
+default reading and the future-proof flip). The end-to-end orchestration
+pin in `tests/Bridge.test.ts` (#81 — `bridge-gpu-source-orchestration`)
+stays green unchanged: the refactor is a pure relocation of the
+underlying statements behind the strategy interface, so the mock
+device's `createBuffer` / `mapAsync` / `getMappedRange` / `unmap`
+/ `destroy` are called in the same order with the same arguments
+as before.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.14 (≈1.20 μs).
+No new bench cell — the `WriteTarget` indirection only fires inside
+`BridgeGPUSource`'s `scheduleReadback` / `flushPending` /
+`pollCompleted`, which are not part of the ring microbench
+measurement window. The `flow_scale recovery` characterization cell
+(recoveryCycles = 33) and the `trajEval (fast)` / `trajEval (clamp)`
+cells (1.10 μs / 4.80 μs) are within their documented budgets.
+
+### Documentation
+
+CHANGELOG entry above. File header on `src/BridgeGPUSource.ts` gains
+a new "WriteTarget strategy (0.7.15)" section documenting the
+abstraction's intent + the today-vs-tomorrow split. `EnvironmentReport`'s
+`webgpuZeroCopy` field carries an inline docstring naming the
+placeholder sniff method and the spec-tracking commitment. README's
+new "Zero-copy roadmap" section is the user-facing reference and
+the "Beyond 1.0" line in the roadmap section now backlinks to it.
+
+Next patches: 0.7.16 (Track 5 — `BridgeWebNNSource<S>` skeleton
+under `src/experimental/` + `webgpu-audio-bridge/experimental`
+subpath), 0.7.17 (Track 5 closeout — `webnn` / `mlTensor` capability
+flags + final docs; the King Roadmap completion patch that unblocks
+the audit cohort's working-tree reservations on `src/Bridge.ts`,
+`src/SpscRing.ts`, and `tests/Bridge.test.ts`).
+
 ## [0.7.14] — 2026-05-27
 
 ### Added — `BridgeBlockProducer<S>` + `examples/audio-rate/` demo (Track 3 of the King roadmap, second patch)
