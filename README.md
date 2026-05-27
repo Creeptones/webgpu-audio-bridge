@@ -41,9 +41,9 @@ The solution is to **stop trying to run audio rate on the GPU**. Instead:
 
 ### Two transport tiers (0.7.0)
 
-The library provides **Turbo mode** (SAB + Atomics, sub-microsecond push/pull) as the default — that's `Bridge<S>` and everything documented below. Turbo mode requires cross-origin isolation, which is a one-time deployment setup (see [Enabling Turbo mode](#enabling-turbo-mode) + [Deploying behind a real host](#deploying-behind-a-real-host) — coming in 0.7.5). The 0.6.x cohort's entire feature surface — `BridgeGPUSource`, `BridgeInputLane`, smoothers, PLL, evaluator, invariant classifier — lives on Turbo mode.
+The library provides **Turbo mode** (SAB + Atomics, sub-microsecond push/pull) as the default — that's `Bridge<S>` and everything documented below. Turbo mode requires cross-origin isolation, which is a one-time deployment setup (see [Enabling Turbo mode](#enabling-turbo-mode)). The 0.6.x cohort's entire feature surface — `BridgeGPUSource`, `BridgeInputLane`, smoothers, PLL, evaluator, invariant classifier — lives on Turbo mode.
 
-**Standard mode** (`MessageChannelBridge<S>`, coming in 0.8.x) is a deliberate second tier with the **same schema DSL surface** and a **MessageChannel + transferable ArrayBuffer** transport. Measured 5–50 ms latency vs Turbo's sub-µs. Right for: prototyping before you've configured COOP/COEP, control-plane updates in unisolated embeds, telemetry channels, non-audio-critical paths. **NOT for audio rate.** See [Browser support matrix](#browser-support-matrix) for what works in each tier.
+**Standard mode** (`MessageChannelBridge<S>`, reserved at 0.8.0) is a deliberate second tier with the **same schema DSL surface** and a **MessageChannel + transferable ArrayBuffer** transport. Measured 5–50 ms latency vs Turbo's sub-µs. Right for: prototyping before you've configured COOP/COEP, control-plane updates in unisolated embeds, telemetry channels, non-audio-critical paths. **NOT for audio rate.** See [Browser support matrix](#browser-support-matrix) for what works in each tier.
 
 The library will **never** auto-detect the environment and silently pick a transport for you. The user picks `Bridge<S>` (Turbo) or `MessageChannelBridge<S>` (Standard) at construction — explicit choice, documented trade-offs, no transparent fallback.
 
@@ -92,80 +92,19 @@ npm run dev:demo          # http://localhost:5173
 
 For end-to-end latency measurements (push → audio-thread consume, percentiles under load), see [`bench/e2e-latency/`](./bench/e2e-latency/) — `npm run bench:e2e`.
 
-For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource-0618) (0.6.18) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest. It targets typical web-audio latency (~15-25 ms input-to-audible) — see the [helper's honest latency breakdown](#what-s-actually-faster-and-what-isn-t) for what it does and doesn't accomplish.
+For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest. It targets typical web-audio latency (~15-25 ms input-to-audible) — see the [helper's honest latency breakdown](#what-s-actually-faster-and-what-isn-t) for what it does and doesn't accomplish.
 
-A second demo at [`examples/fast-lane/`](./examples/fast-lane/) shows the **fast-lane pattern** for pro-audio tracking latency: a dedicated `Bridge<InputSchema>` for gestural events alongside the macro bridge, drained per quantum via `BridgeInputLane.pullAll`. `npm run dev:fast-lane` (http://localhost:5174). See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619) for the architecture + latency math.
+A second demo at [`examples/fast-lane/`](./examples/fast-lane/) shows the **fast-lane pattern** for pro-audio tracking latency: a dedicated `Bridge<InputSchema>` for gestural events alongside the macro bridge, drained per quantum via `BridgeInputLane.pullAll`. `npm run dev:fast-lane` (http://localhost:5174). See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency) for the architecture + latency math.
 
 For headless browser smoke tests against the demo, `npm run test:browser` (Playwright; Chromium only for now).
 
 ## Quick start
 
-This library has no runtime dependencies. Not on the npm registry — **vendor it** directly into your project:
+For a 5-minute hello-frame walkthrough, see [`QUICKSTART.md`](./QUICKSTART.md). Vendor today (`git clone && npm link`); `npm install webgpu-audio-bridge` lands at 0.8.7. No runtime dependencies.
 
-```bash
-# Clone, build, and link from this repo.
-git clone --branch v0.3.0 --depth 1 https://github.com/Creeptones/webgpu-audio-bridge.git
-cd webgpu-audio-bridge && npm install && npm run build && npm link
-# then in your project: npm link webgpu-audio-bridge
-```
+A schema describes the byte layout of one frame; the library ships `physicsControlFrameSchema(n)` as a ready-made example matching the historical V/J shape. `defineSchema({ seq: u64(), vMax: f64(), vEff: f64Array(1000), ... })` covers any shape you need; `FrameFor<typeof S>` gives full TS inference without `as const`.
 
-If you specifically want a single-file copy and can live with the v0.1.x API, the legacy `Float64RingBuffer` is still vendorable as one self-contained file:
-
-```bash
-curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts
-```
-
-The Zenodo-archived [v0.1.1 tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact for that frozen single-file form. New code should prefer the `Bridge<Schema>` API below.
-
-### Define a schema
-
-A schema describes the byte layout of a single frame. Fields are typed (`f64`/`f32`/`u64`/`i64`/`u32`/`i32`/`u16`/`i16`/`u8`/`i8`) as scalars or fixed-length arrays. The library ships `physicsControlFrameSchema(n)` as a ready-made example matching the historical V/J shape:
-
-```ts
-import { defineSchema, u64, f64, f64Array } from "webgpu-audio-bridge";
-
-const MyControlFrame = defineSchema({
-  seq:      u64(),               // bigint
-  tMacroNs: u64(),               // bigint
-  vMax:     f64(),               // number
-  jMax:     f64(),               // number
-  vEff:     f64Array(1000),      // Float64Array(1000)
-  jEff:     f64Array(1000),      // Float64Array(1000)
-});
-```
-
-Field-name autocomplete and per-field type inference work in TypeScript via `FrameFor<typeof MyControlFrame>` — no `as const` or other gymnastics required.
-
-### Producer (DedicatedWorker, GPU side)
-
-```ts
-import { Bridge } from "webgpu-audio-bridge";
-
-// Allocate once; receive the SAB from your manager.
-const { sab, capacity } = Bridge.allocate(/* capacity */ 16, MyControlFrame);
-const ring = new Bridge(sab, capacity, MyControlFrame);
-
-// Hand `sab` to your AudioWorklet via the main thread. (And hand
-// `ring.describeLayout()` to the worklet too — see consumer below.)
-
-// Allocate a reusable scratch frame once; mutate in place each tick.
-const frame = ring.scratchFrame();
-
-// Per macro-frame (e.g. driven by setTimeout self-reschedule at 60Hz):
-frame.seq      = nextSeqBigInt++;
-frame.tMacroNs = BigInt(Math.floor(performance.now() * 1e6));
-frame.vMax     = maxAbs(frame.vEff);
-frame.jMax     = maxAbs(frame.jEff);
-// (fill frame.vEff / frame.jEff in place from your compute output)
-
-const ok = ring.push(frame);
-if (!ok) {
-  // Ring full — consumer has fallen ~266ms behind at capacity=16, 60Hz.
-  // Caller decides: drop frame, or pop oldest and re-push.
-}
-```
-
-For a zero-copy producer path (write payload bytes directly into the slot, no intermediate scratch frame), see `ring.beginPush()` / `commitPush()` in the API reference below.
+Once a schema is defined, producer and consumer each construct a `Bridge<S>` over the same SAB. The audio thread is the consumer; the canonical pattern below.
 
 ### Consumer (AudioWorklet, audio side)
 
@@ -209,9 +148,54 @@ Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-Check `crossOriginIsolated === true` at runtime before constructing a `Bridge<S>`. If it returns `false` you're in Standard-mode territory (`MessageChannelBridge<S>`, 0.8.x) — explicit second tier, documented latency, never a silent fallback.
+Check `crossOriginIsolated === true` at runtime before constructing a `Bridge<S>`. If it returns `false` you're in Standard-mode territory (`MessageChannelBridge<S>`, reserved at 0.8.0) — explicit second tier, documented latency, never a silent fallback.
 
-For zero-config local development, **0.7.1+** ships `npx webgpu-audio-bridge dev` — a static server with COOP/COEP/CORP headers wired up correctly, a browser-side probe that reports environment status to the terminal, and actionable error messages for blocked third-party assets. See [Deploying behind a real host](#deploying-behind-a-real-host) (0.7.5+) for one-config-block recipes against Vercel / Netlify / Cloudflare Pages / GitHub Pages / nginx / Caddy / Fly.io / Render / plain Node.
+For zero-config local development, `npx webgpu-audio-bridge dev` (lands at 0.8.7) ships a static server with COOP/COEP/CORP headers wired up correctly, a browser-side probe that reports environment status to the terminal, and actionable error messages for blocked third-party assets. Production hosts: `headers` arrays on Vercel, Netlify, Cloudflare Pages; `add_header` directives on nginx; static server config equivalents elsewhere — the two headers are universal.
+
+The legacy single-file [`Float64RingBuffer`](./src/Float64RingBuffer.ts) is frozen at the v0.1.x byte format and still vendorable as one file (`curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts`); the [v0.1.1 Zenodo tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact for that form. New code should prefer `Bridge<Schema>`.
+
+## Frame layout
+
+A Bridge SAB is **one 32-byte Int32 header** (8 atomic control lanes) followed by **`capacity` payload slots** of `frameByteSize` each. Both peers construct their `Bridge<S>` instance over the same SAB; the header is shared atomic state, payload slots are the framed bytes that `push` / `pull` move:
+
+```
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Int32 header — 32 bytes, 8 lanes, Atomics on every access       │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ lane 0  write_index   producer-monotonic, wrap mod 2^32 (0.4.0) │
+   │ lane 1  read_index    consumer-monotonic, wrap mod 2^32 (0.4.0) │
+   │ lane 2  flow_scale    consumer→producer Q16.16 hint   (0.5.0)   │
+   │ lane 3  torn_frame    Int32 invariant-fallback count  (0.6.0)   │
+   │ lanes 4–5  pll_offset Int64 ns, aliased BigInt64Array (0.6.16)  │
+   │ lane 6  pll_drift     Q16.16 ppm signed Int32         (0.6.16)  │
+   │ lane 7  pll_status    bit 0 = locked, others reserved (0.6.16)  │
+   ├─────────────────────────────────────────────────────────────────┤
+   │ Payload — capacity × frameByteSize bytes                        │
+   │  slot 0 │ slot 1 │ slot 2 │ … │ slot (capacity−1)               │
+   │  ↑ each slot is one schema-defined frame                        │
+   └─────────────────────────────────────────────────────────────────┘
+        Producer (Worker)                  Consumer (AudioWorklet / Worker)
+            push(frame) ─────────► SAB ──────────► pullLatest(out)
+            beginPush() / commitPush()             pull(out), pullAll(...)
+            flowScaleHint() ◄────── lane 2 ───── (consumer publishes flow_scale)
+            observeConsumerTime() ──────────────► (PLL state lands on 4–7)
+            readPublishedPllState() ◄── 4–7 ◄─── (3rd peer can read without IPC)
+```
+
+`bridge.describeLayout()` returns a JSON-safe byte-offset table for the schema's frame; pass through `processorOptions` so the AudioWorklet reads slots without importing the library. See [API reference](#api-reference) below for the full method surface.
+
+### Schema field types — number vs BigInt
+
+Per-field type choice determines hot-loop allocation cost. The Int32 / Int64 ring header is invisible to schema code; the trade-off here is about your payload fields.
+
+| Type | JS in `frame.<field>` | When to use |
+|---|---|---|
+| `u8` / `i8` / `u16` / `i16` / `u32` / `i32` | `number` | Loop counters, small enums, sequence numbers under 2³², color channels. **Zero allocation in hot loops.** |
+| `f32` | `number` | Color channels, GPU vertex attributes, any field where ±~10⁻⁷ precision is fine and SAB bandwidth matters. **Zero allocation.** |
+| `f64` | `number` | Any numeric science quantity (velocities, potentials, time in seconds, anything where you'd reach for `double` in C). **Zero allocation.** |
+| `u64` / `i64` | `bigint` | Timestamps in ns, sequence numbers ≥ 2³², or anywhere the value semantically *needs* > 53 bits. Reading `frame.field` returns a `BigInt` and writes coerce — **per-field allocation on every access.** |
+
+The PLL publication (lanes 4–5) and Bridge.scratchFrame's `tMacroNs` field both store nanoseconds-since-epoch as `i64` / `u64`. The 0.8.2 patch made the internal PLL publish path **BigInt-free** — the `BigInt64Array` is aliased over the same buffer as the Int32 view and updated via two `Atomics.store(Int32, …)` calls, so the hot path does not allocate. Consumer-side reads of `pllOffsetNs` still return `bigint` (the API surface), but a producer that publishes via `observeConsumerTime` no longer pays per-call BigInt allocation. Apply the same pattern in your own schemas where you can: prefer `number`-backed types for hot-loop fields, reach for `u64` / `i64` only when you genuinely need > 53 bits.
 
 ## API reference
 
@@ -395,7 +379,7 @@ process(_inputs, outputs) {
 
 Wire-compatible with every other facade — the SAB layout, SPSC counter protocol, Q16.16 flow-scale lane, and `__invariant` lane format are unchanged. A `BridgeInputLane` peer interoperates bit-for-bit with a `Bridge<S>` / `BridgeProducer` / `BridgeConsumer` peer over the same SAB.
 
-`BridgeInputLane` is the consumer-side specialization for the **fast-lane pattern** that reaches pro-audio tracking latency. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619) for the architecture, latency math, and worked end-to-end example.
+`BridgeInputLane` is the consumer-side specialization for the **fast-lane pattern** that reaches pro-audio tracking latency. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency) for the architecture, latency math, and worked end-to-end example.
 
 ### Canonical schemas
 
@@ -736,7 +720,7 @@ ring.pullLatest(outV, outJ, outHeader);
 
 The wire bytes match the schema produced by `legacyPhysicsControlFrameSchema(n)`. If you need to migrate incrementally — keep your existing v0.1.x SAB layout, swap to `Bridge<Schema>` — start there.
 
-## BridgeGPUSource (0.6.18)
+## BridgeGPUSource
 
 The headline helper the library has been advertising since 0.3.0. Closes the loop from "compute pass on the GPU writes a storage buffer" to "AudioWorklet pulls the result via `Bridge<S>.pullLatest`" by automating the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration:
 
@@ -824,7 +808,7 @@ t=+5-8     Audible at speakers                               (5-8 ms — browser
 
 **`BridgeGPUSource` makes GPU → AudioWorklet a deliverable web pattern instead of a research demo, at typical web-audio latency (~15-25 ms).** It does *not* reach pro-audio tracking latency (<5 ms input-to-audible) on the GPU path — that requires WebGPU spec evolution (`mappedAtCreation` zero-copy readback, listed under §Roadmap > Beyond 1.0) that we don't control.
 
-For use cases where input *response* must be <5 ms but the GPU's role is slowly-evolving state, the **fast-lane pattern** carves gestural input off the GPU path onto a dedicated `Bridge<InputSchema>`, reaching ~3–6 ms input-to-audible on tuned hardware. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619).
+For use cases where input *response* must be <5 ms but the GPU's role is slowly-evolving state, the **fast-lane pattern** carves gestural input off the GPU path onto a dedicated `Bridge<InputSchema>`, reaching ~3–6 ms input-to-audible on tuned hardware. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency).
 
 What this means in practice — where 0.6.18 lands the GPU → audio stack:
 
@@ -870,7 +854,7 @@ The helper exposes simple counters:
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
 
-### Zero-copy roadmap (0.7.15)
+### Zero-copy readback — scaffold (0.7.15)
 
 The headline `mapAsync` cost on the GPU readback path is **5–15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)) — a hardware/driver-bound floor on what we can deliver today, NOT a library overhead we can optimize away. The WebGPU working group is tracking a future zero-copy / shared-memory readback path (loosely "external memory" / "mapped shared buffer"); when that lands and a browser ships it, `mapAsync` stops being the floor.
 
@@ -898,7 +882,7 @@ console.log("active write target:", source.writeTargetKind()); // 'map-async'
 
 Spec tracking: [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432) (`mappedAtCreation` zero-copy semantics — closest existing thread); a dedicated shared-buffer / external-memory follow-up is expected as the working group's externally-managed memory discussion matures. The capability flag's sniff name (`'mapShared' in GPUBuffer.prototype` today) is a placeholder pending the canonical method name from the spec; the public field on `EnvironmentReport` (`webgpuZeroCopy`) is the stable label and will not change when the underlying predicate updates.
 
-## Achieving pro-audio tracking latency (0.6.19)
+## Achieving pro-audio tracking latency
 
 `BridgeGPUSource` lands GPU → AudioWorklet at typical web-audio latency (~15–25 ms input-to-audible) — comfortable for ambient, generative, WebXR, non-tracking DAW use. It does **not** reach **pro-audio tracking latency** (<5 ms), because `mapAsync`'s 5–15 ms cost is a hardware/driver limit on the WebGPU readback path. The "input → speakers" pipeline today, decomposed:
 
@@ -1055,7 +1039,7 @@ The worked end-to-end demo at [`examples/fast-lane/`](./examples/fast-lane/) imp
 | WebXR controller as a percussion instrument | Trigger feels like real percussion; HRTFs catch up invisibly |
 | Live-coding sketch with a GPU-rendered visualizer | Audio swap is instant; visualizer can lag 50 ms without notice |
 
-## Audio-rate mode (0.7.13 / 0.7.14)
+## Audio-rate mode
 
 Up to here the library has been pitched on the **control-rate-GPU → audio-rate-CPU** pattern: a worker runs heavy simulation at 30–120 Hz; the worklet pulls the freshest macro frame each quantum and synthesizes audio on the CPU. That covers the vast majority of GPU-audio use cases — physics modeling, convolution, neural inference, anything where the model is structurally a parameter source.
 
@@ -1143,7 +1127,7 @@ npm run build && npm run dev:audio-rate
 
 The demo's structural choice list is itself the recipe: 1024-sample blocks at 48 kHz, capacity 4 (≈85 ms floor), producer at 50 Hz, consumer zero-fills on underflow.
 
-## Experimental — WebNN (0.7.16 / 0.7.17)
+## Experimental — WebNN
 
 `BridgeWebNNSource<S>` is a thin adapter for streaming the output of a [WebNN](https://www.w3.org/TR/webnn/) model into a `Bridge<S>`. Real-time voice cloning, neural reverb, neural EQ matching, physics-modelled instruments — anything where the model output is a block of `f32` samples — gets the same low-jitter audio-thread delivery the WebGPU helpers provide, just from a different producer side.
 
@@ -1483,51 +1467,11 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 ## Roadmap
 
-### Shipped
+The path from where the project is today to a 1.0 stability commitment lives in [`ROADMAP.md`](./ROADMAP.md). It covers the in-flight 0.8.x audit cohort (concurrency hardening + property pins + test split + docs + npm publish + flagship consumer + example demo), the reserved 0.8.0 `MessageChannelBridge<S>` minor-bump anchor, the post-cohort parking lot, and the explicit "1.0 is a settled-API promise, not a feature checkpoint" trigger rule.
 
-- ✅ **0.3.0 — Schema-driven frames** (`Bridge<Schema>` + `defineSchema({ ... })`). Replaces the hard-coded `Float64RingBuffer` layout with a typed DSL that supports mixed primitive types as scalars or fixed-length arrays.
-- ✅ **0.4.0 — Int32 wrap counters** (ringbuf.js-class atomic floor). `write_index` / `read_index` lanes moved from BigInt64 to Int32 wrapping mod 2^32; isolated atomic load+store+notify drops from ~160 ns to ~100 ns on V8.
-- ✅ **0.4.1 — Smoothed pulls** (`pullSmoothed` / `pullLatestSmoothed`). One-pole α-blend as a first-class consumer-side primitive, with per-call skip-scaling policy (`'stall-smooth'` / `'catch-up'`; see 0.6.6) on the latest variant.
-- ✅ **0.5.0 — Adaptive backpressure (CFL-style)** (`flowScaleHint()` + lane-2 PI controller). Consumer publishes a continuous rate-control hint in `[0.5, 2.0]`; producer voluntarily honors. First SPSC ring with control-theoretic flow control — see [Adaptive backpressure (CFL-style)](#adaptive-backpressure-cfl-style).
-- ✅ **0.6.0 — Schema invariants** (`.withInvariant(fn)` + lane-3 `tornFrameCounter` + `bridge.telemetry()`). Cross-IPC bit-rot detection as a protocol concern: soft errors recover click-free via the smoother, hard errors fall back to last-known-good. First SPSC ring with payload integrity as a protocol concern — see [Cross-IPC bit-rot detection](#cross-ipc-bit-rot-detection).
-- ✅ **0.6.1 — Trajectory arrays (Pillar 1 of phase-locked extrapolation)** (`f64TrajectoryArray(n, { order })`, `f32TrajectoryArray(n, { order })`, and `evaluateTrajectoryInto(...)`). Producers pack interleaved `(p, v, [a])` samples into a frame field; consumers Taylor-extrapolate to a continuous-time signal at audio rate via the helper. Pillars 2 (nanosecond PLL) and 3 (`pullEvaluated`) remain ahead — see [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
-- ✅ **0.6.2 — Phase-locked loop (Pillar 2 of phase-locked extrapolation, first cut — offset only)** (`bridge.observeConsumerTime(consumerNs, producerNs)`, `bridge.phaseLockedTime(consumerNs)`, `bridge.resetPll()`, plus `pllLocked` / `pllOffsetNs` on `telemetry()`). Consumer-side PI loop tracks the producer↔consumer clock offset; sub-μs convergence in ~30 observations. Heap-only — SAB byte layout unchanged from 0.6.1. Drift estimator, outlier gate, and cross-process observability via lanes 4-5 are queued patches; Pillar 3 (`pullEvaluated`) remains ahead — see [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
-- ✅ **0.6.3 — Per-frame evaluator (Pillar 3 of phase-locked extrapolation, first cut)** (`bridge.evaluateInto(srcFrame, dt, outFrame)` + `bridge.scratchEvaluatedFrame()`). Bridge walks every field of the schema in one call, applying the Pillar 1 evaluator to trajectory fields and passing scalars + non-trajectory arrays through. Heap-only; the producer can be writing the next frame while the consumer re-evaluates the current one in private heap memory at audio rate. `pullEvaluated` sugar, `EvalMode` dispatch, and per-quantum batch API remain queued patches — see [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
-- ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
-- ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
-- ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
-- ✅ **0.7.3 — Observability hooks for downstream inspectors** — three small wire-compatible additions that turn the bridge from a working primitive into one DevTools / inspector / dashboard consumers can introspect at the cadence they need. (a) `Bridge.subscribeTelemetry(cb, opts?)`: rAF-paced observer over the existing `telemetry()` snapshot (`hzCap` default 60, clamped `[1, 240]`; returns an idempotent `Unsubscribe`). (b) Two new heap-side counters on `TelemetrySnapshot`: `softFrames` (soft-classified invariant deviations — increments inside the classifier's "soft" branch) and `stallRecoveries` (PLL outlier-gate transitions from active back to clean observation — one increment per recovery event, disjoint from per-observation `pllOutliersRejected`). (c) `BridgeGPUSource.inFlightCount()` (naming-parity alias for `inFlight()`) + `lastReadbackUs()` (wall-time microseconds of the most recent `mapAsync → decode` cycle via `performance.now()`). New top-level exports: `TelemetrySnapshot`, `TelemetryListener`, `TelemetryUnsubscribe`, `SubscribeTelemetryOptions`. Motivating consumer: the Wavefunction synth's Bridge Inspector panel. SAB byte layout unchanged from 0.7.2; bench medians unchanged at ~1.20 μs.
-- ✅ **0.7.2 — Drop-oldest race-free by construction** — closes the multi-thread race window documented at 0.6.12 in the protocol itself. The consumer-side `pull` / `pullLatest` paths under `policy === 'drop-oldest'` now run a CAS-commit pattern (`Atomics.compareExchange(read_index, R0, R0 + 1)` for `pull`, `(R0 → writeIdx)` for `pullLatest`'s drain-to-newest) that detects any mid-read producer overrun and retries the whole pull. No torn frame ever reaches the caller. **Pairing with `.withInvariant(...)` is no longer required for drop-oldest correctness** — the invariant lane remains useful for cross-IPC bit-rot detection (separate concern), but the race itself is closed in the protocol. Cost: one extra `Atomics` op per pull on the drop-oldest path (plain index read → `Atomics.load`; plain `Atomics.store` → `compareExchange`); reject / drop-newest / block fast paths are byte-identical to 0.7.1 (V8 constant-folds the construct-time `_needsOverrunAware` branch). New 250k-frame cross-thread stress sub-suite (`tests/Bridge.concurrent.test.ts`) asserts `consumed + dropped === pushed`, every consumed frame bit-exact against the producer's recipe, and `tornFrames === 0` on the no-invariant schema. Bench medians unchanged at ~1.20 μs. SAB byte layout unchanged.
-- ✅ **0.7.1 — `getEnvironmentReport()` core** — synchronous, side-effect-free reflection of `globalThis` answering "can this page run Turbo mode, Standard mode, or neither?" New file `src/environment.ts`; new top-level exports `getEnvironmentReport`, `EnvironmentReport`, `EnvironmentFix`, `EstimatedLatencyFloorMs`. Returns a frozen JSON-serializable snapshot of feature flags (`crossOriginIsolated` / `sharedArrayBuffer` / `Atomics` / `Atomics.waitAsync` / `audioWorklet` / `audioContext` / `webgpu` / `webMidi` / `userActivation` / `secureContext`), a deterministic `suggestedMode ∈ 'turbo' | 'standard' | 'unsupported'`, a static `estimatedLatencyFloorMs: { input, output, total }` lookup keyed on the suggested mode, and a frozen array of actionable `EnvironmentFix` records each with stable `id`, `severity ∈ 'blocker' | 'degraded' | 'info'`, `summary`, and `docUrl`. **Pure reflection** — never calls `requestMIDIAccess`, never instantiates `AudioContext`, never sniffs the UA string. **Disjoint from `Bridge<S>.telemetry()`** (platform environment vs ring runtime; different questions, different lifetimes). The foundation API for the 0.7.2 overlay widget, 0.7.4 dev CLI, and 0.7.8 golden-matrix test. SAB byte layout unchanged from 0.7.0; bench medians unchanged at ~1.30 μs.
-- ✅ **0.7.0 — Framing pivot (Turbo mode / Standard mode)** — the first release of the onboarding cohort. README acquires a §Two transport tiers subsection, a top-level §Browser support matrix table, and an uncompromising "SAB-first; no transparent fallback" stance in §What this is and what it isn't. §Setting up SAB renames to §Enabling Turbo mode. `package.json` description and `CITATION.cff` title rewrite to reflect the two-tier framing. No SAB / public-API / wire-format change — purely a coherent release-moment promotion. Pre-announces `MessageChannelBridge<S>` for 0.8.x. See the CHANGELOG `[0.7.0]` block for the full reframing.
-- ✅ **0.6.19 — `BridgeInputLane` + fast-lane pattern** — a thin event-queue facade over `SpscRing<S>` for the input-lane pattern that reaches pro-audio tracking latency (~3–6 ms input-to-audible on tuned hardware). New class `BridgeInputLane<S>` exposes `pullAll(eventBuf, maxCount?) → number` on the consumer side (drain every unread frame in FIFO order) and the same `push` / `beginPush` / `commitPush` surface on the producer side; wire-compatible with every other facade. A new `examples/fast-lane/` end-to-end demo wires up computer keyboard + WebMIDI + on-screen keys against a dual-bridge architecture (macro + input) with sub-sample event placement in the AudioWorklet. New README §Achieving pro-audio tracking latency lays out the dual-bridge architecture, the latency math, and the canonical InputSchema shapes. SAB byte layout unchanged from 0.6.11. See [`BridgeInputLane`](#bridgeinputlanes--event-queue-facade-0619) and [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619).
-- ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, the producer no longer stalls on `mapAsync` — readbacks overlap, throughput rises from 60-125 Hz to 250-1000 Hz, the bridge stops running empty under load, and total input-to-audible latency moves from "30-50 ms with stalls" to "consistent ~15-25 ms." **`mapAsync`'s per-frame cost (5-15 ms) is unchanged** — it stops being a serialization tax but it's still in the chain, so this lands at typical web-audio latency, not pro-audio tracking latency. No `@webgpu/types` runtime dependency. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
-- ✅ **0.6.17 — `forEachSampleInQuantum` batch evaluation** (per-quantum hot loop API). Wraps the canonical "evaluate every sample of an audio quantum" pattern into one call: `bridge.forEachSampleInQuantum(evalFrame, sampleCount, (i, frame) => { block[i] = synth.step(frame.vEff) })`. Bit-identical output to a hand-rolled `evaluateAtSampleOffset` loop, but with per-sample method-dispatch + cache-validity checks hoisted out of the inner loop. EvalMode dispatch (step / alpha / trajectory / catmull) deferred to a future patch — needs the K=4 catmull history ring and interaction story with `resetSmoother` / `resetEvalCache`. SAB byte layout unchanged from 0.6.11. See [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
-- ✅ **0.6.16 — PLL lane 4-5 publication** (cross-process observability, default-on). `Bridge<S>` publishes the live PLL state (offsetNs Int64, driftPpm Q16.16, locked bit) to SAB header lanes 4-7 on every `observeConsumerTime` / `resetPll`. A second peer constructing its own `Bridge` over the same SAB can read via the new `readPublishedPllState()` method without IPC. Strictly additive wire-format use — legacy 0.6.15 peers continue to interoperate. Opt out via `{ publishPllToSab: false }` in `BridgeOptions`. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
-- ✅ **0.6.15 — PLL drift estimator** (opt-in, 2nd-order g-h alpha-beta filter). Pillar 2 second-order: track both `offsetNs` AND `driftRate` (parts-per-million between producer + consumer clocks). When opted in via `enableDriftEstimator: true`, `phaseLockedTime` extrapolates between observations so a quantum-rate AudioWorklet stays sub-μs accurate even when its `AudioContext.currentTime` drifts at tens of ppm against the producer's `performance.now()`. The PI integral is OFF in drift mode (the drift estimator IS the integrator at 2nd order; a redundant KI fights it). `telemetry()` gains `pllDriftPpm`. Default-off preserves 0.6.14 behavior bit-exact. SAB byte layout unchanged from 0.6.11. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
-- ✅ **0.6.14 — PLL Mahalanobis outlier gate** (default-on, opt-out via `ConsumerClockRecoveryOptions`). Pillar 2 robustness — single-frame residual spikes (e.g. 30 ms `mapAsync` stalls) gate before they reach the PI loop, so the offset estimate stays clean. EWMA-based σ̂ tracks the residual scale; 6σ default threshold gates outliers; after 3 consecutive gated observations the loop concludes a step occurred and admits the residual (so genuine epoch changes recover within ~67 ms at 60 Hz). `telemetry()` gains `pllOutliersRejected`. SAB byte layout unchanged from 0.6.11. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
-- ✅ **0.6.13 — Observability dashboards** (six new `telemetry()` fields: `pushedFrames`, `pulledFrames`, `skippedFrames`, `lastFullWaitNs`, `lastEmptyWaitNs`, `maxOccupancyEverSeen`). Second of the two README-named "Remaining 1.0 work" items — closing out the pre-1.0 must-have list. All counters are per-instance heap state (`postMessage` the snapshot for cross-process aggregation). Bench medians unchanged at 1.20 μs (counter increments are two adds + one compare each). SAB byte layout unchanged from 0.6.11. See [Observability dashboards (0.6.13)](#observability-dashboards-0613).
-- ✅ **0.6.12 — Backpressure policies** (`policy: 'reject' | 'drop-newest' | 'drop-oldest' | 'block'` + optional `blockTimeoutMs`). First of two README-named "Remaining 1.0 work" items. `Bridge<S>` + `SpscRing<S>` constructors accept an optional `opts` bag; default `'reject'` preserves 0.4.0..0.6.11 behavior bit-exact. `'drop-newest'` returns true and drops the new frame; `'drop-oldest'` CAS-advances `read_index` to evict the oldest unread frame (multi-thread torn-frame race documented + recommended pairing with `.withInvariant(...)`); `'block'` parks the producer via `waitForSpace` until the consumer drains. `telemetry()` gains `policy` + `droppedFrames`. SAB byte layout unchanged from 0.6.11. See [Overflow policies (0.6.12)](#overflow-policies-0612).
-- ✅ **0.6.10 — Composable consumer / producer + internal primitives exported**. The four heap state machines from 0.6.8 + 0.6.9 (`SpscRing`, `FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`) are now exported from `src/index.ts`. Two new facade classes — `BridgeConsumer<S>` and `BridgeProducer<S>` — wrap them as explicit consumer / producer objects. `Bridge<S>` continues to work unchanged; defaults on `BridgeConsumer` make it bit-identical to `Bridge<S>` on the same SAB. New `onInvariantFailure` policy on `BridgeConsumer` lets callers swap the hard-error behavior (`'fallback-to-previous'` default, `'throw'`, `'pass-through'`, or a custom callback). No public-API break; no wire-format change; SAB protocol identical to 0.6.9 so a facade-built peer interoperates with a `Bridge<S>`-built peer. See [Composable consumer / producer](#composable-consumer--producer-0610).
-- ✅ **0.6.9 — Internal extract: `FrameSmoother` / `ConsumerClockRecovery` / `AdaptiveFlowController`**. Three more heap-state machines lift out of `Bridge<S>` / `SpscRing<S>` into dedicated internal classes (`src/FrameSmoother.ts`, `src/ConsumerClockRecovery.ts`, `src/AdaptiveFlowController.ts`), continuing the seam 0.6.8 carved. The α-smoother prev buffer + trajectory-aware blender + per-field classification tables move to `FrameSmoother`; the PLL offset / integrator / gains move to `ConsumerClockRecovery`; the flow-scale PI loop + Q16.16 encode move to `AdaptiveFlowController`. No public-API change, no wire-format change, no exported symbol additions — every `Bridge<S>` method continues to work bit-identically and the 1 M-frame concurrent SPSC stress passes the new seams unchanged. Preparatory for the 0.6.10 composable exports.
-- ✅ **0.6.8 — Internal `SpscRing` extract**. The SAB / Atomics core of `Bridge<S>` lifts into a new internal class `SpscRing<S>` (`src/SpscRing.ts`). No public-API change, no wire-format change, no exported symbol additions — every `Bridge<S>` method continues to work bit-identically and the 1 M-frame concurrent SPSC stress passes the seam unchanged. Preparatory for the 0.6.10 composable exports.
-- ✅ **0.6.6 — Invariant epsilon floor + smoother named modes**. `.withInvariant(fn, { absoluteEpsilon? })` opts bag adds an absolute lower floor on the classifier's OK band (default `1e-12`) so subnormal-zero and tiny f64 rounding noise no longer misclassify as hard; the relative path is preserved for any non-trivial `stored` so all existing pin behavior is bit-exact. `pullSmoothed` / `pullLatestSmoothed` accept `opts.skipPolicy: 'stall-smooth' | 'catch-up'` (default `'stall-smooth'`, preserves 0.4.1..0.6.5 behavior bit-exact); opt-in `'catch-up'` uses the closed-form `α_eff = 1 − (1 − α_base)^(skipped + 1)` for chase-latency-first behavior on control surfaces. Heap-only; SAB byte layout unchanged from 0.6.5. See [Schema invariants](#schema-invariants--withinvariantfn-opts) and [Smoothed pulls](#smoothed-pulls--pullsmoothed--pulllatestsmoothed).
+Per-release history (every patch with shape, rationale, wire-compat notes, tests, and bench numbers) lives in [`CHANGELOG.md`](./CHANGELOG.md).
 
-### Remaining 1.0 work
-
-1. ✅ **0.6.12 — Backpressure policies** — `policy: 'reject' | 'drop-newest' | 'drop-oldest' | 'block'` constructor option, with optional `blockTimeoutMs` for the parking variant. Default `'reject'` preserves the historical contract bit-exact. `telemetry()` gains `policy` + `droppedFrames`. See [Overflow policies (0.6.12)](#overflow-policies-0612).
-2. ✅ **0.6.13 — Observability dashboards on `telemetry()`** — the snapshot API now carries the full cumulative + wait-duration + high-water-mark surface needed for DevTools-panel integration. See [Observability dashboards (0.6.13)](#observability-dashboards-0613).
-
-Both README-named pre-1.0 must-haves have shipped. The path to 1.0 is now polish + ecosystem (PLL outlier gate / drift estimator, EvalMode dispatch, WebGPU helper), not API gaps.
-
-> **Versioning policy**: many additional improvements are planned before 1.0 and the version number should reflect maturity, not feature count. Post-0.6.0 the default is **patch bumps** (`0.6.x`); minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking API changes, or batched-patch promotion. The project will NOT race to 1.0 — when it lands, it lands as a deliberate stability commitment. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
-
-### Beyond 1.0
-
-- **Topology variants** — MPSC (multiple producers → one consumer) and SPMC (one producer → multiple consumers). SPSC stays the canonical case.
-- **Lane-width variants** — `f16` / quantized lanes for control buses where `f64` is overkill; ~4× bandwidth savings on mobile / Apple Silicon.
-- **`Int32` wrapping-index variant** for use cases that want Adenot-grade push/pull speed and can tolerate a bounded session length.
-- **Zero-copy producer path** — let the GPU write directly into the SAB-backed buffer via `mappedAtCreation` / `mapShared` semantics, avoiding the CPU memcpy. **0.7.15** shipped the forward-compat scaffolding (`WriteTarget` strategy + `webgpuZeroCopy` capability sniff); the actual `SharedMemoryWriteTarget` implementation lands the day a browser exposes the W3C shared-memory readback interface (tracked alongside [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). See [Zero-copy roadmap (0.7.15)](#zero-copy-roadmap-0715) for the scaffold today.
+> **Versioning policy**: many additional improvements are planned before 1.0 and the version number should reflect maturity, not feature count. Post-0.6.0 the default is **patch bumps** (`0.6.x`, `0.7.x`, `0.8.x`); minor bumps are reserved for wire-format changes, breaking API changes, or batched-patch promotion. The project will NOT race to 1.0 — when it lands, it lands as a deliberate stability commitment. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
 Issues and contributions welcome.
 

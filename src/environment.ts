@@ -111,6 +111,15 @@ export interface EnvironmentReport {
   readonly audioContext: boolean;
   /** `typeof navigator?.gpu?.requestAdapter === 'function'`. Does NOT request an adapter. */
   readonly webgpu: boolean;
+  /** `typeof navigator?.requestMIDIAccess === 'function'`. Does NOT request access. */
+  readonly webMidi: boolean;
+
+  // ── Experimental capability flags (0.7.15+) ─────────────────────────────
+  // The fields below sniff specs that have not stabilized AND no browser
+  // ships today. They are surfaced flat (no nested `experimental: { ... }`
+  // key) for zero-friction consumer code; the comment block here is the
+  // visual grouping. Each returns `false` everywhere today.
+
   /**
    * Interface-presence sniff for the future W3C zero-copy / shared-memory
    * readback surface on `GPUBuffer.prototype` (0.7.15). Returns `false`
@@ -125,10 +134,11 @@ export interface EnvironmentReport {
    * deterministically resolves to `'map-async'`; the day this flag
    * flips, a future patch will land `SharedMemoryWriteTarget` and the
    * auto resolution will follow.
+   *
+   * @experimental — capability label is stable; underlying predicate
+   * follows the spec.
    */
   readonly webgpuZeroCopy: boolean;
-  /** `typeof navigator?.requestMIDIAccess === 'function'`. Does NOT request access. */
-  readonly webMidi: boolean;
   /**
    * `typeof navigator?.ml?.createContext === 'function'` (0.7.17).
    * Interface-presence sniff for the W3C WebNN root entry point. Does
@@ -285,10 +295,12 @@ interface FeatureFlags {
   readonly audioWorklet: boolean;
   readonly audioContext: boolean;
   readonly webgpu: boolean;
-  readonly webgpuZeroCopy: boolean;
   readonly webMidi: boolean;
+  // Experimental capability flags — mirror the EnvironmentReport grouping.
+  readonly webgpuZeroCopy: boolean;
   readonly webnn: boolean;
   readonly mlTensor: boolean;
+  // Stable, non-feature host flags.
   readonly userActivation: boolean;
   readonly secureContext: boolean;
 }
@@ -463,7 +475,7 @@ function deriveFixes(f: FeatureFlags, mode: "turbo" | "standard" | "unsupported"
       summary:
         "navigator.requestMIDIAccess is unavailable. The fast-lane input " +
         "pattern still works with pointer / keyboard / touch input.",
-      docUrl: README + "achieving-pro-audio-tracking-latency-0619",
+      docUrl: README + "achieving-pro-audio-tracking-latency",
     }));
   }
 
@@ -505,8 +517,8 @@ export function getEnvironmentReport(): EnvironmentReport {
     audioWorklet: hasAudioWorklet(g),
     audioContext: hasAudioContext(g),
     webgpu: hasWebGpu(nav),
-    webgpuZeroCopy: hasWebGpuZeroCopy(g),
     webMidi: hasWebMidi(nav),
+    webgpuZeroCopy: hasWebGpuZeroCopy(g),
     webnn: hasWebNN(nav),
     mlTensor: hasMLTensor(g),
     userActivation: hasUserActivation(nav),
@@ -524,8 +536,8 @@ export function getEnvironmentReport(): EnvironmentReport {
     audioWorklet: flags.audioWorklet,
     audioContext: flags.audioContext,
     webgpu: flags.webgpu,
-    webgpuZeroCopy: flags.webgpuZeroCopy,
     webMidi: flags.webMidi,
+    webgpuZeroCopy: flags.webgpuZeroCopy,
     webnn: flags.webnn,
     mlTensor: flags.mlTensor,
     userActivation: flags.userActivation,

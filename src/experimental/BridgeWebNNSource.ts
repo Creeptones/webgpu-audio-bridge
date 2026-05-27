@@ -112,6 +112,14 @@ import type {
 // snapshot; we keep typing structural and accept the lossy-but-stable
 // shape until the spec stabilizes.
 
+/**
+ * Structural shape for a WebNN `MLTensor` (or compatible). Imported as
+ * an interface so consumers can pass real `MLTensor` instances or
+ * test doubles without depending on a particular spec snapshot.
+ *
+ * @experimental — see file header. Shape may change across minor
+ * versions as the WebNN spec stabilizes.
+ */
 export interface MLTensorLike {
   /** Resolve to an `ArrayBuffer` (or `ArrayBufferView`) carrying the
    *  tensor's current bytes. The shape mirrors what current WebGPU
@@ -122,15 +130,24 @@ export interface MLTensorLike {
   destroy?: () => void;
 }
 
-/** User-supplied tensor reader, for impls where the read lives on the
- *  context rather than the tensor. The function receives the tensor
- *  the caller passed to `pushFromTensor` and resolves to the bytes. */
+/**
+ * User-supplied tensor reader, for impls where the read lives on the
+ * context rather than the tensor. The function receives the tensor
+ * the caller passed to `pushFromTensor` and resolves to the bytes.
+ *
+ * @experimental — see file header.
+ */
 export type WebNNTensorReader = (
   tensor: MLTensorLike,
 ) => Promise<ArrayBuffer | ArrayBufferView>;
 
 // ── Helper options ──────────────────────────────────────────────────────
 
+/**
+ * Construction options for {@link BridgeWebNNSource}.
+ *
+ * @experimental — see file header.
+ */
 export interface BridgeWebNNSourceOptions<S extends Schema<FieldsObject, any>> {
   /** Schema field auto-incremented as the block index on every
    *  successful push. Resolution mirrors `BridgeBlockProducer`:
@@ -178,6 +195,13 @@ const WEBNN_UNAVAILABLE_MESSAGE =
   "pass { skipAvailabilityCheck: true } to opt out of the gate for " +
   "test code that needs the fallback path without a WebNN runtime.";
 
+/**
+ * WebNN MLTensor → Bridge<S> adapter. See file header for full docs.
+ *
+ * @experimental — lives under `webgpu-audio-bridge/experimental`
+ * because the WebNN spec is volatile. Public shape may change across
+ * minor versions until the spec stabilizes.
+ */
 export class BridgeWebNNSource<S extends Schema<FieldsObject, any>> {
   /** The bridge whose push-side this helper feeds. */
   public readonly bridge: Bridge<S> | BridgeProducer<S>;

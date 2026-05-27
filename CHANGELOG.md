@@ -4,6 +4,193 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.6] — 2026-05-27
+
+### Added — documentation polish (audit cohort, product-polish 1/4)
+
+Sixth patch of the audit cohort, first slice of the product-polish
+sub-cohort (0.8.6 docs → 0.8.7 publish + CLI → 0.8.8 wavefunction
+migration + telemetry overlay → 0.8.9 example demo). No production
+behavior change; touches two source files for annotation-only
+polish (@experimental JSDoc tags + EnvironmentReport divider
+comment + one stale anchor URL fix).
+
+**New top-level docs.**
+
+- `QUICKSTART.md` — new file. 5-minute hello-frame walkthrough.
+  Install → main-thread schema + push + pull → worker producer →
+  pointer to README's AudioWorklet pattern + `examples/minimal/`.
+  Self-contained doorway; README's Quick start section now points
+  here for the warm-up and keeps the AudioWorklet consumer
+  pattern + Enabling Turbo mode for the long-form view.
+- `ROADMAP.md` — new file. Extracts the prior README §Roadmap into
+  a standalone doc, adds the 0.8.x audit-cohort slot table (the
+  clean version-only view without remapping noise), the post-cohort
+  parking lot (`BridgeReader`, WebNN MLTensor zero-copy, cache-line
+  padding, second consumer surface), and an explicit "1.0 trigger"
+  section restating the CLAUDE.md extended-slowdown rule for the
+  public eye. README's §Roadmap is now a short pointer block to
+  `ROADMAP.md` + `CHANGELOG.md`.
+
+**README rework.**
+
+- New **§Frame layout** section between §Quick start and §API
+  reference. Annotated ASCII diagram of the 8-lane Int32 header
+  (write_index / read_index / flow_scale / torn_frame /
+  pll_offset lo+hi / pll_drift / pll_status) + the
+  `capacity × frameByteSize` payload region. Reader can now map
+  `src/Bridge.ts` lane references to the actual SAB byte layout
+  without reading source.
+- New **§Frame layout / Schema field types — number vs BigInt**
+  cheat sheet. Per-type table: u8/i8/.../u32/i32/f32/f64 stay
+  `number` (zero allocation in hot loops); u64/i64 carry the
+  per-access `bigint` allocation tax. Cross-references the 0.8.2
+  BigInt-free PLL publish path as the design rule of thumb.
+- §Quick start trimmed from ~115 lines to ~50 lines. The
+  hello-frame and worker producer slices moved to `QUICKSTART.md`;
+  the AudioWorklet consumer pattern and §Enabling Turbo mode stay
+  (the unique value-add the library exists to make easy).
+- H2 version parentheticals stripped on shipped features:
+  `## BridgeGPUSource (0.6.18)` → `## BridgeGPUSource`,
+  `## Achieving pro-audio tracking latency (0.6.19)` → `…`,
+  `## Audio-rate mode (0.7.13 / 0.7.14)` → `…`,
+  `## Experimental — WebNN (0.7.16 / 0.7.17)` → `…`. The features
+  are the headings; the version history lives in `CHANGELOG.md` /
+  `ROADMAP.md`. Cross-references updated (lines that linked
+  `#bridgegpusource-0618` etc. now link `#bridgegpusource`).
+- `### Zero-copy roadmap (0.7.15)` renamed to
+  `### Zero-copy readback — scaffold (0.7.15)` — the section is the
+  scaffold for a future feature, not the feature itself, and the
+  rename matches the `(scaffold)` marker pattern from CLAUDE.md.
+- Two stale dangling anchors removed: `#deploying-behind-a-real-host`
+  (never written) referenced at §Two transport tiers and §Enabling
+  Turbo mode — replaced with a short inline mention of the
+  COOP/COEP headers being universal across hosts.
+- "coming in 0.7.5" / "coming in 0.8.x" inline annotations on
+  shipped + reserved features updated. Where the parenthetical was
+  date-of-introduction noise, it dropped; where it referred to a
+  not-yet-shipped feature (Standard mode, npx CLI), the wording is
+  pinned to its reserved slot ("reserved at 0.8.0", "lands at 0.8.7").
+
+**Deferred polish (carry-over from Post-0.8.1 §Thread B).**
+
+- **`@experimental` JSDoc tags** added to the four public exports
+  in `src/experimental/BridgeWebNNSource.ts`: `MLTensorLike`,
+  `WebNNTensorReader`, `BridgeWebNNSourceOptions`, and
+  `BridgeWebNNSource` class itself. Going-forward convention chosen
+  is `@experimental` (industry-standard); pre-0.8.6 the file had no
+  per-symbol tags at all, so this is the first sweep — IDE tooltips
+  on those symbols now show the badge.
+- **`EnvironmentReport` divider comment.** Added a
+  `// ── Experimental capability flags (0.7.15+) ──` section block
+  above the `webgpuZeroCopy` / `webnn` / `mlTensor` cluster.
+  **Shape unchanged** (the fields stay flat, not nested under
+  `experimental: { ... }`) so consumer code is zero-impact; the
+  block is purely visual grouping. Field declaration order within
+  the `EnvironmentReport` interface, the internal `FeatureFlags`
+  interface, and the runtime construction object literal were all
+  re-synced so JSON output and IDE-rendered docs reflect the
+  experimental grouping (no behavior change; pure cosmetic).
+- **One stale anchor fix in `src/environment.ts`.** The
+  `missing-web-midi` fix's `docUrl` pointed at
+  `…#achieving-pro-audio-tracking-latency-0619`; updated to
+  `…#achieving-pro-audio-tracking-latency` to match the H2
+  stripped above.
+
+**Patch surface.**
+
+- `QUICKSTART.md` — new.
+- `ROADMAP.md` — new.
+- `README.md` — 1,575 → 1,519 lines (net −56). One new H2 (§Frame
+  layout); two H2s stripped of version suffixes; one H3 renamed
+  for scaffold marking; §Quick start trimmed; §Roadmap replaced
+  with a pointer block.
+- `CHANGELOG.md` — this entry.
+- `package.json` — version 0.8.5 → 0.8.6.
+- `src/experimental/BridgeWebNNSource.ts` — four new
+  `@experimental` JSDoc tags.
+- `src/environment.ts` — divider comment + field re-ordering +
+  one anchor URL.
+
+### Why
+
+Three concerns coordinated into one patch:
+
+1. **README scale.** At 1,575 lines the README had crossed into
+   "no one reads top-to-bottom" territory. Two-thirds of a
+   newcomer's first hour can be lost to the §Roadmap shipped-list
+   reading, which is genuinely historical context. The
+   `QUICKSTART.md` doorway + `ROADMAP.md` extract reduces what
+   the README is responsible for to the present-tense product
+   surface (architecture, frame layout, API reference, the
+   `BridgeGPUSource` / fast-lane / audio-rate stacks, performance
+   numbers, back-pressure, prior art) — the past and the future
+   live in dedicated files.
+
+2. **The version parentheticals are noise on shipped features.**
+   `## BridgeGPUSource (0.6.18)` reads as "this feature is from
+   0.6.18, which is some way back, so maybe it's not current."
+   The 0.6.18 date is real history but it belongs in
+   `CHANGELOG.md`, not in every cross-reference. Stripping the
+   parentheticals also lets us strip the dangling anchor problem
+   (`#deploying-behind-a-real-host` pointed at nothing).
+
+3. **First public docs view.** The 0.8.7 npm publish is the next
+   patch. Whatever the README + `QUICKSTART.md` + `ROADMAP.md`
+   look like the day before publish IS what the npm registry
+   serves on the package page. Landing the docs polish in 0.8.6
+   keeps publish-day risk to "ship the bin script + update the
+   `package.json` files array" rather than "ship the bin script
+   AND do a docs rework AND audit the tarball" all at once.
+
+### Wire compatibility
+
+100% wire-compatible. No SAB byte layout change, no schema
+extension, no public-API change to `Bridge<S>` or the composable
+primitives. The `@experimental` tags + the `EnvironmentReport`
+divider comment + the field-order re-sync are pure metadata;
+runtime behavior of `getEnvironmentReport()` is bit-identical to
+0.8.5 on every input (same suggestedMode, same fixes, same flag
+values). A 0.8.5 producer and a 0.8.6 consumer over the same SAB
+exchange frames bit-identically.
+
+### Tests
+
+All 21 suites green (count unchanged from 0.8.5):
+
+```
+schema / Bridge.core / Bridge.smoother / Bridge.invariant /
+Bridge.pll / Bridge.trajectory / Bridge.backpressure /
+Bridge.observability / Bridge.facades / Bridge.properties /
+BridgeFacades / BridgeInputLane / BridgeBlockConsumer /
+BridgeGPUSource.writeTarget / BridgeWebNNSource / environment /
+Bridge.phaseLock / Bridge.wasmEquivalence / Bridge.concurrent /
+Float64RingBuffer / Float64RingBuffer.concurrent
+```
+
+`tests/environment.test.ts` checks docUrls for non-empty +
+URL-parseable, not for specific anchor strings, so the
+`achieving-pro-audio-tracking-latency` rename is fine. JSON
+round-trip pin (#10) also passes unchanged — the property re-
+ordering is insertion-order-preserved by `Object.freeze`.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged at ~1.20 μs (no
+production code paths touched). `trajEval (fast)` still 1.20 μs
+within budget; `flow_scale recovery` still 33 cycles within the
+100-cycle envelope.
+
+### Documentation
+
+This patch IS the documentation patch — see §Added above for
+each new file (`QUICKSTART.md`, `ROADMAP.md`), the README rework
+shape (new §Frame layout, trimmed §Quick start, stripped H2
+parentheticals, renamed Zero-copy scaffold, removed dangling
+anchors), and the deferred-polish annotation items
+(`@experimental` JSDoc tags, EnvironmentReport divider comment,
+one anchor URL fix in environment.ts).
+
 ## [0.8.5] — 2026-05-27
 
 ### Added — `tests/Bridge.test.ts` 8-way feature-file split (audit cohort, testing-infra 3/3)
