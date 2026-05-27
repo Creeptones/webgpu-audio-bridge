@@ -136,6 +136,17 @@
   ;; (the producer never reads our pending value).
   (global $pendingNewReadIdx (mut i32) (i32.const 0))
 
+  ;; Module-scoped state holding the readIdx observed at the matching
+  ;; peek call (the value the CAS commit uses as its "expected" arg).
+  ;; Used only by commit_pull_cas / commit_pull_latest_cas (0.7.12); the
+  ;; non-CAS release-store commits ignore it. Set on every peek
+  ;; (cheap — one i32 store) so the CAS variant works without needing
+  ;; a separate peek_cas family. Init to 0 — same safe-default rationale
+  ;; as $pendingNewReadIdx (a no-prior-peek commit is a no-op CAS that
+  ;; either matches the lane's 0 once at SAB allocation or fails
+  ;; gracefully on every later attempt).
+  (global $pendingCapturedReadIdx (mut i32) (i32.const 0))
+
   ;; pullLatest peek: latest-frame drain with skip semantics.
   ;; Param:  $mask = capacity − 1 (power-of-two ring; computed JS-side once).
   ;; Returns: slot index (≥ 0) of the newest available frame, or -1 if empty.
@@ -144,8 +155,11 @@
   (func $peek_pull_latest (export "peek_pull_latest") (param $mask i32) (result i32)
     (local $writeIdx i32)
     (local $readIdx i32)
-    ;; readIdx: plain non-atomic read of lane 1 (single-consumer guarantee
-    ;; means we own this lane until our commit).
+    ;; readIdx: lane 1. Under non-CAS commits this is a plain read (single-
+    ;; consumer guarantee — only the consumer writes this lane); under
+    ;; CAS commits (drop-oldest, 0.7.12) the producer may have advanced it
+    ;; between this peek and our commit, which is the race CAS detects.
+    ;; Either way the value here is the captured "expected" for the CAS.
     i32.const 4
     i32.load
     local.set $readIdx
@@ -153,6 +167,12 @@
     i32.const 0
     i32.atomic.load
     local.set $writeIdx
+    ;; Save the observed readIdx for both possible matching commits:
+    ;;   - non-CAS commit_pull_latest uses the release-store path; the
+    ;;     captured value is ignored there.
+    ;;   - CAS commit_pull_latest_cas uses it as the expected arg.
+    local.get $readIdx
+    global.set $pendingCapturedReadIdx
     ;; Safe-default the commit target to the CURRENT readIdx so that
     ;; commit-after-empty-peek (and commit-without-any-prior-peek)
     ;; is a true no-op rather than rewinding the lane. The non-empty
@@ -213,6 +233,10 @@
     i32.const 0
     i32.atomic.load
     local.set $writeIdx
+    ;; Save observed readIdx as CAS-expected for commit_pull_cas (0.7.12).
+    ;; Non-CAS commit_pull ignores it.
+    local.get $readIdx
+    global.set $pendingCapturedReadIdx
     ;; Safe-default: same discipline as peek_pull_latest — point the
     ;; pending commit at the current readIdx so an empty-peek commit
     ;; is a no-op store.
@@ -246,6 +270,93 @@
     i32.const 1
     memory.atomic.notify
     drop)
+
+  ;; ─── CAS-aware drop-oldest commits (0.7.12) ───────────────────────────
+  ;;
+  ;; When the JS Bridge runs `policy: 'drop-oldest'` (0.6.12; race-free
+  ;; since 0.7.2), the producer is allowed to OVERWRITE older slots
+  ;; without waiting for the consumer to release them — and to advance
+  ;; read_index past the freed slot itself. That breaks the SPSC
+  ;; invariant the plain release-store commits rely on: when the
+  ;; consumer commits, the producer may have already moved read_index,
+  ;; and the slot bytes the consumer just read may have been torn by a
+  ;; mid-read overwrite.
+  ;;
+  ;; The fix (mirrors `_pullOverrunAware` / `_pullLatestOverrunAware`
+  ;; in src/SpscRing.ts): the commit becomes a compare-and-exchange
+  ;; against the readIdx the matching peek observed. If the CAS
+  ;; succeeds, the consumer's read happened atomically before any
+  ;; producer overrun and the slot bytes are intact. If the CAS fails,
+  ;; the slot bytes are suspect and the caller must retry the whole
+  ;; peek → read → commit cycle with a fresh snapshot.
+  ;;
+  ;; Returns i32 boolean (1 = success, 0 = race detected → retry).
+  ;; Success branch ALSO performs the producer notify (matches the
+  ;; JS path's notify-only-on-success discipline). Failure branch
+  ;; skips notify — there's no progress to announce, and the next
+  ;; successful commit will notify in its place.
+  ;;
+  ;; Memory ordering: i32.atomic.rmw.cmpxchg has acquire-release
+  ;; semantics on both branches (whether the swap occurs or not).
+  ;; That matches Atomics.compareExchange on every spec-compliant
+  ;; engine, so the cross-language equivalence is bit-for-bit on the
+  ;; observable side as well.
+  ;;
+  ;; Captured-readIdx state is shared with the non-CAS commits via
+  ;; the $pendingCapturedReadIdx global set in both peeks. No new
+  ;; peek_cas family — the caller's choice between CAS / non-CAS
+  ;; happens entirely at commit time, matching the JS dispatcher's
+  ;; `if (this._needsOverrunAware)` branch.
+
+  ;; pullLatest CAS commit.
+  ;; CAS lane 1: expected = $pendingCapturedReadIdx (from peek),
+  ;;             desired  = $pendingNewReadIdx (writeIdx from peek).
+  ;; Returns 1 on success (+ notify), 0 on race (caller retries).
+  (func $commit_pull_latest_cas (export "commit_pull_latest_cas") (result i32)
+    (local $prev i32)
+    i32.const 4
+    global.get $pendingCapturedReadIdx
+    global.get $pendingNewReadIdx
+    i32.atomic.rmw.cmpxchg
+    local.set $prev
+    local.get $prev
+    global.get $pendingCapturedReadIdx
+    i32.eq
+    if (result i32)
+      ;; Success — notify a waiting producer, return 1.
+      i32.const 4
+      i32.const 1
+      memory.atomic.notify
+      drop
+      i32.const 1
+    else
+      ;; Race detected — caller must re-peek + retry. No notify (no
+      ;; progress to announce). Return 0.
+      i32.const 0
+    end)
+
+  ;; FIFO pull CAS commit. Same shape as commit_pull_latest_cas; the
+  ;; difference is what $pendingNewReadIdx holds (readIdx+1 from
+  ;; peek_pull vs writeIdx from peek_pull_latest).
+  (func $commit_pull_cas (export "commit_pull_cas") (result i32)
+    (local $prev i32)
+    i32.const 4
+    global.get $pendingCapturedReadIdx
+    global.get $pendingNewReadIdx
+    i32.atomic.rmw.cmpxchg
+    local.set $prev
+    local.get $prev
+    global.get $pendingCapturedReadIdx
+    i32.eq
+    if (result i32)
+      i32.const 4
+      i32.const 1
+      memory.atomic.notify
+      drop
+      i32.const 1
+    else
+      i32.const 0
+    end)
 
   ;; ─── Scalar field decoders (0.7.7) ────────────────────────────────────
   ;;

@@ -1330,7 +1330,163 @@ function main(): void {
     );
   }
 
-  // ── 13: Invariant lane returns null on no-invariant schema (0.7.11) ─────
+  // ── 14: CAS-aware drop-oldest commit equivalence (0.7.12) ──────────────
+  // The Track 2 cohort's final correctness pin. When the JS Bridge runs
+  // policy='drop-oldest' (0.6.12; race-free since 0.7.2), the producer
+  // is allowed to advance read_index past slots the consumer is still
+  // reading — the consumer must use `Atomics.compareExchange` instead
+  // of a plain release-store on read_index to detect such mid-read
+  // overruns. The WASM consumer's `commit_pull_cas` /
+  // `commit_pull_latest_cas` exports (0.7.12) mirror the JS
+  // `_pullOverrunAware` / `_pullLatestOverrunAware` shape bit-for-bit.
+  //
+  // This pin asserts the cross-language CAS contract using a
+  // single-thread, deterministic race simulation: between peek and
+  // commit, manually overwrite read_index out-of-band to mimic a
+  // producer overrun, then verify the CAS commit returns false (race
+  // detected) and the lane is unchanged. The success path is verified
+  // separately with no out-of-band mutation.
+  //
+  // (Cross-thread contention is already covered for the JS path by
+  // tests/Bridge.concurrent.test.ts at 250k-frame drop-oldest stress;
+  // the unit-level CAS-failure detection is the missing piece that
+  // proves the WASM commits behave identically when a race fires.)
+  {
+    const casSchema = defineSchema({
+      seq: u64(),
+      value: f64(),
+    });
+    const cap = 8;
+    const sabBytes = Bridge.byteLength(cap, casSchema);
+    const alloc = allocateWorkletMemory(sabBytes);
+    const bridge = new Bridge(alloc.sab, cap, casSchema);
+    const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+    const headerView = new Int32Array(alloc.sab, 0, 8);
+    const frameBytes = casSchema.compiled.frameByteSize;
+    const headerBytes = 32;
+    const mask = cap - 1;
+    const dv = new DataView(alloc.sab);
+
+    const push = bridge.scratchFrame();
+
+    // ── 14a: FIFO CAS commit — success path (no race) ─────────────────
+    // Drive a clean pull through peekPull + commitPullCas. With no
+    // out-of-band mutation, the CAS expected (captured readIdx) MUST
+    // match the lane's current value, the swap MUST succeed, and the
+    // boolean return MUST be true.
+    push.seq = 100n;
+    push.value = 1.5;
+    assert(bridge.push(push), "pin14a: push");
+
+    const readIdxBefore14a = Atomics.load(headerView, 1);
+    const slot14a = consumer.peekPull(mask);
+    assert(slot14a >= 0, "pin14a: peekPull");
+    const slotBase14a = headerBytes + slot14a * frameBytes;
+    assertEq(dv.getBigUint64(slotBase14a + 0, true), 100n, "pin14a: seq");
+    assertEq(dv.getFloat64(slotBase14a + 8, true), 1.5, "pin14a: value");
+
+    const ok14a = consumer.commitPullCas();
+    assertEq(ok14a, true, "pin14a: CAS success on uncontended commit");
+    assertEq(
+      Atomics.load(headerView, 1),
+      (readIdxBefore14a + 1) | 0,
+      "pin14a: read_index advanced by 1 on success",
+    );
+
+    // ── 14b: FIFO CAS commit — race detected (out-of-band overrun) ────
+    // Push another frame, peek it via WASM (captures the current
+    // readIdx into the module's $pendingCapturedReadIdx), then BEFORE
+    // calling commitPullCas, manually advance read_index by +1 (the
+    // exact thing a producer's `_dropOldest` step would do under
+    // contention). The captured value no longer matches the lane —
+    // CAS MUST fail and return false. The lane MUST be UNCHANGED by
+    // the failed CAS (cmpxchg is no-op on mismatch).
+    push.seq = 200n;
+    push.value = 2.5;
+    assert(bridge.push(push), "pin14b: push");
+
+    const slot14b = consumer.peekPull(mask);
+    assert(slot14b >= 0, "pin14b: peekPull");
+
+    // Simulated overrun — advance read_index out of band. This MUST
+    // happen AFTER peek (so the CAS-expected captured value is stale)
+    // and BEFORE commit.
+    const observedRead14b = Atomics.load(headerView, 1);
+    Atomics.store(headerView, 1, (observedRead14b + 1) | 0);
+    const laneBeforeFailedCommit = Atomics.load(headerView, 1);
+
+    const ok14b = consumer.commitPullCas();
+    assertEq(ok14b, false, "pin14b: CAS detects race (captured != current)");
+    assertEq(
+      Atomics.load(headerView, 1),
+      laneBeforeFailedCommit,
+      "pin14b: lane unchanged by failed CAS",
+    );
+
+    // Drain the leftover (now-stale) frame so the ring is empty for
+    // 14c. Use a release-store commit since we're not testing CAS
+    // here. peekPull returns -1 if empty; commit is idempotent in
+    // that case.
+    while (bridge.pull(bridge.scratchFrame())) { /* drain */ }
+    assertEq(consumer.peekPull(mask), -1, "pin14b: ring drained");
+
+    // ── 14c: pullLatest CAS commit — success path ─────────────────────
+    // Burst 3 frames, peek the newest via WASM, commit via CAS. Must
+    // succeed and advance read_index straight to writeIdx (consuming
+    // all 3 in one atomic step).
+    for (let k = 0; k < 3; k++) {
+      push.seq = BigInt(300 + k);
+      push.value = 3.0 + k * 0.1;
+      assert(bridge.push(push), `pin14c: push ${k}`);
+    }
+    const writeIdxBefore14c = Atomics.load(headerView, 0);
+    const readIdxBefore14c = Atomics.load(headerView, 1);
+    const burst14c = (writeIdxBefore14c - readIdxBefore14c) | 0;
+    assertEq(burst14c, 3, "pin14c: 3 frames buffered");
+
+    const slot14c = consumer.peekPullLatest(mask);
+    assert(slot14c >= 0, "pin14c: peekPullLatest");
+    const slotBase14c = headerBytes + slot14c * frameBytes;
+    // Newest frame is seq=302, value=3.2 (the third in the burst).
+    assertEq(dv.getBigUint64(slotBase14c + 0, true), 302n, "pin14c: newest seq");
+    assertEq(dv.getFloat64(slotBase14c + 8, true), 3.2, "pin14c: newest value");
+
+    const ok14c = consumer.commitPullLatestCas();
+    assertEq(ok14c, true, "pin14c: pullLatest CAS success");
+    assertEq(
+      Atomics.load(headerView, 1),
+      writeIdxBefore14c,
+      "pin14c: read_index advanced straight to writeIdx (drain-to-newest)",
+    );
+
+    // ── 14d: pullLatest CAS commit — race detected ────────────────────
+    // Symmetric to 14b but for the pullLatest commit. Push a burst,
+    // peek the newest, simulate a producer overrun, confirm the CAS
+    // fails and the lane is unchanged.
+    for (let k = 0; k < 3; k++) {
+      push.seq = BigInt(400 + k);
+      push.value = 4.0 + k * 0.1;
+      assert(bridge.push(push), `pin14d: push ${k}`);
+    }
+    const slot14d = consumer.peekPullLatest(mask);
+    assert(slot14d >= 0, "pin14d: peekPullLatest");
+
+    const observedRead14d = Atomics.load(headerView, 1);
+    Atomics.store(headerView, 1, (observedRead14d + 2) | 0); // ≥1 overrun
+    const laneBeforeFailedCommit14d = Atomics.load(headerView, 1);
+
+    const ok14d = consumer.commitPullLatestCas();
+    assertEq(ok14d, false, "pin14d: pullLatest CAS detects race");
+    assertEq(
+      Atomics.load(headerView, 1),
+      laneBeforeFailedCommit14d,
+      "pin14d: lane unchanged by failed pullLatest CAS",
+    );
+
+    ok(`wasm-cas-drop-oldest-equivalence (FIFO + pullLatest × {success, race-detected})`);
+  }
+
+  // ── 15: Invariant lane returns null on no-invariant schema (0.7.11) ─────
   // The other half of the layout-API contract: a schema with NO
   // `.withInvariant(...)` MUST surface `invariantByteOffset: null` so
   // worklet callers can branch on presence without falling back to
@@ -1341,13 +1497,13 @@ function main(): void {
     assertEq(
       plainLayout.invariantByteOffset,
       null,
-      "pin13: no-invariant schema layout exposes invariantByteOffset=null",
+      "pin15: no-invariant schema layout exposes invariantByteOffset=null",
     );
     ok(`wasm-invariant-layout-null-for-plain-schema`);
   }
 
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits in agreement with JS atomics.",
   );
 }
 

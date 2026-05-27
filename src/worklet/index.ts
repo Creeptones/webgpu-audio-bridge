@@ -232,6 +232,27 @@ export interface WorkletConsumer {
    *  readIdx + 1), notify. */
   commitPull(): void;
 
+  /** CAS-aware FIFO pull commit (0.7.12). Use when the Bridge was
+   *  constructed with `policy: 'drop-oldest'`. Mirrors
+   *  `_pullOverrunAware` in `src/SpscRing.ts`: instead of a plain
+   *  release-store on `read_index`, compare-and-exchange against
+   *  the readIdx the matching peek observed. Returns `true` on
+   *  success (the slot bytes are intact + the producer was
+   *  notified); returns `false` if the producer overran mid-read,
+   *  in which case the caller MUST re-peek and retry the whole pull
+   *  (the slot bytes are suspect). Bounded by `capacity + 1` retries
+   *  under SPSC, but in practice succeeds on the first attempt.
+   *
+   *  Pair with the existing `peekPull(mask)`; the CAS state is set
+   *  on every peek so callers choose CAS vs release-store entirely
+   *  at commit time — no separate `peekPullCas` family. */
+  commitPullCas(): boolean;
+  /** CAS-aware `pullLatest` commit (0.7.12). Same shape as
+   *  `commitPullCas` but advances `read_index` straight to the
+   *  observed `write_index` (consuming all skipped older frames
+   *  in one atomic step). Pair with `peekPullLatest(mask)`. */
+  commitPullLatestCas(): boolean;
+
   /** Scalar field decoders (0.7.7). One per FieldKind in the schema
    *  DSL. Each takes the ABSOLUTE byte offset within the WASM memory
    *  (= within the SAB) — typically
@@ -407,6 +428,8 @@ export function instantiateConsumer(
     readonly commit_pull_latest: () => void;
     readonly peek_pull: (mask: number) => number;
     readonly commit_pull: () => void;
+    readonly commit_pull_latest_cas: () => number;
+    readonly commit_pull_cas: () => number;
     readonly read_f64: (off: number) => number;
     readonly read_f32: (off: number) => number;
     readonly read_i64: (off: number) => bigint;
@@ -447,6 +470,8 @@ export function instantiateConsumer(
     "commit_pull_latest",
     "peek_pull",
     "commit_pull",
+    "commit_pull_latest_cas",
+    "commit_pull_cas",
     "read_f64",
     "read_f32",
     "read_i64",
@@ -487,6 +512,8 @@ export function instantiateConsumer(
     commitPullLatest: () => exports.commit_pull_latest(),
     peekPull: (mask) => exports.peek_pull(mask),
     commitPull: () => exports.commit_pull(),
+    commitPullCas: () => exports.commit_pull_cas() === 1,
+    commitPullLatestCas: () => exports.commit_pull_latest_cas() === 1,
     readF64: (off) => exports.read_f64(off),
     readF32: (off) => exports.read_f32(off),
     readI64: (off) => exports.read_i64(off),

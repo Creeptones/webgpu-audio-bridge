@@ -4,6 +4,151 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.12] — 2026-05-27
+
+### Added — CAS-aware drop-oldest WASM commits (Track 2 of the King roadmap, eighth patch)
+
+Eighth and final functional patch in the Track 2 cohort. Ships
+the WASM-side counterparts to `_pullOverrunAware` /
+`_pullLatestOverrunAware` (the JS race-free drop-oldest path
+added in 0.7.2): two new commit exports that use
+`i32.atomic.rmw.cmpxchg` instead of a plain release-store on
+`read_index`, returning success/failure so the caller can retry
+on a detected producer overrun. After this patch the WASM
+consumer can drive every Bridge policy the JS consumer supports
+— `block` (default release-store path, 0.7.6) and `drop-oldest`
+(CAS path, this patch).
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`wasm/decoder.wat`** gains:
+  - One new module-scoped global `$pendingCapturedReadIdx`
+    holding the `readIdx` observed at the matching peek call.
+    Set on every peek (one extra i32 store — negligible) so the
+    caller chooses CAS vs release-store commit entirely at
+    commit time, no `peek_cas` family needed.
+  - `commit_pull_cas` — FIFO drop-oldest commit. CAS lane 1
+    with expected = `$pendingCapturedReadIdx`, desired =
+    `$pendingNewReadIdx` (which holds `readIdx + 1` from the
+    matching `peek_pull`). Returns 1 on success (+ notify), 0
+    on race (caller must re-peek and retry; the slot bytes
+    were torn by a producer overrun).
+  - `commit_pull_latest_cas` — `pullLatest` drop-oldest commit.
+    Same CAS shape but `$pendingNewReadIdx` holds the
+    `writeIdx` from `peek_pull_latest`, so the successful CAS
+    advances `read_index` straight to `writeIdx` (drain-to-
+    newest in one atomic step). Notify on success only.
+
+  The CAS uses WebAssembly threads spec's
+  `i32.atomic.rmw.cmpxchg`, which has acquire-release semantics
+  on both success and failure branches — matches
+  `Atomics.compareExchange` bit-for-bit on every spec-compliant
+  engine.
+
+  WAT binary size: 1883 bytes (0.7.11) → 2019 bytes (0.7.12).
+  +136 bytes for two cmpxchg-based exports + the captured-readIdx
+  global.
+
+- **`src/worklet/index.ts`** `WorkletConsumer` interface gains
+  two typed methods returning boolean:
+  - `commitPullCas(): boolean` — true on success, false →
+    caller must re-peek.
+  - `commitPullLatestCas(): boolean` — same shape for the
+    drain-to-newest variant.
+
+  Instantiation guard now validates all 29 exports.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds Pin 14:
+  - **14a (FIFO CAS success)** — clean peek + commit; CAS
+    matches captured value, returns true, `read_index`
+    advances by 1.
+  - **14b (FIFO CAS race detected)** — peek, then manually
+    advance `read_index` out of band (deterministic simulation
+    of a producer overrun mid-read), then commitPullCas: CAS
+    expected no longer matches the lane, returns false, lane
+    unchanged by the failed CAS.
+  - **14c (pullLatest CAS success)** — 3-frame burst, peek
+    newest, commitPullLatestCas: success, `read_index`
+    advances straight to `writeIdx` (consuming all 3 in one
+    atomic step).
+  - **14d (pullLatest CAS race detected)** — symmetric race
+    simulation for the pullLatest path.
+
+  Total pins in the file: 15 (pin 15 = the existing
+  "no-invariant schema layout returns null" pin renumbered).
+  All 13 prior wasmEquivalence pins still pass.
+
+### Why
+
+The drop-oldest policy is the only Bridge policy whose
+correctness requires more than a plain release-store on
+`read_index`. The producer's `_dropOldest` step advances
+`read_index` past slots the consumer is still reading; without
+CAS-on-commit the consumer's release-store would rewind the
+lane to a stale value, breaking the SPSC invariant and tearing
+the next frame.
+
+The JS Bridge has run this CAS shape since 0.7.2 — and the
+cross-thread 250k-frame `drop-oldest` stress in
+`tests/Bridge.concurrent.test.ts` exercises it exhaustively
+under real contention. What was missing was the WASM
+counterpart: a consumer running through the WASM decoder under
+drop-oldest had no way to detect the same race, so it could
+only safely target `block`-policy Bridges. After this patch the
+WASM consumer is a drop-in replacement for the JS pull on every
+policy the library supports.
+
+The pin's single-thread deterministic race simulation
+(manually `Atomics.store` between peek and commit) is the
+correct shape for unit-level CAS verification — the
+cross-thread stress already covers the production contention
+path via the JS consumer; here we just need to prove the WASM
+CAS detects the same logical condition the JS CAS detects, and
+that's exactly what manually overwriting `read_index` does.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no
+SchemaLayoutDescription field changes. Producer-side push
+paths are unchanged. JS-side consumer paths are unchanged.
+Only the WASM consumer module gains new exports + the shim
+gains new methods — additive at every layer.
+
+### Tests
+
+- `tests/Bridge.wasmEquivalence.test.ts` Pin 14 (above).
+  All 14 prior pins still pass. File now contains 15 pins
+  total covering the entire WASM consumer surface.
+- `tests/Bridge.test.ts` (63 single-thread pins) unchanged
+  — no JS-side surface this patch touched.
+- `tests/Bridge.concurrent.test.ts` (1M FIFO + 250k
+  drop-oldest cross-thread stresses) still pass — the JS CAS
+  path they exercise hasn't moved.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.11 (≈1.20
+μs). trajEval (fast) 1.10 μs < 1.25 μs budget. WASM consumer
+hot path unaffected — the CAS commits are not on any benched
+codepath (the existing bench's pull cells use the JS pull, not
+the WASM commit).
+
+### Documentation
+
+CHANGELOG entry above. WAT inline comments document the
+captured-readIdx + CAS rationale and the bit-for-bit
+correspondence with `Atomics.compareExchange`. Shim JSDoc
+explains the success/failure semantics and the caller's retry
+obligation.
+
+This closes Track 2's functional cohort. Remaining optional
+patches in the cohort (per the King roadmap handoff doc) are
+0.7.13 (`pullLatestComplete` ergonomics helper — single shim
+call for peek → decode-all-fields → commit) and 0.7.14
+(WASM-vs-JS `pullLatest` bench cell to capture the speedup
+numbers the roadmap estimates at 1.2-1.5× scalar / 2-3× SIMD).
+After those land, Track 3 (block-rate consumer) opens.
+
 ## [0.7.11] — 2026-05-27
 
 ### Added — Invariant lane visibility in `describeLayout()` (Track 2 of the King roadmap, seventh patch)
