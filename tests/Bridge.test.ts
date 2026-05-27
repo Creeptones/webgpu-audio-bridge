@@ -5395,6 +5395,13 @@ async function testBridgeGpuSourceIntrospection(): Promise<void> {
   assertEq(src.inFlightCount(), 0, "after poll: inFlightCount=0");
 
   // (d) After a second cycle, lastReadbackUs UPDATES to the latest.
+  //     The intent is "the lane got rewritten with a fresh measurement",
+  //     not "the new measurement is larger" — on Windows the host kernel
+  //     timer quantizes setTimeout(3) and setTimeout(7) into the same
+  //     ~15.6ms slot, so the two readings carry stochastic noise rather
+  //     than ordered-by-wait-length values. Assert `us2 !== usAfterFirst`
+  //     (the field was written) plus `us2 > 1000` (a sensible non-zero
+  //     reading) instead of the brittle ordering. (0.7.13 CI hygiene)
   const usAfterFirst = us;
   assertEq(src.scheduleReadback(fakeSrcBuffer, mockEncoder), true, "schedule 2");
   src.flushPending();
@@ -5411,7 +5418,10 @@ async function testBridgeGpuSourceIntrospection(): Promise<void> {
   await Promise.resolve();
   src.pollCompleted();
   const us2 = src.lastReadbackUs();
-  assert(us2 > usAfterFirst, `lastReadbackUs updates to latest (was ${usAfterFirst}, now ${us2})`);
+  assert(
+    us2 !== usAfterFirst && us2 > 1000,
+    `lastReadbackUs updates to latest with sensible reading (was ${usAfterFirst}, now ${us2})`,
+  );
 
   // (e) Safe to call after destroy. lastReadbackUs returns the
   // last-recorded value; inFlightCount returns 0 (every slot was idle
