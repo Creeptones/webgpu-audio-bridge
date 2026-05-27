@@ -39,6 +39,35 @@ The solution is to **stop trying to run audio rate on the GPU**. Instead:
 
 `mapAsync`'s 5–15 ms latency is fine at 60 Hz (16.6 ms cadence). It is fatal at 48 kHz. This library makes the difference concrete.
 
+### Two transport tiers (0.7.0)
+
+The library provides **Turbo mode** (SAB + Atomics, sub-microsecond push/pull) as the default — that's `Bridge<S>` and everything documented below. Turbo mode requires cross-origin isolation, which is a one-time deployment setup (see [Enabling Turbo mode](#enabling-turbo-mode) + [Deploying behind a real host](#deploying-behind-a-real-host) — coming in 0.7.5). The 0.6.x cohort's entire feature surface — `BridgeGPUSource`, `BridgeInputLane`, smoothers, PLL, evaluator, invariant classifier — lives on Turbo mode.
+
+**Standard mode** (`MessageChannelBridge<S>`, coming in 0.8.x) is a deliberate second tier with the **same schema DSL surface** and a **MessageChannel + transferable ArrayBuffer** transport. Measured 5–50 ms latency vs Turbo's sub-µs. Right for: prototyping before you've configured COOP/COEP, control-plane updates in unisolated embeds, telemetry channels, non-audio-critical paths. **NOT for audio rate.** See [Browser support matrix](#browser-support-matrix) for what works in each tier.
+
+The library will **never** auto-detect the environment and silently pick a transport for you. The user picks `Bridge<S>` (Turbo) or `MessageChannelBridge<S>` (Standard) at construction — explicit choice, documented trade-offs, no transparent fallback.
+
+## Browser support matrix
+
+| Capability | Chrome ≥ 113 | Firefox ≥ 113 | Safari ≥ 16.4 | iOS Safari ≥ 16.4 |
+|---|---|---|---|---|
+| `crossOriginIsolated` | ✅ with COOP/COEP | ✅ with COOP/COEP | ✅ with COOP/COEP | ✅ with COOP/COEP |
+| `SharedArrayBuffer` | ✅ (isolated only) | ✅ (isolated only) | ✅ (isolated only) | ✅ (isolated only) |
+| `Atomics.wait` | ✅ worker only | ✅ worker only | ✅ worker only | ✅ worker only |
+| `Atomics.waitAsync` | ✅ | ⚠️ flagged | ❌ | ❌ |
+| `AudioWorklet` | ✅ | ✅ | ✅ | ✅ |
+| `WebGPU` | ✅ | ⚠️ Nightly behind `dom.webgpu.enabled` | ✅ 18.0+ (16.4–17.x: Technology Preview) | ✅ 18.0+ |
+| WebMIDI | ✅ | ✅ 108+ | ❌ | ❌ |
+| **Turbo mode** (`Bridge<S>`) | ✅ | ✅ | ✅ | ✅ |
+| **Standard mode** (`MessageChannelBridge<S>`, 0.8.x) | ✅ | ✅ | ✅ | ✅ |
+
+Notes:
+
+- **`Atomics.wait` is worker-only by spec** — never callable from the main thread or the AudioWorklet's `process()`. The library's `waitForData` / `waitForSpace` enforce this; AudioWorklet consumers poll via `pullLatest` and tolerate misses.
+- **WebGPU on Firefox** has been available behind `dom.webgpu.enabled` in Nightly through 2024–2026; stable rollout tracking [bug 1262052](https://bugzilla.mozilla.org/show_bug.cgi?id=1262052). The library has a CPU fallback in `examples/minimal/worker.js` for compute paths that need to degrade gracefully.
+- **WebMIDI on Safari** is not supported; the fast-lane pattern works without WebMIDI (pointer + keyboard suffice — see `examples/fast-lane/`).
+- **Standard mode** has no `Atomics` dependency and so does not require cross-origin isolation. The latency floor is ~5–50 ms (measured baseline in 0.8.3).
+
 ## The macro/micro pattern
 
 The architectural framing this library encodes:
@@ -171,16 +200,18 @@ class MyProcessor extends AudioWorkletProcessor {
 
 If you'd rather keep the audio thread free of the library import — the recommended pattern for production worklets — see [`examples/minimal/worklet.js`](./examples/minimal/worklet.js): the main thread sends `bridge.describeLayout()` via `processorOptions.layout`, and the worklet reconstructs typed-array views from byte offsets inline (~30 lines, zero imports).
 
-### Setting up SAB (cross-origin isolation required)
+### Enabling Turbo mode
 
-`SharedArrayBuffer` is only available in cross-origin-isolated contexts. Your hosting page must set:
+Turbo mode (`Bridge<S>` + SAB + Atomics) requires **one-time deployment setup**: serve every isolated page with these headers:
 
 ```
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-Check `crossOriginIsolated === true` at runtime before using this library.
+Check `crossOriginIsolated === true` at runtime before constructing a `Bridge<S>`. If it returns `false` you're in Standard-mode territory (`MessageChannelBridge<S>`, 0.8.x) — explicit second tier, documented latency, never a silent fallback.
+
+For zero-config local development, **0.7.1+** ships `npx webgpu-audio-bridge dev` — a static server with COOP/COEP/CORP headers wired up correctly, a browser-side probe that reports environment status to the terminal, and actionable error messages for blocked third-party assets. See [Deploying behind a real host](#deploying-behind-a-real-host) (0.7.5+) for one-config-block recipes against Vercel / Netlify / Cloudflare Pages / GitHub Pages / nginx / Caddy / Fly.io / Render / plain Node.
 
 ## API reference
 
@@ -1220,6 +1251,8 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 
 ## What this is, and what it isn't
 
+**This is, and remains, an SAB-first library.** Turbo mode (`Bridge<S>` over `SharedArrayBuffer` + `Atomics`) is the canonical path. The 0.8.x `MessageChannelBridge<S>` is a deliberate explicit second tier with documented worse latency — **not a transparent fallback**. The library will never auto-detect the user's environment and silently pick a transport for them; the choice between `Bridge<S>` and `MessageChannelBridge<S>` is explicit at construction time. See [Two transport tiers](#two-transport-tiers-070) for the framing, [Browser support matrix](#browser-support-matrix) for what works where, and the §FAQ entry "Will the library add a transparent fallback?" (0.7.9) for the long-form answer.
+
 **This is:**
 
 - A small, tested, MIT-licensed reference primitive for the WebGPU → AudioWorklet streaming pattern.
@@ -1252,6 +1285,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.7.0 — Framing pivot (Turbo mode / Standard mode)** — the first release of the onboarding cohort. README acquires a §Two transport tiers subsection, a top-level §Browser support matrix table, and an uncompromising "SAB-first; no transparent fallback" stance in §What this is and what it isn't. §Setting up SAB renames to §Enabling Turbo mode. `package.json` description and `CITATION.cff` title rewrite to reflect the two-tier framing. No SAB / public-API / wire-format change — purely a coherent release-moment promotion. Pre-announces `MessageChannelBridge<S>` for 0.8.x. See the CHANGELOG `[0.7.0]` block for the full reframing.
 - ✅ **0.6.19 — `BridgeInputLane` + fast-lane pattern** — a thin event-queue facade over `SpscRing<S>` for the input-lane pattern that reaches pro-audio tracking latency (~3–6 ms input-to-audible on tuned hardware). New class `BridgeInputLane<S>` exposes `pullAll(eventBuf, maxCount?) → number` on the consumer side (drain every unread frame in FIFO order) and the same `push` / `beginPush` / `commitPush` surface on the producer side; wire-compatible with every other facade. A new `examples/fast-lane/` end-to-end demo wires up computer keyboard + WebMIDI + on-screen keys against a dual-bridge architecture (macro + input) with sub-sample event placement in the AudioWorklet. New README §Achieving pro-audio tracking latency lays out the dual-bridge architecture, the latency math, and the canonical InputSchema shapes. SAB byte layout unchanged from 0.6.11. See [`BridgeInputLane`](#bridgeinputlanes--event-queue-facade-0619) and [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619).
 - ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, the producer no longer stalls on `mapAsync` — readbacks overlap, throughput rises from 60-125 Hz to 250-1000 Hz, the bridge stops running empty under load, and total input-to-audible latency moves from "30-50 ms with stalls" to "consistent ~15-25 ms." **`mapAsync`'s per-frame cost (5-15 ms) is unchanged** — it stops being a serialization tax but it's still in the chain, so this lands at typical web-audio latency, not pro-audio tracking latency. No `@webgpu/types` runtime dependency. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
 - ✅ **0.6.17 — `forEachSampleInQuantum` batch evaluation** (per-quantum hot loop API). Wraps the canonical "evaluate every sample of an audio quantum" pattern into one call: `bridge.forEachSampleInQuantum(evalFrame, sampleCount, (i, frame) => { block[i] = synth.step(frame.vEff) })`. Bit-identical output to a hand-rolled `evaluateAtSampleOffset` loop, but with per-sample method-dispatch + cache-validity checks hoisted out of the inner loop. EvalMode dispatch (step / alpha / trajectory / catmull) deferred to a future patch — needs the K=4 catmull history ring and interaction story with `resetSmoother` / `resetEvalCache`. SAB byte layout unchanged from 0.6.11. See [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).

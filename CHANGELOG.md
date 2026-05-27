@@ -4,6 +4,113 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.0] — 2026-05-26
+
+### Reframed — Turbo mode / Standard mode (the framing pivot)
+
+The library acquires a two-tier transport framing. **Turbo mode**
+(`Bridge<S>` + SAB + Atomics) is the canonical primary path — the
+entire 0.6.x feature surface lives there. **Standard mode**
+(`MessageChannelBridge<S>`, 0.8.x) is a deliberate explicit
+second tier with documented worse latency (5-50 ms typical)
+sharing the same schema DSL.
+
+Concrete edits in this release:
+
+- New §Two transport tiers subsection under §The problem this
+  solves, introducing the framing and pre-announcing
+  `MessageChannelBridge<S>` for 0.8.x.
+- New top-level §Browser support matrix table immediately
+  after §The macro/micro pattern. Columns: Chrome / Firefox /
+  Safari / iOS Safari. Rows: `crossOriginIsolated`, SAB,
+  `Atomics.wait`, `Atomics.waitAsync`, AudioWorklet, WebGPU,
+  WebMIDI, Turbo mode, Standard mode. Honest cell-level
+  caveats footnoted.
+- §Setting up SAB renames to §Enabling Turbo mode. Same
+  COOP/COEP recipe, but the prose reframes the headers as
+  "one-time setup for the fast tier" rather than "deployment
+  restriction." Adds forward-references to the 0.7.1+ dev CLI
+  and 0.7.5+ deployment recipes.
+- §What this is, and what it isn't gains an uncompromising
+  preamble paragraph: **"This is, and remains, an SAB-first
+  library. The library will never auto-detect the user's
+  environment and silently pick a transport for them."** Triple
+  anchored alongside the §Two transport tiers framing and the
+  forthcoming §FAQ entry.
+- `package.json` description rewrites from "Schema-driven
+  lock-free SPSC SharedArrayBuffer ring..." to "Schema-driven
+  control-rate-to-audio-rate bridge for the browser. Turbo
+  mode (SAB + Atomics, sub-microsecond) and Standard mode
+  (MessageChannel, 5-50ms — 0.8.x) share one schema DSL and
+  one frame API." The SAB ring is now described as the
+  *implementation* of Turbo mode, not the headline claim.
+- `CITATION.cff` title updates to match. The library name
+  `webgpu-audio-bridge` is unchanged; the Zenodo concept DOI
+  is unchanged. A new version DOI for 0.7.0 will mint at
+  Zenodo deposit time.
+
+### Why
+
+The library is technically inside the frontier on the SAB path
+— what remains for 1.0 is **adoption friction**, not feature
+gaps. A reader who sees "Schema-driven lock-free SPSC
+SharedArrayBuffer ring..." evaluates "this requires special
+hosting" in 8 seconds and bounces. The reframing converts
+that into "this library has a Turbo mode and a Standard
+mode" — a feature comparison the reader engages with rather
+than a deal-breaker they reject.
+
+Critically the SAB-first stance is unchanged. The reframing
+is honest: Turbo mode is what the library is for; Standard
+mode is the explicit second tier for prototyping,
+unisolated embeds, and control-plane updates where 5-50 ms
+latency is genuinely acceptable. The library will never
+auto-detect and silently fall back — that contract is
+documented in three places (§Two transport tiers,
+§What this is and what it isn't, forthcoming §FAQ in
+0.7.9).
+
+0.7.0 is the first release in the **onboarding cohort**
+(paths 2, 3, 4, 8 from the strategic roadmap). 0.7.x will
+go deep: dev CLI (0.7.1+), environment diagnostics
+(0.7.1-0.7.2), deployment recipes for 8+ hosts (0.7.5),
+FAQ + Troubleshooting (0.7.9), recipe round-trip
+verification against real deployments (0.7.10). The cohort
+gate at 0.7.12 will reassess 1.0 readiness with the
+deliverables visible.
+
+### Wire compatibility
+
+- **No SAB changes.** Bit-exact protocol with 0.6.19.
+- **No public-API change.** Every `Bridge<S>` /
+  `BridgeProducer` / `BridgeConsumer` / `BridgeInputLane` /
+  `BridgeGPUSource` method works unchanged.
+- **No exported symbol additions or removals.**
+- The minor bump (`0.6.19 → 0.7.0`) is purely a coherent
+  release moment — the third CLAUDE.md minor-bump trigger
+  ("deliberate batched-patch promotion"). The README's
+  top-level voice + the package elevator pitch + the
+  citation title all shift in lockstep; that's the public
+  face of the library changing shape, which is the
+  promotion criterion.
+
+### Tests
+
+No new tests. The framing pivot is pure prose. All 8
+existing suites green; bench medians unchanged at 1.20 μs.
+
+### Documentation
+
+- `README.md`: new §Two transport tiers subsection (under
+  §The problem this solves), new top-level §Browser support
+  matrix table, §Setting up SAB → §Enabling Turbo mode
+  rename + rewrite, §What this is and what it isn't preamble
+  paragraph. ~250 LOC of README diff.
+- `package.json`: `description` field rewritten.
+- `CITATION.cff`: `title` field rewritten; `version` bumped
+  to 0.7.0; `date-released` updated; new version DOI
+  placeholder added.
+
 ## [0.6.19] — 2026-05-26
 
 ### Added — `BridgeInputLane<S>` + fast-lane pattern

@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "webgpu-audio-bridge: A streaming bridge from WebGPU compute to AudioWorklet via SharedArrayBuffer"
+title: "webgpu-audio-bridge: A schema-driven control-rate-to-audio-rate bridge for the browser, with two transport tiers (SAB + Atomics; MessageChannel)"
 message: "If you use this software, please cite it as below."
 type: software
 authors:
@@ -8,13 +8,16 @@ authors:
 repository-code: "https://github.com/Creeptones/webgpu-audio-bridge"
 url: "https://github.com/Creeptones/webgpu-audio-bridge"
 doi: "10.5281/zenodo.20380886"
-version: "0.3.0"
-date-released: "2026-05-25"
+version: "0.7.0"
+date-released: "2026-05-26"
 license: MIT
 identifiers:
   - type: doi
     value: "10.5281/zenodo.20380886"
     description: "Concept DOI — resolves to the latest release."
+  - type: doi
+    value: "TBD"
+    description: "Version DOI — v0.7.0 specifically (assigned at Zenodo deposit time; the framing-pivot release that introduces the two-tier transport model)."
   - type: doi
     value: "TBD"
     description: "Version DOI — v0.3.0 specifically (assigned at Zenodo deposit time)."
