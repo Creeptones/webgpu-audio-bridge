@@ -114,6 +114,20 @@ export type {
   BridgeGPUSourceOptions,
 } from "./BridgeGPUSource.js";
 
+// ── Block-shaped GPU readback adapter (0.7.14 — Track 3) ──────────────────
+//
+// `BridgeBlockProducer<S>` is the producer-side companion to
+// `BridgeBlockConsumer<S>`. Wraps `BridgeGPUSource<S>` with a decoder that
+// automatically copies a compute-shader output buffer's PCM samples into
+// the schema's lone `f32Array` field, optionally maintaining an auto-
+// increment `u64` block index. See src/BridgeBlockProducer.ts header +
+// README "Audio-rate mode" for the pacing math.
+
+export { BridgeBlockProducer } from "./BridgeBlockProducer.js";
+export type {
+  BridgeBlockProducerOptions,
+} from "./BridgeBlockProducer.js";
+
 // ── Environment diagnostics (0.7.1) ───────────────────────────────────────
 //
 // Synchronous, frozen snapshot of the host environment relative to the

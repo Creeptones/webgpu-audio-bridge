@@ -1025,6 +1025,94 @@ The worked end-to-end demo at [`examples/fast-lane/`](./examples/fast-lane/) imp
 | WebXR controller as a percussion instrument | Trigger feels like real percussion; HRTFs catch up invisibly |
 | Live-coding sketch with a GPU-rendered visualizer | Audio swap is instant; visualizer can lag 50 ms without notice |
 
+## Audio-rate mode (0.7.13 / 0.7.14)
+
+Up to here the library has been pitched on the **control-rate-GPU → audio-rate-CPU** pattern: a worker runs heavy simulation at 30–120 Hz; the worklet pulls the freshest macro frame each quantum and synthesizes audio on the CPU. That covers the vast majority of GPU-audio use cases — physics modeling, convolution, neural inference, anything where the model is structurally a parameter source.
+
+The flip-side use case is **pure GPU synthesis**: a compute shader writes a block of PCM samples directly and the worklet plays them back. No CPU synthesis, no per-sample math on the audio thread — the GPU is the synthesizer. `BridgeBlockProducer<S>` + `BridgeBlockConsumer<S>` (Track 3 of the King roadmap, shipped across 0.7.13 + 0.7.14) make that pattern a one-line consumer:
+
+```ts
+// AudioWorklet (consumer side):
+import { Bridge, BridgeBlockConsumer } from "webgpu-audio-bridge";
+
+class BlockPlayer extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    const { sab, capacity, blockSize } = opts.processorOptions;
+    const schema = defineSchema({
+      blockIndex: u64(),
+      samples:    f32Array(blockSize),
+    });
+    const bridge = new Bridge(sab, capacity, schema);
+    this.consumer = new BridgeBlockConsumer(bridge);   // default zero-fill on underflow
+  }
+  process(_, outputs) {
+    this.consumer.process(outputs[0][0]);              // 128-sample quantum
+    return true;
+  }
+}
+```
+
+```ts
+// Worker (producer side):
+import { Bridge, BridgeBlockProducer } from "webgpu-audio-bridge";
+
+const bridge   = new Bridge(sab, capacity, blockSchema);
+const producer = new BridgeBlockProducer(device, bridge, { stagingBufferCount: 3 });
+
+// Per producer tick (paced at audio consumption rate — see latency floor below):
+const enc = device.createCommandEncoder();
+// … encode compute pass that fills `computeOutputBuf` with `blockSize` f32 samples …
+producer.scheduleReadback(computeOutputBuf, enc);
+device.queue.submit([enc.finish()]);
+producer.flushPending();
+producer.pollCompleted();          // decoded blocks push through the bridge
+```
+
+The bridge schema must declare **exactly one** `f32Array` field (the samples block); the block size derives from the field's declared length. Both helpers validate this at construction. An optional `u64 blockIndex` field is auto-incremented by the producer on every successful push.
+
+### Latency floor (honest math, hard floor — not a target)
+
+Block mode is inherently higher-latency than control mode. The audio worklet plays back what the producer wrote, and "what the producer wrote" can be up to `ring depth × block size / sample rate` seconds old by the time the worklet pulls it. That's the structural floor — no amount of tuning eliminates it. The honest table:
+
+| Ring depth `D` | Block size `B` | Sample rate `R` | Worst-case input-to-audible |
+|---|---|---|---|
+| 2 | 1024 | 48 000 | 43 ms |
+| 3 | 1024 | 48 000 | 64 ms |
+| 4 | 1024 | 48 000 | 85 ms |
+| 3 | 512 | 48 000 | 32 ms |
+| 3 | 2048 | 48 000 | 128 ms |
+| 4 | 1024 | 44 100 | 93 ms |
+
+Rule of thumb: pick the smallest `D` that survives your producer-side jitter and the smallest `B` that gives the GPU enough work per dispatch to be worth the round trip. `D = 3, B = 1024, R = 48 kHz` is a reasonable default (≈64 ms floor). This is the SAME order of magnitude as a typical web-audio output buffer — block mode trades input latency for the ability to run the entire synthesizer on the GPU.
+
+### Pacing
+
+The producer must pace at the audio **consumption** rate. For `B`-sample blocks at sample rate `R`, the worklet consumes `R / B` blocks per second — at `B = 1024` and `R = 48 000` that's ≈46.875 Hz. Dispatch at slightly above that rate (50 Hz works well) so the ring stays close to a steady-state occupancy of one block. The staging-buffer ring inside `BridgeBlockProducer` (default depth 3) provides the additional headroom for GPU pipelining overlap.
+
+Over-producing fills the ring; under the default `'reject'` policy the surplus pushes return `false` and the producer should back off. Under `'drop-oldest'` the producer overwrites stale blocks — fine for live monitoring, problematic for sample-accurate playback where every block matters.
+
+### Underflow policies
+
+`BridgeBlockConsumer` accepts an `underflowPolicy` option for the ring-empty case:
+
+| Policy | Behavior on ring-empty | When to use |
+|---|---|---|
+| `'zero-fill'` (default) | Write zeros for the unfilled tail. | Production worklets — matches AudioWorklet's "return true and emit silence" idiom. |
+| `'hold-last'` | Repeat the most recently produced sample. | Smoother audible degradation under brief glitches; flat-line under prolonged underflow. |
+| `'throw'` | Throw a descriptive `Error` from `process()`. | Tests / strict development. Never in production — an unhandled throw permanently terminates the AudioWorkletProcessor. |
+
+### Worked example
+
+[`examples/audio-rate/`](./examples/audio-rate/) ships the canonical end-to-end demo: a worker runs a WGSL additive-sine-bank compute shader that emits 1024 samples per tick; `BridgeBlockProducer` pipes them into the ring; an AudioWorklet drives them out through `BridgeBlockConsumer.process(outputs[0][0])`. CPU fallback when WebGPU isn't available; on-page status panel shows production rate, dropped readbacks, last-readback μs, frames consumed, and underflow samples.
+
+```bash
+npm run build && npm run dev:audio-rate
+# open http://localhost:5175/
+```
+
+The demo's structural choice list is itself the recipe: 1024-sample blocks at 48 kHz, capacity 4 (≈85 ms floor), producer at 50 Hz, consumer zero-fills on underflow.
+
 ## Use cases
 
 The pattern this library implements unblocks browser projects that previously had no clean answer:

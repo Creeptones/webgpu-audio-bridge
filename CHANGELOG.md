@@ -4,6 +4,193 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.14] — 2026-05-27
+
+### Added — `BridgeBlockProducer<S>` + `examples/audio-rate/` demo (Track 3 of the King roadmap, second patch)
+
+Second patch in the Track 3 cohort. Closes the audio-rate /
+block-rate consumption story by shipping the producer-side
+companion to 0.7.13's `BridgeBlockConsumer<S>`, plus a worked
+end-to-end demo (`examples/audio-rate/`) and a new README
+"Audio-rate mode" section with the honest latency-floor table.
+After this patch a user who wants "pure GPU synthesis" —
+compute shader → bridge → AudioWorklet — has one canonical
+helper on each side and a runnable reference.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/BridgeBlockProducer.ts`** (new, ~260 LOC). Wraps
+  `BridgeGPUSource<S>` with a decoder that auto-copies the
+  mapped staging-buffer bytes into the schema's lone `f32Array`
+  field via `Float32Array.prototype.set`. Optionally
+  auto-increments a `u64` block-index field on every successful
+  push (default behavior: use `'blockIndex'` if present on the
+  schema as a `u64` scalar, otherwise no auto-increment;
+  explicit `null` disables; explicit name validates).
+  An optional `fillScalars` hook runs once per readback for
+  caller-side scalar fields (timestamp, frame metadata).
+
+  Public surface:
+  - `constructor(device, bridge, opts?)` with
+    `stagingBufferCount`, `blockIndexField`, `fillScalars`,
+    `bufferLabelPrefix`.
+  - `scheduleReadback(srcBuffer, encoder, srcOffset?): boolean`
+    — forwards to the wrapped source's same-named method.
+  - `flushPending()`, `pollCompleted(): number`,
+    `inFlight()` / `inFlightCount()` / `capacity()`,
+    `pushedCount()`, `droppedCount()`, `lastReadbackUs()`,
+    `destroy()` — full delegation surface for telemetry +
+    lifecycle.
+  - Public readonly: `bridge`, `blockSize`, `samplesByteSize`,
+    `samplesField`, `blockIndexField`, `source` (the wrapped
+    `BridgeGPUSource` instance, exposed for callers who want
+    the underlying telemetry).
+
+  Schema constraint: exactly one `f32Array` field — mirrors
+  `BridgeBlockConsumer`. Block-index field resolution rejects
+  array fields and non-`u64` scalars at construction with a
+  descriptive error.
+
+  Staging buffer size is set to `blockSize * 4` (samples bytes
+  only) — not the bridge's full frame byte size. The compute
+  shader output buffer's contents are the only thing copied
+  across the GPU → CPU boundary; scalar fields are heap-side
+  state set by the decoder closure.
+
+- **`src/index.ts`** gains the new exports:
+  `BridgeBlockProducer`, `BridgeBlockProducerOptions`.
+
+- **`examples/audio-rate/`** (new, 6 files). Minimal end-to-end
+  demo: a `DedicatedWorker` runs a WGSL additive-sine-bank
+  compute shader (8 voices, 1024 samples per dispatch, time-and-
+  control-modulated frequency spread), wraps a
+  `BridgeBlockProducer` over `BridgeGPUSource`, and dispatches
+  at 50 Hz. The `AudioWorklet` constructs a sibling `Bridge` +
+  `BridgeBlockConsumer` over the same SAB and runs the canonical
+  one-liner `process(outputs[0][0])` to fill each 128-sample
+  quantum. CPU fallback when WebGPU isn't available. Files:
+  `serve.mjs` (port 5175, COOP/COEP/CORP headers), `index.html`,
+  `main.js`, `schema.js`, `worker.js`, `worklet.js`.
+
+  The demo's structural defaults are themselves the recipe:
+  capacity 4 (≈85 ms floor), 1024-sample blocks at 48 kHz,
+  producer paced at 50 Hz against the 46.875 Hz consumption
+  rate, consumer zero-fills on underflow. On-page status panel
+  shows production rate, dropped readbacks, last-readback μs,
+  frames consumed, and underflow samples.
+
+- **`package.json`** `scripts` gains
+  `"dev:audio-rate": "node examples/audio-rate/serve.mjs"`
+  alongside the existing `dev:demo` / `dev:fast-lane` entries.
+
+- **`README.md`** gains a new top-level `## Audio-rate mode
+  (0.7.13 / 0.7.14)` section with: the canonical block-mode
+  consumer + producer code skeletons; the honest latency-floor
+  table (`D × B / R`, including the headline 64 ms at
+  `D=3, B=1024, R=48 kHz` row); the pacing math (50 Hz producer
+  for 46.875 Hz consumer); the three underflow policies with
+  guidance on when to use each; and a pointer to
+  `examples/audio-rate/`. The latency table is documented as a
+  HARD FLOOR — not a target — to set caller expectations
+  honestly.
+
+### Why
+
+The 0.7.13 patch shipped the consumer-side helper but left the
+producer side to a hand-rolled `BridgeGPUSource` decoder. That's
+doable — the decoder is ~10 lines — but every adopter writing
+it independently reaches the same five design micro-decisions
+(staging buffer size = sample bytes not frame bytes; block index
+lives outside the readback path; auto-increment vs. caller-driven;
+mapped-range view aliasing; what to do if the schema has multiple
+f32Arrays). Bundling those decisions into one helper saves five
+minutes per adopter and prevents the most common "I forgot to
+increment blockIndex" footgun.
+
+The example wasn't optional. Block mode's structural latency
+floor of 60-100 ms makes it counter-intuitive — adopters
+benchmarking against control mode's 5-15 ms floor see the gap
+and assume something is wrong. The honest table in the README
+plus the working demo together set expectations correctly: this
+isn't slow, it's structurally bound by the round-trip width;
+choose the helper that matches your latency budget.
+
+The 50 Hz pacing choice in the demo deserves explicit mention.
+Producer rate must slightly exceed the consumption rate
+(`R / B = 46.875 Hz`) so the ring stays one-block-ahead in
+steady state. Setting producer rate equal to consumption rate
+makes the ring oscillate between 0 and 1 occupancy with every
+jitter event consuming spare margin; producing slightly faster
+gives the worklet a small buffer cushion the underflow policy
+never has to engage. 50 Hz at 1024 samples = 51,200 samples/sec
+generated vs. 48,000 consumed — the 6.7% surplus is absorbed by
+the bridge's `'reject'` policy when the ring is at capacity (no
+torn frames; the producer just sees a `false` return and pauses
+for the next tick).
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema
+extension, no protocol change. `BridgeBlockProducer` is a
+heap-side helper on top of `BridgeGPUSource`'s existing
+staging-buffer-ring + `mapAsync` orchestration. A bridge fed by
+`BridgeBlockProducer` is bit-for-bit interoperable with one fed
+by a hand-rolled `BridgeGPUSource` whose decoder does the same
+`Float32Array.set`.
+
+### Tests
+
+Per the King roadmap handoff: this patch ships **no new test
+file**. The 0.7.13 `tests/BridgeBlockConsumer.test.ts` (13
+pins) already covers the consumer-side block + cursor +
+underflow + telemetry semantics; the
+`tests/Bridge.test.ts`'s `bridge-gpu-source-orchestration`
+pin (#81) covers the underlying `BridgeGPUSource` state
+machine. `BridgeBlockProducer` is a thin decoder-closure +
+schema-validation shim over `BridgeGPUSource`; the audio-rate
+demo running glitch-free at audio rate is the integration test.
+This is the explicit handoff guidance — calling it out here so
+the gate doesn't read as a missing test.
+
+The full 11-suite gate runs green from 0.7.13 unchanged
+(typecheck clean; all schema / Bridge / BridgeFacades /
+BridgeInputLane / BridgeBlockConsumer / environment /
+Bridge.phaseLock / Bridge.wasmEquivalence / Bridge.concurrent /
+Float64RingBuffer / Float64RingBuffer.concurrent suites pass).
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.13 (≈1.20
+μs). No new bench cell — `BridgeBlockProducer.scheduleReadback`
+delegates to `BridgeGPUSource.scheduleReadback`; the decoder's
+hot path is one `Float32Array.set(blockSize * 4 bytes)` plus
+optional bigint increment, both well outside the ring
+microbench's measurement window.
+
+### Documentation
+
+CHANGELOG entry above. Comprehensive file header on
+`src/BridgeBlockProducer.ts` documents the schema constraint,
+the block-index field resolution rules, the staging-buffer-size
+choice, the pacing math, and the wire-compatibility guarantee.
+New README "Audio-rate mode" section (above the existing
+"## Use cases" section) lays out the consumer + producer
+skeletons, the latency-floor table as a hard floor, the
+underflow policies + when to use each, and a pointer to
+`examples/audio-rate/`. The demo's `index.html` carries an
+in-page version of the latency math so a user who just opens
+the demo without reading the README still sees the structural
+floor explicit.
+
+This closes Track 3. Next patches: 0.7.15 (Track 4 — zero-copy
+WebGPU scaffolding via `WriteTarget` strategy + `webgpuZeroCopy`
+capability flag), 0.7.16 / 0.7.17 (Track 5 — WebNN experimental
+adapter under `webgpu-audio-bridge/experimental` subpath +
+capability flags + final docs). After 0.7.17 ships the audit
+cohort's working-tree edits (`src/Bridge.ts`, `src/SpscRing.ts`,
+`tests/Bridge.test.ts` — intentionally untouched here) become
+unblocked for the 0.8.x line.
+
 ## [0.7.13] — 2026-05-27
 
 ### Added — `BridgeBlockConsumer<S>` (Track 3 of the King roadmap, first patch)
