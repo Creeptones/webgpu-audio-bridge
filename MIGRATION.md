@@ -1,6 +1,8 @@
 # Migrating to `Bridge<Schema>` (0.3.0)
 
-The 0.3.0 release introduces a schema-driven `Bridge<Schema>` class that replaces the hard-coded `Float64RingBuffer`. The old class is preserved (deprecated) for v0.1.x byte-compat.
+> **Note for 0.9.0+ readers.** This guide describes the 0.3.0 introduction of the schema-driven `Bridge<Schema>` class. Through 0.8.x the legacy `Float64RingBuffer` class was preserved (deprecated) for v0.1.x byte-compat; the **0.9.0 release deleted it**, along with `legacyPhysicsControlFrameSchema(n)` and the `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm. If you have code still on the legacy surface, this guide remains the migration path — read it, then upgrade to `0.9.x`. The `Float64RingBuffer` import lines below will no longer resolve on `0.9.x`; pin `webgpu-audio-bridge@0.8.x` (or the v0.1.1 npm tarball / [Zenodo DOI](https://doi.org/10.5281/zenodo.20382407)) while migrating. See CHANGELOG `[0.9.0]` for the full removal note.
+
+The 0.3.0 release introduces a schema-driven `Bridge<Schema>` class that replaced the hard-coded `Float64RingBuffer`. Through 0.8.x the old class was preserved (deprecated) for v0.1.x byte-compat; at 0.9.0 it was removed.
 
 This guide shows how to port from `Float64RingBuffer` to `Bridge` for the common physics frame shape. The two have different wire formats by default; see the [Wire compatibility](#wire-compatibility) section below for the byte-compatible escape hatch.
 

@@ -5,12 +5,12 @@
  * a Web Worker (typically driving WebGPU compute) into an AudioWorklet — the
  * control-rate-GPU / audio-rate-CPU pattern.
  *
- * Three public surfaces:
+ * Two public surfaces:
  *
- *   - `Bridge<Schema>` (recommended for new code): schema-driven frame
- *     codec. Describe your frame with `defineSchema({ ... })` and arbitrary
- *     primitive types (f64/f32/u64/i64/u32/i32/u16/i16/u8/i8 scalars and
- *     arrays). Ships the monolithic producer + consumer API. Shipped 0.3.
+ *   - `Bridge<Schema>`: schema-driven frame codec. Describe your frame with
+ *     `defineSchema({ ... })` and arbitrary primitive types
+ *     (f64/f32/u64/i64/u32/i32/u16/i16/u8/i8 scalars and arrays). Ships the
+ *     monolithic producer + consumer API. Shipped 0.3.
  *
  *   - `SpscRing<Schema>` + `BridgeProducer<Schema>` /
  *     `BridgeConsumer<Schema>` + `FrameSmoother<Schema>` /
@@ -20,11 +20,11 @@
  *     are wired in and which invariant-failure policy is active. Same SAB
  *     protocol — a facade-built peer interoperates with a Bridge-built peer.
  *
- *   - `Float64RingBuffer` (deprecated): the original hard-coded
- *     `[seq, tMacroNs, vMax, jMax] + V_eff[N] + J_eff[N]` Float64 frame.
- *     Still exported, kept as-is for v0.1.x byte-compat. Slated for removal
- *     no earlier than 2.0. New code should prefer `Bridge` +
- *     `physicsControlFrameSchema(n)`.
+ * The 0.9.0 release removed three legacy surfaces (`Float64RingBuffer`, the
+ * `legacyPhysicsControlFrameSchema(n)` byte-twin, and the
+ * `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm). If you need any
+ * of those, pin `webgpu-audio-bridge@0.8.x` — see CHANGELOG `[0.9.0]` for
+ * the migration guide.
  *
  * See README.md for the architectural pattern and use cases.
  */
@@ -190,41 +190,5 @@ export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "./trajectory.js";
 
 // Canonical schemas — see src/schemas/physics.ts.
-//
-// The `legacyPhysicsControlFrameSchema` re-export is deprecated and will be
-// removed at 0.9.0 (the pre-1.0 breaking cut). New code should import
-// `physicsControlFrameSchema` only. The deprecation tag rides on the
-// definition in `src/schemas/physics.ts`; this re-export inherits it.
-export {
-  physicsControlFrameSchema,
-  /** @deprecated 0.8.11 — removed at 0.9.0. See `src/schemas/physics.ts`. */
-  legacyPhysicsControlFrameSchema,
-} from "./schemas/physics.js";
-export type {
-  PhysicsControlFrameSchema,
-  /** @deprecated 0.8.11 — removed at 0.9.0. */
-  LegacyPhysicsControlFrameSchema,
-} from "./schemas/physics.js";
-
-// ── Legacy (deprecated): Float64RingBuffer ─────────────────────────────────
-//
-// **Scheduled for removal at 0.9.0** (the pre-1.0 breaking cut). The
-// `@deprecated` tag rides on the class definition in
-// `src/Float64RingBuffer.ts`; the runtime backstop warning fires once per
-// process from the constructor. Pin `webgpu-audio-bridge@0.8.x` (or the
-// v0.1.1 npm tarball for the original surface) if you cannot migrate
-// before 0.9.0.
-
-/**
- * @deprecated 0.3.0 — replaced by `Bridge<Schema>` with
- * `physicsControlFrameSchema(n)`. The legacy class is preserved unchanged
- * for v0.1.x byte-compat and is **scheduled for removal at 0.9.0** (the
- * pre-1.0 breaking cut). See `src/Float64RingBuffer.ts` for the full
- * deprecation note + migration path.
- */
-export {
-  Float64RingBuffer,
-  RING_FRAME_PRELUDE,
-  type RingFrameHeader,
-  type RingAllocation,
-} from "./Float64RingBuffer.js";
+export { physicsControlFrameSchema } from "./schemas/physics.js";
+export type { PhysicsControlFrameSchema } from "./schemas/physics.js";

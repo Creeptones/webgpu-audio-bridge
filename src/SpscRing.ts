@@ -207,20 +207,21 @@
  *
  * ─── Schema-dispatch overhead ─────────────────────────────────────────────
  *
- * Compared to the hand-rolled Float64RingBuffer code path, SpscRing<S>
- * pays a small dispatch cost on the hot path: a per-scalar-field closure
- * call (each closure captures one umbrella view + one offset + one stride
- * + the field name). Closures are precomputed at construction; the call
+ * Compared to a hand-rolled single-shape code path, SpscRing<S> pays a
+ * small dispatch cost on the hot path: a per-scalar-field closure call
+ * (each closure captures one umbrella view + one offset + one stride +
+ * the field name). Closures are precomputed at construction; the call
  * site is an indexed-loop over a small array of writer closures. For
  * typical schemas (5-10 scalars + a handful of arrays) the overhead is
  * ~50-150ns/op on top of the ~1.1μs Atomics.notify-dominated baseline.
  *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
- * Same lineage as Float64RingBuffer — Paul Adenot's `ringbuf.js` (2018) is
- * the canonical SPSC-over-SAB technique that this library extends. See
- * src/Float64RingBuffer.ts for full attribution and the README's
- * Acknowledgments.
+ * Paul Adenot's `ringbuf.js` (2018) is the canonical SPSC-over-SAB
+ * technique that this library extends. See README §Acknowledgments for
+ * the full lineage. (Earlier releases had a hand-rolled `Float64RingBuffer`
+ * class that hosted the in-source attribution; that file was removed at
+ * 0.9.0 — the attribution lives in the README now.)
  */
 
 import {

@@ -17,8 +17,8 @@ export const N = 4;            // 4 harmonic frequencies in the demo
 export const CAPACITY = 16;    // 16 slots at 60Hz = ~266ms of buffered macro state
 
 /**
- * The canonical physics control frame. u64 seq/tMacroNs (not byte-compatible
- * with v0.1.x Float64RingBuffer — see legacyPhysicsControlFrameSchema for that).
+ * The canonical physics control frame. u64 seq/tMacroNs (BigInt) for proper
+ * 64-bit semantics — no `≤ 2^53` precision caveat.
  */
 export function makeSchema(n = N) {
   return defineSchema({

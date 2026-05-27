@@ -215,11 +215,11 @@ const WEBNN_UNAVAILABLE_MESSAGE =
   "test code that needs the fallback path without a WebNN runtime.";
 
 /** Module-global one-shot guard for the experimental-status runtime warning.
- *  Mirrors the pattern used by `Float64RingBuffer` (0.8.11): warn at most
- *  once per process load so an app that constructs multiple sources doesn't
- *  drown stderr; the `@experimental` JSDoc provides the IDE-time signal and
- *  this warn is the runtime backstop for anyone who imported via a
- *  non-typed path. Added 0.8.12 (pre-1.0 cohort, WebNN warning sharpening). */
+ *  Warn at most once per process load so an app that constructs multiple
+ *  sources doesn't drown stderr; the `@experimental` JSDoc provides the
+ *  IDE-time signal and this warn is the runtime backstop for anyone who
+ *  imported via a non-typed path. Added 0.8.12 (pre-1.0 cohort, WebNN
+ *  warning sharpening). */
 let _bridgeWebNNSourceExperimentalWarned = false;
 
 /**

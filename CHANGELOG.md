@@ -4,6 +4,355 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.0] — 2026-05-27
+
+### Removed — three legacy surfaces (pre-1.0 cohort 4/N, the breaking cut)
+
+**This is a breaking release.** Three public surfaces deprecated through
+0.8.x are now deleted. The 0.9.0 → 1.0.0 patch lifetime begins from this
+slimmer surface — see `ROADMAP.md` for the 0.9.x soak plan.
+
+The three removals, in order of likely impact:
+
+1. **`Float64RingBuffer`** (the v0.1.x hard-coded class). Removed from
+   `src/Float64RingBuffer.ts` (file deleted, ~436 LOC). The
+   `RING_FRAME_PRELUDE` named export, the `RingFrameHeader` type, and the
+   `RingAllocation` type go with it.
+2. **`legacyPhysicsControlFrameSchema(n)`** (the all-f64 byte-twin to
+   `Float64RingBuffer`). Removed from `src/schemas/physics.ts`. The
+   companion `LegacyPhysicsControlFrameSchema` type alias is removed too.
+3. **`BridgeBlockConsumer` `underflowPolicy: 'throw'`**. The `'throw'`
+   value is removed from the `BlockUnderflowPolicy` union; the matching
+   branch in `_handleUnderflow` is deleted; the `BlockUnderflowPolicy`
+   type is now `'zero-fill' | 'hold-last'`.
+
+The migration paths for each are documented below in long form. There is
+no `0.9.0` deprecation soak — that soak was 0.8.11 (with `console.warn`
+on every construction) and 0.8.12 (continued warnings; WebNN warning
+sharpened). If you have not migrated by now, **pin
+`webgpu-audio-bridge@0.8.x`** while you do. The v0.1.1 npm tarball and
+[Zenodo DOI](https://doi.org/10.5281/zenodo.20382407) remain available for
+anyone who specifically wants the original single-file `Float64RingBuffer`
+form.
+
+### Migration
+
+#### 1. `Float64RingBuffer` → `Bridge<Schema>`
+
+Before (0.8.x, deprecated):
+
+```ts
+import { Float64RingBuffer, type RingFrameHeader } from "webgpu-audio-bridge";
+
+const { sab } = Float64RingBuffer.allocate(16, 1000);
+const ring = new Float64RingBuffer(sab, 16, 1000);
+
+// Producer:
+const header: RingFrameHeader = { seq: 0, tMacroNs: 0, vMax: 0, jMax: 0 };
+const vEff = new Float64Array(1000);
+const jEff = new Float64Array(1000);
+// (fill vEff, jEff)
+ring.push(vEff, jEff, header);
+
+// Consumer:
+const outV = new Float64Array(1000);
+const outJ = new Float64Array(1000);
+const outHeader: RingFrameHeader = { seq: 0, tMacroNs: 0, vMax: 0, jMax: 0 };
+ring.pull(outV, outJ, outHeader);
+```
+
+After (0.9.0+):
+
+```ts
+import { Bridge, physicsControlFrameSchema } from "webgpu-audio-bridge";
+
+const schema = physicsControlFrameSchema(1000);
+const { sab } = Bridge.allocate(16, schema);
+const ring = new Bridge(sab, 16, schema);
+
+// Producer:
+const scratch = ring.scratchFrame();
+scratch.seq = 1n;                  // u64 → bigint literal
+scratch.tMacroNs = 0n;
+scratch.vMax = 0;
+scratch.jMax = 0;
+// (fill scratch.vEff, scratch.jEff in place)
+ring.push(scratch);
+
+// Consumer:
+const out = ring.scratchFrame();
+ring.pull(out);
+// out.seq, out.tMacroNs, out.vMax, out.jMax, out.vEff, out.jEff
+```
+
+Three differences to notice:
+
+- `physicsControlFrameSchema(n)` types `seq` and `tMacroNs` as **`u64`
+  (`bigint`)** instead of `f64` (`number`). Producers write `1n`, not
+  `1`; consumers read a `bigint`.
+- Push takes **one argument** — a frame object with named fields —
+  instead of three positional args (vEff, jEff, header).
+- `ring.scratchFrame()` allocates the reusable frame once; both push and
+  pull mutate it in place.
+
+If your producer specifically needs the all-f64 wire layout (e.g. for
+sub-microsecond fractional `tMacroNs` precision; the e2e-latency bench
+in this repo is the canonical example), declare it inline:
+
+```ts
+import { defineSchema, f64, f64Array, Bridge } from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq:      f64(),
+  tMacroNs: f64(),
+  vMax:     f64(),
+  jMax:     f64(),
+  vEff:     f64Array(n),
+  jEff:     f64Array(n),
+});
+const { sab } = Bridge.allocate(capacity, schema);
+const ring = new Bridge(sab, capacity, schema);
+```
+
+The resulting SAB bytes are bit-identical to what
+`legacyPhysicsControlFrameSchema(n)` produced — same field order, same
+types, same per-field byte offsets.
+
+#### 2. `legacyPhysicsControlFrameSchema(n)` → inline `defineSchema`
+
+See the inline-schema example immediately above. Concrete migration:
+
+```ts
+// Before (0.8.x):
+import { Bridge, legacyPhysicsControlFrameSchema } from "webgpu-audio-bridge";
+const schema = legacyPhysicsControlFrameSchema(n);
+
+// After (0.9.0+):
+import { Bridge, defineSchema, f64, f64Array } from "webgpu-audio-bridge";
+const schema = defineSchema({
+  seq:      f64(),
+  tMacroNs: f64(),
+  vMax:     f64(),
+  jMax:     f64(),
+  vEff:     f64Array(n),
+  jEff:     f64Array(n),
+});
+```
+
+The `LegacyPhysicsControlFrameSchema` type alias goes with the function;
+the inline form's type is `ReturnType<typeof yourFactory>` if you want
+to name it. For most callers the schema is constructed once and the
+inferred `Bridge<S>` type carries through, so the named alias is
+unnecessary.
+
+#### 3. `BridgeBlockConsumer` `underflowPolicy: 'throw'` → caller-side wrapper
+
+Before (0.8.x, deprecated):
+
+```ts
+const consumer = new BridgeBlockConsumer(bridge, { underflowPolicy: "throw" });
+consumer.process(out);  // throws Error on ring-empty
+```
+
+After (0.9.0+):
+
+```ts
+const consumer = new BridgeBlockConsumer(bridge);  // default 'zero-fill'
+// Strict-fail-on-underflow caller-side wrapper:
+const before = consumer.underflowSamples();
+consumer.process(out);
+if (consumer.underflowSamples() > before) {
+  throw new Error("ring underflow");
+}
+```
+
+The wrapper preserves the strict-fail semantic for tests but moves the
+throw out of `AudioWorklet.process()` — where an unhandled throw
+permanently terminates the processor (bug-shaped for a production
+policy). For production worklets, `'zero-fill'` (default) matches the
+AudioWorklet `return true and emit silence` idiom and never throws; the
+`underflowSamples()` counter is still available for telemetry.
+
+The full migration in this repo's tests:
+`tests/BridgeBlockConsumer.test.ts` pin 8 was renamed from
+`underflow 'throw'` to `strict-on-underflow caller-side wrapper`. The
+new pin asserts the same observable behavior (caller sees a throw on
+ring-empty) without selecting a policy on the consumer.
+
+### Why
+
+The pre-1.0 audit identified three surfaces that should not survive into
+the 1.0 stability contract:
+
+1. **`Float64RingBuffer`** predates the schema DSL by two minor versions
+   (0.1.x → 0.3.0). New code has used `Bridge<Schema>` since 0.3.0;
+   carrying the legacy class forever inflates the 1.0 API surface, ties
+   the byte format to the v0.1.x shape forever, and forces every
+   internal refactor to keep both call-sites compiling. The class is also
+   the largest single source file in the repo (~436 LOC) and its
+   `Atomics.notify` / park-wake protocol commentary was the canonical
+   "Park / wake protocol" + "Wall-clock vs CPU-shape tradeoff"
+   reference for the entire codebase — that documentation now lives in
+   `src/SpscRing.ts` (the production primitive).
+2. **`legacyPhysicsControlFrameSchema`** exists *only* as the
+   `Float64RingBuffer` byte-twin via `Bridge<Schema>`. With
+   `Float64RingBuffer` gone there is no remaining motivation to ship an
+   f64-via-Number schema variant in the canonical API — the all-f64 wire
+   layout is a niche need (sub-µs fractional timestamps) that's better
+   expressed inline at the call site.
+3. **`BridgeBlockConsumer` `underflowPolicy: 'throw'`** is a footgun: an
+   unhandled throw from `AudioWorklet.process()` permanently terminates
+   the processor. The arm exists in case tests want a
+   strict-fail-on-underflow signal, but a `'zero-fill'` + post-call
+   `underflowSamples()` check does the same thing without the
+   production-time hazard.
+
+Per the cohort plan all three have zero known consumers (the survey ran
+0.6.0 → 0.8.0). The 0.8.11 → 0.8.12 cohort emitted runtime
+`console.warn`s from each surface as a final heads-up; 0.9.0 is the
+removal.
+
+### Wire compatibility
+
+**Wire-compatible.** No SAB byte layout change, no schema-DSL extension,
+no protocol change. `Bridge<S>` peers continue to interoperate
+bit-identically across the 0.8.12 ↔ 0.9.0 boundary as long as both sides
+use the surviving APIs (`physicsControlFrameSchema(n)` or any schema
+defined via `defineSchema`). The removal is purely a public-API surface
+prune; the runtime behavior of every remaining symbol is unchanged.
+
+A 0.8.12 producer feeding a `physicsControlFrameSchema(n)` schema
+through `Bridge.push` is bit-identical to a 0.9.0 producer doing the
+same. A 0.8.12 producer using `legacyPhysicsControlFrameSchema(n)` is
+bit-identical to a 0.9.0 producer using the inline `defineSchema(...)`
+form documented above.
+
+### Tests
+
+20 suites green (down from 21: `Float64RingBuffer.test.ts` and
+`Float64RingBuffer.concurrent.test.ts` deleted; `BridgeBlockConsumer.test.ts`
+pin 8 migrated to the caller-side wrapper pattern; new
+`typecheck-deprecations.test.ts` added with four `@ts-expect-error` pins
+catching accidental re-introduction of the removed surfaces).
+
+The 1M-frame `Bridge.concurrent.test.ts` cross-thread SPSC stress pin
+remains green; the WASM equivalence suite remains green. No protocol
+regressions from the removal.
+
+The new typecheck-deprecations pins fire at TypeScript-compile time:
+each `@ts-expect-error` directive lives on an access of a removed symbol
+or literal. If a future patch accidentally re-introduces any of them
+(re-exporting `Float64RingBuffer`, re-adding `'throw'` to
+`BlockUnderflowPolicy`, etc.), the corresponding directive becomes
+unused and `tsc --noEmit` fails loudly. This is the "no accidental
+walkback" pin for the 0.9.x soak.
+
+### Bench
+
+`bench/Bridge.bench.ts` push / pull / pullLatest medians unchanged at
+~1.20 μs (N=1000). The `Float64RingBuffer.bench.ts` companion is
+deleted; the schema-dispatch overhead — formerly the headline comparison
+cell — is now an absolute number against the memcpy baseline.
+
+`bench/e2e-latency/` migrated from `legacyPhysicsControlFrameSchema(n)`
+to an inline `defineSchema(...)` with the same all-f64 layout. Bench
+wire format preserved (sub-µs fractional `tMacroNs` precision intact);
+no calibration-baseline drift.
+
+### Documentation
+
+- `README.md` — §Legacy API section removed entirely. The
+  `'throw'` row in the underflow-policy table replaced by an
+  "Pre-0.9.0" callout pointing at the caller-side wrapper. The canonical
+  schemas section dropped the `legacyPhysicsControlFrameSchema(n)` row;
+  the all-f64 wire layout is documented as an inline-`defineSchema`
+  recipe in the same place. Two file-link references in the Performance
+  / Back-pressure sections pointed at `src/Float64RingBuffer.ts`;
+  rewritten to point at `src/SpscRing.ts` (where the canonical
+  Park/wake + Wall-clock-vs-CPU-shape commentary lives post-extract).
+  Top-of-file Legacy callout reworded to past tense.
+- `src/Bridge.ts` — file-header "Generalization of Float64RingBuffer"
+  paragraph reworded to past tense (the class is gone; the
+  generalization framing is now historical context, not a live
+  reference). Attribution section reworded to point at the README's
+  Acknowledgments section as the home for the full lineage.
+- `src/SpscRing.ts` — Schema-dispatch overhead section reworded to drop
+  the "compared to Float64RingBuffer" framing; Attribution section
+  reworded to drop the `see src/Float64RingBuffer.ts for full
+  attribution` line.
+- `src/index.ts` — public-API tour reworded from "Three public surfaces"
+  to "Two public surfaces"; the legacy paragraph replaced by a "0.9.0
+  removed three legacy surfaces" callout with the pin path. Both legacy
+  re-export blocks (`legacyPhysicsControlFrameSchema` + `Float64RingBuffer`)
+  removed.
+- `src/schemas/physics.ts` — file-header rewritten to describe one
+  canonical schema. Migration footnote points at the
+  `defineSchema(...)` inline pattern for the all-f64 niche.
+- `src/BridgeBlockConsumer.ts` — file-header "Underflow policy" section
+  rewritten to two arms; a migration footnote describes the caller-side
+  wrapper pattern. `BlockUnderflowPolicy` JSDoc + `BridgeBlockConsumerOptions`
+  field JSDoc lose the deprecation language.
+- `MIGRATION.md` — top-of-file callout added for 0.9.0+ readers,
+  explaining the doc remains the canonical migration path but the
+  `Float64RingBuffer` imports below require pinning `0.8.x` to test.
+- `bench/Bridge.bench.ts` — file-header reworded to describe the
+  microbench in its own right rather than as a companion to the deleted
+  `Float64RingBuffer.bench.ts`.
+- `bench/e2e-latency/schema.js` + `worklet.js` — migrated to inline
+  `defineSchema(...)` (above); comments updated.
+- `examples/minimal/schema.js` — `Float64RingBuffer` callout in the
+  schema's docstring removed.
+- `tests/Bridge.concurrent.test.ts` — "Same reason as
+  Float64RingBuffer.concurrent.test.ts" header note reworded (the
+  sibling file is gone).
+- `ROADMAP.md` — 0.9.0 row promoted; cohort header advanced.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+Deletions:
+
+- `src/Float64RingBuffer.ts` (entire file, ~436 LOC).
+- `tests/Float64RingBuffer.test.ts` (411 LOC).
+- `tests/Float64RingBuffer.concurrent.test.ts` (599 LOC).
+- `bench/Float64RingBuffer.bench.ts` (221 LOC).
+
+Edits:
+
+- `src/schemas/physics.ts` — strip `legacyPhysicsControlFrameSchema` +
+  `LegacyPhysicsControlFrameSchema`; rewrite file header.
+- `src/BridgeBlockConsumer.ts` — strip `'throw'` from `BlockUnderflowPolicy`;
+  drop the warn flag + constructor branch + `_handleUnderflow` branch;
+  rewrite file header section and JSDocs.
+- `src/index.ts` — strip both legacy re-export blocks; rewrite the
+  public-API tour.
+- `src/Bridge.ts` — file-header + Attribution section reword.
+- `src/SpscRing.ts` — Schema-dispatch overhead + Attribution section reword.
+- `src/experimental/BridgeWebNNSource.ts` — module-private guard comment
+  reword (the prior comment cross-referenced the 0.8.11 `Float64RingBuffer`
+  pattern; the new comment stands on its own).
+- `bench/Bridge.bench.ts` — file header + acceptance-gate comment reword.
+- `bench/e2e-latency/schema.js` — migrate to inline `defineSchema(...)`.
+- `bench/e2e-latency/worklet.js` — comment reword.
+- `examples/minimal/schema.js` — docstring reword.
+- `tests/Bridge.concurrent.test.ts` — file-header note reword.
+- `tests/BridgeBlockConsumer.test.ts` — migrate pin 8 (`'throw'` →
+  caller-side wrapper); drop `'throw'` from pin 13's `policies` array.
+- `package.json` — drop the legacy entries from `test` / `test:unit` /
+  `test:concurrent` / `bench` scripts; add `tests/typecheck-deprecations.test.ts`
+  to `test` + `test:unit`; version `0.8.12` → `0.9.0`.
+- `README.md` — §Legacy API removed; underflow table + canonical schemas
+  reworked; two file-link references rewritten to point at SpscRing;
+  top-of-file callout reworded.
+- `MIGRATION.md` — 0.9.0+ top-of-file callout added.
+- `ROADMAP.md` — 0.9.0 row promoted; cohort header advanced.
+- `CHANGELOG.md` — this entry.
+
+Additions:
+
+- `tests/typecheck-deprecations.test.ts` — four `@ts-expect-error`
+  pins catching accidental re-introduction of the removed surfaces.
+
 ## [0.8.12] — 2026-05-27
 
 ### Added — `BridgeWebNNSource` experimental-status warning sharpening (pre-1.0 cohort 3/N)

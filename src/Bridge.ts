@@ -1,10 +1,12 @@
 /**
  * Bridge<Schema> — schema-driven lock-free SPSC SAB ring.
  *
- * Generalization of Float64RingBuffer. The ring protocol, memory ordering,
- * and park/wake semantics are identical — only the payload codec is now
- * driven by a user-supplied `Schema` (see ./schema.ts) instead of the
- * hard-coded `[seq, tMacroNs, vMax, jMax] + V_eff[N] + J_eff[N]` frame.
+ * Generalization of the project's original hard-coded
+ * `[seq, tMacroNs, vMax, jMax] + V_eff[N] + J_eff[N]` Float64 frame (the
+ * v0.1.x `Float64RingBuffer` class; removed at 0.9.0). The ring protocol,
+ * memory ordering, and park/wake semantics are identical — only the
+ * payload codec is now driven by a user-supplied `Schema` (see
+ * ./schema.ts).
  *
  * ─── 0.6.8 / 0.6.9 architecture note ─────────────────────────────────────
  *
@@ -234,8 +236,11 @@
  *
  * ─── Attribution ─────────────────────────────────────────────────────────
  *
- * Same lineage as Float64RingBuffer — Paul Adenot's `ringbuf.js` (2018) is
- * the canonical SPSC-over-SAB technique that this library extends.
+ * Paul Adenot's `ringbuf.js` (2018) is the canonical SPSC-over-SAB
+ * technique that this library extends. The original v0.1.x
+ * `Float64RingBuffer` class (removed at 0.9.0) was a direct adaptation;
+ * Bridge<S> generalizes the codec while preserving the same protocol
+ * shape. See README §Acknowledgments for the full lineage.
  */
 
 import {

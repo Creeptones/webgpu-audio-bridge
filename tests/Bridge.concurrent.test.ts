@@ -64,8 +64,8 @@
  *
  * ─── Why the producer source is inlined (eval: true) ──────────────────────
  *
- * Same reason as Float64RingBuffer.concurrent.test.ts: the test runs under
- * `tsx`, which doesn't trivially propagate its loader to worker_threads. The
+ * The test runs under `tsx`, which doesn't trivially propagate its loader
+ * to worker_threads. The
  * worker uses `new Worker(PRODUCER_SOURCE, { eval: true })` and receives the
  * schema layout (as JSON via `describeLayout()`) through workerData. The
  * inline producer reconstructs typed-array views over the SAB at the right

@@ -37,7 +37,7 @@
  * ─── Underflow policy ────────────────────────────────────────────────────
  *
  * When the consumer is asked to produce N samples but the ring is empty
- * mid-call, three behaviors are configurable at construction:
+ * mid-call, two behaviors are configurable at construction:
  *
  *   'zero-fill' (default) — write zeros for the unfilled tail. Matches the
  *      AudioWorklet's standard "return true and emit silence" contract; the
@@ -48,20 +48,18 @@
  *      the cost of a flat-line artifact under prolonged underflow. On the
  *      very first call (no samples produced yet) `hold-last` repeats zero.
  *
- *   'throw' — **DEPRECATED at 0.8.11, removed at 0.9.0.** Throws a
- *      descriptive Error from the offending `process()` call. Useful in
- *      tests and as a strict signal during development. Production
- *      worklets should never have selected this; an unhandled throw from
- *      `process()` permanently terminates the AudioWorkletProcessor —
- *      bug-shaped semantics for a "production" policy choice. Tests that
- *      want strict-fail-on-underflow should pull frames directly via
- *      `bridge.pull` (or wrap `BridgeBlockConsumer` in a callback that
- *      checks `underflowSamples()` and throws on rise) rather than rely
- *      on this arm.
- *
  * Underflow events accumulate on `underflowSamples()` regardless of policy
  * for telemetry / diagnostics. Use `framesConsumed()` for the symmetric
  * "frames successfully pulled" counter.
+ *
+ * Note for callers porting from pre-0.9.0: the third policy `'throw'`
+ * (deprecated at 0.8.11) was removed at 0.9.0. An unhandled throw from
+ * AudioWorklet `process()` permanently terminates the processor — bug-
+ * shaped semantics for a "production" policy choice. Tests that want
+ * strict-fail-on-underflow should construct with `'zero-fill'` and observe
+ * `underflowSamples()` after each `process()` call, throwing from caller
+ * code when the counter advances. See CHANGELOG `[0.9.0]` for the
+ * migration pattern.
  *
  * ─── Cursor + checkout discipline ─────────────────────────────────────────
  *
@@ -110,21 +108,13 @@ import type {
 
 /** Behavior when `process()` asks for more samples than the ring can supply.
  *  See the file header "Underflow policy" section for the audible /
- *  operational tradeoffs of each. The `'throw'` arm is deprecated at
- *  0.8.11 and will be removed at 0.9.0 (the pre-1.0 breaking cut). */
-export type BlockUnderflowPolicy = "zero-fill" | "hold-last" | "throw";
+ *  operational tradeoffs of each. */
+export type BlockUnderflowPolicy = "zero-fill" | "hold-last";
 
 export interface BridgeBlockConsumerOptions {
-  /** How `process()` handles a ring-empty event. Default `'zero-fill'`.
-   *  The `'throw'` value is deprecated and removed at 0.9.0; migrate
-   *  strict-fail-on-underflow tests to a wrapper that observes
-   *  `underflowSamples()` and throws from caller code. */
+  /** How `process()` handles a ring-empty event. Default `'zero-fill'`. */
   readonly underflowPolicy?: BlockUnderflowPolicy;
 }
-
-/** Module-global one-shot guard for the `'throw'` underflow-policy
- *  deprecation warning. */
-let _throwPolicyDeprecationWarned = false;
 
 export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
   /** The bridge whose pull-side this consumer drives. Exposed so callers can
@@ -168,18 +158,6 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
   constructor(bridge: Bridge<S>, opts?: BridgeBlockConsumerOptions) {
     this.bridge = bridge;
     this.underflowPolicy = opts?.underflowPolicy ?? "zero-fill";
-    if (this.underflowPolicy === "throw" && !_throwPolicyDeprecationWarned) {
-      _throwPolicyDeprecationWarned = true;
-      console.warn(
-        "[webgpu-audio-bridge] BridgeBlockConsumer underflowPolicy: 'throw' " +
-        "is deprecated and will be removed at 0.9.0 (the pre-1.0 breaking " +
-        "cut). An unhandled throw from AudioWorklet process() permanently " +
-        "terminates the processor — bug-shaped semantics. For " +
-        "strict-fail-on-underflow tests, observe underflowSamples() and " +
-        "throw from caller code (or use bridge.pull directly). Pin " +
-        "webgpu-audio-bridge@0.8.x if you cannot migrate before 0.9.0.",
-      );
-    }
 
     // ── Schema validation: exactly one f32Array field ─────────────────
     const fields = bridge.schema.compiled.fields;
@@ -301,11 +279,6 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       case "hold-last":
         out.fill(this.holdSample, offset, offset + count);
         return;
-      case "throw":
-        throw new Error(
-          `BridgeBlockConsumer: ring underflow (${count} samples requested ` +
-          `with no frame available); 'throw' policy active.`,
-        );
     }
   }
 }

@@ -4,19 +4,21 @@
  * Standalone tsx script. Run with:
  *   npx tsx bench/Bridge.bench.ts
  *
- * Companion to bench/Float64RingBuffer.bench.ts. Same loop shape, same iter
- * counts, same hard budget — measures the schema-driven path on a schema with
- * the same physical layout as the legacy ring (physicsControlFrameSchema(N))
- * so that "Bridge vs Float64RingBuffer" is an apples-to-apples comparison of
- * the per-field-closure dispatch overhead.
+ * Measures the schema-driven push/pull/pullLatest hot path against the
+ * `physicsControlFrameSchema(N)` canonical layout. The hard ceiling
+ * HARD_BUDGET_NS = 10μs catches catastrophic regressions; the documented
+ * baseline at N=1000 is ~1.20 μs median for push/pull/pullLatest on a
+ * Node 22 dev laptop. The per-op cost is dominated by the SAB memcpy at
+ * large N; the schema dispatch (per-scalar-field closure call) adds
+ * ~50-150ns on top of the ~1.1μs Atomics.notify-dominated baseline for
+ * typical schemas (5-10 scalars + a handful of arrays).
  *
- * The plan budgets ~50-150ns extra per op for the closure dispatch (one
- * scalar writer/reader per scalar field, indexed-loop call), measured against
- * the ~1.1μs Atomics.notify-dominated baseline. The hard ceiling
- * HARD_BUDGET_NS = 10μs catches catastrophic regressions; anything between
- * the Float64RingBuffer median and the ceiling is acceptable for the schema
- * path (users wanting peak perf on the legacy shape still have
- * Float64RingBuffer exported).
+ * (Pre-0.9.0 this file was the companion to a hand-rolled
+ * `bench/Float64RingBuffer.bench.ts` that measured the legacy single-shape
+ * ring. That companion was removed at 0.9.0 alongside the
+ * `Float64RingBuffer` class itself; the schema-dispatch overhead — formerly
+ * the headline comparison cell — is now an absolute number against the
+ * memcpy baseline.)
  *
  * 0.4.0 perf note. The counter representation switched from BigInt64 to Int32
  * wrap (see src/Bridge.ts "Counter representation" section). At N=1000 the
@@ -716,9 +718,9 @@ function main(): void {
   }
   console.log();
 
-  // Per the plan: schema dispatch costs ~50-150ns/op on top of the
-  // Float64RingBuffer baseline. The acceptance gate is the hard budget; the
-  // per-op number is for hardware comparison.
+  // Acceptance gate: hard budget. The per-op number is for hardware
+  // comparison; the schema-dispatch overhead is ~50-150ns/op on top of
+  // the ~1.1μs Atomics.notify-dominated baseline for typical schemas.
   const meds = { push: pushMed, pull: pullMed, pullLatest: pullLatestMed };
   for (const [name, med] of Object.entries(meds)) {
     if (med < HARD_BUDGET_NS) {

@@ -152,7 +152,7 @@ Check `crossOriginIsolated === true` at runtime before constructing a `Bridge<S>
 
 For zero-config local development, `npx webgpu-audio-bridge dev [path] [--port N]` ships a static server with COOP/COEP/CORP headers wired up correctly. Default path is the current directory; default port is 5173. Production hosts: `headers` arrays on Vercel, Netlify, Cloudflare Pages; `add_header` directives on nginx; static server config equivalents elsewhere — the two headers are universal.
 
-The legacy single-file [`Float64RingBuffer`](./src/Float64RingBuffer.ts) is frozen at the v0.1.x byte format and still vendorable as one file (`curl -O https://raw.githubusercontent.com/Creeptones/webgpu-audio-bridge/v0.1.1/src/Float64RingBuffer.ts`); the [v0.1.1 Zenodo tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact for that form. New code should prefer `Bridge<Schema>`.
+The library shipped a legacy single-file `Float64RingBuffer` class through 0.8.x; that surface was removed at 0.9.0. If you need the original hard-coded form (e.g. as a single-file vendor drop) the [v0.1.1 Zenodo tarball](https://doi.org/10.5281/zenodo.20382407) is the canonical citable artifact and `webgpu-audio-bridge@0.8.x` (or [v0.1.1 on npm](https://www.npmjs.com/package/webgpu-audio-bridge/v/0.1.1)) is the canonical pin. See CHANGELOG `[0.9.0]` for the migration guide.
 
 ## Frame layout
 
@@ -383,12 +383,13 @@ Wire-compatible with every other facade — the SAB layout, SPSC counter protoco
 
 ### Canonical schemas
 
-The library ships ready-made schemas for the historical V/J control-rate physics shape:
+The library ships one ready-made schema for the historical V/J control-rate physics shape:
 
-- **`physicsControlFrameSchema(n)`** — recommended for new code. `seq` and `tMacroNs` are `u64` (bigint) for proper 64-bit semantics — no `≤ 2^53` precision caveat. Bytes are NOT compatible with v0.1.x `Float64RingBuffer` (which stores those fields as `f64`-via-`Number`).
-- **`legacyPhysicsControlFrameSchema(n)`** — wire-compatible with v0.1.x `Float64RingBuffer` bytes. All fields stored as `f64`. Use this if you're porting line-by-line from `Float64RingBuffer`, want number-typed `seq`/`tMacroNs` reads, or need fractional sub-microsecond precision in `tMacroNs` (as the latency bench does).
+- **`physicsControlFrameSchema(n)`** — `seq` and `tMacroNs` are `u64` (bigint) for proper 64-bit semantics, no `≤ 2^53` precision caveat.
 
-Both schemas describe the same six fields:
+If you specifically need the all-f64 wire layout (e.g. for sub-microsecond fractional `tMacroNs` precision, as the e2e latency bench does), declare it inline with `defineSchema({ seq: f64(), tMacroNs: f64(), vMax: f64(), jMax: f64(), vEff: f64Array(n), jEff: f64Array(n) })` — the resulting bytes match the pre-0.9.0 `legacyPhysicsControlFrameSchema(n)` (removed at 0.9.0) exactly.
+
+The schema describes six fields:
 
 ```
 seq         monotonic frame counter
@@ -704,25 +705,6 @@ Cache semantics on empty pulls: when `pullLatest` returns -1, `pullEvaluatedLate
 `bridge.resetEvalCache()` invalidates the cache (use on `AudioContext` suspend/resume or producer-epoch changes). Independent of `resetSmoother()` and `resetPll()`.
 
 This is the **second cut** of Pillar 3. The `EvalMode` dispatch (`step` / `alpha` / `trajectory` / `catmull`) and per-quantum batch API are still queued as follow-up patches.
-
-### Legacy API — `Float64RingBuffer`
-
-> **Deprecated 0.3.0; scheduled for removal at 0.9.0** (the pre-1.0 breaking cut, formerly "no earlier than 2.0"). Use `Bridge` + `physicsControlFrameSchema(n)` for new code. Constructing a `Float64RingBuffer` now emits a one-shot `console.warn` per process load — that's the **0.8.11 deprecation-soak**: a final heads-up before the surface is deleted. If you cannot migrate before 0.9.0, **pin `webgpu-audio-bridge@0.8.x`** (or the v0.1.1 npm tarball / [Zenodo DOI](https://doi.org/10.5281/zenodo.20382407) for the original single-file form).
->
-> The same removal-at-0.9.0 schedule applies to `legacyPhysicsControlFrameSchema(n)` and the `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm; all three emit matching one-shot deprecation warnings at 0.8.11.
-
-The original hard-coded API survives unchanged:
-
-```ts
-import { Float64RingBuffer, type RingFrameHeader } from "webgpu-audio-bridge";
-
-const ring = new Float64RingBuffer(sab, /*capacity*/ 16, /*n*/ 1000);
-ring.push(vEff, jEff, { seq, tMacroNs, vMax, jMax });
-ring.pull(outV, outJ, outHeader);
-ring.pullLatest(outV, outJ, outHeader);
-```
-
-The wire bytes match the schema produced by `legacyPhysicsControlFrameSchema(n)`. If you need to migrate incrementally — keep your existing v0.1.x SAB layout, swap to `Bridge<Schema>` — start there.
 
 ## BridgeGPUSource
 
@@ -1118,7 +1100,8 @@ Over-producing fills the ring; under the default `'reject'` policy the surplus p
 |---|---|---|
 | `'zero-fill'` (default) | Write zeros for the unfilled tail. | Production worklets — matches AudioWorklet's "return true and emit silence" idiom. |
 | `'hold-last'` | Repeat the most recently produced sample. | Smoother audible degradation under brief glitches; flat-line under prolonged underflow. |
-| `'throw'` | Throw a descriptive `Error` from `process()`. | Tests / strict development. Never in production — an unhandled throw permanently terminates the AudioWorkletProcessor. |
+
+(Pre-0.9.0 there was a third `'throw'` policy that threw a descriptive `Error` from `process()`. It was removed at 0.9.0 because an unhandled throw from `AudioWorklet.process()` permanently terminates the processor — bug-shaped semantics for a "production" policy choice. For strict-fail-on-underflow tests, construct with `'zero-fill'` and observe `underflowSamples()` after each `process()` call, throwing from caller code when the counter advances.)
 
 ### Worked example
 
@@ -1216,7 +1199,7 @@ Benchmarked on Node 22.17 (Windows 11, dev laptop) at `N=1000`, `CAPACITY=16`, 1
 
 Outliers above the p99 (max values not shown above can reach hundreds of microseconds or low milliseconds) are dominated by V8 GC pauses, not ring-buffer pathology — medians and p99s are the load-bearing numbers.
 
-**0.2.0 added an unconditional `Atomics.notify` to every `push` / `pull` / `pullLatest`** (see [Back-pressure](#back-pressure) below). On Windows + V8 that's ~1 μs / call even when nobody is parked, so the floor moved from ~150–200 ns / op (0.1.x) to ~1.1 μs / op. The cost is the price of correct back-pressure under genuine 2-thread contention — see the "Wall-clock vs CPU-shape tradeoff" section in `src/Float64RingBuffer.ts` for the full rationale. In production it's invisible (435 syscalls/sec for ~0.05 % CPU); on a synthetic 1M-frame stress test it's a ~1.6× wall-clock slowdown, but the same run drops wasted busy-spin iterations by 3 orders of magnitude, which is the axis that actually matters.
+**0.2.0 added an unconditional `Atomics.notify` to every `push` / `pull` / `pullLatest`** (see [Back-pressure](#back-pressure) below). On Windows + V8 that's ~1 μs / call even when nobody is parked, so the floor moved from ~150–200 ns / op (0.1.x) to ~1.1 μs / op. The cost is the price of correct back-pressure under genuine 2-thread contention — see the "Wall-clock vs CPU-shape tradeoff" section in `src/SpscRing.ts` for the full rationale. In production it's invisible (435 syscalls/sec for ~0.05 % CPU); on a synthetic 1M-frame stress test it's a ~1.6× wall-clock slowdown, but the same run drops wasted busy-spin iterations by 3 orders of magnitude, which is the axis that actually matters.
 
 A future variant could drop to `Int32` wrapping indices for lower push/pull overhead (closer to ringbuf.js's reported numbers, though direct comparison isn't apples-to-apples — ringbuf.js measures `Float32` audio-sample-shaped payloads, this library measures `Float64` × 1000-element control-rate frames) at the cost of a phase-bit complication and bounded session length.
 
@@ -1258,7 +1241,7 @@ while (!ring.push(vEff, jEff, header)) {
 
 **Do NOT call `waitForData()` from `AudioWorklet.process()`** — that method is hard-real-time and must never block. AudioWorklets should keep polling via `pullLatest()` and rely on the consumer-side smoothing they already have. `waitForSpace` / `waitForData` are for Workers, the main thread, Node tests, and any non-realtime downstream reader that can afford to block.
 
-Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic, so the load-then-park race is closed: if the peer advances its index between your load and your wait, the wait returns `"not-equal"` immediately rather than parking forever. The matching `Atomics.notify` is **unconditional** on every `push` / `pull` / `pullLatest` — a parked peer is guaranteed to be woken on the next state change. This is deliberately not edge-triggered; an earlier iteration tried "notify only on empty→non-empty / full→non-full" and lost wake-ups under genuine 2-thread contention. See the "Park / wake protocol" section in `src/Float64RingBuffer.ts` for the full story.
+Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic, so the load-then-park race is closed: if the peer advances its index between your load and your wait, the wait returns `"not-equal"` immediately rather than parking forever. The matching `Atomics.notify` is **unconditional** on every `push` / `pull` / `pullLatest` — a parked peer is guaranteed to be woken on the next state change. This is deliberately not edge-triggered; an earlier iteration tried "notify only on empty→non-empty / full→non-full" and lost wake-ups under genuine 2-thread contention. See the "Park / wake protocol" section in `src/SpscRing.ts` for the full story.
 
 ### Overflow policies (0.6.12)
 

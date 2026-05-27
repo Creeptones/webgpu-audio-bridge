@@ -33,7 +33,7 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
     this.capacity = capacity;
     this.mask = BigInt(capacity - 1);
     // Reconstruct umbrella + per-field offsets from the layout description.
-    // The bench uses legacyPhysicsControlFrameSchema (all-f64), so a single
+    // The bench uses an all-f64 schema (see ./schema.js), so a single
     // Float64Array umbrella view covers every field.
     this.indices = new BigInt64Array(sab, 0, 2);
     this.stride8 = layout.frameByteSize / 8;

@@ -24,11 +24,13 @@ versioning policy:
 Treating minor bumps as cheap promotions inflates the version number
 past the actual maturity. Each patch is the checkpoint.
 
-## Currently shipping — the 0.8.x audit cohort
+## Currently shipping — the 0.9.x soak cohort
 
-A hygiene + product-polish pass before the 1.0 question gets serious
-attention. Internal-only slot labels match the ship order, not the
-original plan.
+The 0.8.x audit cohort closed with three pre-1.0 prune patches
+(0.8.10–0.8.12) that documented and deprecated the legacy surfaces, then
+the **0.9.0 breaking cut** that deleted them. The 0.9.x line is the soak
+window: deep patches against the slimmed surface until the 1.0 stability
+question can be answered.
 
 | Slot | Status | Theme |
 |---|---|---|
@@ -44,6 +46,7 @@ original plan.
 | 0.8.10 | ✅ shipped | `interpolationMode` union closed at 1.0 (pre-1.0 prune 1/N) |
 | 0.8.11 | ✅ shipped | Deprecation-soak pass before 0.9.0 cut (pre-1.0 prune 2/N) |
 | 0.8.12 | ✅ shipped | `BridgeWebNNSource` experimental-status warning sharpening (pre-1.0 prune 3/N) |
+| **0.9.0** | ✅ **shipped** | **Breaking cut**: removed `Float64RingBuffer`, `legacyPhysicsControlFrameSchema`, and `underflowPolicy: 'throw'`. Migration guide in CHANGELOG. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
@@ -51,10 +54,12 @@ top-level files, library on npm with a one-command dev server, a
 flagship downstream consumer end-to-end, and a self-contained
 example demo that doubles as a regression harness.
 
-0.8.10 ships out of strict numerical order — 0.8.8 + 0.8.9 are scoped
-externally (consumer migration + demo) and continue in parallel; the
-interpolationMode-union closure had no dependencies on either, so it
-landed first as the smallest pre-1.0-prune patch.
+0.8.10 → 0.8.12 shipped out of strict numerical order — 0.8.8 + 0.8.9
+are scoped externally (consumer migration + demo) and continue in
+parallel; the pre-1.0 prune patches had no dependencies on either, so
+they landed first as the smallest 0.8.x patches still queued. 0.9.0 is
+the minor-bump anchor for the breaking cut; the slimmer surface is the
+substrate for the 0.9.x soak.
 
 ## Reserved slot — 0.8.0 (MessageChannelBridge)
 
@@ -68,12 +73,11 @@ channels, anything non-audio-critical. **Not for audio rate.**
 The minor-bump anchor that ships whenever the wire-format change is
 ready. Timing is flexible relative to 0.8.6–0.8.9.
 
-## Beyond the cohort (speculative, `0.8.13+`)
+## Beyond the cohort (speculative, `0.9.1+`)
 
 Surfaced as a parking lot; none of these is planned in detail yet.
-For the structured path to 1.0 — including the remaining 0.8.x
-patches + the 0.9.0 breaking cut — see the internal pre-1.0 cohort
-plan.
+For the structured path to 1.0 — including the 0.9.x polish patches +
+the soak gate — see the internal pre-1.0 cohort plan.
 
 - **`BridgeReader<S>` / typed consumer view** — the inverse of
   `BridgeGPUSource`. A receiver-side helper that owns the

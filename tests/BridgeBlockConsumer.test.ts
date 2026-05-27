@@ -30,7 +30,12 @@
  *   7. Underflow 'hold-last' — consume one frame fully, then call
  *      process again while ring is empty; assert output is filled with
  *      the last sample value of the consumed frame.
- *   8. Underflow 'throw' — empty ring; process call throws.
+ *   8. Strict-fail-on-underflow caller-side wrapper — empty ring;
+ *      caller observes underflowSamples() delta after process() and throws
+ *      from caller code. This is the 0.9.0 replacement for the removed
+ *      `underflowPolicy: 'throw'` arm; the bug-shaped semantics of throwing
+ *      from inside AudioWorklet process() are eliminated by moving the
+ *      throw to caller code that runs outside the audio thread.
  *   9. Mid-quantum underflow — consume part of a frame, exhaust it,
  *      ring empty for the rest; the consumed portion is real samples
  *      and the rest is zero-filled.
@@ -255,15 +260,28 @@ function testUnderflowHoldLast(): void {
   ok("7. underflow 'hold-last'");
 }
 
-// ── 8. Underflow 'throw' ───────────────────────────────────────────────────
-function testUnderflowThrow(): void {
+// ── 8. Strict-fail-on-underflow caller-side wrapper ───────────────────────
+function testStrictUnderflowWrapper(): void {
+  // Replaces the pre-0.9.0 `underflowPolicy: 'throw'` arm. The wrapper
+  // observes the `underflowSamples()` counter delta after process() and
+  // throws from caller code — same strict-fail signal, without the bug-
+  // shaped semantics of throwing from inside AudioWorklet process().
   const { bridge } = makeBridge();
-  const cons = new BridgeBlockConsumer(bridge, { underflowPolicy: "throw" });
+  const cons = new BridgeBlockConsumer(bridge);
+  const out = new Float32Array(QUANTUM);
   let threw = false;
-  try { cons.process(new Float32Array(QUANTUM)); }
-  catch { threw = true; }
-  assert(threw, "underflow 'throw' policy throws on empty ring");
-  ok("8. underflow 'throw'");
+  try {
+    const before = cons.underflowSamples();
+    cons.process(out);
+    if (cons.underflowSamples() > before) {
+      throw new Error(
+        `BridgeBlockConsumer caller-side strict mode: ring underflow ` +
+        `(${cons.underflowSamples() - before} samples zero-filled).`,
+      );
+    }
+  } catch { threw = true; }
+  assert(threw, "caller-side wrapper detects ring-empty mid-process");
+  ok("8. strict-on-underflow caller-side wrapper");
 }
 
 // ── 9. Mid-quantum underflow (partial real + zero-fill tail) ──────────────
@@ -357,7 +375,7 @@ function testBounds(): void {
 // ── 13. Symmetry: matches `underflowPolicy` round-trip on the class ───────
 function testPolicyRoundtrip(): void {
   const { bridge } = makeBridge();
-  const policies: BlockUnderflowPolicy[] = ["zero-fill", "hold-last", "throw"];
+  const policies: BlockUnderflowPolicy[] = ["zero-fill", "hold-last"];
   for (const policy of policies) {
     const cons = new BridgeBlockConsumer(bridge, { underflowPolicy: policy });
     assertEq(cons.underflowPolicy, policy, `policy ${policy} round-trips`);
@@ -373,7 +391,7 @@ function main(): void {
   testMultiFrameSpan();
   testUnderflowZeroFill();
   testUnderflowHoldLast();
-  testUnderflowThrow();
+  testStrictUnderflowWrapper();
   testMidQuantumUnderflow();
   testReset();
   testTelemetry();
