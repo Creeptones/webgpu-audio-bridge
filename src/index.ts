@@ -93,6 +93,21 @@ export type {
   BridgeGPUSourceOptions,
 } from "./BridgeGPUSource.js";
 
+// ── Environment diagnostics (0.7.1) ───────────────────────────────────────
+//
+// Synchronous, frozen snapshot of the host environment relative to the
+// library's two transport tiers — `crossOriginIsolated`, SAB, Atomics,
+// AudioWorklet, WebGPU. Deliberately disjoint from `Bridge<S>.telemetry()`:
+// platform reflection vs ring runtime. See src/environment.ts header for
+// the disjoint-by-design contract.
+
+export { getEnvironmentReport } from "./environment.js";
+export type {
+  EnvironmentReport,
+  EnvironmentFix,
+  EstimatedLatencyFloorMs,
+} from "./environment.js";
+
 export {
   defineSchema,
   describeSchemaLayout,

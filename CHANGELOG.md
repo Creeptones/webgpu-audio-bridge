@@ -4,6 +4,161 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.1] — 2026-05-26
+
+### Added — `getEnvironmentReport()` core
+
+The 0.7.x onboarding cohort's first additive API: a synchronous,
+side-effect-free reflection of `globalThis` that answers "can this
+page run Turbo mode, Standard mode, or neither?" and emits a frozen
+list of actionable fixes for whatever is missing. The function
+lives in a new file `src/environment.ts` and is exported from
+`src/index.ts` under a new `// ── Environment diagnostics (0.7.1) ──`
+section header.
+
+Shape (top-level, frozen):
+
+- `crossOriginIsolated`, `sharedArrayBuffer`, `atomics`,
+  `atomicsWaitAsync`, `audioWorklet`, `audioContext`, `webgpu`,
+  `webMidi`, `userActivation`, `secureContext` — boolean feature
+  flags, one per detected capability.
+- `suggestedMode: 'turbo' | 'standard' | 'unsupported'` — derived
+  deterministically: `turbo` iff `crossOriginIsolated && SAB &&
+  Atomics && audioWorklet`; `standard` iff `audioWorklet && !SAB`;
+  `unsupported` iff `!audioWorklet`.
+- `estimatedLatencyFloorMs: { input, output, total }` — static
+  lookup keyed on `suggestedMode`. Numbers seeded from the README
+  §Honest input → audible breakdown (~1.3 ms quantum-boundary,
+  ~5-8 ms output buffer + DAC). Standard-mode `input` bumps to
+  10 ms to model the MessageChannel hop. Informational, never
+  measured.
+- `fixes: ReadonlyArray<EnvironmentFix>` — frozen array of frozen
+  `{ id, severity: 'blocker' | 'degraded' | 'info', summary,
+  docUrl }` objects. Stable `id` for overlay/CLI keying;
+  `summary` is human-readable; `docUrl` is a README anchor or
+  external spec link. Severity rules: `blocker` reserved for
+  truly-no-transport states; `degraded` for "Turbo unavailable,
+  Standard works"; `info` for non-blocking environmental notes.
+- `userAgent` — raw `navigator.userAgent` string, captured for
+  bug-report copy/paste only. Never parsed; no browser sniffing.
+
+Hard constraints honored in the implementation:
+
+- **Pure reflection.** `typeof globalThis.X`, `'X' in
+  Constructor.prototype`, `nav?.gpu?.requestAdapter`. Never calls
+  `navigator.requestMIDIAccess()` (prompt), never instantiates
+  `new AudioContext()` (resource), never `fetch`es, never sniffs
+  the UA string.
+- **Frozen, JSON-serializable.** `Object.isFrozen(report) ===
+  true`, `Object.isFrozen(report.fixes) === true`, and every
+  nested fix + the `estimatedLatencyFloorMs` object are also
+  frozen. `JSON.parse(JSON.stringify(report))` round-trips
+  cleanly — the 0.7.4 dev-CLI HTTP probe and 0.7.2 overlay
+  widget can transport it as plain JSON.
+- **No platform sniffing.** Feature detection only; no UA
+  regex; `userAgent` field exists for human triage, not branch
+  control.
+- **Disjoint from `Bridge<S>.telemetry()`.** No field-name
+  overlap; no method on either returns the other. Ring runtime
+  vs platform environment — different questions, different
+  lifetimes. Architectural decision #5 from the cohort plan,
+  enforced by file layout (a separate module under
+  `src/environment.ts` with no Bridge dependency) and by review.
+
+### Why
+
+The 0.7.0 framing pivot reframed the library's surface as Turbo
+mode (the canonical primary path) + Standard mode (the explicit
+second tier coming in 0.8.x). The new framing is only useful if
+the library can tell a user **which tier they're in right now,
+and what to fix to get to a better one**. `getEnvironmentReport()`
+is the foundation API that the next four onboarding-cohort
+patches build on:
+
+- 0.7.2 — `mountEnvironmentOverlay()` vanilla DOM widget renders
+  the report inline on the page.
+- 0.7.3 — the shared CLI server core uses it to inject a
+  probe response.
+- 0.7.4 — the `npx webgpu-audio-bridge dev` CLI prints it in the
+  terminal.
+- 0.7.8 — the golden-matrix test patches `globalThis` per
+  browser-support-matrix cell and asserts the emitted
+  `fixes[]` content stays actionable.
+
+The patch is deliberately scoped down to "just the API" — the
+overlay, CLI, and golden-matrix tests are separate patches in
+the cohort, each with their own gate. This keeps each release
+boundary small and reviewable.
+
+### Wire compatibility
+
+- **No SAB changes.** Bit-exact protocol with 0.7.0.
+- **No public-API break.** Every `Bridge<S>` / `BridgeProducer`
+  / `BridgeConsumer` / `BridgeInputLane` / `BridgeGPUSource`
+  method works unchanged. `Bridge.telemetry()` is unchanged.
+- **Additive exports only.** New top-level exports:
+  `getEnvironmentReport`, `EnvironmentReport`,
+  `EnvironmentFix`, `EstimatedLatencyFloorMs`. No removals,
+  no renames.
+- Bench medians unchanged at ~1.30 μs — the new function is
+  off any hot path (it's intended to be called once on page
+  load, never per quantum).
+
+### Tests
+
+New file `tests/environment.test.ts` adds a 12-pin standalone
+tsx-script suite (no test framework, mirrors the
+`tests/BridgeInputLane.test.ts` style):
+
+1. Vanilla / bare-globalThis shape → `unsupported`.
+2. Each prerequisite-present cell flips its matching field
+   (SAB / Atomics / Atomics.waitAsync / AudioContext +
+   audioWorklet on prototype / crossOriginIsolated /
+   isSecureContext / navigator.gpu / navigator.requestMIDIAccess
+   / navigator.userActivation).
+3. All four Turbo prerequisites present → `'turbo'`, latency
+   floor `{ 1.3, 6, 7.3 }`.
+4. `audioWorklet` true + SAB false → `'standard'`, latency
+   floor `{ 10, 6, 16 }`.
+5. `audioWorklet` false short-circuits to `'unsupported'` with
+   a single `missing-audio-worklet` blocker fix (no other
+   fixes muddy the message).
+6. Every fix has a non-empty summary and a parseable docUrl.
+7. Frozen-object invariant: report, fixes array, every fix,
+   and the latency-floor sub-object all `Object.isFrozen`.
+8. Every fix severity ∈ `{'blocker', 'degraded', 'info'}`.
+9. Static latency-floor lookups distinct per mode and ordered
+   `turbo < standard`, `unsupported === 0`.
+10. JSON round-trip: `JSON.parse(JSON.stringify(report))`
+    preserves every field shape.
+11. Pure reflection: installing a throwing
+    `navigator.requestMIDIAccess` and a throwing
+    `AudioContext` constructor proves neither is invoked.
+12. `enable-coop-coep` fix severity downgrade — `'degraded'`
+    in Standard mode, absent altogether when
+    `crossOriginIsolated === true`.
+
+Added to both `npm test` and `npm run test:unit` script
+chains in `package.json`. The full suite (now 9 tsx-script
+suites including the existing 8) runs green; bench unchanged
+at ~1.30 μs medians.
+
+### Documentation
+
+- `src/environment.ts` module header documents the disjoint
+  contract with `Bridge.telemetry()`, the "feature detection
+  only — no UA sniffing, no side effects" stance, and the
+  JSDoc on every exported interface field.
+- `src/index.ts` gets a new `// ── Environment diagnostics
+  (0.7.1) ──` section header with a 6-line preamble.
+- `README.md`'s Roadmap → Shipped gets a new `0.7.1` bullet
+  above the existing `0.7.0` entry.
+- Public README integration (overlay-rendered report, CLI
+  usage examples, browser-support-matrix-as-derived-from-fixes
+  table) is deferred to 0.7.2 / 0.7.4 / 0.7.8 respectively —
+  each patch lands its own README surface so the consumer-facing
+  story stays coherent with the shipped surface.
+
 ## [0.7.0] — 2026-05-26
 
 ### Reframed — Turbo mode / Standard mode (the framing pivot)
