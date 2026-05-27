@@ -136,6 +136,11 @@ interface StagingSlot {
    *  The `then` handler flips `mapped` to true so `pollCompleted` can
    *  pick it up synchronously without blocking. */
   pending: Promise<undefined> | null;
+  /** `performance.now()` (milliseconds, fractional) captured the moment
+   *  `flushPending` started `mapAsync` on this slot. 0 if no mapAsync
+   *  is in flight on the slot. Read by `pollCompleted` to compute the
+   *  cycle duration into `_lastReadbackUs`. (0.7.3) */
+  mapStartedAtMs: number;
 }
 
 /** Constructor options for `BridgeGPUSource`. */
@@ -187,6 +192,15 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  ring was full under `'reject'` policy). */
   private _droppedCount: number = 0;
 
+  /** Wall-time microseconds of the most recent completed mapAsync →
+   *  decode → push cycle (0.7.3). Computed as `(performance.now() -
+   *  slot.mapStartedAtMs) * 1000` at the moment `pollCompleted`
+   *  finishes the slot. Returns 0 if no readback has completed yet.
+   *  Inspector use case: visualise the readback round-trip
+   *  characteristic on the page — `mapAsync` typically lands in
+   *  5-15 ms, dominated by the GPU driver. */
+  private _lastReadbackUs: number = 0;
+
   constructor(
     device: GpuDeviceLike,
     bridge: Bridge<S> | BridgeProducer<S>,
@@ -222,6 +236,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         state: "idle",
         mapped: false,
         pending: null,
+        mapStartedAtMs: 0,
       };
     }
   }
@@ -271,6 +286,12 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (slot.state === "scheduled") {
         slot.state = "in-flight";
         slot.mapped = false;
+        // 0.7.3 — capture the mapAsync start timestamp. `performance.now()`
+        // is available in all the host environments this library targets
+        // (browser main, DedicatedWorker, AudioWorklet, Node). Used by
+        // `pollCompleted` to compute the cycle-duration written to
+        // `_lastReadbackUs`.
+        slot.mapStartedAtMs = performance.now();
         // Capture the promise + arrange a then-handler that flips
         // `mapped` to true. `pollCompleted` then synchronously sees
         // the flag; the user never `await`s on us.
@@ -331,10 +352,20 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         // semantics are active; we just observe the failure here.
         this._droppedCount = (this._droppedCount + 1) | 0;
       }
+      // 0.7.3 — compute the wall-time cycle duration before clearing
+      // the timestamp. `performance.now()` returns fractional
+      // milliseconds; × 1000 produces fractional microseconds. The
+      // last-completion wins; concurrent pollCompleted iterations are
+      // not expected (single-threaded JS), so this is just "most
+      // recently completed slot in this poll".
+      if (slot.mapStartedAtMs > 0) {
+        this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
+      }
       slot.buffer.unmap();
       slot.state = "idle";
       slot.mapped = false;
       slot.pending = null;
+      slot.mapStartedAtMs = 0;
     }
     return count;
   }
@@ -346,6 +377,38 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (this.slots[i]!.state !== "idle") n++;
     }
     return n;
+  }
+
+  /** Naming-parity alias for `inFlight()` (0.7.3). Identical semantics
+   *  — number of staging buffers currently in `scheduled` / `in-flight`
+   *  / `ready` (anything not `idle`). Added as the canonical name for
+   *  the in-page Bridge Inspector pattern that pairs this with
+   *  `Bridge.subscribeTelemetry()`; the original `inFlight()` is
+   *  preserved for back-compat with 0.6.18 callers. */
+  inFlightCount(): number {
+    return this.inFlight();
+  }
+
+  /** Wall-time microseconds of the most recently completed
+   *  mapAsync → decode → push cycle (0.7.3). 0 if no readback has
+   *  completed yet, or after `destroy()`-then-no-further-readbacks.
+   *  Fractional microseconds (the underlying `performance.now()`
+   *  is fractional milliseconds).
+   *
+   *  Inspector use case: render the GPU readback round-trip
+   *  characteristic on-page. Typical Chrome on Windows: 5-15 ms
+   *  (5000-15000 μs); driver and adapter dependent. The number
+   *  surfaces the `mapAsync` cost the README's "What's actually
+   *  faster (and what isn't)" section discusses — workloads
+   *  watching this counter can detect adapter / driver upgrades
+   *  shifting the floor.
+   *
+   *  Implementation: timestamped at `flushPending` start and read
+   *  at `pollCompleted` finish; the difference is the full cycle.
+   *  Heap-only, consumer-thread; not synchronized across
+   *  postMessage. */
+  lastReadbackUs(): number {
+    return this._lastReadbackUs;
   }
 
   /** Cumulative successful readback pushes. */

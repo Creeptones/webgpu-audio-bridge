@@ -860,6 +860,8 @@ The helper exposes simple counters:
 - `source.pushedCount()` — cumulative successful readbacks (decoder ran + bridge push succeeded)
 - `source.droppedCount()` — cumulative drops (decoder skipped because bridge was full at commit time; respects the bridge's `policy`)
 - `source.inFlight()` — staging buffers currently in some non-idle state
+- `source.inFlightCount()` (0.7.3) — naming-parity alias for `inFlight()`. Identical semantics; introduced as the canonical name for the in-page Bridge Inspector pattern that pairs with `Bridge.subscribeTelemetry()`.
+- `source.lastReadbackUs()` (0.7.3) — wall-time microseconds for the most recently completed `mapAsync → decode → push` cycle. `0` before the first completion; fractional μs thereafter. Heap-only; consumer-thread. Inspector use: render the GPU readback round-trip characteristic on-page; typical Chrome on Windows lands in 5-15 ms (5000-15000 μs), driver- and adapter-dependent.
 - `source.capacity()` — total staging buffer count
 
 ### WebGPU type compatibility
@@ -1150,11 +1152,15 @@ The controller targets half-full occupancy with `Kp = 0.5, Ki = 0.05` (~10 ms se
 ```ts
 const t = bridge.telemetry();
 //   t.tornFrames              — cumulative hard-error invariant fallbacks
+//   t.softFrames              — cumulative soft-classified deviations (0.7.3)
+//   t.stallRecoveries         — cumulative PLL outlier-gate recoveries (0.7.3)
 //   t.flowScale               — current Q16.16 hint in [0.5, 2.0]
 //   t.available               — current buffered count
 //   t.capacity                — ring capacity
 //   t.writeIndex / readIndex  — current SPSC counters (mod 2^32)
 //   t.pllLocked / pllOffsetNs — current PLL state
+//   t.pllOutliersRejected     — cumulative single-spike rejects (0.6.14)
+//   t.pllDriftPpm             — drift estimator output (0.6.15; 0 when off)
 //   t.policy                  — backpressure policy (0.6.12)
 //   t.droppedFrames           — cumulative producer drops (0.6.12)
 //   t.pushedFrames            — cumulative successful writes (0.6.13)
@@ -1164,6 +1170,45 @@ const t = bridge.telemetry();
 //   t.lastEmptyWaitNs         — duration of last waitForData that parked (0.6.13)
 //   t.maxOccupancyEverSeen    — high-water mark since construction (0.6.13)
 ```
+
+Field semantics for the 0.7.3 additions:
+
+| Field | Increment trigger | Disjoint from |
+|---|---|---|
+| `softFrames` | Invariant classifier returns `kind: "soft"` on a pull — the deviation lands inside the soft band; the α-smoother absorbs it. Zero on no-invariant schemas. | `tornFrames` (hard-fallback counter) — soft and hard are mutually exclusive classifications. |
+| `stallRecoveries` | PLL outlier gate transitions from "currently rejecting outliers" (`_consecutiveOutliers > 0`) back to clean observation. One increment per recovery event — single-spike streak resumption OR sustained-step admission. | `pllOutliersRejected` (per-observation reject counter) — that's edges-out, this is edges-back. |
+
+### Live telemetry subscription (0.7.3)
+
+Inspector / DevTools / dashboard consumers usually want an rAF-paced telemetry feed, not a manual `setInterval(() => bridge.telemetry(), 16)`. `bridge.subscribeTelemetry(cb, opts)` installs a capped-Hz observer over the existing snapshot:
+
+```ts
+import { Bridge, type TelemetrySnapshot } from "webgpu-audio-bridge";
+
+let lastTorn = 0;
+let lastSoft = 0;
+let lastStall = 0;
+const unsub = bridge.subscribeTelemetry((snap: TelemetrySnapshot) => {
+  if (snap.tornFrames !== lastTorn) inspector.flash('tear');
+  if (snap.softFrames !== lastSoft) inspector.flash('soft');
+  if (snap.stallRecoveries !== lastStall) inspector.flash('stall');
+  lastTorn = snap.tornFrames;
+  lastSoft = snap.softFrames;
+  lastStall = snap.stallRecoveries;
+  inspector.updateOccupancyBar(snap.available / snap.capacity);
+}, { hzCap: 60 });
+
+// In your component unmount / teardown handler:
+unsub();
+```
+
+- **`hzCap`** defaults to `60`. Clamped to `[1, 240]`. Non-finite / out-of-range values are silently clamped (no throw — inspector callers are fire-and-forget).
+- Each `subscribeTelemetry` installs its own `setInterval(cb, 1000 / hz)`. Subscribers are not fanned out from a shared interval — typical inspector pages use one subscription per inspected Bridge, which is cheap.
+- The returned `Unsubscribe` is **idempotent**: calling twice is a no-op. Bridge has no `dispose()` — the subscription survives until the consumer calls the handle or the surrounding execution context (page, Worker) tears down.
+- **Threading**: `setInterval` is available in the browser main thread, DedicatedWorker, SharedWorker, and Node. It is **NOT** legal inside `AudioWorkletGlobalScope.process()`. Call `subscribeTelemetry` from the inspector UI thread, not from a `process()` body.
+- The snapshot delivered to the listener is the same frozen `TelemetrySnapshot` shape `bridge.telemetry()` returns — safe to retain (no aliasing into mutable Bridge state).
+
+Inspector pattern: diff successive snapshots' counters to derive events. `tornFrames` delta = hard fallback fired; `softFrames` delta = soft classification fired; `stallRecoveries` delta = PLL just caught a stall. The bridge itself doesn't surface edge-callbacks across the consumer-thread → inspector-thread boundary (awkward to wire); cumulative counters in the snapshot do the same job and are cross-thread-safe to read via `postMessage`.
 
 Key dashboard-shaped reads:
 
@@ -1285,6 +1330,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.7.3 — Observability hooks for downstream inspectors** — three small wire-compatible additions that turn the bridge from a working primitive into one DevTools / inspector / dashboard consumers can introspect at the cadence they need. (a) `Bridge.subscribeTelemetry(cb, opts?)`: rAF-paced observer over the existing `telemetry()` snapshot (`hzCap` default 60, clamped `[1, 240]`; returns an idempotent `Unsubscribe`). (b) Two new heap-side counters on `TelemetrySnapshot`: `softFrames` (soft-classified invariant deviations — increments inside the classifier's "soft" branch) and `stallRecoveries` (PLL outlier-gate transitions from active back to clean observation — one increment per recovery event, disjoint from per-observation `pllOutliersRejected`). (c) `BridgeGPUSource.inFlightCount()` (naming-parity alias for `inFlight()`) + `lastReadbackUs()` (wall-time microseconds of the most recent `mapAsync → decode` cycle via `performance.now()`). New top-level exports: `TelemetrySnapshot`, `TelemetryListener`, `TelemetryUnsubscribe`, `SubscribeTelemetryOptions`. Motivating consumer: the Wavefunction synth's Bridge Inspector panel. SAB byte layout unchanged from 0.7.2; bench medians unchanged at ~1.20 μs.
 - ✅ **0.7.2 — Drop-oldest race-free by construction** — closes the multi-thread race window documented at 0.6.12 in the protocol itself. The consumer-side `pull` / `pullLatest` paths under `policy === 'drop-oldest'` now run a CAS-commit pattern (`Atomics.compareExchange(read_index, R0, R0 + 1)` for `pull`, `(R0 → writeIdx)` for `pullLatest`'s drain-to-newest) that detects any mid-read producer overrun and retries the whole pull. No torn frame ever reaches the caller. **Pairing with `.withInvariant(...)` is no longer required for drop-oldest correctness** — the invariant lane remains useful for cross-IPC bit-rot detection (separate concern), but the race itself is closed in the protocol. Cost: one extra `Atomics` op per pull on the drop-oldest path (plain index read → `Atomics.load`; plain `Atomics.store` → `compareExchange`); reject / drop-newest / block fast paths are byte-identical to 0.7.1 (V8 constant-folds the construct-time `_needsOverrunAware` branch). New 250k-frame cross-thread stress sub-suite (`tests/Bridge.concurrent.test.ts`) asserts `consumed + dropped === pushed`, every consumed frame bit-exact against the producer's recipe, and `tornFrames === 0` on the no-invariant schema. Bench medians unchanged at ~1.20 μs. SAB byte layout unchanged.
 - ✅ **0.7.1 — `getEnvironmentReport()` core** — synchronous, side-effect-free reflection of `globalThis` answering "can this page run Turbo mode, Standard mode, or neither?" New file `src/environment.ts`; new top-level exports `getEnvironmentReport`, `EnvironmentReport`, `EnvironmentFix`, `EstimatedLatencyFloorMs`. Returns a frozen JSON-serializable snapshot of feature flags (`crossOriginIsolated` / `sharedArrayBuffer` / `Atomics` / `Atomics.waitAsync` / `audioWorklet` / `audioContext` / `webgpu` / `webMidi` / `userActivation` / `secureContext`), a deterministic `suggestedMode ∈ 'turbo' | 'standard' | 'unsupported'`, a static `estimatedLatencyFloorMs: { input, output, total }` lookup keyed on the suggested mode, and a frozen array of actionable `EnvironmentFix` records each with stable `id`, `severity ∈ 'blocker' | 'degraded' | 'info'`, `summary`, and `docUrl`. **Pure reflection** — never calls `requestMIDIAccess`, never instantiates `AudioContext`, never sniffs the UA string. **Disjoint from `Bridge<S>.telemetry()`** (platform environment vs ring runtime; different questions, different lifetimes). The foundation API for the 0.7.2 overlay widget, 0.7.4 dev CLI, and 0.7.8 golden-matrix test. SAB byte layout unchanged from 0.7.0; bench medians unchanged at ~1.30 μs.
 - ✅ **0.7.0 — Framing pivot (Turbo mode / Standard mode)** — the first release of the onboarding cohort. README acquires a §Two transport tiers subsection, a top-level §Browser support matrix table, and an uncompromising "SAB-first; no transparent fallback" stance in §What this is and what it isn't. §Setting up SAB renames to §Enabling Turbo mode. `package.json` description and `CITATION.cff` title rewrite to reflect the two-tier framing. No SAB / public-API / wire-format change — purely a coherent release-moment promotion. Pre-announces `MessageChannelBridge<S>` for 0.8.x. See the CHANGELOG `[0.7.0]` block for the full reframing.

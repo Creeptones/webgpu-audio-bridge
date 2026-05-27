@@ -361,6 +361,35 @@
  *      independent of pullLatest's drain). Validates the
  *      CAS-commit-from-R0-straight-to-W advance pattern matches
  *      the reject-policy semantics on the happy path.
+ *  84. subscribeTelemetry cadence (0.7.3). Subscribe at hzCap=60,
+ *      count callbacks over 200ms, assert within ±2 of expected
+ *      (floor(hz * duration/1000) ≈ 12). Default cadence path.
+ *  85. subscribeTelemetry snapshot shape (0.7.3). Listener receives
+ *      a frozen object with every TelemetrySnapshot field including
+ *      the new 0.7.3 `softFrames` and `stallRecoveries` numeric
+ *      fields. Field identity / type match `bridge.telemetry()`.
+ *  86. subscribeTelemetry unsubscribe (0.7.3). Calling the returned
+ *      handle stops the interval (no further callbacks). Double-call
+ *      is a no-op (no throw, no double-clear).
+ *  87. subscribeTelemetry hzCap clamping (0.7.3). Out-of-range and
+ *      non-finite hzCap values produce a working subscription —
+ *      hzCap = 0 / -5 / 999 / NaN / Infinity all clamp to [1, 240]
+ *      without throwing.
+ *  88. softFrames counter (0.7.3). Increments inside the invariant
+ *      classifier's "soft" branch on raw and smoothed pull paths.
+ *      Does NOT increment on `ok` pulls or hard-fallback pulls.
+ *      Per-instance heap-side; survives independent of `tornFrames`.
+ *  89. stallRecoveries counter (0.7.3). One increment per outlier-
+ *      gate transition from active (rejecting) back to clean
+ *      observation. Verified across both transition paths: single-
+ *      spike → clean resumption AND sustained-step → admission.
+ *      Subsequent clean observations after recovery do NOT
+ *      re-increment.
+ *  90. BridgeGPUSource introspection (0.7.3). `inFlightCount()` is
+ *      identical to `inFlight()` (naming-parity alias).
+ *      `lastReadbackUs()` returns 0 before any cycle completes, then
+ *      a positive fractional microsecond count after a mapAsync →
+ *      decode cycle. Both methods are safe to call after `destroy()`.
  *
  * The single-threaded scope mirrors tests/Float64RingBuffer.test.ts. Real
  * cross-thread memory ordering is covered by tests/Bridge.concurrent.test.ts.
@@ -4982,6 +5011,403 @@ function testDropOldestPullLatestSkippedAccounting(): void {
   ok("drop-oldest-pullLatest-skipped-accounting");
 }
 
+// ── 84. subscribeTelemetry cadence (0.7.3) ───────────────────────────────
+//      Verify the listener fires approximately at the requested Hz.
+//      ±2 of the expected count over 200ms — generous enough to absorb
+//      the setInterval drift V8 introduces on a loaded CI runner.
+async function testSubscribeTelemetryCadence(): Promise<void> {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  let calls = 0;
+  const unsub = bridge.subscribeTelemetry(() => { calls++; }, { hzCap: 60 });
+  await new Promise<void>((r) => setTimeout(r, 200));
+  unsub();
+
+  // Expected ≈ floor(60 * 200/1000) = 12. Allow ±2 — under load V8's
+  // setInterval can drift a tick or two; ±2 is the spec band.
+  const expected = 12;
+  assert(
+    calls >= expected - 2 && calls <= expected + 2,
+    `subscribeTelemetry cadence: expected ~${expected} calls over 200ms at 60Hz, got ${calls}`,
+  );
+
+  ok("subscribe-telemetry-cadence");
+}
+
+// ── 85. subscribeTelemetry snapshot shape (0.7.3) ────────────────────────
+async function testSubscribeTelemetrySnapshotShape(): Promise<void> {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  let received: unknown = null;
+  const unsub = bridge.subscribeTelemetry((snap) => {
+    received = snap;
+  }, { hzCap: 240 }); // tight cadence so the first callback fires fast
+  await new Promise<void>((r) => setTimeout(r, 50));
+  unsub();
+
+  assert(received !== null, "subscribeTelemetry fired at least once");
+  const snap = received as Record<string, unknown>;
+  // Every field that bridge.telemetry() returns must appear on the
+  // delivered snapshot with the right type.
+  const ref = bridge.telemetry();
+  for (const key of Object.keys(ref)) {
+    assert(key in snap, `snapshot has field "${key}"`);
+    assertEq(
+      typeof (snap as Record<string, unknown>)[key],
+      typeof (ref as unknown as Record<string, unknown>)[key],
+      `snapshot field "${key}" type matches`,
+    );
+  }
+  // The two new 0.7.3 fields specifically.
+  assertEq(typeof snap.softFrames, "number", "softFrames is number");
+  assertEq(typeof snap.stallRecoveries, "number", "stallRecoveries is number");
+  assertEq(snap.softFrames, 0, "softFrames initially 0");
+  assertEq(snap.stallRecoveries, 0, "stallRecoveries initially 0");
+  // Frozen contract.
+  assert(Object.isFrozen(snap), "snapshot is frozen");
+
+  ok("subscribe-telemetry-snapshot-shape");
+}
+
+// ── 86. subscribeTelemetry unsubscribe (0.7.3) ───────────────────────────
+async function testSubscribeTelemetryUnsubscribe(): Promise<void> {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  let calls = 0;
+  const unsub = bridge.subscribeTelemetry(() => { calls++; }, { hzCap: 120 });
+  await new Promise<void>((r) => setTimeout(r, 50));
+  const callsBeforeUnsub = calls;
+  assert(callsBeforeUnsub > 0, "got at least one callback before unsub");
+
+  unsub();
+  await new Promise<void>((r) => setTimeout(r, 80));
+  assertEq(
+    calls,
+    callsBeforeUnsub,
+    `no more callbacks after unsub: expected ${callsBeforeUnsub}, got ${calls}`,
+  );
+
+  // Double-unsubscribe is a no-op (must not throw).
+  let threw = false;
+  try {
+    unsub();
+  } catch {
+    threw = true;
+  }
+  assert(!threw, "double-unsubscribe is a no-op (does not throw)");
+
+  ok("subscribe-telemetry-unsubscribe");
+}
+
+// ── 87. subscribeTelemetry hzCap clamping (0.7.3) ────────────────────────
+//      Verify out-of-range / non-finite hzCap values produce a working
+//      subscription (the constructor silently clamps; no throw).
+async function testSubscribeTelemetryHzCapClamping(): Promise<void> {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  // Each variant should produce a working subscription that fires at
+  // least once within a short window. We don't pin the exact cadence
+  // (the clamp lands at 1Hz for some, which would take ~1s; and
+  // Windows Node's setInterval has 4-16ms timer resolution that can
+  // under-deliver vs the theoretical Hz). We only pin "doesn't throw
+  // + produces a working subscription."
+  //
+  // For 1Hz-clamped variants (hzCap = 0, -5) we use a 100ms window
+  // and expect 0 calls (1Hz fires once per second).
+  // For all other variants we use a 100ms window and expect ≥ 1 call.
+  const variants: Array<{ hzCap: unknown; minExpected: number; window: number }> = [
+    { hzCap: 0,        minExpected: 0, window: 100 },   // clamps to 1Hz; ≤ 0 calls
+    { hzCap: -5,       minExpected: 0, window: 100 },   // clamps to 1Hz
+    { hzCap: 999,      minExpected: 1, window: 100 },   // clamps to 240Hz
+    { hzCap: NaN,      minExpected: 1, window: 100 },   // fallback 60Hz
+    { hzCap: Infinity, minExpected: 1, window: 100 },   // clamps to 240Hz
+  ];
+
+  for (const v of variants) {
+    let calls = 0;
+    let threw = false;
+    let unsub = () => { /* no-op placeholder */ };
+    try {
+      // Cast away the type — we're deliberately feeding bad values.
+      unsub = bridge.subscribeTelemetry(() => { calls++; }, {
+        hzCap: v.hzCap as number,
+      });
+    } catch {
+      threw = true;
+    }
+    assert(!threw, `hzCap=${String(v.hzCap)}: subscribeTelemetry must not throw`);
+    await new Promise<void>((r) => setTimeout(r, v.window));
+    unsub();
+    assert(
+      calls >= v.minExpected,
+      `hzCap=${String(v.hzCap)}: expected ≥ ${v.minExpected} calls in ${v.window}ms, got ${calls}`,
+    );
+  }
+
+  ok("subscribe-telemetry-hzCap-clamping");
+}
+
+// ── 88. softFrames counter (0.7.3) ───────────────────────────────────────
+//      Mirrors testInvariantSoftErrorSmoothing (pin #37) which engineers
+//      a mid-soft-band invariant delta. After a soft-classified pull,
+//      softFrames === 1. Subsequent ok pulls and hard pulls leave it
+//      unchanged. The invariant test infrastructure (makeInvariantSchema,
+//      makeInvFrame, emptyInvFrame) is reused.
+function testSoftFramesCounter(): void {
+  const schema = makeInvariantSchema();
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyInvFrame();
+
+  // Initial: 0.
+  assertEq(ring.telemetry().softFrames, 0, "initial softFrames=0");
+
+  // (a) ok pull (no deviation) — softFrames stays at 0.
+  const A = makeInvFrame(1, [1, 2, 3, 4]); // invariant = 30
+  ring.push(A);
+  assertEq(ring.pull(out), true, "seed pull A (ok)");
+  assertEq(ring.telemetry().softFrames, 0, "ok pull doesn't bump softFrames");
+  assertEq(ring.telemetry().tornFrames, 0, "ok pull doesn't bump tornFrames");
+
+  // (b) soft pull — mid-band invariant deviation (mirrors pin #37).
+  const B = makeInvFrame(2, [1, 2, 3, 4]);
+  ring.push(B);
+  const f64View = new Float64Array(sab, RING_HEADER_BYTES, capacity * 6);
+  f64View[7] = 3; // mutation 1 → 3, delta ≈ 0.267 → soft band
+  assertEq(ring.pull(out), true, "soft-error pull");
+  assertEq(ring.telemetry().softFrames, 1, "softFrames=1 after soft pull");
+  assertEq(ring.telemetry().tornFrames, 0, "softFrames does not double-count as tornFrames");
+
+  // (c) hard pull — large deviation triggers fallback. softFrames must
+  // NOT increment; tornFrames increments instead.
+  // Slot layout: per-slot stride = 6 f64 (seq:u64@0, vEff[0..3]@1..4,
+  // __invariant@5). Mutate vEff[0] of slot 2 (frame C): index 2*6+1=13.
+  const C = makeInvFrame(3, [1, 2, 3, 4]);
+  ring.push(C);
+  f64View[2 * 6 + 1] = 100; // huge delta — hard band
+  assertEq(ring.pull(out), true, "hard-error pull");
+  assertEq(ring.telemetry().softFrames, 1, "hard pull doesn't bump softFrames");
+  assertEq(ring.telemetry().tornFrames, 1, "hard pull bumps tornFrames");
+
+  // (d) another soft pull — confirms the counter is monotonic.
+  const D = makeInvFrame(4, [1, 2, 3, 4]);
+  ring.push(D);
+  f64View[3 * 6 + 1] = 3; // mid-band again
+  assertEq(ring.pull(out), true, "second soft-error pull");
+  assertEq(ring.telemetry().softFrames, 2, "softFrames=2 after second soft");
+
+  ok("soft-frames-counter");
+}
+
+// ── 89. stallRecoveries counter (0.7.3) ──────────────────────────────────
+//      Two transition paths verified:
+//        (a) Single-spike streak → clean resumption increments once.
+//        (b) Sustained step admitted increments once.
+//      Subsequent clean observations after the recovery do NOT
+//      re-increment.
+function testStallRecoveriesCounter(): void {
+  const n = 2;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const TRUE_OFFSET_NS = 0;
+  const rng = mulberry32(0xab7c);
+  // Seed + warmup.
+  ring.observeConsumerTime(0, TRUE_OFFSET_NS);
+  let consumerNs = 1_000_000;
+  for (let i = 0; i < 25; i++) {
+    consumerNs += 16_666_667;
+    const jitter = (rng() - 0.5) * 200_000;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + jitter);
+  }
+  assertEq(ring.telemetry().stallRecoveries, 0, "no recoveries during clean warmup");
+
+  // (a) Single 30 ms spike — gate rejects it. _consecutiveOutliers
+  // goes 0 → 1. stallRecoveries unchanged (no transition yet).
+  consumerNs += 16_666_667;
+  ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + 30_000_000);
+  assertEq(ring.telemetry().stallRecoveries, 0, "spike alone: no recovery yet");
+
+  // First clean observation → _consecutiveOutliers 1 → 0. Recovery!
+  consumerNs += 16_666_667;
+  const jitter1 = (rng() - 0.5) * 200_000;
+  ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + jitter1);
+  assertEq(ring.telemetry().stallRecoveries, 1, "clean obs after spike: stallRecoveries=1");
+
+  // (b) MORE clean observations do not re-increment.
+  for (let i = 0; i < 3; i++) {
+    consumerNs += 16_666_667;
+    const j = (rng() - 0.5) * 200_000;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + j);
+  }
+  assertEq(ring.telemetry().stallRecoveries, 1, "subsequent clean obs do not re-bump");
+
+  // (c) Sustained-step path. Inject a series of spikes that exceeds the
+  // consecutiveLimit (default = 3 per ConsumerClockRecovery defaults).
+  // After limit+1 spikes the gate admits the step, _consecutiveOutliers
+  // resets, AND stallRecoveries increments.
+  for (let i = 0; i < 4; i++) {
+    consumerNs += 16_666_667;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + 30_000_000);
+  }
+  assertEq(ring.telemetry().stallRecoveries, 2, "sustained-step admit: stallRecoveries=2");
+
+  // (d) Still monotonic — more clean observations after step admit do
+  // NOT increment (gate has already reset).
+  for (let i = 0; i < 3; i++) {
+    consumerNs += 16_666_667;
+    const j = (rng() - 0.5) * 200_000;
+    ring.observeConsumerTime(consumerNs, consumerNs + TRUE_OFFSET_NS + j);
+  }
+  assertEq(ring.telemetry().stallRecoveries, 2, "post-admit clean obs do not re-bump");
+
+  ok("stall-recoveries-counter");
+}
+
+// ── 90. BridgeGPUSource introspection (0.7.3) ────────────────────────────
+//      Reuses the mock-device pattern from pin #81. The mock device's
+//      `createBuffer` captures every created buffer into a closure-side
+//      `allBuffers` array so the test can drive pendingResolve()
+//      manually. Verifies inFlightCount alias, lastReadbackUs cycle
+//      timing, and post-destroy safety.
+async function testBridgeGpuSourceIntrospection(): Promise<void> {
+  interface MockBuffer extends GpuBufferLike {
+    backing: ArrayBuffer;
+    mapped: boolean;
+    destroyed: boolean;
+    pendingResolve: (() => void) | null;
+  }
+  const allBuffers: MockBuffer[] = [];
+  const mockDevice: GpuDeviceLike = {
+    createBuffer(desc) {
+      const backing = new ArrayBuffer(desc.size);
+      const buf: MockBuffer = {
+        size: desc.size,
+        backing,
+        mapped: false,
+        destroyed: false,
+        pendingResolve: null,
+        mapAsync(_mode) {
+          if (this.destroyed) return Promise.reject(new Error("destroyed"));
+          return new Promise<undefined>((resolve) => {
+            this.pendingResolve = () => {
+              this.mapped = true;
+              resolve(undefined);
+            };
+          });
+        },
+        getMappedRange(offset, size) {
+          assert(this.mapped, `getMappedRange on unmapped buffer`);
+          return this.backing.slice(
+            offset ?? 0,
+            (offset ?? 0) + (size ?? this.backing.byteLength),
+          );
+        },
+        unmap() { this.mapped = false; },
+        destroy() { this.destroyed = true; },
+      };
+      allBuffers.push(buf);
+      return buf;
+    },
+  };
+  const mockEncoder: GpuCommandEncoderLike = {
+    copyBufferToBuffer(_src, _so, dst, _do, _size) {
+      const bytes = new Uint8Array((dst as MockBuffer).backing);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
+    },
+  };
+
+  const schema = defineSchema({ seq: u64(), payload: f64Array(2) });
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+  const decoder = (mappedRange: ArrayBuffer, frame: FrameFor<typeof schema>) => {
+    const view = new DataView(mappedRange);
+    frame.seq = view.getBigUint64(0, true);
+    frame.payload.set(new Float64Array(mappedRange, 8, 2));
+  };
+  const src = new BridgeGPUSource(mockDevice, bridge, decoder, {
+    stagingBufferCount: 3,
+  });
+  // allBuffers[0..2] are the staging buffers from BridgeGPUSource's
+  // constructor. fakeSrcBuffer below will append at allBuffers[3].
+
+  // (a) inFlightCount === inFlight, both 0 initially.
+  assertEq(src.inFlightCount(), 0, "initial inFlightCount=0");
+  assertEq(src.inFlightCount(), src.inFlight(), "inFlightCount alias matches inFlight pre-schedule");
+
+  // (b) lastReadbackUs is 0 before any cycle completes.
+  assertEq(src.lastReadbackUs(), 0, "lastReadbackUs=0 before first cycle");
+
+  // (c) Schedule + flushPending + manually delay 2ms + resolve +
+  // pollCompleted → lastReadbackUs > 0.
+  const fakeSrcBuffer = mockDevice.createBuffer({ size: schema.frameByteSize, usage: 0 });
+  void fakeSrcBuffer;
+  assertEq(src.scheduleReadback(fakeSrcBuffer, mockEncoder), true, "schedule 1");
+  assertEq(src.inFlightCount(), 1, "after schedule: inFlightCount=1");
+  assertEq(src.inFlightCount(), src.inFlight(), "inFlightCount alias matches inFlight post-schedule");
+
+  src.flushPending();
+  // Ensure performance.now() advances measurably before we resolve.
+  await new Promise<void>((r) => setTimeout(r, 3));
+
+  // Resolve the staging buffer's pendingResolve. allBuffers[0] is the
+  // first staging buffer; pin #81 establishes the same indexing.
+  assert(allBuffers[0]!.pendingResolve !== null, "staging buffer 0 has pending mapAsync");
+  allBuffers[0]!.pendingResolve!();
+  // Yield to drain microtasks so the .then handler flips slot.mapped.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const polled = src.pollCompleted();
+  assertEq(polled, 1, "1 readback completed");
+  const us = src.lastReadbackUs();
+  assert(us > 0, `lastReadbackUs > 0 after cycle (got ${us})`);
+  assert(us > 1000, `lastReadbackUs reflects ≥ ~3ms delay (got ${us} μs)`);
+  assertEq(src.inFlightCount(), 0, "after poll: inFlightCount=0");
+
+  // (d) After a second cycle, lastReadbackUs UPDATES to the latest.
+  const usAfterFirst = us;
+  assertEq(src.scheduleReadback(fakeSrcBuffer, mockEncoder), true, "schedule 2");
+  src.flushPending();
+  await new Promise<void>((r) => setTimeout(r, 7));
+  // The second staging slot to fire its mapAsync; find any
+  // pendingResolve still set.
+  for (let i = 0; i < 3; i++) {
+    if (allBuffers[i]!.pendingResolve !== null) {
+      allBuffers[i]!.pendingResolve!();
+      break;
+    }
+  }
+  await Promise.resolve();
+  await Promise.resolve();
+  src.pollCompleted();
+  const us2 = src.lastReadbackUs();
+  assert(us2 > usAfterFirst, `lastReadbackUs updates to latest (was ${usAfterFirst}, now ${us2})`);
+
+  // (e) Safe to call after destroy. lastReadbackUs returns the
+  // last-recorded value; inFlightCount returns 0 (every slot was idle
+  // before destroy; destroy itself doesn't change state).
+  src.destroy();
+  assertEq(src.inFlightCount(), 0, "inFlightCount=0 after destroy (safe to call)");
+  const usAfterDestroy = src.lastReadbackUs();
+  assertEq(usAfterDestroy, us2, "lastReadbackUs unchanged after destroy");
+
+  ok("bridge-gpu-source-introspection");
+}
+
 async function main(): Promise<void> {
   testConstructionValidation();
   testAllocateAndByteLength();
@@ -5067,6 +5493,13 @@ async function main(): Promise<void> {
   await testBridgeGpuSourceOrchestration();
   testDropOldestPullBitExactVsReject();
   testDropOldestPullLatestSkippedAccounting();
+  await testSubscribeTelemetryCadence();
+  await testSubscribeTelemetrySnapshotShape();
+  await testSubscribeTelemetryUnsubscribe();
+  await testSubscribeTelemetryHzCapClamping();
+  testSoftFramesCounter();
+  testStallRecoveriesCounter();
+  await testBridgeGpuSourceIntrospection();
   console.log("\nAll Bridge tests passed.");
 }
 

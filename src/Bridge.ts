@@ -289,6 +289,108 @@ export interface BridgeOptions extends SpscRingOptions {
   readonly publishPllToSab?: boolean;
 }
 
+/**
+ * Snapshot shape returned by `Bridge<S>.telemetry()` and delivered to
+ * listeners registered via `Bridge<S>.subscribeTelemetry()` (0.7.3).
+ *
+ * Every field except `tornFrames` is **per-instance heap-side** — two
+ * peers over the same SAB each see their own counters. `tornFrames` is
+ * the only SAB-backed counter (lane 3) and so is cross-process readable.
+ * For cross-process aggregation of the heap-side fields, post-message
+ * the snapshot across at a sampled cadence (the `subscribeTelemetry`
+ * subscription is the intended hook for that pattern).
+ *
+ * Field stability: new fields may be **added** in patch releases without
+ * breaking consumers (the shape is `readonly` on every field and not
+ * declared `as const`, so additive widening at the source is non-
+ * breaking). Existing fields will not change semantics across 0.x.y.
+ *
+ * Designed disjoint from `getEnvironmentReport()` (0.7.1) — platform
+ * environment vs ring runtime; different questions, different lifetimes.
+ */
+export interface TelemetrySnapshot {
+  /** Cumulative hard-classified invariant fallbacks since SAB
+   *  allocation. SAB lane 3 (cross-process readable via Atomics.load).
+   *  Wraps mod 2^32 like the other Int32 lanes. Zero on schemas with no
+   *  invariant attached. */
+  readonly tornFrames: number;
+  /** Cumulative soft-classified invariant deviations that triggered the
+   *  adaptive α-smoother rather than the hard-fallback path (0.7.3).
+   *  Heap-side, consumer-thread. Increments inside the classifier's
+   *  "soft" branch on both raw and smoothed pull paths. Zero on no-
+   *  invariant schemas. */
+  readonly softFrames: number;
+  /** Cumulative PLL outlier-gate stall recoveries — transitions from
+   *  "currently rejecting outliers" back to clean observation (0.7.3).
+   *  One increment per recovery event (NOT one per normal observation
+   *  after recovery). Heap-side, consumer-thread. */
+  readonly stallRecoveries: number;
+  /** Current consumer→producer adaptive backpressure hint, in
+   *  [0.5, 2.0]. Same value `flowScaleHint()` returns. */
+  readonly flowScale: number;
+  /** Number of frames currently buffered in the ring. */
+  readonly available: number;
+  /** Ring capacity, constant per Bridge instance. */
+  readonly capacity: number;
+  /** Producer counter (Int32, wraps mod 2^32). */
+  readonly writeIndex: number;
+  /** Consumer counter (Int32, wraps mod 2^32). */
+  readonly readIndex: number;
+  /** PLL lock state (0.6.2). */
+  readonly pllLocked: boolean;
+  /** PLL offset estimate, nanoseconds (0.6.2). */
+  readonly pllOffsetNs: number;
+  /** Cumulative single-spike outliers rejected by the Mahalanobis gate
+   *  (0.6.14). Independent of `stallRecoveries` — this is the count of
+   *  rejected observations, not the count of recovery transitions. */
+  readonly pllOutliersRejected: number;
+  /** Drift estimator output, ppm (0.6.15). Zero in offset-only mode
+   *  (the default). */
+  readonly pllDriftPpm: number;
+  /** Active backpressure policy (0.6.12). */
+  readonly policy: BackpressurePolicy;
+  /** Cumulative frames dropped by `'drop-newest'` / `'drop-oldest'`
+   *  overflow handling. Heap-side per-instance (producer-side counter
+   *  on the SpscRing). (0.6.12) */
+  readonly droppedFrames: number;
+  /** Cumulative successful `push` / `commitPush` count (0.6.13). */
+  readonly pushedFrames: number;
+  /** Cumulative successful `pull` / `pullLatest` count (0.6.13). */
+  readonly pulledFrames: number;
+  /** Cumulative `pullLatest`-discarded staleness (0.6.13). */
+  readonly skippedFrames: number;
+  /** Nanoseconds of the most recent producer `waitForSpace` that
+   *  parked (0.6.13). */
+  readonly lastFullWaitNs: number;
+  /** Nanoseconds of the most recent consumer `waitForData` that
+   *  parked (0.6.13). */
+  readonly lastEmptyWaitNs: number;
+  /** High-water mark of buffered count since construction (0.6.13). */
+  readonly maxOccupancyEverSeen: number;
+}
+
+/** Listener callback shape for `subscribeTelemetry` (0.7.3). Receives
+ *  a fresh snapshot per tick; the snapshot is frozen and safe to
+ *  retain (no aliasing into mutable Bridge state). */
+export type TelemetryListener = (snap: TelemetrySnapshot) => void;
+
+/** Returned by `subscribeTelemetry` (0.7.3). Calling it removes the
+ *  listener and stops the underlying interval. Idempotent — calling
+ *  twice is a no-op. */
+export type TelemetryUnsubscribe = () => void;
+
+/** Options for `subscribeTelemetry` (0.7.3). */
+export interface SubscribeTelemetryOptions {
+  /** Listener invocation cadence, Hz. Default `60` (typical rAF cadence
+   *  for an in-page Bridge Inspector chyron). Clamped to `[1, 240]`;
+   *  non-finite / out-of-range values fall back to 60 then clamp.
+   *
+   *  No fan-out from a shared interval: each `subscribeTelemetry` call
+   *  creates its own `setInterval(cb, 1000 / hz)`. Subscribers are
+   *  expected to be cheap — typically one inspector panel per page. */
+  readonly hzCap?: number;
+}
+
 type AnyTypedArray =
   | Float64Array
   | Float32Array
@@ -388,6 +490,20 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    *  `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` for no-invariant schemas, where it
    *  is never read). See file header "Schema invariants" + 0.6.6 CHANGELOG. */
   private readonly invariantAbsoluteEpsilon: number;
+
+  /** Cumulative soft-classified invariant deviations on this Bridge
+   *  instance (0.7.3). Increments inside `_invariantHandleRaw` and
+   *  `_invariantHandleSmoothed` when the classifier returns `kind:
+   *  "soft"`. Wraps mod 2^32 via the `| 0` trick. Surfaced as
+   *  `telemetry().softFrames`. */
+  private _softFrames: number = 0;
+
+  /** Active `setInterval` handles from `subscribeTelemetry` (0.7.3).
+   *  Each subscription owns its own handle; the returned `Unsubscribe`
+   *  removes it from this set and calls `clearInterval`. Stored on
+   *  Bridge (not module-level) so multiple Bridge instances don't
+   *  share state. */
+  private readonly _telemetryIntervals: Set<ReturnType<typeof setInterval>> = new Set();
 
   /** Public, frozen recovery thresholds — exported for tests and callers
    *  that want to pin against the exact boundaries. */
@@ -1084,6 +1200,11 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
     if (kind === "ok") {
       this.smoother.seedFrom(out);
     } else if (kind === "soft") {
+      // 0.7.3: count the soft branch. The smoother absorbs the
+      // within-threshold deviation; the counter lets a Bridge
+      // Inspector visualise "ride-over" events distinctly from
+      // hard fallbacks (tornFrames).
+      this._softFrames = (this._softFrames + 1) | 0;
       this.smoother.observe(out, alpha);
     } else {
       // hard
@@ -1123,6 +1244,14 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       // corrupt data.
       this.smoother.fallbackInto(out);
       return;
+    }
+    if (kind === "soft") {
+      // 0.7.3: count the soft branch on the smoothed path too, so the
+      // counter is unified across pull / pullLatest / pullSmoothed /
+      // pullLatestSmoothed. The smoother itself runs at the user's
+      // requested α below — the soft classification doesn't perturb it
+      // (the smoother is already smoothing).
+      this._softFrames = (this._softFrames + 1) | 0;
     }
     // ok or soft: smoother handles both. Identical to no-invariant path.
     this.smoother.observe(out, alpha);
@@ -1170,28 +1299,12 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
    * consumer activity the values are individually consistent but not
    * mutually atomic. For diagnostic / dashboard use only.
    */
-  telemetry(): {
-    readonly tornFrames: number;
-    readonly flowScale: number;
-    readonly available: number;
-    readonly capacity: number;
-    readonly writeIndex: number;
-    readonly readIndex: number;
-    readonly pllLocked: boolean;
-    readonly pllOffsetNs: number;
-    readonly pllOutliersRejected: number;
-    readonly pllDriftPpm: number;
-    readonly policy: BackpressurePolicy;
-    readonly droppedFrames: number;
-    readonly pushedFrames: number;
-    readonly pulledFrames: number;
-    readonly skippedFrames: number;
-    readonly lastFullWaitNs: number;
-    readonly lastEmptyWaitNs: number;
-    readonly maxOccupancyEverSeen: number;
-  } {
+  telemetry(): TelemetrySnapshot {
     return Object.freeze({
       tornFrames: this.ring.tornFrameCount(),
+      // 0.7.3 — heap-side counters, consumer-thread.
+      softFrames: this._softFrames,
+      stallRecoveries: this.pll.stallRecoveries,
       flowScale: this.ring.flowScaleHint(),
       available: this.ring.available(),
       capacity: this.capacity,
@@ -1231,6 +1344,70 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
       maxOccupancyEverSeen: this.ring.maxOccupancy(),
     });
+  }
+
+  /**
+   * Subscribe to live `telemetry()` snapshots at a capped Hz cadence
+   * (0.7.3). Each subscription installs its own `setInterval`; the
+   * callback is invoked with a fresh frozen `TelemetrySnapshot` per
+   * tick. Returns an `Unsubscribe` handle that stops the interval and
+   * removes the listener. Calling the handle twice is a no-op.
+   *
+   * Intended use: an in-page Bridge Inspector that diffs successive
+   * snapshots to derive events (a `softFrames` delta means "soft
+   * classification just fired", `tornFrames` delta means "hard
+   * fallback just fired", `stallRecoveries` delta means "PLL just
+   * caught a stall"). The 0.7.3 patch ships the subscribe seam; the
+   * downstream Wavefunction Inspector is the motivating consumer.
+   *
+   *   const unsub = bridge.subscribeTelemetry((snap) => {
+   *     if (snap.tornFrames !== lastTorn) flashChyron('tear');
+   *     lastTorn = snap.tornFrames;
+   *   }, { hzCap: 30 });
+   *   // later:
+   *   unsub();
+   *
+   * Cadence: `opts.hzCap` defaults to 60 Hz (~rAF cadence); clamped
+   * to `[1, 240]`. Non-finite values fall back to 60 then clamp.
+   *
+   * No fan-out: subscribers do not share a single interval. Each
+   * `subscribe` is its own `setInterval`. Inspector pages typically
+   * use one subscription per inspected Bridge; cheap.
+   *
+   * No automatic cleanup: there is no `Bridge.dispose()`. The
+   * subscription survives until the consumer calls the returned
+   * `Unsubscribe` or the surrounding execution context (page,
+   * Worker, AudioWorklet) is torn down by the host. Inspector
+   * components should call the handle in their unmount lifecycle.
+   *
+   * Threading: `setInterval` is available in the browser main thread,
+   * DedicatedWorker, SharedWorker, and Node. It is NOT available
+   * inside an `AudioWorkletGlobalScope`; do not call
+   * `subscribeTelemetry` from a `process()` body. The intended caller
+   * is the inspector UI thread, not the consumer's audio thread.
+   */
+  subscribeTelemetry(
+    cb: TelemetryListener,
+    opts?: SubscribeTelemetryOptions,
+  ): TelemetryUnsubscribe {
+    const rawHz = opts?.hzCap;
+    // Default 60; non-finite → 60; then clamp to [1, 240].
+    const base = (typeof rawHz === "number" && Number.isFinite(rawHz)) ? rawHz : 60;
+    const hz = Math.min(240, Math.max(1, base));
+    const intervalMs = 1000 / hz;
+    const handle = setInterval(() => {
+      // Each tick reads a fresh snapshot. The frozen object guarantees
+      // the listener cannot mutate Bridge state by mutating the snap.
+      cb(this.telemetry());
+    }, intervalMs);
+    this._telemetryIntervals.add(handle);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._telemetryIntervals.delete(handle);
+      clearInterval(handle);
+    };
   }
 
   /**

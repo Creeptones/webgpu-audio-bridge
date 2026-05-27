@@ -235,6 +235,15 @@ export class ConsumerClockRecovery {
   private _observationsSinceLock: number = 0;
   private _consecutiveOutliers: number = 0;
   private _outliersRejected: number = 0;
+  /** Cumulative stall recoveries (0.7.3). One increment per transition
+   *  of the outlier gate from "currently rejecting outliers"
+   *  (`_consecutiveOutliers > 0`) back to clean observation. Distinct
+   *  from `_outliersRejected` (per-observation reject count); this is
+   *  per-event. Inspector visualises stall onset/recovery via a
+   *  monotonic counter rather than an edge-callback because callbacks
+   *  across the consumer thread → main thread boundary are awkward.
+   *  Heap-only — survives across `reset()`. */
+  private _stallRecoveries: number = 0;
 
   // Gate tuning, captured at construction; immutable for the lifetime of
   // the instance. See file header for the per-field semantics.
@@ -391,6 +400,10 @@ export class ConsumerClockRecovery {
           // path so this observation is incorporated.
           this._sigmaEwma = absRes / this._outlierSigmaMultiplier;
           this._consecutiveOutliers = 0;
+          // 0.7.3 — sustained-step recovery. We had `> limit` outliers
+          // in a row and are now admitting the step into the loop; this
+          // is unambiguously a stall→normal transition. Count once.
+          this._stallRecoveries = (this._stallRecoveries + 1) | 0;
           // Fall through to normal-path update below.
         } else {
           // Single spike. Skip PI + EWMA update; just count it.
@@ -399,6 +412,14 @@ export class ConsumerClockRecovery {
         }
       } else {
         // Clean observation — reset the consecutive-outlier streak.
+        // 0.7.3 — single-spike recovery. If we had at least one
+        // outlier counted in the streak and now a clean observation
+        // arrived, count the streak-break as a recovery transition.
+        // No increment if `_consecutiveOutliers === 0` already (just
+        // normal steady-state observations; nothing to recover from).
+        if (this._consecutiveOutliers > 0) {
+          this._stallRecoveries = (this._stallRecoveries + 1) | 0;
+        }
         this._consecutiveOutliers = 0;
       }
     }
@@ -527,6 +548,19 @@ export class ConsumerClockRecovery {
    *  via `Bridge.telemetry().pllOutliersRejected`. (0.6.14) */
   get outliersRejected(): number {
     return this._outliersRejected;
+  }
+
+  /** Number of stall→normal transitions the outlier gate has observed
+   *  since construction (0.7.3). One increment per recovery event:
+   *  either a sustained step that exceeded `outlierConsecutiveLimit`
+   *  consecutive outliers and was admitted, or a transient spike
+   *  streak that ended with a clean observation. Cumulative across
+   *  `reset()` calls (the counter is not cleared on reset — it's a
+   *  diagnostic). Disjoint from `outliersRejected` (per-observation
+   *  reject count) — this is per-event. Read via
+   *  `Bridge.telemetry().stallRecoveries`. */
+  get stallRecoveries(): number {
+    return this._stallRecoveries;
   }
 
   /** Current EWMA estimate of |residual| in ns. Zero before any observe

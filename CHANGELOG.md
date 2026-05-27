@@ -4,6 +4,184 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.3] — 2026-05-27
+
+### Added — observability hooks for downstream inspectors
+
+Three small, wire-compatible additions that make the Bridge legible
+to a downstream "Bridge Inspector" UI. All additive; no SAB byte
+changes; no public-API breaks. Bench medians unchanged at ~1.20 μs.
+
+**Patch 1 — `bridge.subscribeTelemetry(cb, opts?)`.** A live
+observable stream over the existing `telemetry()` snapshot. Each
+call to `subscribeTelemetry` installs its own `setInterval` at
+`1000 / hzCap` ms invoking the listener with a fresh frozen
+snapshot per tick. Returns an idempotent `Unsubscribe` handle that
+stops the interval and removes the listener.
+
+  ```ts
+  const unsub = bridge.subscribeTelemetry((snap) => {
+    if (snap.tornFrames !== lastTorn) flashChyron('tear');
+    lastTorn = snap.tornFrames;
+  }, { hzCap: 30 });
+  // later in component teardown:
+  unsub();
+  ```
+
+  - `hzCap` default `60` (≈ rAF cadence); clamped to `[1, 240]`.
+    Non-finite values fall back to 60 then clamp.
+  - Threading: `setInterval` is available in browser main thread,
+    DedicatedWorker, SharedWorker, and Node. **Not** legal inside
+    `AudioWorkletGlobalScope.process()` — inspector calls
+    `subscribe` on the UI thread, not the audio thread.
+  - No fan-out from a shared interval (each subscribe is its own
+    interval; subscribers are cheap by design).
+  - No automatic cleanup: Bridge has no `dispose()`. Subscription
+    survives until the consumer calls the returned `Unsubscribe`
+    or the surrounding execution context tears down.
+
+**Patch 2 — telemetry() counters: `softFrames` + `stallRecoveries`.**
+Two new fields on the `TelemetrySnapshot` return type. Both are
+heap-side (per-instance, consumer-thread-only) — SAB header lanes
+0-7 are all in use, and expanding `RING_HEADER_BYTES` would be a
+wire-format change. For cross-process aggregation, post-message
+the snapshot across at a sampled cadence (the `subscribeTelemetry`
+subscription is the intended hook).
+
+  - **`softFrames`** — cumulative count of soft-classified
+    invariant deviations on this Bridge instance. Increments
+    inside `_invariantHandleRaw` and `_invariantHandleSmoothed`
+    when the classifier returns `kind: "soft"`. Disjoint from
+    `tornFrames` (the existing hard-classification counter). Zero
+    on schemas without `.withInvariant(...)`. Wraps mod 2^32 via
+    the `| 0` idiom.
+  - **`stallRecoveries`** — cumulative count of PLL outlier-gate
+    transitions from "currently rejecting outliers" back to clean
+    observation. One increment per recovery event (NOT per normal
+    observation after recovery). Two transition paths counted:
+    single-spike streak that ends with a clean observation, and
+    sustained-step streak that exceeds `outlierConsecutiveLimit`
+    and gets admitted. Disjoint from `pllOutliersRejected` (the
+    existing per-observation reject counter) — that's edges-out,
+    this is edges-back.
+
+  Inspector pattern: subscribe to telemetry, diff successive
+  snapshots' counters, render an event per delta (`softFrames`
+  delta = soft classification fired; `tornFrames` delta = hard
+  fallback fired; `stallRecoveries` delta = stall caught).
+
+**Patch 3 — `BridgeGPUSource.inFlightCount()` + `lastReadbackUs()`.**
+Two new introspection methods on the GPU-source helper:
+
+  - **`inFlightCount()`** — naming-parity alias for the existing
+    `inFlight()` (count of staging buffers in some non-idle state,
+    typically 0 - `stagingBufferCount`). Both methods identical;
+    the new name is the canonical public API for the in-page
+    Bridge Inspector pattern that pairs with `subscribeTelemetry()`.
+  - **`lastReadbackUs()`** — wall-time microseconds for the most
+    recently completed mapAsync → decode → push cycle. Timestamped
+    at `flushPending` start (`performance.now()`) and read at
+    `pollCompleted` finish; the difference is the full cycle.
+    Returns `0` before the first completion; fractional
+    microseconds thereafter. Heap-only, consumer-thread.
+
+  Inspector use case: render the GPU readback round-trip
+  characteristic on-page. Typical Chrome on Windows: 5-15 ms
+  (5000-15000 μs); driver- and adapter-dependent. Surfaces the
+  `mapAsync` cost the README's "What's actually faster (and what
+  isn't)" section discusses.
+
+### Why
+
+The downstream consumer is the **Wavefunction synth** at
+`../NewProject/website` — the team is building a real-time
+Bridge Inspector panel that visualises the library's novel
+primitives (PLL recovery, trajectory smoothing, invariant
+classifier, GPU staging ring). The primitives all exist; what
+was missing was observation hooks. Without `subscribeTelemetry`
+the inspector had to roll its own `setInterval(() =>
+bridge.telemetry(), 16)`; without the new counters the soft
+classifier was invisible (it's the most common invariant event
+in practice — torn frames are rare); without GPU-source
+introspection the staging-ring was opaque.
+
+This patch is the surface upgrade that turns the bridge from a
+working primitive into one that DevTools / inspector / dashboard
+consumers can introspect at the cadence they need. The
+disjoint-from-environment-report contract is preserved: ring
+runtime vs platform environment.
+
+### Wire compatibility
+
+- **No SAB changes.** Bit-exact protocol with 0.7.2.
+- **No public-API break.** Every existing method works
+  unchanged. The `TelemetrySnapshot` interface extracted from the
+  inline return type at `telemetry()` is structurally identical
+  to the 0.7.2 inline shape PLUS two new heap-side numeric
+  fields — additive widening.
+- **Additive exports only.** New top-level types:
+  `TelemetrySnapshot`, `TelemetryListener`, `TelemetryUnsubscribe`,
+  `SubscribeTelemetryOptions`. New methods: `Bridge.subscribeTelemetry`,
+  `BridgeGPUSource.inFlightCount`, `BridgeGPUSource.lastReadbackUs`.
+  No removals; no renames.
+- Bench medians unchanged at ~1.20 μs across push / pull /
+  pullLatest. The counter increments live off the hot path
+  (`_softFrames` increments only on invariant deviation —
+  control-rate cadence; `stallRecoveries` increments only on
+  PLL outlier-gate transitions — sub-Hz cadence; the GPU-source
+  `performance.now()` capture lives at flush/poll boundaries,
+  not the per-quantum pull hot path).
+
+### Tests
+
+`tests/Bridge.test.ts` gains 7 new pins (now 90 total):
+
+- **#84 subscribeTelemetry cadence** — listener fires ≈ `hz` times
+  per second; counted callbacks over 200ms at 60Hz must land
+  within ±2 of expected.
+- **#85 subscribeTelemetry snapshot shape** — listener receives a
+  frozen object whose fields match `bridge.telemetry()` exactly,
+  including the new 0.7.3 `softFrames` and `stallRecoveries`
+  numeric fields.
+- **#86 subscribeTelemetry unsubscribe** — calling the handle
+  stops callbacks; double-call is a no-op.
+- **#87 subscribeTelemetry hzCap clamping** — `hzCap = 0 / -5 /
+  999 / NaN / Infinity` all produce working subscriptions
+  without throwing.
+- **#88 softFrames counter** — increments only on soft-classified
+  pulls (mid-band invariant deviation), not on `ok` pulls or
+  hard-fallback pulls. Verified via the same engineered-deviation
+  technique as pin #37.
+- **#89 stallRecoveries counter** — one increment per outlier-gate
+  transition. Verified across both transition paths (single-spike
+  → clean resumption + sustained-step → admission); subsequent
+  clean observations after recovery do NOT re-increment.
+- **#90 BridgeGPUSource introspection** — `inFlightCount()` ===
+  `inFlight()`; `lastReadbackUs()` is 0 before the first cycle,
+  > 0 after, and tracks the most recent cycle (not the first).
+  Safe to call after `destroy()`.
+
+All 9 tsx-script suites green; bench medians at 1.20 μs.
+
+### Documentation
+
+- `src/Bridge.ts`: full JSDoc on the new `TelemetrySnapshot` /
+  `TelemetryListener` / `TelemetryUnsubscribe` /
+  `SubscribeTelemetryOptions` types; method JSDoc on
+  `subscribeTelemetry` documents cadence, threading, no-dispose
+  contract, intended use case.
+- `src/ConsumerClockRecovery.ts`: `stallRecoveries` getter
+  carries the per-event vs per-observation distinction relative
+  to `outliersRejected`.
+- `src/BridgeGPUSource.ts`: `inFlightCount` documents the
+  naming-parity alias; `lastReadbackUs` documents the
+  flush→poll timing and typical numbers.
+- `README.md`: telemetry-fields table gains `softFrames` and
+  `stallRecoveries` rows; new §Live telemetry subscription
+  subsection under §Observability dashboards; BridgeGPUSource
+  diagnostics section gains the two new methods. Roadmap →
+  Shipped gets a new 0.7.3 bullet above the 0.7.2 entry.
+
 ## [0.7.2] — 2026-05-27
 
 ### Hardened — drop-oldest is race-free by construction

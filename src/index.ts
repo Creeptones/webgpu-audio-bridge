@@ -37,6 +37,11 @@ export type {
   BridgeOptions,
   SmoothedPullOptions,
   SmootherSkipPolicy,
+  // Observability snapshot + subscription seam (0.7.3)
+  TelemetrySnapshot,
+  TelemetryListener,
+  TelemetryUnsubscribe,
+  SubscribeTelemetryOptions,
 } from "./Bridge.js";
 
 // ── Composable primitives (0.6.10) ────────────────────────────────────────
