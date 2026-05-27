@@ -624,4 +624,494 @@
         local.set $i
         br $loop
       end
+    end)
+
+  ;; ─── f32 trajectory evaluators (0.7.10) ───────────────────────────────
+  ;;
+  ;; Mirror of the f64 family above, with two changes per evaluator:
+  ;;   - f32 loads/stores in place of f64 (4-byte stride per element)
+  ;;   - dt and Hermite basis coefficients are f64 in the WAT signature
+  ;;     even though the per-sample math is f32; we demote them via
+  ;;     `f32.demote_f64` at the call site so the JS caller can pass a
+  ;;     plain Number and the WAT does the truncation. Matches the JS
+  ;;     evaluator's behavior of accepting a Number `dt` and writing
+  ;;     into a Float32Array (which truncates per-store).
+  ;;
+  ;; The interleaved layouts are identical to the f64 versions just
+  ;; with 4-byte instead of 8-byte strides.
+
+  (func $eval_taylor_f32_o1 (export "eval_taylor_f32_o1")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32)
+    local.get $dstOff
+    local.get $srcOff
+    local.get $n
+    i32.const 2
+    i32.shl                    ;; n << 2 = n * 4 (f32 bytes)
+    memory.copy)
+
+  (func $eval_taylor_f32_o2 (export "eval_taylor_f32_o2")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcEnd i32)
+    (local $dstP i32)
+    (local $srcP i32)
+    ;; The per-sample math runs in f64 (matching the JS evaluator: a
+    ;; Float32Array read promotes the element to a Number = f64; the
+    ;; expression `flat[j] + flat[j+1] * dt` is all f64 arithmetic; the
+    ;; demote to f32 only happens on the Float32Array store). Doing the
+    ;; math in f32 instead would introduce 0.5-ULP differences against
+    ;; JS — visible on order=3 terms where the quadratic accumulates.
+    ;; The SIMD f32x4 path is constrained to f32 math (no per-lane
+    ;; widen), so SIMD-vs-scalar bit-exact equality does NOT hold; the
+    ;; SIMD pin uses an epsilon tolerance.
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    local.get $srcOff
+    local.get $n
+    i32.const 3
+    i32.shl                    ;; n * 8 (two f32 per sample)
+    i32.add
+    local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP
+        local.get $srcEnd
+        i32.ge_u
+        br_if $exit
+        local.get $dstP
+        local.get $srcP
+        f32.load align=1            ;; p (f32)
+        f64.promote_f32             ;; → f64
+        local.get $srcP
+        i32.const 4
+        i32.add
+        f32.load align=1            ;; v (f32)
+        f64.promote_f32             ;; → f64
+        local.get $dt               ;; dt (already f64)
+        f64.mul
+        f64.add                     ;; p + v*dt (f64)
+        f32.demote_f64              ;; truncate to f32 for store
+        f32.store align=1
+        local.get $srcP
+        i32.const 8
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 4
+        i32.add
+        local.set $dstP
+        br $loop
+      end
+    end)
+
+  (func $eval_taylor_f32_o3 (export "eval_taylor_f32_o3")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcEnd i32)
+    (local $dstP i32)
+    (local $srcP i32)
+    (local $halfDt2 f64)
+    ;; halfDt2 = 0.5 * dt * dt in f64 — matches the JS evaluator which
+    ;; computes it before the loop with all-Number arithmetic.
+    local.get $dt
+    local.get $dt
+    f64.mul
+    f64.const 0.5
+    f64.mul
+    local.set $halfDt2
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    ;; srcEnd = srcOff + n * 12  (three f32 per sample)
+    local.get $srcOff
+    local.get $n
+    i32.const 4
+    i32.mul
+    i32.const 3
+    i32.mul
+    i32.add
+    local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP
+        local.get $srcEnd
+        i32.ge_u
+        br_if $exit
+        local.get $dstP
+        ;; out = (((p + v*dt) + a*halfDt2)) demoted to f32
+        local.get $srcP
+        f32.load align=1            ;; p (f32)
+        f64.promote_f32             ;; → f64
+        local.get $srcP
+        i32.const 4
+        i32.add
+        f32.load align=1            ;; v
+        f64.promote_f32
+        local.get $dt
+        f64.mul
+        f64.add                     ;; p + v*dt (f64)
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f32.load align=1            ;; a
+        f64.promote_f32
+        local.get $halfDt2
+        f64.mul
+        f64.add                     ;; + a*halfDt2 (f64)
+        f32.demote_f64              ;; → f32 for store
+        f32.store align=1
+        local.get $srcP
+        i32.const 12
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 4
+        i32.add
+        local.set $dstP
+        br $loop
+      end
+    end)
+
+  (func $eval_hermite_f32 (export "eval_hermite_f32")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h00 f64) (param $h10s f64) (param $h01 f64) (param $h11s f64)
+    (local $i i32)
+    (local $prevP i32)
+    (local $currP i32)
+    (local $dstP i32)
+    (local $strideBytes i32)
+    ;; Math runs in f64 (matching the JS evaluator's Float32Array-read
+    ;; → Number promotion → f64 arithmetic → Float32Array-store demote
+    ;; semantics). Basis coefficients stay in f64 throughout.
+    ;; strideBytes = strideElems * 4
+    local.get $strideElems
+    i32.const 2
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff
+    local.set $prevP
+    local.get $currOff
+    local.set $currP
+    local.get $dstOff
+    local.set $dstP
+    i32.const 0
+    local.set $i
+    block $exit
+      loop $loop
+        local.get $i
+        local.get $n
+        i32.ge_u
+        br_if $exit
+        local.get $dstP
+        ;; h00 * P0
+        local.get $prevP
+        f32.load align=1
+        f64.promote_f32
+        local.get $h00
+        f64.mul
+        ;; + h10s * M0
+        local.get $prevP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        f64.promote_f32
+        local.get $h10s
+        f64.mul
+        f64.add
+        ;; + h01 * P1
+        local.get $currP
+        f32.load align=1
+        f64.promote_f32
+        local.get $h01
+        f64.mul
+        f64.add
+        ;; + h11s * M1
+        local.get $currP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        f64.promote_f32
+        local.get $h11s
+        f64.mul
+        f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $prevP
+        local.get $strideBytes
+        i32.add
+        local.set $prevP
+        local.get $currP
+        local.get $strideBytes
+        i32.add
+        local.set $currP
+        local.get $dstP
+        i32.const 4
+        i32.add
+        local.set $dstP
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $loop
+      end
+    end)
+
+  ;; ─── SIMD-vectorized order=2 Taylor evaluators (0.7.10) ───────────────
+  ;;
+  ;; The order=2 interleaved layout `[p_0, v_0, p_1, v_1, …]` is the
+  ;; ONLY trajectory shape that vectorizes cleanly with the WebAssembly
+  ;; SIMD ops — two consecutive v128 loads cover four output samples
+  ;; (for f32) or two (for f64), an i8x16.shuffle pair deinterleaves
+  ;; positions from velocities, and one fused multiply-add (mul +
+  ;; add — WASM has no fma op, so two instructions) produces the
+  ;; results which a single store writes out.
+  ;;
+  ;; Order=3 (24 bytes per sample for f64, 12 for f32) does not pack
+  ;; into v128 multiples cleanly and the deinterleave cost dwarfs the
+  ;; per-sample win; that path stays scalar in this patch and forever
+  ;; unless a future SIMD generation introduces wider vectors.
+  ;;
+  ;; Both SIMD evaluators MUST produce bit-identical output to their
+  ;; scalar counterparts. WebAssembly's spec disallows implicit FMA
+  ;; in `f32x4.mul` + `f32x4.add` (matching scalar `f32.mul` + `f32.add`
+  ;; semantics), so this holds by construction on any spec-compliant
+  ;; runtime.
+  ;;
+  ;; Both evaluators handle the SIMD body + a scalar tail for the
+  ;; trailing 0-3 (f32) or 0-1 (f64) samples that don't fill a final
+  ;; vector iteration.
+
+  ;; f32 order=2 SIMD: processes 4 samples per iteration.
+  ;; Per SIMD step:
+  ;;   v0 = v128.load(srcP + 0)   = [p_0, v_0, p_1, v_1]
+  ;;   v1 = v128.load(srcP + 16)  = [p_2, v_2, p_3, v_3]
+  ;;   positions  = shuffle(v0, v1, [0..3, 8..11, 16..19, 24..27])
+  ;;              = [p_0, p_1, p_2, p_3]
+  ;;   velocities = shuffle(v0, v1, [4..7, 12..15, 20..23, 28..31])
+  ;;              = [v_0, v_1, v_2, v_3]
+  ;;   result = f32x4.add(positions, f32x4.mul(velocities, dt_v))
+  ;;   v128.store(dstP, result)
+  (func $eval_taylor_f32_o2_simd (export "eval_taylor_f32_o2_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $dt32 f32)
+    (local $dtV v128)
+    (local $v0 v128)
+    (local $v1 v128)
+    (local $positions v128)
+    (local $velocities v128)
+    local.get $dt
+    f32.demote_f64
+    local.set $dt32
+    local.get $dt32
+    f32x4.splat
+    local.set $dtV
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    ;; tailEnd = srcOff + n * 8 (total bytes of the trajectory's flat array)
+    local.get $srcOff
+    local.get $n
+    i32.const 3
+    i32.shl
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = srcOff + (n & ~3) * 8   = srcOff + ((n >> 2) << 5)
+    ;; — last byte of the last SIMD-processable chunk (4 samples = 32 bytes).
+    local.get $srcOff
+    local.get $n
+    i32.const 2
+    i32.shr_u
+    i32.const 5
+    i32.shl
+    i32.add
+    local.set $simdEnd
+    ;; SIMD body
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        local.get $srcP
+        v128.load align=1
+        local.set $v0
+        local.get $srcP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $v1
+        local.get $v0
+        local.get $v1
+        i8x16.shuffle 0 1 2 3 8 9 10 11 16 17 18 19 24 25 26 27
+        local.set $positions
+        local.get $v0
+        local.get $v1
+        i8x16.shuffle 4 5 6 7 12 13 14 15 20 21 22 23 28 29 30 31
+        local.set $velocities
+        local.get $dstP
+        local.get $positions
+        local.get $velocities
+        local.get $dtV
+        f32x4.mul
+        f32x4.add
+        v128.store align=1
+        local.get $srcP
+        i32.const 32
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 16
+        i32.add
+        local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail for the trailing 0..3 samples.
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $srcP
+        f32.load align=1
+        local.get $srcP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        local.get $dt32
+        f32.mul
+        f32.add
+        f32.store align=1
+        local.get $srcP
+        i32.const 8
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 4
+        i32.add
+        local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; f64 order=2 SIMD: processes 2 samples per iteration.
+  ;; Per SIMD step:
+  ;;   v0 = v128.load(srcP + 0)   = [p_0, v_0]
+  ;;   v1 = v128.load(srcP + 16)  = [p_1, v_1]
+  ;;   positions  = shuffle(v0, v1, [0..7, 16..23])  = [p_0, p_1]
+  ;;   velocities = shuffle(v0, v1, [8..15, 24..31]) = [v_0, v_1]
+  ;;   result = f64x2.add(positions, f64x2.mul(velocities, dt_v))
+  ;;   v128.store(dstP, result)
+  (func $eval_taylor_f64_o2_simd (export "eval_taylor_f64_o2_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $dtV v128)
+    (local $v0 v128)
+    (local $v1 v128)
+    (local $positions v128)
+    (local $velocities v128)
+    local.get $dt
+    f64x2.splat
+    local.set $dtV
+    local.get $srcOff
+    local.set $srcP
+    local.get $dstOff
+    local.set $dstP
+    ;; tailEnd = srcOff + n * 16
+    local.get $srcOff
+    local.get $n
+    i32.const 4
+    i32.shl
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = srcOff + (n & ~1) * 16  = srcOff + ((n >> 1) << 5)
+    ;; — 2 samples per SIMD chunk = 32 bytes.
+    local.get $srcOff
+    local.get $n
+    i32.const 1
+    i32.shr_u
+    i32.const 5
+    i32.shl
+    i32.add
+    local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        local.get $srcP
+        v128.load align=1
+        local.set $v0
+        local.get $srcP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $v1
+        local.get $v0
+        local.get $v1
+        i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+        local.set $positions
+        local.get $v0
+        local.get $v1
+        i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+        local.set $velocities
+        local.get $dstP
+        local.get $positions
+        local.get $velocities
+        local.get $dtV
+        f64x2.mul
+        f64x2.add
+        v128.store align=1
+        local.get $srcP
+        i32.const 32
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 16
+        i32.add
+        local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail for the trailing 0..1 samples.
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $srcP
+        f64.load align=1
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $dt
+        f64.mul
+        f64.add
+        f64.store align=1
+        local.get $srcP
+        i32.const 16
+        i32.add
+        local.set $srcP
+        local.get $dstP
+        i32.const 8
+        i32.add
+        local.set $dstP
+        br $tailLoop
+      end
     end))

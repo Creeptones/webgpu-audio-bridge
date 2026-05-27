@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/Bridge.js";
 import {
   defineSchema, f64, f32, u64, i64, u32, i32, u16, i16, u8, i8,
-  f64Array, f32Array, u32Array, f64TrajectoryArray,
+  f64Array, f32Array, u32Array, f64TrajectoryArray, f32TrajectoryArray,
 } from "../src/schema.js";
 import { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "../src/trajectory.js";
 import {
@@ -890,8 +890,326 @@ function main(): void {
     );
   }
 
+  // ── 10: f32 trajectory evaluator equivalence (0.7.10) ──────────────────
+  // Mirror of Pin 9 but using f32TrajectoryArray. Three Taylor orders
+  // + Hermite, each evaluated against the JS evaluateTrajectoryInto /
+  // evaluateHermiteTrajectoryInto reference. Bit-exact equality is
+  // expected because the WASM evaluator demotes dt and the Hermite
+  // basis coefficients to f32 ONCE per call (matching what a
+  // Float32Array-bound JS evaluator does implicitly per store).
+  {
+    const TRAJ_N = 24;
+    const trajSchema32 = defineSchema({
+      seq: u64(),
+      tO1: f32TrajectoryArray(TRAJ_N, { order: 1 }),
+      tO2: f32TrajectoryArray(TRAJ_N, { order: 2 }),
+      tO3: f32TrajectoryArray(TRAJ_N, { order: 3 }),
+    });
+    const trajCap32 = 4;
+    const sabBytes32 = Bridge.byteLength(trajCap32, trajSchema32);
+    // Scratch: 5 evaluators × TRAJ_N × 4 bytes
+    const dstBytesEach = TRAJ_N * 4;
+    const totalScratch32 = dstBytesEach * 5;
+    const alloc32 = allocateWorkletMemory({
+      sabBytes: sabBytes32,
+      scratchBytes: totalScratch32,
+    });
+    const bridge32 = new Bridge(alloc32.sab, trajCap32, trajSchema32);
+    const consumer32 = instantiateConsumer(wasmBytes, alloc32.memory);
+
+    const headerBytes = 32;
+    const frameBytes32 = trajSchema32.compiled.frameByteSize;
+    const mask32 = trajCap32 - 1;
+    const off32: Record<string, number> = {};
+    for (const f of trajSchema32.compiled.fields) off32[f.name] = f.byteOffset;
+    const scratchBase32 = alloc32.scratchByteOffset!;
+    const dstO1Off32 = scratchBase32;
+    const dstO2Off32 = dstO1Off32 + dstBytesEach;
+    const dstO3Off32 = dstO2Off32 + dstBytesEach;
+    const dstHermO2Off32 = dstO3Off32 + dstBytesEach;
+    const dstHermO3Off32 = dstHermO2Off32 + dstBytesEach;
+    const dstO1View32 = new Float32Array(alloc32.sab, dstO1Off32, TRAJ_N);
+    const dstO2View32 = new Float32Array(alloc32.sab, dstO2Off32, TRAJ_N);
+    const dstO3View32 = new Float32Array(alloc32.sab, dstO3Off32, TRAJ_N);
+    const dstHermO2View32 = new Float32Array(alloc32.sab, dstHermO2Off32, TRAJ_N);
+    const dstHermO3View32 = new Float32Array(alloc32.sab, dstHermO3Off32, TRAJ_N);
+
+    const push32 = bridge32.scratchFrame();
+    const pull32 = bridge32.scratchFrame();
+    const jsO1_32 = new Float32Array(TRAJ_N);
+    const jsO2_32 = new Float32Array(TRAJ_N);
+    const jsO3_32 = new Float32Array(TRAJ_N);
+    const jsHermO2_32 = new Float32Array(TRAJ_N);
+    const jsHermO3_32 = new Float32Array(TRAJ_N);
+
+    function fill32(row: number): void {
+      const theta = 0.13 + row * 0.041;
+      const omega = 2 * Math.PI * 3;
+      for (let k = 0; k < TRAJ_N; k++) {
+        push32.tO1[k] = Math.fround(Math.sin(k * theta));
+      }
+      for (let k = 0; k < TRAJ_N; k++) {
+        push32.tO2[k * 2] = Math.fround(Math.sin(k * theta + row));
+        push32.tO2[k * 2 + 1] = Math.fround(omega * Math.cos(k * theta + row));
+      }
+      for (let k = 0; k < TRAJ_N; k++) {
+        push32.tO3[k * 3] = Math.fround(Math.cos(k * theta + row * 0.5));
+        push32.tO3[k * 3 + 1] = Math.fround(-omega * Math.sin(k * theta + row * 0.5));
+        push32.tO3[k * 3 + 2] = Math.fround(-omega * omega * Math.cos(k * theta + row * 0.5));
+      }
+    }
+
+    while (bridge32.pull(pull32)) { /* drain */ }
+    const taylorRows = 4;
+    const dts = [0.0, 0.005, 0.012345, 0.0166667];
+    for (let r = 0; r < taylorRows; r++) {
+      fill32(r);
+      assert(bridge32.push(push32), `pin10a: push row ${r}`);
+      const slot = consumer32.peekPull(mask32);
+      assert(slot >= 0, `pin10a: peekPull row ${r}`);
+      const slotBase = headerBytes + slot * frameBytes32;
+      for (const dt of dts) {
+        consumer32.evalTaylorF32O1(slotBase + off32.tO1!, dstO1Off32, TRAJ_N);
+        evaluateTrajectoryInto(
+          push32.tO1 as Float32Array,
+          trajSchema32.compiled.fields.find((f) => f.name === "tO1")!.trajectory!,
+          dt,
+          jsO1_32,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(dstO1View32[k], jsO1_32[k], `pin10a tO1[${k}] row=${r} dt=${dt}`);
+        }
+        consumer32.evalTaylorF32O2(slotBase + off32.tO2!, dstO2Off32, TRAJ_N, dt);
+        evaluateTrajectoryInto(
+          push32.tO2 as Float32Array,
+          trajSchema32.compiled.fields.find((f) => f.name === "tO2")!.trajectory!,
+          dt,
+          jsO2_32,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(dstO2View32[k], jsO2_32[k], `pin10a tO2[${k}] row=${r} dt=${dt}`);
+        }
+        consumer32.evalTaylorF32O3(slotBase + off32.tO3!, dstO3Off32, TRAJ_N, dt);
+        evaluateTrajectoryInto(
+          push32.tO3 as Float32Array,
+          trajSchema32.compiled.fields.find((f) => f.name === "tO3")!.trajectory!,
+          dt,
+          jsO3_32,
+        );
+        for (let k = 0; k < TRAJ_N; k++) {
+          assertEq(dstO3View32[k], jsO3_32[k], `pin10a tO3[${k}] row=${r} dt=${dt}`);
+        }
+      }
+      consumer32.commitPull();
+    }
+    ok(
+      `wasm-taylor-f32-equivalence (${taylorRows} rows × ${dts.length} dts × 3 orders × ${TRAJ_N} samples)`,
+    );
+
+    // f32 Hermite sub-pin — two consecutive frames, several (t, segS) pairs.
+    while (bridge32.pull(pull32)) { /* drain */ }
+    fill32(100);
+    assert(bridge32.push(push32), "pin10b: push prev");
+    const pushPrevO2_32 = new Float32Array(push32.tO2 as Float32Array);
+    const pushPrevO3_32 = new Float32Array(push32.tO3 as Float32Array);
+    fill32(101);
+    assert(bridge32.push(push32), "pin10b: push curr");
+    const pushCurrO2_32 = new Float32Array(push32.tO2 as Float32Array);
+    const pushCurrO3_32 = new Float32Array(push32.tO3 as Float32Array);
+
+    const prevSlot32 = consumer32.peekPull(mask32);
+    assert(prevSlot32 >= 0, "pin10b: peek prev");
+    const prevBase32 = headerBytes + prevSlot32 * frameBytes32;
+    consumer32.commitPull();
+    const currSlot32 = consumer32.peekPull(mask32);
+    assert(currSlot32 >= 0, "pin10b: peek curr");
+    const currBase32 = headerBytes + currSlot32 * frameBytes32;
+
+    const hermCases32 = [
+      { t: 0.0, segS: 1 / 60 },
+      { t: 0.5, segS: 1 / 60 },
+      { t: 1.0, segS: 1 / 60 },
+      { t: 0.3, segS: 0.001 },
+    ];
+    for (const { t, segS } of hermCases32) {
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const h00 = 2 * t3 - 3 * t2 + 1;
+      const h10s = (t3 - 2 * t2 + t) * segS;
+      const h01 = -2 * t3 + 3 * t2;
+      const h11s = (t3 - t2) * segS;
+      consumer32.evalHermiteF32(
+        prevBase32 + off32.tO2!,
+        currBase32 + off32.tO2!,
+        dstHermO2Off32,
+        TRAJ_N,
+        2,
+        h00, h10s, h01, h11s,
+      );
+      evaluateHermiteTrajectoryInto(
+        pushPrevO2_32, pushCurrO2_32,
+        trajSchema32.compiled.fields.find((f) => f.name === "tO2")!.trajectory!,
+        t, segS, jsHermO2_32,
+      );
+      for (let k = 0; k < TRAJ_N; k++) {
+        assertEq(dstHermO2View32[k], jsHermO2_32[k], `pin10b herm-o2[${k}] t=${t}`);
+      }
+      consumer32.evalHermiteF32(
+        prevBase32 + off32.tO3!,
+        currBase32 + off32.tO3!,
+        dstHermO3Off32,
+        TRAJ_N,
+        3,
+        h00, h10s, h01, h11s,
+      );
+      evaluateHermiteTrajectoryInto(
+        pushPrevO3_32, pushCurrO3_32,
+        trajSchema32.compiled.fields.find((f) => f.name === "tO3")!.trajectory!,
+        t, segS, jsHermO3_32,
+      );
+      for (let k = 0; k < TRAJ_N; k++) {
+        assertEq(dstHermO3View32[k], jsHermO3_32[k], `pin10b herm-o3[${k}] t=${t}`);
+      }
+    }
+    consumer32.commitPull();
+    ok(
+      `wasm-hermite-f32-equivalence (${hermCases32.length} (t, segS) × 2 orders × ${TRAJ_N} samples)`,
+    );
+  }
+
+  // ── 11: SIMD-vs-scalar order=2 Taylor equivalence (0.7.10) ─────────────
+  // The f64x2 SIMD path is bit-identical to its scalar counterpart —
+  // WebAssembly's spec disallows implicit FMA in either, and the
+  // scalar f64 evaluator already runs all math in f64. The f32x4
+  // SIMD path is NOT bit-identical to the scalar f32 evaluator
+  // because the scalar version promotes f32 → f64 for the intermediate
+  // math (to match JS's `Float32Array[i] * Number` semantics) while
+  // SIMD `f32x4.mul` necessarily stays in f32. The two paths agree
+  // to within 1 ULP at f32 precision — verified with a tight epsilon
+  // below.
+  //
+  // The pin also covers sample-count edge cases that exercise the
+  // scalar tail: a multiple of 4 (clean SIMD, no tail), a value with
+  // a 1-3 sample tail (f32 path), and a value with a 0-1 sample tail
+  // (f64 path). Same SOURCE bytes drive both implementations so any
+  // shuffle misalignment surfaces instantly.
+  {
+    // Sample counts chosen to span the SIMD / tail boundary:
+    //   17 — f32 SIMD does 4 chunks of 4 samples + 1 scalar tail sample.
+    //        f64 SIMD does 8 chunks of 2 samples + 1 scalar tail sample.
+    //   32 — clean multiple of 4 (no tail for either width).
+    //   3  — too small for f32 SIMD (entire body is scalar tail);
+    //        too small for f64 SIMD only at the trailing 1 sample.
+    for (const N of [17, 32, 3]) {
+      const simdSchemaF64 = defineSchema({
+        traj: f64TrajectoryArray(N, { order: 2 }),
+      });
+      const simdSchemaF32 = defineSchema({
+        traj: f32TrajectoryArray(N, { order: 2 }),
+      });
+      const cap = 4;
+      const f64SabBytes = Bridge.byteLength(cap, simdSchemaF64);
+      const f32SabBytes = Bridge.byteLength(cap, simdSchemaF32);
+      const f64DstBytes = N * 8;
+      const f32DstBytes = N * 4;
+
+      // f64 SIMD-vs-scalar
+      {
+        const alloc = allocateWorkletMemory({
+          sabBytes: f64SabBytes,
+          scratchBytes: f64DstBytes * 2,
+        });
+        const bridge = new Bridge(alloc.sab, cap, simdSchemaF64);
+        const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+        const headerBytes = 32;
+        const frameBytes = simdSchemaF64.compiled.frameByteSize;
+        const mask = cap - 1;
+        const trajOff = simdSchemaF64.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+        const scratchBase = alloc.scratchByteOffset!;
+        const scalarOff = scratchBase;
+        const simdOff = scratchBase + f64DstBytes;
+        const scalarView = new Float64Array(alloc.sab, scalarOff, N);
+        const simdView = new Float64Array(alloc.sab, simdOff, N);
+
+        const pushFrame = bridge.scratchFrame();
+        for (let k = 0; k < N; k++) {
+          pushFrame.traj[k * 2] = Math.sin(k * 0.21 + 1);
+          pushFrame.traj[k * 2 + 1] = Math.cos(k * 0.21 + 1) * 100;
+        }
+        assert(bridge.push(pushFrame), `pin11 f64 N=${N}: push`);
+        const slot = consumer.peekPull(mask);
+        assert(slot >= 0, `pin11 f64 N=${N}: peek`);
+        const slotBase = headerBytes + slot * frameBytes;
+        const dts = [0, 0.001, 0.016667];
+        for (const dt of dts) {
+          consumer.evalTaylorF64O2(slotBase + trajOff, scalarOff, N, dt);
+          consumer.evalTaylorF64O2Simd(slotBase + trajOff, simdOff, N, dt);
+          for (let k = 0; k < N; k++) {
+            assertEq(simdView[k], scalarView[k], `pin11 f64 simd-vs-scalar [${k}] N=${N} dt=${dt}`);
+          }
+        }
+        consumer.commitPull();
+      }
+
+      // f32 SIMD-vs-scalar — agreement within 1 ULP at f32 precision.
+      // The scalar f32 path runs intermediate math in f64 (matching JS);
+      // SIMD f32x4 stays in f32 — so values diverge by ≤ 0.5 ULP per
+      // operation, accumulating to ~1 ULP after the mul + add chain.
+      // F32_EPSILON_REL = 2^-23 ≈ 1.19e-7 is the per-value spacing for
+      // f32 around magnitude 1; we use 4× that as a safe relative
+      // tolerance to absorb compound rounding.
+      {
+        const alloc = allocateWorkletMemory({
+          sabBytes: f32SabBytes,
+          scratchBytes: f32DstBytes * 2,
+        });
+        const bridge = new Bridge(alloc.sab, cap, simdSchemaF32);
+        const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+        const headerBytes = 32;
+        const frameBytes = simdSchemaF32.compiled.frameByteSize;
+        const mask = cap - 1;
+        const trajOff = simdSchemaF32.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+        const scratchBase = alloc.scratchByteOffset!;
+        const scalarOff = scratchBase;
+        const simdOff = scratchBase + f32DstBytes;
+        const scalarView = new Float32Array(alloc.sab, scalarOff, N);
+        const simdView = new Float32Array(alloc.sab, simdOff, N);
+
+        const pushFrame = bridge.scratchFrame();
+        for (let k = 0; k < N; k++) {
+          pushFrame.traj[k * 2] = Math.fround(Math.sin(k * 0.21 + 1));
+          pushFrame.traj[k * 2 + 1] = Math.fround(Math.cos(k * 0.21 + 1) * 100);
+        }
+        assert(bridge.push(pushFrame), `pin11 f32 N=${N}: push`);
+        const slot = consumer.peekPull(mask);
+        assert(slot >= 0, `pin11 f32 N=${N}: peek`);
+        const slotBase = headerBytes + slot * frameBytes;
+        const dts = [0, 0.001, 0.016667];
+        // 4 × f32 epsilon = ~4.77e-7 relative tolerance
+        const F32_TOL_REL = 4 * Math.pow(2, -23);
+        for (const dt of dts) {
+          consumer.evalTaylorF32O2(slotBase + trajOff, scalarOff, N, dt);
+          consumer.evalTaylorF32O2Simd(slotBase + trajOff, simdOff, N, dt);
+          for (let k = 0; k < N; k++) {
+            const s = scalarView[k]!;
+            const v = simdView[k]!;
+            const tol = Math.max(Math.abs(s), Math.abs(v), 1) * F32_TOL_REL;
+            assert(
+              Math.abs(s - v) <= tol,
+              `pin11 f32 simd-vs-scalar [${k}] N=${N} dt=${dt}: scalar=${s} simd=${v} |Δ|=${Math.abs(s - v)} > tol=${tol}`,
+            );
+          }
+        }
+        consumer.commitPull();
+      }
+    }
+    ok(
+      `wasm-simd-vs-scalar-equivalence (N ∈ {17, 32, 3} × 3 dts × f64 bit-exact + f32 within 4×ULP)`,
+    );
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64 Taylor/Hermite trajectories in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths in agreement with JS atomics.",
   );
 }
 

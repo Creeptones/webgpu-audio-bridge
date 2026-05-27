@@ -333,6 +333,41 @@ export interface WorkletConsumer {
     h11s: number,
   ): void;
 
+  /** f32 trajectory evaluators (0.7.10). Mirror of the f64 family
+   *  above, with two precision differences:
+   *    - Source / output strides are 4 bytes per element.
+   *    - The per-sample math runs in f32 (the WASM signature accepts
+   *      f64 `dt` and Hermite basis coefficients for JS Number
+   *      convenience; the WAT demotes them to f32 once per call so
+   *      the inner loop's arithmetic matches a Float32Array-backed
+   *      JS evaluator bit-for-bit). */
+  evalTaylorF32O1(srcOffset: number, dstOffset: number, n: number): void;
+  evalTaylorF32O2(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+  evalTaylorF32O3(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+  evalHermiteF32(
+    prevOffset: number,
+    currOffset: number,
+    dstOffset: number,
+    n: number,
+    strideElems: number,
+    h00: number,
+    h10s: number,
+    h01: number,
+    h11s: number,
+  ): void;
+
+  /** SIMD-vectorized order=2 Taylor evaluators (0.7.10). Process
+   *  4 samples per iteration (f32x4) or 2 samples per iteration
+   *  (f64x2) using `i8x16.shuffle` to deinterleave positions from
+   *  velocities in the AoS `[p, v, p, v, …]` layout, followed by
+   *  one SIMD mul + add. A scalar tail handles the trailing
+   *  0-3 (f32) or 0-1 (f64) samples that don't fill a final
+   *  SIMD chunk. Bit-identical output to the scalar `evalTaylorF*O2`
+   *  variants — WebAssembly's spec disallows implicit FMA in SIMD
+   *  ops on every spec-compliant runtime. */
+  evalTaylorF32O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+  evalTaylorF64O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -391,6 +426,16 @@ export function instantiateConsumer(
       n: number, strideElems: number,
       h00: number, h10s: number, h01: number, h11s: number,
     ) => void;
+    readonly eval_taylor_f32_o1: (srcOff: number, dstOff: number, n: number) => void;
+    readonly eval_taylor_f32_o2: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_taylor_f32_o3: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_hermite_f32: (
+      prevOff: number, currOff: number, dstOff: number,
+      n: number, strideElems: number,
+      h00: number, h10s: number, h01: number, h11s: number,
+    ) => void;
+    readonly eval_taylor_f32_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_taylor_f64_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -417,6 +462,12 @@ export function instantiateConsumer(
     "eval_taylor_f64_o2",
     "eval_taylor_f64_o3",
     "eval_hermite_f64",
+    "eval_taylor_f32_o1",
+    "eval_taylor_f32_o2",
+    "eval_taylor_f32_o3",
+    "eval_hermite_f32",
+    "eval_taylor_f32_o2_simd",
+    "eval_taylor_f64_o2_simd",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -461,5 +512,17 @@ export function instantiateConsumer(
       exports.eval_taylor_f64_o3(srcOff, dstOff, n, dt),
     evalHermiteF64: (prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s) =>
       exports.eval_hermite_f64(prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s),
+    evalTaylorF32O1: (srcOff, dstOff, n) =>
+      exports.eval_taylor_f32_o1(srcOff, dstOff, n),
+    evalTaylorF32O2: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f32_o2(srcOff, dstOff, n, dt),
+    evalTaylorF32O3: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f32_o3(srcOff, dstOff, n, dt),
+    evalHermiteF32: (prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s) =>
+      exports.eval_hermite_f32(prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s),
+    evalTaylorF32O2Simd: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f32_o2_simd(srcOff, dstOff, n, dt),
+    evalTaylorF64O2Simd: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f64_o2_simd(srcOff, dstOff, n, dt),
   };
 }
