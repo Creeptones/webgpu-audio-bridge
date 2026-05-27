@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Schema-driven control-rate-to-audio-rate bridge for the browser. Turbo mode (SAB + Atomics, sub-microsecond push/pull) and Standard mode (MessageChannel, 5-50ms — 0.8.x) share one schema DSL and one frame API. Streams structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet.",
   "type": "module",
   "main": "./dist/index.js",
@@ -35,8 +35,8 @@
   "scripts": {
     "build": "npm run build:wasm && tsc -p tsconfig.build.json",
     "build:wasm": "node wasm/build.mjs",
-    "test": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/Bridge.properties.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/BridgeBlockConsumer.test.ts && tsx tests/BridgeGPUSource.writeTarget.test.ts && tsx tests/BridgeWebNNSource.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
-    "test:unit": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/Bridge.properties.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/BridgeBlockConsumer.test.ts && tsx tests/BridgeGPUSource.writeTarget.test.ts && tsx tests/BridgeWebNNSource.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Float64RingBuffer.test.ts",
+    "test": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.core.test.ts && tsx tests/Bridge.smoother.test.ts && tsx tests/Bridge.invariant.test.ts && tsx tests/Bridge.pll.test.ts && tsx tests/Bridge.trajectory.test.ts && tsx tests/Bridge.backpressure.test.ts && tsx tests/Bridge.observability.test.ts && tsx tests/Bridge.facades.test.ts && tsx tests/Bridge.properties.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/BridgeBlockConsumer.test.ts && tsx tests/BridgeGPUSource.writeTarget.test.ts && tsx tests/BridgeWebNNSource.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
+    "test:unit": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.core.test.ts && tsx tests/Bridge.smoother.test.ts && tsx tests/Bridge.invariant.test.ts && tsx tests/Bridge.pll.test.ts && tsx tests/Bridge.trajectory.test.ts && tsx tests/Bridge.backpressure.test.ts && tsx tests/Bridge.observability.test.ts && tsx tests/Bridge.facades.test.ts && tsx tests/Bridge.properties.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/BridgeBlockConsumer.test.ts && tsx tests/BridgeGPUSource.writeTarget.test.ts && tsx tests/BridgeWebNNSource.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Float64RingBuffer.test.ts",
     "test:concurrent": "tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
     "test:browser": "playwright test --config tests/browser/playwright.config.ts",
     "bench": "tsx bench/Bridge.bench.ts && tsx bench/Float64RingBuffer.bench.ts",

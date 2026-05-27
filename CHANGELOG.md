@@ -4,6 +4,181 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.5] — 2026-05-27
+
+### Added — `tests/Bridge.test.ts` 8-way feature-file split (audit cohort, testing-infra 3/3)
+
+Fifth patch of the audit cohort, third and final slice of the
+testing-infrastructure sub-cohort. Mechanically splits the
+single 5,736-line `tests/Bridge.test.ts` (93 test functions
+covering pins 1–92) into eight feature files. No production code
+touched; no behavior change; pin numbers preserved verbatim in
+the new section comments so `git log -L` / `git blame` traverse
+the split cleanly.
+
+**New file.** `tests/_bridgeHelpers.ts` — shared helpers extracted
+from the old file's preamble + the inline invariant-fixture block:
+
+- `mulberry32(seed)` — deterministic PRNG for fuzz pins.
+- `PhysFrame` / `makePhysFrame(seq, n)` / `emptyPhysFrame(n)` /
+  `framesEqual(a, b)` — physics-schema fixture builders shared
+  by every split file that touches `physicsControlFrameSchema`.
+- `makeInvariantSchema()` / `InvFrame` / `makeInvFrame(seq, vEff)`
+  / `emptyInvFrame()` — `withInvariant` fixture used by the
+  invariant-classifier pins (#34–40, 48, 54) AND the
+  softFrames/stallRecoveries observability pins (#88–89). The
+  invariant block was previously inline at the top of the
+  invariant test cluster (lines 1693–1727 of the old file); it
+  moved into the shared helper to avoid duplicating it across
+  two split files.
+
+Per-pin fixture builders that don't cross file boundaries stayed
+local to their tests (per the handoff guidance — don't extract
+beyond what's necessary).
+
+**The 8 split files** — pin layout follows the audit-plan table
+(handoff Post-0.8.4 §"What's next — 0.8.5"). Pin 3 in the
+file-header docstring is compound (covers both `testEmptyPull` and
+`testFullPush` — the second function counts toward core's 18-
+function total even though the pin range advertised is 1–17):
+
+| File | Function count | Pins | Topic |
+|---|---|---|---|
+| `tests/Bridge.core.test.ts` | 18 | 1–17 | Construction, allocate, FIFO, wrap, mixed-type schema, Int32-boundary algebra |
+| `tests/Bridge.smoother.test.ts` | 13 | 18–27, 47, 55, 91 | α-smoother math, integer round, float-array blend, trajectory interop, catch-up policy, per-instance heap state |
+| `tests/Bridge.observability.test.ts` | 17 | 28–33, 49, 69–71, 84–90 | Flow_scale PI controller, end-to-end latency, push/pull/skip counters, wait durations, subscribeTelemetry, soft/stall counters, BridgeGPUSource introspection |
+| `tests/Bridge.invariant.test.ts` | 9 | 34–40, 48, 54 | `.withInvariant` round-trip, hard/soft/threshold classification, trajectory × invariant interop, epsilon floor |
+| `tests/Bridge.pll.test.ts` | 16 | 41–43, 50–53, 72–79, 92 | Cold-start, convergence, step + reset + validation, timestamp role / sample-rate / unit conversion, Mahalanobis outlier gate, drift estimator, lane 4-5 publication, BigInt-free encoding boundary |
+| `tests/Bridge.trajectory.test.ts` | 9 | 44–46, 56–60, 80 | `evaluateInto` round-trip, validation, clamps (velocity / acceleration / hold / saturate), clamp-free bit-exact, `forEachSampleInQuantum` |
+| `tests/Bridge.backpressure.test.ts` | 7 | 64–68, 82–83 | Policy reject / drop-newest / drop-oldest / block fast-path / block timeout, drop-oldest CAS-commit pull bit-exact, drop-oldest pullLatest skipped accounting |
+| `tests/Bridge.facades.test.ts` | 4 | 61–63, 81 | FrameSmoother / ConsumerClockRecovery / AdaptiveFlowController unit construction, BridgeGPUSource orchestration |
+
+Each split file:
+- Imports only the symbols its body actually references (the
+  TypeScript `noUnusedLocals` gate enforces this).
+- Preserves the original `// ── N. <title> ──...` section comment
+  verbatim above each test function so `grep -n "// ── 91"` still
+  finds the per-instance-heap-state pin (now in
+  `Bridge.smoother.test.ts`).
+- Owns a per-file `main()` that calls every test in pin-number
+  order and prints `\nAll <topic> tests passed.` on success. The
+  three async pins (#81 `testBridgeGpuSourceOrchestration`, #84–87
+  the four `subscribeTelemetry*` pins, #90
+  `testBridgeGpuSourceIntrospection`) land in files whose `main()`
+  is also async (`Bridge.facades.test.ts` and
+  `Bridge.observability.test.ts`).
+
+**Patch surface (testing-infrastructure only):**
+
+- `tests/Bridge.test.ts` — deleted.
+- `tests/Bridge.core.test.ts` — new (679 lines, 18 functions).
+- `tests/Bridge.smoother.test.ts` — new (741 lines, 13 functions).
+- `tests/Bridge.observability.test.ts` — new (1,081 lines, 17 functions).
+- `tests/Bridge.invariant.test.ts` — new (625 lines, 9 functions).
+- `tests/Bridge.pll.test.ts` — new (1,233 lines, 16 functions).
+- `tests/Bridge.trajectory.test.ts` — new (614 lines, 9 functions).
+- `tests/Bridge.backpressure.test.ts` — new (375 lines, 7 functions).
+- `tests/Bridge.facades.test.ts` — new (376 lines, 4 functions).
+- `tests/_bridgeHelpers.ts` — new shared helper module.
+- `package.json` — `test` and `test:unit` scripts updated:
+  single `tsx tests/Bridge.test.ts` invocation replaced with eight
+  sequential invocations in feature-grouped order
+  (core → smoother → invariant → pll → trajectory → backpressure →
+  observability → facades), preserving the
+  `tests/Bridge.properties.test.ts` position (now after
+  `Bridge.facades.test.ts`).
+
+### Why
+
+The single 5,736-line file was the largest unit in the test
+directory by ~5× and the largest in the repo by ~5×. Every audit
+in 0.7.x → 0.8.x noted it as a code-organization regression
+relative to the surrounding files (`schema.test.ts`,
+`Bridge.phaseLock.test.ts`, etc.) that already follow one-file-
+per-topic. Concrete wins from the split:
+
+- **Faster feedback during local development.** Running a single
+  topic's suite (e.g. `npx tsx tests/Bridge.smoother.test.ts`)
+  finishes in ~50 ms vs the previous file's ~750 ms. When
+  iterating on smoother behavior you stop paying for the PLL +
+  trajectory + observability pins per cycle.
+- **Topic-scoped review surface.** A PR that touches
+  `src/FrameSmoother.ts` now has a single test file in its diff
+  (`tests/Bridge.smoother.test.ts`), not the whole monolith.
+- **Pin discovery via filename.** "Where is pin #62?" used to
+  require knowing it lived in `Bridge.test.ts` at line 3656; now
+  the topic groupings let you guess (62 ≈ ConsumerClockRecoveryUnit
+  ≈ facades file).
+- **Test parallelization headroom.** Sequential `&&` chains stay
+  in `package.json`'s `test` script for now (the order matters
+  for the post-build:wasm step), but the 8 split files can each
+  run in parallel under a future runner change without coordinating
+  shared state — they're independently rooted.
+
+The split is mechanical: no test logic changed. The
+`tests/_bridgeHelpers.ts` extraction is the only behavioral
+delta, and it's strictly a function move (the original definitions
+were inline at the top of `Bridge.test.ts` and inline at the
+invariant cluster).
+
+**Closes the testing-infrastructure sub-cohort.** With 0.8.3
+(flake fix), 0.8.4 (property pins), and 0.8.5 (file split) all
+landed, the audit cohort's testing-infra slice is complete. The
+remaining audit-cohort patches (0.8.6 documentation polish, 0.8.7
+npm publish + CLI, 0.8.8 wavefunction migration, 0.8.9
+Aubry-André example) touch product surface rather than test
+infrastructure.
+
+### Wire compatibility
+
+**100% wire-compatible.** No production code touched; no SAB
+layout, schema, or public-API change. A 0.8.4 consumer and a
+0.8.5 consumer over the same SAB exchange frames bit-identically.
+
+### Tests
+
+21 suites green (previously 14; 8 new from the split + same 14
+from before − 1 from `Bridge.test.ts` deletion = 21). Each split
+file's `main()` prints its own `\nAll <topic> tests passed.`
+banner so failures are localized to the offending feature.
+
+Test-function counts per file: 18 / 13 / 17 / 9 / 16 / 9 / 7 / 4
+(core / smoother / observability / invariant / pll / trajectory /
+backpressure / facades) = 93 functions total. The handoff's
+expected "92 pins" was off-by-one due to the file-header pin 3
+being compound (`testEmptyPull` + `testFullPush` both count
+toward core); the split preserves both functions in
+`Bridge.core.test.ts` with their original `// ── 3.` / `// ── 5.`
+section comments intact for git-blame.
+
+**Pre-existing in-file labeling quirk preserved.** The old
+`Bridge.test.ts` had two adjacent section comments both labeled
+`// ── 15.` (lines 925 + 963 of the pre-split file: pin 14
+"Mixed-type schema" and pin 15 "Wrap across Int32 sign boundary"
+respectively, with the first comment carrying a pre-existing
+typo). The split preserves both comments verbatim — fixing the
+typo would change a line whose content has been stable since the
+0.4.x cohort and break `git blame` on that line. Future readers
+greping for "pin 14" should also try "pin 15" if the topic
+matches mixed-type schemas.
+
+### Bench
+
+No production code touched; no bench changes. Push 1.20 μs, pull
+1.20 μs, pullLatest 1.20 μs medians unchanged from the 0.8.4
+baseline. Trajectory eval and flow_scale recovery cells also
+unchanged.
+
+### Documentation
+
+CHANGELOG entry above. README untouched (the split changes test
+file names but no public API). Each split file's header docstring
+lists only the pins it owns, with `tests/Bridge.test.ts` (in
+0.8.4) referenced as the source for the original combined per-pin
+descriptions — that's where to look for the full multi-line
+explanation of any pin until the next time someone audits each
+split file's header.
+
 ## [0.8.4] — 2026-05-27
 
 ### Added — fast-check property pins for FrameSmoother / trajectory / PLL (audit cohort, testing-infra 2/3)
