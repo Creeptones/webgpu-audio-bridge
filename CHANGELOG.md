@@ -4,6 +4,191 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.16] — 2026-05-27
+
+### Added — `BridgeWebNNSource<S>` experimental WebNN adapter (Track 5, first patch)
+
+Ships an experimental adapter for streaming WebNN model output
+through a `Bridge<S>`. Lives at `src/experimental/BridgeWebNNSource.ts`
+and is reachable via the new `webgpu-audio-bridge/experimental`
+package subpath. **Outside the 1.0 stability contract** — the
+underlying WebNN spec is W3C Candidate Recommendation, Chrome
+flag-gated (`chrome://flags/#web-machine-learning-api`), Safari
+absent, Firefox early — so this helper may break across MINOR
+version bumps as the spec stabilizes. Patch bumps within a minor
+preserve compatibility.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`src/experimental/BridgeWebNNSource.ts`** (new, ~340 LOC). A
+  thin heap-side helper that takes a `Bridge<S>` whose schema
+  declares exactly one `f32Array` field (the samples block) and
+  exposes:
+
+  - `pushFromTensor(tensor: MLTensorLike): Promise<boolean>` — async
+    path that reads the tensor's bytes (via `tensor.read()` or the
+    optional `tensorReader` override), copies into the schema's
+    samples field, optionally bumps a `u64` block index, runs an
+    optional `fillScalars` hook, and commits via the bridge's
+    `beginPush` / `commitPush` zero-copy path.
+
+  - `pushFromTypedArray(samples: Float32Array): boolean` — sync
+    fallback path. Works on any host (no WebNN dependency on this
+    code path). Useful for CPU-side models or transitional code
+    while WebNN stabilizes. Same auto-increment + fillScalars
+    surface as the async path.
+
+  - Static `BridgeWebNNSource.isAvailable(): boolean` — non-throwing
+    probe of `typeof globalThis.MLTensor === 'function'`.
+    Interface-presence sniff, NOT UA detection.
+
+  Constructor gates on `globalThis.MLTensor` being a function and
+  throws a descriptive `"WebNN not available"` error otherwise; the
+  error names the Chrome flag, points at the static probe, and
+  notes the `skipAvailabilityCheck: true` opt-out for test code that
+  needs the typed-array fallback path without a real WebNN runtime.
+
+  Schema constraints mirror `BridgeBlockProducer`:
+  - exactly one `f32Array` field (zero or multiple throws);
+  - optional `blockIndexField` resolution rules:
+    `null` disables, `'name'` validates a `u64` scalar, `undefined`
+    defaults to `'blockIndex'` if present as a `u64` scalar.
+  - optional `fillScalars` hook runs once per successful push after
+    samples + block-index are written.
+
+  Telemetry surface: `pushedCount()`, `droppedCount()`, `blockIndex()`.
+  Public readonly fields: `bridge`, `blockSize`, `samplesByteSize`,
+  `samplesField`, `blockIndexField`.
+
+- **`src/experimental/index.ts`** (new). Re-exports
+  `BridgeWebNNSource` and its public types (`BridgeWebNNSourceOptions`,
+  `MLTensorLike`, `WebNNTensorReader`). Carries the stability-contract
+  docstring for the subpath.
+
+- **`package.json`** — new `exports` entry:
+
+      "./experimental": {
+        "types": "./dist/experimental/index.d.ts",
+        "import": "./dist/experimental/index.js",
+        "require": "./dist/experimental/index.js"
+      }
+
+  Users import via `webgpu-audio-bridge/experimental`. The subpath
+  name signals "outside the 1.0 contract"; the main entry point
+  (`webgpu-audio-bridge`) is unchanged.
+
+- **`tests/BridgeWebNNSource.test.ts`** (new, 10 pins). Covers:
+
+  1. `isAvailable()` reflects the current `globalThis` state.
+  2. Constructor gates on `MLTensor` with a descriptive error
+     message naming the Chrome flag + the static probe.
+  3. `skipAvailabilityCheck: true` bypasses the gate.
+  4. Zero-`f32Array` and multi-`f32Array` schemas throw on
+     construction with informative messages.
+  5. Block-index field resolution covers all four cases (default
+     present, default absent, explicit string, explicit null, and
+     the wrong-kind + missing-field error paths).
+  6. `pushFromTypedArray` round-trips a known sample buffer through
+     the bridge with bit-exact samples + correct auto-incremented
+     `blockIndex` on the consumer side.
+  7. Size-mismatch handling: shorter than `blockSize` throws;
+     longer is accepted and only the first `blockSize` samples
+     are copied (subarray semantics).
+  8. Full ring → `pushFromTypedArray` returns `false`,
+     `droppedCount` increments, and `blockIndex` does NOT
+     advance on drop.
+  9. `pushFromTensor` exercises the present-WebNN path via a
+     `globalThis.MLTensor` shim installed for the test's duration;
+     bytes land in the bridge correctly.
+  10. `tensorReader` override is honored when the caller supplies
+      the WebNN-context-side read variant.
+
+  Wired into `test` and `test:unit` scripts alongside the existing
+  test files (mirror the 0.7.13 / 0.7.15 patterns).
+
+### Why
+
+WebNN is positioned as the standard for AI inference in the
+browser. As models like real-time voice cloning, neural reverb,
+neural EQ matching, and physics-modelled instruments mature, the
+output side of these models will need to land in the audio thread
+with low jitter — exactly what `Bridge<S>` is built for. Shipping
+an experimental adapter NOW (rather than waiting for spec
+stability) does two things:
+
+1. **Positions the library as the AI-audio bridge** — users
+   evaluating "how do I get my WebNN model into AudioWorklet"
+   will find a working adapter. The typed-array fallback path
+   makes the helper useful even for CPU-side models that don't
+   touch WebNN at all yet.
+
+2. **Captures the design space** — the schema-validation rules,
+   the block-index convention, the `tensorReader` escape hatch
+   for context-side reads, the `fillScalars` hook for producer-
+   side metadata — these decisions all become concrete and
+   reviewable now rather than baked into a hand-rolled
+   integration ten projects down the line.
+
+Living under `src/experimental/` makes the volatility explicit.
+The stable surface (`Bridge<S>.push`, schema DSL,
+`getEnvironmentReport()`) remains under the 1.0 contract; this
+helper does not.
+
+### Wire compatibility
+
+100%. No SAB byte change, no new SAB lanes, no schema extension,
+no protocol change. `BridgeWebNNSource` composes the public
+`Bridge<S>` push surface (`beginPush` / `commitPush`) — a bridge
+fed via this helper is bit-for-bit interoperable with one fed by
+a hand-rolled push loop performing the same `Float32Array.set` +
+scalar assignment + commit. The new `./experimental` exports
+subpath is additive on `package.json`; the main entry point's
+shape is unchanged.
+
+### Tests
+
+13 suites green. `tests/BridgeWebNNSource.test.ts` adds 10 pins
+covering the construction gate, schema validation, the typed-
+array round-trip + counters, the MLTensor-installed path via a
+`globalThis` shim, and the `tensorReader` override. The 0.7.15
+suites (`environment.test.ts`'s 13 pins,
+`BridgeGPUSource.writeTarget.test.ts`'s 6 pins, and the
+underlying `bridge-gpu-source-orchestration` pin in
+`tests/Bridge.test.ts`) remain green unchanged.
+
+### Bench
+
+Push / pull / pullLatest medians unchanged from 0.7.15 (≈1.20 μs).
+No new bench cell — `BridgeWebNNSource`'s push paths are
+non-hot-path (they're called at WebNN inference cadence, dozens
+of Hz at most, not the audio quantum cadence). The `trajEval
+(fast)` cell is at the 1.20 μs fast-path budget boundary
+(≤1.25 μs), so within budget.
+
+### Documentation
+
+CHANGELOG entry above. Comprehensive file header on
+`src/experimental/BridgeWebNNSource.ts` documents the construction
+gate, the schema constraint, the two push surfaces, the stability
+contract, and the wire-compatibility guarantee. The experimental
+subpath's index file carries the "outside the 1.0 contract"
+docstring so callers reading their import path see the contract
+immediately.
+
+README is intentionally NOT updated in this patch — the user-
+facing "Experimental — WebNN" section lands in 0.7.17 alongside
+the `webnn` + `mlTensor` capability flags on
+`getEnvironmentReport()`. Mirroring the 0.7.13 / 0.7.14 split:
+this patch ships the helper; the next patch ships the report
+flags + README documentation + final docs for the cohort.
+
+Next patch: 0.7.17 (Track 5 closeout — `webnn` + `mlTensor`
+capability flags on `getEnvironmentReport()` + README
+"Experimental — WebNN" section + final docs; the completion
+patch that unblocks the audit cohort's working-tree
+reservations on `src/Bridge.ts`, `src/SpscRing.ts`, and
+`tests/Bridge.test.ts` for the 0.8.x line).
+
 ## [0.7.15] — 2026-05-27
 
 ### Added — `WriteTarget` strategy scaffold + `webgpuZeroCopy` capability flag (Track 4 of the King roadmap)
