@@ -170,8 +170,153 @@ function main(): void {
   );
   ok(`memory-identity (${pages} pages, ${byteLength} bytes)`);
 
+  // ── 5: FIFO peek+commit drains agree with JS Bridge.pull bytes (0.7.6) ──
+  // The hot-path pin for the SPSC dance. Push N frames via the JS Bridge,
+  // then drain via the WASM consumer's peek_pull / commit_pull cycle. For
+  // each drained frame, read the slot bytes directly from the SAB and
+  // verify they match what was pushed. The slot index returned by WASM
+  // must equal `readIdx & mask` — same algebra the JS Bridge uses.
+  //
+  // The schema is { seq: u64, tMacroNs: u64, value: f64 } so the in-
+  // slot field offsets are seq @ 0, tMacroNs @ 8, value @ 16 — easy to
+  // index via DataView without reaching into the Bridge's private
+  // umbrella views.
+  {
+    const frameBytes = schema.compiled.frameByteSize;
+    const headerBytes = 32; // matches RING_HEADER_BYTES (the bridge's static)
+    const mask = CAPACITY - 1;
+    const dv = new DataView(sab);
+
+    // Drain whatever's left over from pin 3 so we start with an empty ring.
+    while (bridge.pull(scratchPull)) { /* drain */ }
+    assertEq(
+      consumer.peekPull(mask),
+      -1,
+      "peekPull on empty ring returns -1",
+    );
+    consumer.commitPull(); // no-op semantics on empty (idempotent store)
+    assertEq(
+      Atomics.load(headerView, 1),
+      Atomics.load(headerView, 0),
+      "commit_pull on empty ring leaves read_index === write_index",
+    );
+
+    const N = 150; // enough to wrap CAPACITY (=16) several times
+    for (let i = 0; i < N; i++) {
+      scratchPush.seq = BigInt(1_000_000_000 + i);
+      scratchPush.tMacroNs = BigInt((1_000_000_000 + i) * 1_000);
+      scratchPush.value = -3.14 + i * 0.01;
+      assert(bridge.push(scratchPush), `pin5: push ${i}`);
+
+      const expectedReadIdx = Atomics.load(headerView, 1);
+      const expectedSlot = (expectedReadIdx >>> 0) & mask;
+      const slot = consumer.peekPull(mask);
+      assertEq(slot, expectedSlot, `pin5: peekPull slot at i=${i}`);
+
+      // Read slot bytes via DataView — same bytes JS Bridge.pull would
+      // surface through its umbrella views. Little-endian per the
+      // bridge's SAB conventions.
+      const slotOffset = headerBytes + slot * frameBytes;
+      const seq = dv.getBigUint64(slotOffset + 0, true);
+      const tMacroNs = dv.getBigUint64(slotOffset + 8, true);
+      const value = dv.getFloat64(slotOffset + 16, true);
+      assertEq(seq, BigInt(1_000_000_000 + i), `pin5: seq[${i}]`);
+      assertEq(tMacroNs, BigInt((1_000_000_000 + i) * 1_000), `pin5: tMacroNs[${i}]`);
+      assertEq(value, -3.14 + i * 0.01, `pin5: value[${i}]`);
+
+      consumer.commitPull();
+      // After commit, read_index advanced by exactly one.
+      assertEq(
+        Atomics.load(headerView, 1),
+        (expectedReadIdx + 1) | 0,
+        `pin5: read_index post-commit at i=${i}`,
+      );
+    }
+    ok(`wasm-pull-fifo-equivalence (${N} frames drained, wrap covered ${Math.floor(N / CAPACITY)}×)`);
+  }
+
+  // ── 6: pullLatest peek+commit skips correctly (0.7.6) ──────────────────
+  // The drain-to-newest contract. Push a burst of K frames without
+  // draining, then a single WASM peek_pull_latest must return the slot
+  // of the K-th frame and commit_pull_latest must advance read_index
+  // ALL THE WAY to write_index (consuming the older K-1 in one shot).
+  // Repeat several times to cover wraparound and varying burst sizes.
+  {
+    const frameBytes = schema.compiled.frameByteSize;
+    const headerBytes = 32;
+    const mask = CAPACITY - 1;
+    const dv = new DataView(sab);
+
+    // Drain leftover.
+    while (bridge.pull(scratchPull)) { /* drain */ }
+    assertEq(
+      consumer.peekPullLatest(mask),
+      -1,
+      "peekPullLatest on empty ring returns -1",
+    );
+    consumer.commitPullLatest(); // idempotent on empty
+
+    const bursts = [1, 2, 5, CAPACITY - 1, CAPACITY]; // last burst saturates the ring
+    let pushSeqBase = 2_000_000_000;
+    for (let bIdx = 0; bIdx < bursts.length; bIdx++) {
+      const K = bursts[bIdx]!;
+      const writeIdxBefore = Atomics.load(headerView, 0);
+
+      for (let k = 0; k < K; k++) {
+        scratchPush.seq = BigInt(pushSeqBase + k);
+        scratchPush.tMacroNs = BigInt((pushSeqBase + k) * 1_000);
+        scratchPush.value = 100 + k * 0.5;
+        assert(bridge.push(scratchPush), `pin6: push burst ${bIdx} item ${k}`);
+      }
+
+      const writeIdxAfter = Atomics.load(headerView, 0);
+      assertEq(
+        (writeIdxAfter - writeIdxBefore) | 0,
+        K,
+        `pin6: burst ${bIdx} produced ${K} pushes`,
+      );
+
+      // WASM peek must return slot of the LAST pushed frame (writeIdx − 1).
+      const expectedNewestSlot = ((writeIdxAfter - 1) >>> 0) & mask;
+      const slot = consumer.peekPullLatest(mask);
+      assertEq(slot, expectedNewestSlot, `pin6: peekPullLatest slot for burst ${bIdx}`);
+
+      // The slot's contents must equal the LAST frame in the burst.
+      const slotOffset = headerBytes + slot * frameBytes;
+      const seq = dv.getBigUint64(slotOffset + 0, true);
+      const tMacroNs = dv.getBigUint64(slotOffset + 8, true);
+      const value = dv.getFloat64(slotOffset + 16, true);
+      assertEq(seq, BigInt(pushSeqBase + K - 1), `pin6: newest seq for burst ${bIdx}`);
+      assertEq(
+        tMacroNs,
+        BigInt((pushSeqBase + K - 1) * 1_000),
+        `pin6: newest tMacroNs for burst ${bIdx}`,
+      );
+      assertEq(value, 100 + (K - 1) * 0.5, `pin6: newest value for burst ${bIdx}`);
+
+      consumer.commitPullLatest();
+
+      // After commit, read_index === writeIdxAfter (consumed everything).
+      assertEq(
+        Atomics.load(headerView, 1),
+        writeIdxAfter,
+        `pin6: read_index post-commit for burst ${bIdx}`,
+      );
+      // Ring must be empty for the next iteration.
+      assertEq(
+        consumer.peekPullLatest(mask),
+        -1,
+        `pin6: ring empty after drain for burst ${bIdx}`,
+      );
+      consumer.commitPullLatest();
+
+      pushSeqBase += K;
+    }
+    ok(`wasm-pullLatest-skip-equivalence (${bursts.length} bursts ${bursts.join(",")})`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance in agreement with JS atomics.",
   );
 }
 

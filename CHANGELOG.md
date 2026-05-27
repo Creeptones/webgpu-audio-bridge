@@ -4,6 +4,130 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.6] — 2026-05-27
+
+### Added — WASM-owned SPSC pull dance (Track 2 of the King roadmap, second patch)
+
+The WASM consumer now owns the consumer-side atomic discipline for
+both `pull` (FIFO) and `pullLatest` (drain-to-newest). The hot
+path's most ordering-sensitive lines — the acquire-load of
+`write_index`, the empty/non-empty arbitration, the
+release-store of the advanced `read_index`, and the always-notify
+that wakes a parked producer — execute inside WebAssembly, while
+the slot's payload read (the schema-driven decode) stays JS-side
+via the existing typed-array umbrella views. The split preserves
+the load-bearing SPSC invariant: the producer cannot overwrite a
+slot until the consumer releases its read on it.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`wasm/decoder.wat`** grows four new exports:
+  - **`peek_pull_latest(mask: i32) → i32`** — acquire-loads
+    `write_index`, returns the slot index of the newest available
+    frame (or `-1` on empty). Saves the observed `write_index`
+    into a module-scoped i32 global so the matching commit knows
+    what to release to. **No mutation of `read_index`** — the JS
+    caller reads the slot bytes BETWEEN this peek and the commit.
+  - **`commit_pull_latest()`** — release-stores `read_index ←
+    saved write_index`, then `memory.atomic.notify` on lane 1 to
+    wake a parked producer (always-notify; matches JS Bridge's
+    unconditional discipline).
+  - **`peek_pull(mask: i32) → i32`** — FIFO variant. Returns
+    slot of the oldest unread frame (or `-1`). Saves
+    `read_index + 1` for the matching commit.
+  - **`commit_pull()`** — release-stores `read_index ← (saved
+    readIdx + 1)`, then notifies.
+
+  Empty-peek safety: both peeks SAFE-DEFAULT the pending-commit
+  global to the CURRENT `read_index` before deciding empty vs
+  non-empty. That makes commit-after-empty-peek (and
+  commit-without-any-prior-peek) a true no-op store rather than
+  rewinding the lane — important for defensive callers and for
+  the smoke-test loops that mix peek and commit unconditionally.
+
+- **`src/worklet/index.ts`** `WorkletConsumer` interface grows
+  four typed methods: `peekPullLatest(mask)`, `commitPullLatest()`,
+  `peekPull(mask)`, `commitPull()`. The instantiation guard
+  in `instantiateConsumer` now validates ALL six exports
+  (the 0.7.5 two plus these four) at construction time, so a
+  stale/mis-built binary surfaces at instantiation rather than
+  as a cryptic deep-in-audio-thread `is not a function`.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds two pins:
+  - **Pin 5 — FIFO pull equivalence.** Drives 150 push/peek/
+    JS-read/commit cycles (9+ ring wraps at capacity=16),
+    asserts every slot index agrees with `readIdx & mask`,
+    asserts the DataView-read slot bytes match what was pushed
+    (`seq: u64`, `tMacroNs: u64`, `value: f64` per frame),
+    and asserts `read_index` advances by exactly one per commit.
+  - **Pin 6 — pullLatest skip equivalence.** Drives bursts of
+    1, 2, 5, 15, and 16 (= capacity) pushes without intermediate
+    draining; a single peek+commit per burst must return the
+    slot of the LAST frame and advance `read_index` ALL THE WAY
+    to `write_index` (consuming K-1 older frames in one shot).
+    Verifies the slot data matches the burst's tail frame.
+
+  The two existing 0.7.5 header-readback pins still pass —
+  purely additive.
+
+### Why
+
+The atomic dance is the consumer-side hot-path-critical
+portion of `pullLatest`. Today's JS implementation pays a
+property-access tax (six fields on the `SpscRing` instance:
+`this.indices`, `this.mask`, the four counter-lane constants)
+plus the per-call function-call overhead from the outer
+`Bridge.pullLatest → SpscRing.pullLatest → Atomics.*` chain.
+The WASM consumer eliminates all of it — the four exports
+compile to single-digit instruction counts each.
+
+The PEEK/COMMIT split is what lets us defer the schema-driven
+payload decode (the JS-side `.set()` calls on the umbrella
+typed-array views) to subsequent patches WITHOUT giving up the
+WASM atomic-discipline win. Each later patch can move one decode
+kind into WASM at a time (scalar → array → SIMD-vectorized
+trajectory) and the equivalence corpus grows accordingly.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout unchanged.
+The WASM-side atomic ops (`i32.atomic.load`, `i32.atomic.store`,
+`memory.atomic.notify`) emit the exact same memory-model
+guarantees as the JS-side `Atomics.load` / `Atomics.store` /
+`Atomics.notify` they replace, so the SPSC invariant holds
+identically. A producer running 0.7.5 (JS Bridge) interoperates
+bit-for-bit with a 0.7.6 consumer using the WASM peek/commit
+dance, and vice-versa.
+
+### Tests
+
+The two new equivalence pins land alongside the four 0.7.5
+pins in `Bridge.wasmEquivalence.test.ts`; all six green.
+All 0.7.5 suites (Bridge, BridgeFacades, BridgeInputLane,
+schema, environment, Bridge.phaseLock incl. the Hermite pin,
+two 1 M-frame concurrent stress runs, Float64RingBuffer
+legacy) all green — purely additive change.
+
+### Bench
+
+push/pull/pullLatest medians unchanged (the JS path is what
+the bench measures; the WASM path has no bench coverage yet).
+Bench gates for WASM vs JS pullLatest land alongside the full
+end-to-end WASM port (a later 0.7.x patch where the schema-
+driven decode also lives inside WASM and the JS shim has no
+hot-path work beyond the two WASM calls).
+
+### Documentation
+
+`wasm/decoder.wat` carries a self-contained section header
+documenting the PEEK/COMMIT contract, the SPSC invariant the
+split preserves, the memory-ordering guarantees of each
+`i32.atomic.*` op vs its JS-side counterpart, and the empty-
+peek safe-default discipline. `WorkletConsumer` interface
+docstrings in `src/worklet/index.ts` mirror the WAT contract.
+README integration lands once the full pullLatest is WASM-
+backed.
+
 ## [0.7.5] — 2026-05-27
 
 ### Added — WASM consumer scaffolding (Track 2 of the King roadmap, first patch)

@@ -123,10 +123,11 @@ export function allocateWorkletMemory(
   return { memory, sab, byteLength: pages * WASM_PAGE_BYTES, pages };
 }
 
-/** Handle returned by `instantiateConsumer`. The smoke-test surface
- *  today exposes the two SAB header readbacks the decoder.wat module
- *  declares; subsequent patches grow this into the full pullLatest /
- *  schema-decode surface. */
+/** Handle returned by `instantiateConsumer`. The 0.7.5 cut exposed
+ *  the two SAB header readbacks the decoder.wat module declares; 0.7.6
+ *  adds the pull / pullLatest peek+commit dance (the consumer-side SPSC
+ *  atomic discipline, the hot-path-critical portion of pullLatest);
+ *  subsequent patches grow this into the full schema-driven decode. */
 export interface WorkletConsumer {
   /** Atomically read lane 0 of the SAB header (write_index). Returns
    *  the same value as JS-side `Atomics.load(int32View, 0)` for the
@@ -135,6 +136,35 @@ export interface WorkletConsumer {
   /** Atomically read lane 1 of the SAB header (read_index). Returns
    *  the same value as JS-side `Atomics.load(int32View, 1)`. */
   readReadIndex(): number;
+
+  /** pullLatest peek (0.7.6). Reads write_index (acquire) and read_index;
+   *  if the ring is empty returns -1, otherwise returns the slot index
+   *  of the newest available frame AND saves the observed write_index
+   *  in module-scoped state for the matching `commitPullLatest`. Does
+   *  NOT advance read_index — the caller reads the slot bytes via JS-
+   *  side typed-array views BETWEEN this peek and the commit, preserving
+   *  the SPSC invariant that the producer cannot overwrite a slot until
+   *  the consumer releases its read on it.
+   *
+   *  `mask` is `capacity - 1` (precomputed once at Bridge setup since
+   *  capacity is fixed for the lifetime of the SAB). */
+  peekPullLatest(mask: number): number;
+  /** pullLatest commit (0.7.6). Release-store read_index ← (saved
+   *  write_index from the matching peek), then notify a producer that
+   *  may be parked on the read_index lane via `Atomics.wait`. Must be
+   *  called after the matching `peekPullLatest` returned ≥ 0 AND after
+   *  the caller has finished reading the slot bytes. */
+  commitPullLatest(): void;
+
+  /** FIFO pull peek (0.7.6). Same shape as `peekPullLatest` but
+   *  oldest-frame-first; no skip semantics. Returns the slot index of
+   *  the oldest unread frame (or -1 if empty) and saves `readIdx + 1`
+   *  for the matching `commitPull`. */
+  peekPull(mask: number): number;
+  /** FIFO pull commit (0.7.6). Release-store read_index ← (saved
+   *  readIdx + 1), notify. */
+  commitPull(): void;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -170,18 +200,36 @@ export function instantiateConsumer(
   const exports = instance.exports as {
     readonly read_write_index: () => number;
     readonly read_read_index: () => number;
+    readonly peek_pull_latest: (mask: number) => number;
+    readonly commit_pull_latest: () => void;
+    readonly peek_pull: (mask: number) => number;
+    readonly commit_pull: () => void;
   };
-  if (
-    typeof exports.read_write_index !== "function" ||
-    typeof exports.read_read_index !== "function"
-  ) {
-    throw new Error(
-      "instantiateConsumer: WASM module is missing the expected exports (read_write_index, read_read_index); is the binary current?",
-    );
+  // Validate every export at instantiation time so a stale or
+  // mis-built binary surfaces here rather than as a cryptic "is not a
+  // function" deep inside the audio thread's `process()` body.
+  const expectedExports = [
+    "read_write_index",
+    "read_read_index",
+    "peek_pull_latest",
+    "commit_pull_latest",
+    "peek_pull",
+    "commit_pull",
+  ] as const;
+  for (const name of expectedExports) {
+    if (typeof (exports as Record<string, unknown>)[name] !== "function") {
+      throw new Error(
+        `instantiateConsumer: WASM module is missing the expected export '${name}'; is the binary current? (rebuild with \`npm run build:wasm\`)`,
+      );
+    }
   }
   return {
     instance,
     readWriteIndex: () => exports.read_write_index(),
     readReadIndex: () => exports.read_read_index(),
+    peekPullLatest: (mask) => exports.peek_pull_latest(mask),
+    commitPullLatest: () => exports.commit_pull_latest(),
+    peekPull: (mask) => exports.peek_pull(mask),
+    commitPull: () => exports.commit_pull(),
   };
 }

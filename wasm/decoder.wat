@@ -75,4 +75,174 @@
   ;; Read the consumer's read_index (lane 1, byte offset 4). Acquire load.
   (func $read_read_index (export "read_read_index") (result i32)
     i32.const 4
-    i32.atomic.load))
+    i32.atomic.load)
+
+  ;; ─── SPSC pull dance (0.7.6) ──────────────────────────────────────────
+  ;;
+  ;; The full pullLatest contract over the Bridge's SAB header is a
+  ;; three-step dance:
+  ;;
+  ;;   (a) acquire-load writeIdx and plain-read readIdx, decide which
+  ;;       slot to read (and whether the ring has anything to read at all)
+  ;;   (b) read the payload bytes for that slot
+  ;;   (c) release-store the advanced read_index and notify the producer
+  ;;
+  ;; Step (b) is the schema-driven decode — the JS Bridge owns the typed-
+  ;; array umbrella views (`new Float64Array(sab, 32, …)` etc.) that
+  ;; project the payload bytes into typed reads. Subsequent patches in
+  ;; the Track 2 cohort will port (b) into WASM one decode kind at a
+  ;; time (scalar → array → SIMD trajectory); this patch ports just (a)
+  ;; and (c). The JS caller does (b) using its existing JS-side views.
+  ;;
+  ;; The PEEK/COMMIT split preserves the load-bearing SPSC invariant
+  ;; that the producer cannot overwrite a slot until the consumer
+  ;; releases its read on it. Specifically:
+  ;;
+  ;;     peek_pull_latest(mask) → slot OR -1
+  ;;       Reads writeIdx (acquire) + readIdx, stores writeIdx into a
+  ;;       module-scoped global so the matching commit_pull_latest knows
+  ;;       what to release to. Returns the slot index of the newest
+  ;;       frame, or -1 if the ring is empty. NO mutation of read_index.
+  ;;
+  ;;     commit_pull_latest()
+  ;;       Release-stores read_index ← saved writeIdx, then notifies the
+  ;;       producer. Caller MUST have read the slot bytes between the
+  ;;       matching peek and this commit, OR be okay with discarding
+  ;;       the frame (e.g., the inner loop's drain-only sweep).
+  ;;
+  ;; The FIFO `pull` flavor (peek_pull / commit_pull) is the same shape
+  ;; but advances read_index by 1 rather than to writeIdx.
+  ;;
+  ;; WASM globals are per-instance — each instantiateConsumer() call
+  ;; creates a fresh WebAssembly.Instance with its own globals, so two
+  ;; consumers over two different Bridges never share state.
+  ;;
+  ;; Memory ordering (matches the JS Bridge contract bit-for-bit):
+  ;;   - peek's writeIdx load is acquire-ordered (i32.atomic.load), so
+  ;;     the producer's prior release-store on writeIdx happens-before
+  ;;     the slot read that follows on the JS side.
+  ;;   - commit's read_index store is release-ordered (i32.atomic.store),
+  ;;     so any consumer-side reads happen-before any subsequent
+  ;;     producer overwrite of the freed slot.
+  ;;   - The notify (memory.atomic.notify) wakes a producer parked on
+  ;;     the read_index lane via Atomics.wait; matches the JS Bridge's
+  ;;     unconditional always-notify protocol (cheap when no waiter,
+  ;;     correct when there is one).
+
+  ;; Module-scoped state holding the writeIdx (or readIdx+1) observed by
+  ;; the most recent peek call. The matching commit reads this back and
+  ;; release-stores it into the read_index lane. Init to 0; safe because
+  ;; commit's release-store on lane 1 just overwrites whatever was there
+  ;; (the producer never reads our pending value).
+  (global $pendingNewReadIdx (mut i32) (i32.const 0))
+
+  ;; pullLatest peek: latest-frame drain with skip semantics.
+  ;; Param:  $mask = capacity − 1 (power-of-two ring; computed JS-side once).
+  ;; Returns: slot index (≥ 0) of the newest available frame, or -1 if empty.
+  ;; Side effect: saves the observed writeIdx into $pendingNewReadIdx so
+  ;;              commit_pull_latest knows what to release.
+  (func $peek_pull_latest (export "peek_pull_latest") (param $mask i32) (result i32)
+    (local $writeIdx i32)
+    (local $readIdx i32)
+    ;; readIdx: plain non-atomic read of lane 1 (single-consumer guarantee
+    ;; means we own this lane until our commit).
+    i32.const 4
+    i32.load
+    local.set $readIdx
+    ;; writeIdx: acquire load of lane 0.
+    i32.const 0
+    i32.atomic.load
+    local.set $writeIdx
+    ;; Safe-default the commit target to the CURRENT readIdx so that
+    ;; commit-after-empty-peek (and commit-without-any-prior-peek)
+    ;; is a true no-op rather than rewinding the lane. The non-empty
+    ;; branch below overwrites with writeIdx — the value we actually
+    ;; want to release to.
+    local.get $readIdx
+    global.set $pendingNewReadIdx
+    ;; Empty if writeIdx === readIdx. i32 equality is wrap-correct
+    ;; regardless of signed-ness because the producer never wraps a full
+    ;; 2^32 between consumer observations under the capacity ≤ 2^30 bound.
+    local.get $writeIdx
+    local.get $readIdx
+    i32.eq
+    if (result i32)
+      i32.const -1
+    else
+      ;; Save the writeIdx so commit knows where to advance read_index.
+      local.get $writeIdx
+      global.set $pendingNewReadIdx
+      ;; Return slot = (writeIdx − 1) & mask. Power-of-two mask makes the
+      ;; modular arithmetic wrap-invisible.
+      local.get $writeIdx
+      i32.const 1
+      i32.sub
+      local.get $mask
+      i32.and
+    end)
+
+  ;; pullLatest commit: release-store read_index ← saved writeIdx; notify.
+  ;; Must be called AFTER the matching peek_pull_latest returned a
+  ;; non-negative slot AND the caller has finished reading the slot
+  ;; bytes. Safe to call after a peek that returned -1 (no-op semantics:
+  ;; the saved value still equals the previous read_index so the store
+  ;; is idempotent).
+  (func $commit_pull_latest (export "commit_pull_latest")
+    ;; Release-store lane 1 = saved writeIdx
+    i32.const 4
+    global.get $pendingNewReadIdx
+    i32.atomic.store
+    ;; Notify ≤ 1 waiting producer parked on lane 1 via Atomics.wait.
+    ;; Drop the notification count return — caller never needs it.
+    i32.const 4
+    i32.const 1
+    memory.atomic.notify
+    drop)
+
+  ;; FIFO pull peek: oldest-frame drain (no skip).
+  ;; Param:  $mask = capacity − 1.
+  ;; Returns: slot index (≥ 0) of the oldest unread frame, or -1 if empty.
+  ;; Side effect: saves (readIdx + 1) into $pendingNewReadIdx so the
+  ;;              matching commit advances read_index by exactly one.
+  (func $peek_pull (export "peek_pull") (param $mask i32) (result i32)
+    (local $writeIdx i32)
+    (local $readIdx i32)
+    i32.const 4
+    i32.load
+    local.set $readIdx
+    i32.const 0
+    i32.atomic.load
+    local.set $writeIdx
+    ;; Safe-default: same discipline as peek_pull_latest — point the
+    ;; pending commit at the current readIdx so an empty-peek commit
+    ;; is a no-op store.
+    local.get $readIdx
+    global.set $pendingNewReadIdx
+    local.get $writeIdx
+    local.get $readIdx
+    i32.eq
+    if (result i32)
+      i32.const -1
+    else
+      ;; Save readIdx + 1 for commit.
+      local.get $readIdx
+      i32.const 1
+      i32.add
+      global.set $pendingNewReadIdx
+      ;; Return slot = readIdx & mask
+      local.get $readIdx
+      local.get $mask
+      i32.and
+    end)
+
+  ;; FIFO pull commit: release-store read_index ← (saved readIdx + 1); notify.
+  ;; Same protocol shape as commit_pull_latest; the difference is which
+  ;; value was saved.
+  (func $commit_pull (export "commit_pull")
+    i32.const 4
+    global.get $pendingNewReadIdx
+    i32.atomic.store
+    i32.const 4
+    i32.const 1
+    memory.atomic.notify
+    drop))
