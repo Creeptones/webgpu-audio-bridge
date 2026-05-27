@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "Schema-driven control-rate-to-audio-rate bridge for the browser. Turbo mode (SAB + Atomics, sub-microsecond push/pull) and Standard mode (MessageChannel, 5-50ms — 0.8.x) share one schema DSL and one frame API. Streams structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet.",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,20 +10,28 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.js"
-    }
+    },
+    "./worklet": {
+      "types": "./dist/worklet/index.d.ts",
+      "import": "./dist/worklet/index.js",
+      "require": "./dist/worklet/index.js"
+    },
+    "./worklet/decoder.wasm": "./dist/worklet/decoder.wasm"
   },
   "files": [
     "dist",
     "src",
+    "wasm",
     "README.md",
     "LICENSE",
     "CITATION.cff",
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "test": "tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
-    "test:unit": "tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Float64RingBuffer.test.ts",
+    "build": "npm run build:wasm && tsc -p tsconfig.build.json",
+    "build:wasm": "node wasm/build.mjs",
+    "test": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
+    "test:unit": "npm run build:wasm && tsx tests/schema.test.ts && tsx tests/Bridge.test.ts && tsx tests/BridgeFacades.test.ts && tsx tests/BridgeInputLane.test.ts && tsx tests/environment.test.ts && tsx tests/Bridge.phaseLock.test.ts && tsx tests/Bridge.wasmEquivalence.test.ts && tsx tests/Float64RingBuffer.test.ts",
     "test:concurrent": "tsx tests/Bridge.concurrent.test.ts && tsx tests/Float64RingBuffer.concurrent.test.ts",
     "test:browser": "playwright test --config tests/browser/playwright.config.ts",
     "bench": "tsx bench/Bridge.bench.ts && tsx bench/Float64RingBuffer.bench.ts",
@@ -64,6 +72,7 @@
     "@playwright/test": "^1.48.0",
     "@types/node": "^20.19.41",
     "tsx": "^4.0.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "wabt": "^1.0.39"
   }
 }

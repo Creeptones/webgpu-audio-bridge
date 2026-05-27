@@ -4,6 +4,155 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.5] — 2026-05-27
+
+### Added — WASM consumer scaffolding (Track 2 of the King roadmap, first patch)
+
+First cut of the WebAssembly fast-path consumer described in
+Track 2 of the King roadmap. Today it ships the toolchain, the
+shared-memory plumbing, the feature-detect probes, and a
+smoke-test decoder that proves WASM-side atomic reads of the
+Bridge SAB header agree bit-for-bit with the JS-side
+`Atomics.load` of the same lanes. **Subsequent patches port the
+full pullLatest protocol one decode kind at a time** (scalar →
+array → trajectory → SIMD-vectorized trajectory → CAS-aware
+drop-oldest). The pure-JS consumer path remains the canonical
+default; the WASM path is opt-in via the new
+`webgpu-audio-bridge/worklet` exports subpath.
+
+**What landed in 0.7.5:**
+
+- **`wasm/decoder.wat`** — minimal WebAssembly Text module
+  exporting `read_write_index()` and `read_read_index()`, both
+  `i32.atomic.load` operations over byte offsets 0 / 4 (the
+  SPSC counter lanes of the SAB header). Imports `env.memory`
+  with `(1 16384 shared)` bounds (1 page up to 1 GiB shared
+  memory, matching the WebAssembly threads spec max). Smoke
+  shape only — the SPSC protocol and the schema decode arrive
+  in later patches. 101-byte binary.
+
+- **`wasm/build.mjs`** — `wabt`-based WAT → WASM compiler.
+  Both the `simd` and `threads` features are enabled at parse
+  time so the later patches' f64x2 / f32x4 / `i32.atomic.*`
+  ops compile without per-source flag drift. Outputs to
+  `dist/worklet/<name>.wasm`. Discoverable by adding `.wat`
+  files to `wasm/`; no entry-list edit required. Direct port
+  of the website's `wasm/build.mjs` pattern (Phase 4b modal
+  DSP infrastructure) — keeps the two pipelines in lockstep.
+
+- **`src/worklet/wasmSimdSupport.ts`** — three feature probes:
+  - `hasWasmSimd()` — validates a known-good 31-byte
+    simd128-only module (same probe as the
+    `wasm-feature-detect` npm package + Chrome's SIMD rollout
+    docs).
+  - `hasWasmThreads()` — validates a 14-byte shared-memory
+    module + checks `SharedArrayBuffer` is in scope. The
+    smoke-test decoder needs threads even before SIMD enters
+    the picture.
+  - `hasWasmConsumerSupport()` — conjunction of the two.
+  All three cache per-process. Ported from the website's
+  `src/lib/dimensional/wasmSimdSupport.ts` with the threads
+  probe added.
+
+- **`src/worklet/index.ts`** — the consumer-side JS shim:
+  - `allocateWorkletMemory(byteLength)` — owner-side
+    `WebAssembly.Memory({ shared: true })` allocator. Rounds
+    up to the nearest 64 KiB page. Returns
+    `{ memory, sab, byteLength, pages }` where `sab` IS
+    `memory.buffer` — pass `sab` to `new Bridge(...)` and
+    `memory` to `instantiateConsumer(...)` so the producer
+    and consumer share one underlying buffer.
+  - `instantiateConsumer(wasmBytes, memory)` — synchronous
+    `WebAssembly.Instance` construction with the caller's
+    shared memory as the `env.memory` import. Synchronous
+    (NOT `WebAssembly.instantiate`, which is async and
+    illegal in `AudioWorkletGlobalScope.process()`). Returns
+    a typed `WorkletConsumer` handle.
+  - `WorkletConsumer` interface — today exposes
+    `readWriteIndex()` / `readReadIndex()` plus the raw
+    `instance` for debugging. Grows the full pullLatest
+    surface in later patches.
+
+- **`webgpu-audio-bridge/worklet` exports subpath** —
+  `package.json` now lists the consumer shim under the
+  `./worklet` key with the standard `types` / `import` /
+  `require` conditions, plus a direct `./worklet/decoder.wasm`
+  entry for callers that need the binary URL. The root
+  `webgpu-audio-bridge` export is unchanged.
+
+- **`build:wasm` npm script + `build` chains it** — every
+  `npm run build` now produces `dist/worklet/decoder.wasm`
+  alongside the TS dist. `wabt` is a new devDep (~700 KiB
+  pure-JS toolkit, no native deps).
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** — four pins:
+  1. Feature-probe consistency (`hasWasmConsumerSupport ===
+     hasWasmSimd && hasWasmThreads`).
+  2. Binary loads in this runtime (`readFileSync` on the
+     built `decoder.wasm` is non-empty and instantiates).
+  3. WASM/JS header equivalence — 200 push/pull cycles
+     against a `defineSchema({seq:u64, tMacroNs:u64,
+     value:f64})` Bridge, asserting
+     `consumer.readWriteIndex() === Atomics.load(int32View, 0)`
+     and `consumer.readReadIndex() === Atomics.load(int32View, 1)`
+     at every step. Headline guarantee.
+  4. Memory identity — `memory.buffer === sab` and `sab
+     instanceof SharedArrayBuffer`.
+
+### Why
+
+WASM-driven decode is the headline Track 2 cred from the King
+roadmap: it eliminates the last credible source of audio
+glitches (JS object allocation + V8 GC pauses on the audio
+thread) and unlocks SIMD-vectorized trajectory decode for the
+hot path. Shipping the scaffolding as a self-contained patch
+gives every subsequent patch a stable target to grow against:
+the build pipeline works, the toolchain decision (hand-written
+WAT, harvested from the website's `modal-dsp.wat`
+infrastructure) is settled, the feature-detect surface exists,
+the shim's allocator + instantiator can be re-used as the
+exports expand.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout
+unchanged; the WASM module reads the EXACT same lanes JS does
+via the EXACT same atomic primitives. A producer running 0.7.4
+interoperates bit-for-bit with a 0.7.5 consumer using the
+WASM shim, and vice-versa.
+
+### Tests
+
+- New `Bridge.wasmEquivalence.test.ts` (4 pins above).
+- The new test is appended to the `npm test` and `npm run
+  test:unit` scripts; both prepend `npm run build:wasm` so a
+  fresh checkout's first test run produces the binary
+  automatically.
+- All 0.7.4 suites (Bridge, BridgeFacades, BridgeInputLane,
+  schema, environment, Bridge.phaseLock incl. the Hermite
+  pin, two 1 M-frame concurrent stress runs, Float64RingBuffer
+  legacy) all green — purely additive change.
+
+### Bench
+
+push/pull/pullLatest medians unchanged. The WASM path has no
+hot-loop integration yet, so there is no bench delta to
+report this patch. Bench gates land alongside the
+`pullLatest` WASM port (a later 0.7.x patch) where the
+push/pull WASM-vs-JS median comparison becomes meaningful.
+
+### Documentation
+
+- `wasm/decoder.wat`, `wasm/build.mjs`, and
+  `src/worklet/index.ts` each carry self-contained file
+  headers documenting the SAB layout assumptions, the
+  WebAssembly page-bounds math, the threads-vs-SIMD probe
+  rationale, and the eventual full-decoder surface.
+- README rewrite to introduce the `webgpu-audio-bridge/worklet`
+  subpath lands in a follow-up alongside the first functional
+  `pullLatest` WASM port (when the surface is meaningful
+  enough to warrant the README real estate).
+
 ## [0.7.4] — 2026-05-27
 
 ### Added — Hermite cubic reconstruction (Track 1 of the King roadmap)
