@@ -321,4 +321,50 @@
 
   (func $read_u8 (export "read_u8") (param $off i32) (result i32)
     local.get $off
-    i32.load8_u))
+    i32.load8_u)
+
+  ;; ─── Array bulk copy (0.7.8) ──────────────────────────────────────────
+  ;;
+  ;; The schema DSL's array fields (f64Array, f32Array, integer arrays)
+  ;; are stored contiguously inside a slot's payload region. The JS
+  ;; Bridge's `pull` decodes them via TypedArray umbrella views and a
+  ;; `frame.fieldName.set(arrayView[slot])` bulk copy — fast on x86 and
+  ;; ARM, but still a JS hot-path operation that pays the umbrella-
+  ;; lookup tax + the per-call function-call overhead.
+  ;;
+  ;; This single `copy_array` export does the equivalent bulk copy
+  ;; inside WASM via `memory.copy` (bulk-memory proposal — already
+  ;; enabled in the build). The caller passes:
+  ;;
+  ;;   srcOff:    absolute byte offset of the array's start within the
+  ;;              slot (= header_bytes + slot * frame_bytes + field.byteOffset)
+  ;;   dstOff:    absolute byte offset of the destination region within
+  ;;              the same WebAssembly.Memory. The shim's `allocate-
+  ;;              WorkletMemory({ sabBytes, scratchBytes })` reserves a
+  ;;              region above the SAB ring for exactly this use; the
+  ;;              JS caller can also wire its own destination anywhere
+  ;;              in the Memory it owns.
+  ;;   byteCount: array.length * elementByteSize. The shim caller
+  ;;              precomputes this once per field at setup time.
+  ;;
+  ;; The Memory.copy operand order is (dst, src, len) per the WASM
+  ;; spec; we accept (src, dst, byteCount) at the export level for
+  ;; readability and swap inside.
+  ;;
+  ;; Endianness: byte-level copy — no endianness involved. The
+  ;; destination region's typed-array view (created JS-side) interprets
+  ;; the bytes in the platform's native endianness, matching the SAB
+  ;; ring's discipline.
+  ;;
+  ;; Overlap: `memory.copy` is well-defined for overlapping ranges per
+  ;; spec — same semantics as memmove (handles forward/backward overlap
+  ;; correctly). The shim's allocated scratch region never overlaps the
+  ;; SAB ring (it lives in pages above), so the overlap case is moot in
+  ;; the canonical wiring; documented here for callers who DIY the
+  ;; destination layout.
+  (func $copy_array (export "copy_array")
+        (param $srcOff i32) (param $dstOff i32) (param $byteCount i32)
+    local.get $dstOff
+    local.get $srcOff
+    local.get $byteCount
+    memory.copy))

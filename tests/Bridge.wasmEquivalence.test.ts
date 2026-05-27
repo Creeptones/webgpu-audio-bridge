@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/Bridge.js";
 import {
   defineSchema, f64, f32, u64, i64, u32, i32, u16, i16, u8, i8,
+  f64Array, f32Array, u32Array,
 } from "../src/schema.js";
 import {
   allocateWorkletMemory,
@@ -459,8 +460,164 @@ function main(): void {
     );
   }
 
+  // ── 8: Array decoder equivalence (0.7.8) ───────────────────────────────
+  // The WASM `copy_array` export bulk-copies an array field's bytes
+  // from a slot to a caller-provided destination region inside the
+  // same WebAssembly.Memory. The shim's `allocateWorkletMemory({
+  // sabBytes, scratchBytes })` overload reserves a page-aligned
+  // scratch region above the SAB ring for exactly this use.
+  //
+  // This pin defines a small array schema, pushes N frames of known
+  // array values, drains each via WASM peek → copy_array (per array
+  // field) → JS reads from the scratch view → commit, and asserts
+  // the scratch-region bytes equal what was pushed. A cross-check
+  // against JS Bridge.pull on a fresh push confirms the JS-side
+  // umbrella TypedArray decode agrees with the WASM bulk copy.
+  {
+    const ARRAY_N = 32;
+    const arraySchema = defineSchema({
+      seq: u64(),
+      tMacroNs: u64(),
+      vEff: f64Array(ARRAY_N),
+      gEff: f32Array(ARRAY_N),
+      iEff: u32Array(ARRAY_N),
+    });
+    const arrayCapacity = 8;
+    const arraySabBytes = Bridge.byteLength(arrayCapacity, arraySchema);
+    // Scratch region carries one copy of all three arrays:
+    //   vEff:  ARRAY_N × 8 bytes (f64)
+    //   gEff:  ARRAY_N × 4 bytes (f32)
+    //   iEff:  ARRAY_N × 4 bytes (u32)
+    const vEffBytes = ARRAY_N * 8;
+    const gEffBytes = ARRAY_N * 4;
+    const iEffBytes = ARRAY_N * 4;
+    const arrayScratchBytes = vEffBytes + gEffBytes + iEffBytes;
+
+    const arrayAlloc = allocateWorkletMemory({
+      sabBytes: arraySabBytes,
+      scratchBytes: arrayScratchBytes,
+    });
+    assert(
+      arrayAlloc.scratchByteOffset !== undefined,
+      "pin8: allocator returned a scratch offset for the scratchBytes overload",
+    );
+    assertEq(
+      arrayAlloc.scratchBytes,
+      arrayScratchBytes,
+      "pin8: allocator preserved the requested scratchBytes",
+    );
+    const scratchBase = arrayAlloc.scratchByteOffset!;
+
+    const arrayBridge = new Bridge(arrayAlloc.sab, arrayCapacity, arraySchema);
+    const arrayConsumer = instantiateConsumer(wasmBytes, arrayAlloc.memory);
+
+    const frameBytes = arraySchema.compiled.frameByteSize;
+    const headerBytes = 32;
+    const mask = arrayCapacity - 1;
+    const arrayFieldOffsets: Record<string, number> = {};
+    for (const field of arraySchema.compiled.fields) {
+      arrayFieldOffsets[field.name] = field.byteOffset;
+    }
+
+    // JS-side TypedArray views over the scratch region. The shim's
+    // allocator returns a single contiguous scratch byte range; we
+    // partition it by laying f64 first, then f32, then u32. The byte
+    // offsets are computed once and reused per pull.
+    const scratchVEffOff = scratchBase;
+    const scratchGEffOff = scratchBase + vEffBytes;
+    const scratchIEffOff = scratchBase + vEffBytes + gEffBytes;
+    const scratchVEffView = new Float64Array(arrayAlloc.sab, scratchVEffOff, ARRAY_N);
+    const scratchGEffView = new Float32Array(arrayAlloc.sab, scratchGEffOff, ARRAY_N);
+    const scratchIEffView = new Uint32Array(arrayAlloc.sab, scratchIEffOff, ARRAY_N);
+
+    const arrayPushFrame = arrayBridge.scratchFrame();
+    const arrayPullFrame = arrayBridge.scratchFrame();
+    // Drain any leftover so the test starts clean.
+    while (arrayBridge.pull(arrayPullFrame)) { /* drain */ }
+
+    const ROWS = 6;
+    for (let r = 0; r < ROWS; r++) {
+      // Generate a per-row pattern that varies element-by-element AND
+      // row-by-row, so any off-by-one in slot/offset math surfaces.
+      for (let k = 0; k < ARRAY_N; k++) {
+        arrayPushFrame.vEff[k] = Math.sin((r + 1) * k * 0.137) * 1e3;
+        arrayPushFrame.gEff[k] = Math.fround(Math.cos(r * 0.4 + k * 0.07) * 0.99);
+        arrayPushFrame.iEff[k] = ((r << 16) | (k + 1)) >>> 0;
+      }
+      arrayPushFrame.seq = BigInt(7_000_000_000 + r);
+      arrayPushFrame.tMacroNs = BigInt((7_000_000_000 + r) * 1_000);
+      assert(arrayBridge.push(arrayPushFrame), `pin8: push row ${r}`);
+
+      const slot = arrayConsumer.peekPull(mask);
+      assert(slot >= 0, `pin8: peekPull row ${r} should not be empty`);
+      const slotBase = headerBytes + slot * frameBytes;
+
+      // Bulk-copy each array via WASM `copy_array`. Source = slot's
+      // field byte offset; destination = scratch region's partition
+      // for that array; byte count = array elements × element bytes.
+      arrayConsumer.copyArray(
+        slotBase + arrayFieldOffsets.vEff!,
+        scratchVEffOff,
+        vEffBytes,
+      );
+      arrayConsumer.copyArray(
+        slotBase + arrayFieldOffsets.gEff!,
+        scratchGEffOff,
+        gEffBytes,
+      );
+      arrayConsumer.copyArray(
+        slotBase + arrayFieldOffsets.iEff!,
+        scratchIEffOff,
+        iEffBytes,
+      );
+
+      // Compare the scratch views (populated by WASM) to the values we
+      // pushed.
+      for (let k = 0; k < ARRAY_N; k++) {
+        assertEq(
+          scratchVEffView[k],
+          arrayPushFrame.vEff[k],
+          `pin8 vEff[${k}] row ${r}`,
+        );
+        assertEq(
+          scratchGEffView[k],
+          arrayPushFrame.gEff[k],
+          `pin8 gEff[${k}] row ${r}`,
+        );
+        assertEq(
+          scratchIEffView[k],
+          arrayPushFrame.iEff[k],
+          `pin8 iEff[${k}] row ${r}`,
+        );
+      }
+      arrayConsumer.commitPull();
+    }
+
+    // Cross-check: push one more row and pull via JS Bridge.pull. The
+    // JS-decoded arrays must equal the values we pushed (mirrors the
+    // WASM-decoded scratch above bit-for-bit).
+    for (let k = 0; k < ARRAY_N; k++) {
+      arrayPushFrame.vEff[k] = -k * 0.5;
+      arrayPushFrame.gEff[k] = Math.fround(k * 0.25);
+      arrayPushFrame.iEff[k] = (0xDEAD0000 | k) >>> 0;
+    }
+    arrayPushFrame.seq = 9999n;
+    arrayPushFrame.tMacroNs = 9_999_999n;
+    assert(arrayBridge.push(arrayPushFrame), "pin8: cross-check push");
+    assert(arrayBridge.pull(arrayPullFrame), "pin8: cross-check pull");
+    for (let k = 0; k < ARRAY_N; k++) {
+      assertEq(arrayPullFrame.vEff[k], -k * 0.5, `pin8 cross-check vEff[${k}]`);
+      assertEq(arrayPullFrame.gEff[k], Math.fround(k * 0.25), `pin8 cross-check gEff[${k}]`);
+      assertEq(arrayPullFrame.iEff[k], (0xDEAD0000 | k) >>> 0, `pin8 cross-check iEff[${k}]`);
+    }
+
+    ok(
+      `wasm-array-copy-equivalence (${ROWS} rows × ${ARRAY_N} elements × 3 array fields, scratch=${arrayScratchBytes}B + JS cross-check)`,
+    );
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields in agreement with JS atomics.",
   );
 }
 

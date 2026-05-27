@@ -4,6 +4,143 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.8] — 2026-05-27
+
+### Added — WASM array field bulk copy (Track 2 of the King roadmap, fourth patch)
+
+Second payload-decode patch in the Track 2 cohort. The WASM
+consumer can now bulk-copy a slot's array-field bytes into a
+caller-provided destination region inside the same
+`WebAssembly.Memory`. Combined with the 0.7.7 scalar decoders,
+WASM now covers BOTH primitive shapes the schema DSL declares —
+scalars (read element-by-element) and arrays (copy-then-view).
+The remaining payload-decode patches in the cohort port the
+trajectory-specific path (SIMD f64x2/f32x4) and the
+CAS-aware drop-oldest mode.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`wasm/decoder.wat`** gains one export:
+  - `copy_array(srcOff: i32, dstOff: i32, byteCount: i32)`
+    invokes `memory.copy` (bulk-memory proposal; already
+    enabled in the build). The op handles overlapping ranges
+    correctly per spec (memmove semantics). The shim's
+    allocated scratch region never overlaps the SAB ring (the
+    scratch lives in pages above the SAB), so the overlap case
+    is moot in canonical wiring.
+
+- **`src/worklet/index.ts`** gains:
+  - **`WorkletMemoryAllocationOptions`** interface — the
+    options-object overload form of `allocateWorkletMemory`.
+    Fields: `sabBytes: number` (required) +
+    `scratchBytes?: number` (optional, default 0).
+  - **`allocateWorkletMemory({ sabBytes, scratchBytes })`** —
+    new overload that reserves a page-aligned consumer-side
+    scratch region above the SAB ring in the same Memory.
+    Returns `scratchByteOffset` + `scratchBytes` on the
+    allocation. The single-`number` form still works (zero
+    scratch).
+  - **`WorkletMemoryAllocation.scratchByteOffset` /
+    `scratchBytes`** — new optional fields, present iff
+    `scratchBytes > 0` was requested. Bytes
+    `[scratchByteOffset, scratchByteOffset + scratchBytes)`
+    inside the Memory are reserved for the consumer's
+    `copy_array` destinations; the JS caller wires its
+    `Float64Array` / `Float32Array` / `Uint32Array` / … views
+    over this range.
+  - **`WorkletConsumer.copyArray(srcOff, dstOff, byteCount)`**
+    — thin shim over the WASM export. Per-pull canonical
+    wiring: `srcOff = RING_HEADER_BYTES + slot * frameByteSize
+    + arrayField.byteOffset`; `dstOff = scratchByteOffset`
+    (plus per-array sub-offset); `byteCount = array.length *
+    elementByteSize`. The instantiation guard now validates
+    all 17 exports.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds Pin 8:
+  - Defines a schema with three array fields of different
+    kinds: `vEff: f64Array(32)`, `gEff: f32Array(32)`,
+    `iEff: u32Array(32)`. Allocates `{ sabBytes,
+    scratchBytes: 512 }` — three contiguous scratch
+    partitions for the three array kinds.
+  - Pushes 6 rows of per-element patterns (`sin(r·k·0.137)`
+    for vEff, `Math.fround(cos(…))` for gEff, packed `(r << 16)
+    | (k + 1)` for iEff) — distinct row-by-row and
+    element-by-element so any off-by-one in slot or field
+    offsets surfaces.
+  - Per row: WASM `peekPull` → three `copyArray` calls (one
+    per array) → JS reads from `Float64Array` / `Float32Array`
+    / `Uint32Array` views over the scratch partitions →
+    `commitPull`. Asserts all 96 elements per row match the
+    pushed values. 6 × 32 × 3 = 576 element-level equivalences.
+  - Cross-check: JS Bridge.pull on a fresh push of distinct
+    arrays produces the exact same values via its umbrella
+    TypedArray views.
+
+  All seven 0.7.7 pins still pass.
+
+### Why
+
+Array decode is the second-largest chunk of JS hot-path work
+in a typical Bridge consumer (after the per-slot atomic dance,
+which 0.7.6 already moved into WASM). Each `frame.fieldName.set(
+arrayView[slot])` call pays:
+  - One umbrella-view lookup (array indexing into the
+    pre-computed views array).
+  - One TypedArray `.set()` call (the bulk copy itself —
+    JS-engine-implemented, fast but still a JS call).
+  - One property-write on the scratch frame object (the
+    `frame.fieldName = …`).
+
+The `copy_array` WASM export retires the umbrella lookup and the
+property write — the bulk copy itself becomes a single
+`memory.copy` instruction, which compiles to a native memcpy
+intrinsic on every modern engine. The scratch region pattern
+also makes the destination layout EXPLICIT to the caller, so
+the inspector / audio worklet can read whichever subset of
+arrays it needs without paying for the others.
+
+The page-aligned scratch above the SAB ring keeps the producer's
+view of the SAB unchanged. The producer never touches the
+scratch pages (its push goes through `Bridge.push` which only
+writes within `[0, sabBytes)`), and the consumer's scratch is
+private to the consumer.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout unchanged.
+The scratch region lives OUTSIDE the SAB-bytes the Bridge
+declares it owns, so a producer that does not allocate via
+`allocateWorkletMemory` (e.g., a plain `new SharedArrayBuffer(
+Bridge.byteLength(...))`) is byte-identical to one that does.
+The shim's overloaded allocator preserves the original
+single-`number` form so 0.7.5/0.7.6/0.7.7 callers continue to
+work unchanged.
+
+### Tests
+
+Pin 8 covers 576 array-element equivalences across three array
+kinds (f64/f32/u32) plus the JS cross-check. All seven 0.7.7
+pins still green. All other suites green — purely additive.
+
+### Bench
+
+push/pull/pullLatest medians unchanged at 1.20 μs. The WASM
+end-to-end pullLatest is now ONE patch away from feature parity
+with the JS path (trajectory SIMD remaining); the headline
+bench (WASM vs JS pullLatest median) lands alongside that
+patch when the comparison becomes meaningful.
+
+### Documentation
+
+`wasm/decoder.wat` gains a section header documenting the
+`copy_array` operand order (the WASM spec puts `dst` first;
+the export accepts `(src, dst, byteCount)` for readability and
+swaps inside), the spec's overlap semantics (memmove), and the
+endianness invariance of byte-level copies.
+`WorkletMemoryAllocationOptions` and the overload form are
+documented at the type definition. README integration lands
+once the full pullLatest is WASM-backed.
+
 ## [0.7.7] — 2026-05-27
 
 ### Added — WASM scalar field decoders (Track 2 of the King roadmap, third patch)

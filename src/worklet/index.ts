@@ -56,7 +56,14 @@ export const WASM_PAGE_BYTES = 65_536;
  *  `sab` always point at the same bytes — `sab === memory.buffer`. The
  *  caller passes `sab` to `new Bridge(...)` and `memory` to
  *  `instantiateConsumer(...)` so producer (JS Bridge) and consumer
- *  (WASM decoder) share one underlying buffer. */
+ *  (WASM decoder) share one underlying buffer.
+ *
+ *  When the caller requests a scratch region (0.7.8 — `{ sabBytes,
+ *  scratchBytes }` overload), `scratchByteOffset` is the byte at which
+ *  the scratch region starts inside the Memory. The SAB ring lives at
+ *  bytes `[0, sabBytes)`; the scratch lives at `[scratchByteOffset,
+ *  scratchByteOffset + scratchBytes)`. The two regions never overlap
+ *  by construction. */
 export interface WorkletMemoryAllocation {
   /** The WebAssembly.Memory object. Hand to `instantiateConsumer` as
    *  the consumer-side env.memory import. */
@@ -68,27 +75,68 @@ export interface WorkletMemoryAllocation {
   readonly byteLength: number;
   /** Number of 64 KiB pages reserved. */
   readonly pages: number;
+  /** Byte offset where the scratch region starts. Set when the caller
+   *  uses the `{ sabBytes, scratchBytes }` overload with
+   *  `scratchBytes > 0`; `undefined` otherwise (single-region
+   *  allocations don't reserve any scratch). The JS caller wires its
+   *  destination TypedArray views over `[scratchByteOffset,
+   *  scratchByteOffset + scratchBytes)` and passes `scratchByteOffset`
+   *  (plus per-array sub-offsets) to `WorkletConsumer.copyArray`. */
+  readonly scratchByteOffset?: number;
+  /** Allocated scratch byte count. `undefined` or `0` when no scratch
+   *  was requested. */
+  readonly scratchBytes?: number;
+}
+
+/** Options object form of `allocateWorkletMemory` (0.7.8). Use this
+ *  when the consumer needs a WASM-addressable destination region for
+ *  `copy_array` outputs that is NOT inside the SAB ring (the SAB ring
+ *  is the producer's namespace; the scratch is consumer-owned). */
+export interface WorkletMemoryAllocationOptions {
+  /** Bytes the SAB ring needs — pass `Bridge.byteLength(capacity, schema)`. */
+  readonly sabBytes: number;
+  /** Optional extra bytes for a consumer-side scratch region that lives
+   *  above the SAB ring in the same Memory. Default 0 (no scratch). */
+  readonly scratchBytes?: number;
 }
 
 /**
  * Allocate a `WebAssembly.Memory` large enough to hold a Bridge SAB of
- * `requestedByteLength` bytes. The returned `sab` IS the memory's
- * underlying buffer — wrap it with `new Bridge(sab, capacity, schema)`
- * to get the producer-side handle, and hand the `memory` field to
+ * `sabBytes` bytes. The returned `sab` IS the memory's underlying
+ * buffer — wrap it with `new Bridge(sab, capacity, schema)` to get
+ * the producer-side handle, and hand the `memory` field to
  * `instantiateConsumer` so the consumer-side WASM decoder sees the
  * exact same bytes.
  *
- * Caller is responsible for passing a byteLength that matches what
- * `Bridge.byteLength(capacity, schema)` returns; the helper rounds up
- * to the nearest WebAssembly page boundary (64 KiB), so the SAB will
- * always be at least as large as requested.
+ * 0.7.8 overload — `{ sabBytes, scratchBytes }` — reserves an
+ * additional consumer-side scratch region ABOVE the SAB ring in the
+ * same Memory. `copy_array` (the WASM array bulk-copy export) targets
+ * this region; JS-side TypedArray views over `[scratchByteOffset,
+ * scratchByteOffset + scratchBytes)` give the caller typed access to
+ * the decoded array bytes. The scratch region's start is
+ * page-aligned (64 KiB) so the SAB ring's bytes are never disturbed.
+ *
+ * Both forms round up the total allocation to the nearest WebAssembly
+ * page boundary so the WebAssembly.Memory's reserved page count
+ * accommodates the request.
  */
+export function allocateWorkletMemory(sabBytes: number): WorkletMemoryAllocation;
+export function allocateWorkletMemory(opts: WorkletMemoryAllocationOptions): WorkletMemoryAllocation;
 export function allocateWorkletMemory(
-  requestedByteLength: number,
+  arg: number | WorkletMemoryAllocationOptions,
 ): WorkletMemoryAllocation {
-  if (!Number.isFinite(requestedByteLength) || requestedByteLength <= 0) {
+  const opts: WorkletMemoryAllocationOptions = typeof arg === "number"
+    ? { sabBytes: arg }
+    : arg;
+  const { sabBytes, scratchBytes = 0 } = opts;
+  if (!Number.isFinite(sabBytes) || sabBytes <= 0) {
     throw new Error(
-      `allocateWorkletMemory: requestedByteLength must be a positive finite number, got ${requestedByteLength}`,
+      `allocateWorkletMemory: sabBytes must be a positive finite number, got ${sabBytes}`,
+    );
+  }
+  if (!Number.isFinite(scratchBytes) || scratchBytes < 0) {
+    throw new Error(
+      `allocateWorkletMemory: scratchBytes must be a non-negative finite number, got ${scratchBytes}`,
     );
   }
   if (typeof WebAssembly === "undefined" || typeof WebAssembly.Memory !== "function") {
@@ -99,7 +147,13 @@ export function allocateWorkletMemory(
       "allocateWorkletMemory: SharedArrayBuffer is not available — page must be cross-origin isolated (COOP/COEP)",
     );
   }
-  const pages = Math.ceil(requestedByteLength / WASM_PAGE_BYTES);
+  // Round the SAB region up to a page boundary so the scratch region
+  // (if any) starts page-aligned. The Bridge's TypedArray views only
+  // touch the bytes it explicitly asked for; the slack between
+  // sabBytes and sabPages*PAGE_BYTES is harmlessly unused.
+  const sabPages = Math.ceil(sabBytes / WASM_PAGE_BYTES);
+  const scratchPages = Math.ceil(scratchBytes / WASM_PAGE_BYTES);
+  const pages = sabPages + scratchPages;
   // Reserve exactly `pages` (initial === maximum) so the SAB never grows
   // underneath the JS Bridge's typed-array views (a grow would detach
   // them — silent corruption). The Bridge does not size the SAB at
@@ -120,7 +174,20 @@ export function allocateWorkletMemory(
       "allocateWorkletMemory: WebAssembly.Memory({ shared: true }) did not return a SharedArrayBuffer; runtime does not actually support threads",
     );
   }
-  return { memory, sab, byteLength: pages * WASM_PAGE_BYTES, pages };
+  const base: WorkletMemoryAllocation = {
+    memory,
+    sab,
+    byteLength: pages * WASM_PAGE_BYTES,
+    pages,
+  };
+  if (scratchBytes > 0) {
+    return {
+      ...base,
+      scratchByteOffset: sabPages * WASM_PAGE_BYTES,
+      scratchBytes,
+    };
+  }
+  return base;
 }
 
 /** Handle returned by `instantiateConsumer`. The 0.7.5 cut exposed
@@ -195,6 +262,18 @@ export interface WorkletConsumer {
   readI8(byteOffset: number): number;
   readU8(byteOffset: number): number;
 
+  /** Array bulk copy (0.7.8). Move `byteCount` bytes from `srcOffset`
+   *  to `dstOffset` inside the WASM memory via `memory.copy`. The
+   *  canonical wiring: `srcOffset = RING_HEADER_BYTES + slot *
+   *  frameByteSize + arrayField.byteOffset`; `dstOffset =
+   *  allocation.scratchByteOffset` (plus any per-array sub-offset);
+   *  `byteCount = array.length * elementByteSize`. The JS caller's
+   *  TypedArray view over the destination region surfaces the decoded
+   *  array values without an additional copy. `memory.copy` handles
+   *  overlap correctly per spec (memmove semantics), so the shim does
+   *  not need to police caller layouts. */
+  copyArray(srcOffset: number, dstOffset: number, byteCount: number): void;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -244,6 +323,7 @@ export function instantiateConsumer(
     readonly read_u16: (off: number) => number;
     readonly read_i8: (off: number) => number;
     readonly read_u8: (off: number) => number;
+    readonly copy_array: (srcOff: number, dstOff: number, byteCount: number) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -265,6 +345,7 @@ export function instantiateConsumer(
     "read_u16",
     "read_i8",
     "read_u8",
+    "copy_array",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -299,5 +380,7 @@ export function instantiateConsumer(
     readU16: (off) => exports.read_u16(off),
     readI8: (off) => exports.read_i8(off),
     readU8: (off) => exports.read_u8(off),
+    copyArray: (srcOff, dstOff, byteCount) =>
+      exports.copy_array(srcOff, dstOff, byteCount),
   };
 }
