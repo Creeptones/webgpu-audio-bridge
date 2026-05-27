@@ -707,7 +707,9 @@ This is the **second cut** of Pillar 3. The `EvalMode` dispatch (`step` / `alpha
 
 ### Legacy API — `Float64RingBuffer`
 
-> **Deprecated 0.3.0.** Use `Bridge` + `physicsControlFrameSchema(n)` for new code. The legacy class is preserved unchanged for v0.1.x byte-compat and will be removed no earlier than 2.0.
+> **Deprecated 0.3.0; scheduled for removal at 0.9.0** (the pre-1.0 breaking cut, formerly "no earlier than 2.0"). Use `Bridge` + `physicsControlFrameSchema(n)` for new code. Constructing a `Float64RingBuffer` now emits a one-shot `console.warn` per process load — that's the **0.8.11 deprecation-soak**: a final heads-up before the surface is deleted. If you cannot migrate before 0.9.0, **pin `webgpu-audio-bridge@0.8.x`** (or the v0.1.1 npm tarball / [Zenodo DOI](https://doi.org/10.5281/zenodo.20382407) for the original single-file form).
+>
+> The same removal-at-0.9.0 schedule applies to `legacyPhysicsControlFrameSchema(n)` and the `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm; all three emit matching one-shot deprecation warnings at 0.8.11.
 
 The original hard-coded API survives unchanged:
 

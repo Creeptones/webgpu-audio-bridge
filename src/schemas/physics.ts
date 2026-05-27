@@ -51,15 +51,34 @@ export function physicsControlFrameSchema(n: number) {
 /** TS type of the frame view for `physicsControlFrameSchema(n)`. */
 export type PhysicsControlFrameSchema = ReturnType<typeof physicsControlFrameSchema>;
 
+/** Module-global one-shot guard for the legacy schema's runtime deprecation
+ *  warning. We warn at most once per process load — the `@deprecated`
+ *  JSDoc gives the IDE-time strikethrough; this is the runtime backstop. */
+let _legacyPhysicsControlFrameSchemaDeprecationWarned = false;
+
 /**
- * Byte-compatible with v0.1.x `Float64RingBuffer`. All fields are f64
- * (Number) — same lane layout, same SAB byte sequence per frame. Use this
- * if you're migrating from `Float64RingBuffer` and want to preserve the
- * exact wire format, or want number-typed seq/tMacroNs reads at the cost of
- * the `≤ 2^53` precision caveat. New code should prefer
- * `physicsControlFrameSchema(n)` instead.
+ * @deprecated 0.8.11 — scheduled for removal at 0.9.0 (the pre-1.0
+ * breaking cut). Byte-compatible with v0.1.x `Float64RingBuffer` (also
+ * removed at 0.9.0). All fields are f64 (Number) — same lane layout, same
+ * SAB byte sequence per frame. Use this if you're migrating from
+ * `Float64RingBuffer` and want to preserve the exact wire format, or want
+ * number-typed seq/tMacroNs reads at the cost of the `≤ 2^53` precision
+ * caveat. New code should prefer `physicsControlFrameSchema(n)` instead.
+ *
+ * If you cannot migrate before 0.9.0, pin `webgpu-audio-bridge@0.8.x` (or
+ * the v0.1.1 npm tarball for the original `Float64RingBuffer` surface).
  */
 export function legacyPhysicsControlFrameSchema(n: number) {
+  if (!_legacyPhysicsControlFrameSchemaDeprecationWarned) {
+    _legacyPhysicsControlFrameSchemaDeprecationWarned = true;
+    console.warn(
+      "[webgpu-audio-bridge] legacyPhysicsControlFrameSchema() is " +
+      "deprecated and will be removed at 0.9.0 (the pre-1.0 breaking " +
+      "cut). Migrate to physicsControlFrameSchema(n) (u64 seq/tMacroNs); " +
+      "see CHANGELOG.md for the wire-format diff. Pin " +
+      "webgpu-audio-bridge@0.8.x if you cannot migrate before 0.9.0.",
+    );
+  }
   return defineSchema({
     seq:      f64(),
     tMacroNs: f64(),
@@ -70,7 +89,8 @@ export function legacyPhysicsControlFrameSchema(n: number) {
   });
 }
 
-/** TS type of the frame view for `legacyPhysicsControlFrameSchema(n)`. */
+/** @deprecated 0.8.11 — removed at 0.9.0. TS type of the frame view for
+ *  `legacyPhysicsControlFrameSchema(n)`. */
 export type LegacyPhysicsControlFrameSchema = ReturnType<typeof legacyPhysicsControlFrameSchema>;
 
 // Surface the Schema marker for downstream type-only consumers.

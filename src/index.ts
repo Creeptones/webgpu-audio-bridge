@@ -190,21 +190,37 @@ export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "./trajectory.js";
 
 // Canonical schemas — see src/schemas/physics.ts.
+//
+// The `legacyPhysicsControlFrameSchema` re-export is deprecated and will be
+// removed at 0.9.0 (the pre-1.0 breaking cut). New code should import
+// `physicsControlFrameSchema` only. The deprecation tag rides on the
+// definition in `src/schemas/physics.ts`; this re-export inherits it.
 export {
   physicsControlFrameSchema,
+  /** @deprecated 0.8.11 — removed at 0.9.0. See `src/schemas/physics.ts`. */
   legacyPhysicsControlFrameSchema,
 } from "./schemas/physics.js";
 export type {
   PhysicsControlFrameSchema,
+  /** @deprecated 0.8.11 — removed at 0.9.0. */
   LegacyPhysicsControlFrameSchema,
 } from "./schemas/physics.js";
 
 // ── Legacy (deprecated): Float64RingBuffer ─────────────────────────────────
+//
+// **Scheduled for removal at 0.9.0** (the pre-1.0 breaking cut). The
+// `@deprecated` tag rides on the class definition in
+// `src/Float64RingBuffer.ts`; the runtime backstop warning fires once per
+// process from the constructor. Pin `webgpu-audio-bridge@0.8.x` (or the
+// v0.1.1 npm tarball for the original surface) if you cannot migrate
+// before 0.9.0.
 
 /**
  * @deprecated 0.3.0 — replaced by `Bridge<Schema>` with
  * `physicsControlFrameSchema(n)`. The legacy class is preserved unchanged
- * for v0.1.x byte-compat and will be removed no earlier than 2.0.
+ * for v0.1.x byte-compat and is **scheduled for removal at 0.9.0** (the
+ * pre-1.0 breaking cut). See `src/Float64RingBuffer.ts` for the full
+ * deprecation note + migration path.
  */
 export {
   Float64RingBuffer,

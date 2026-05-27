@@ -4,6 +4,140 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.8.11] — 2026-05-27
+
+### Added — deprecation-soak pass before the 0.9.0 breaking cut (pre-1.0 cohort 2/N)
+
+Second patch of the pre-1.0 cohort plan. Three legacy surfaces are
+explicitly slated for removal at the 0.9.0 breaking cut; this patch is the
+one-version deprecation soak that gives any silent vendor user a runtime
+heads-up before the surface disappears.
+
+**Deprecated surfaces (all removed at 0.9.0).**
+
+- `Float64RingBuffer` (the pre-0.3.0 hard-coded class). Already carried a
+  `@deprecated 0.3.0` JSDoc; the soak adds:
+  - One-shot `console.warn` from the constructor (module-global guard, fires
+    at most once per process load), pointing at the 0.9.0 removal + the
+    migration path + the v0.1.x pin escape hatch.
+  - `@deprecated` JSDoc updated to spell out "scheduled for removal at
+    0.9.0" instead of the prior vague "no earlier than 2.0" language.
+- `legacyPhysicsControlFrameSchema(n)` + `LegacyPhysicsControlFrameSchema`
+  type alias. Adds `@deprecated 0.8.11 — removed at 0.9.0` JSDoc on both
+  the function and the type; the function logs once on first call with
+  the same module-global guard pattern. The `src/index.ts` re-export
+  picks up the JSDoc via a colocated tag.
+- `BridgeBlockConsumer` `underflowPolicy: 'throw'`. Constructor emits a
+  one-shot `console.warn` when caller selects `'throw'`. The file-header
+  "Underflow policy" docstring + the `BlockUnderflowPolicy` type
+  docstring + the `BridgeBlockConsumerOptions.underflowPolicy` field
+  docstring all gain explicit "deprecated at 0.8.11, removed at 0.9.0"
+  notes. The arm survives at 0.8.11 (existing tests + callers still
+  work, just with a warning); the implementation in `_handleUnderflow`
+  is unchanged.
+
+**One-shot guard pattern.** Each warn site uses a module-private boolean
+that flips on first fire. This:
+
+- Keeps the warning visible (anyone running a fresh test suite or a
+  one-shot app sees it).
+- Avoids spamming stderr in apps that construct multiple instances (the
+  test suite constructs 12 `Float64RingBuffer` instances — one warning
+  per process is the right cadence).
+- Costs nothing at steady state (one branch on a module-private boolean
+  after the first call).
+
+**Documentation updates.**
+
+- `README.md` §Legacy API — `Float64RingBuffer` callout reworded: removal
+  schedule updated from "no earlier than 2.0" to "0.9.0", explicit
+  mention of the one-shot warning, explicit mention that
+  `legacyPhysicsControlFrameSchema` + `underflowPolicy: 'throw'` follow
+  the same schedule. Added the `webgpu-audio-bridge@0.8.x` pin
+  recommendation for users who cannot migrate in time.
+- `src/index.ts` — section header comments above the legacy re-exports
+  updated to spell out the 0.9.0 removal + the pin escape hatch;
+  per-export `@deprecated` JSDoc tags added so IDE tooling marks
+  consumer usage as strikethrough.
+
+### Why
+
+The pre-1.0 audit identified three legacy surfaces that should not survive
+into the 1.0 stability contract:
+
+1. `Float64RingBuffer` predates the schema DSL by two minor versions; new
+   code has used `Bridge<Schema>` since 0.3.0. Carrying the legacy class
+   forever inflates the 1.0 API surface, ties the byte format to the v0.1.x
+   shape forever, and forces every internal refactor to keep both
+   call-sites compiling.
+2. `legacyPhysicsControlFrameSchema` exists *only* as the
+   `Float64RingBuffer` byte-twin via `Bridge<Schema>`. With the
+   `Float64RingBuffer` class going away there's no remaining motivation to
+   ship an f64-via-Number schema variant — `physicsControlFrameSchema`
+   (u64 seq + tMacroNs) is strictly better for new code.
+3. `BridgeBlockConsumer` `underflowPolicy: 'throw'` is a footgun: an
+   unhandled throw from an AudioWorklet's `process()` permanently
+   terminates the processor. The arm exists in case tests want a
+   strict-fail-on-underflow signal, but a test-only wrapper around the
+   `'zero-fill'` policy + `underflowSamples()` counter does the same thing
+   without the production-time hazard.
+
+Per user direction the cohort plan reports zero known consumers on all
+three surfaces. The 0.8.11 → 0.9.0 gap is therefore the cheap-insurance
+deprecation soak — a one-version window where anyone who somehow vendored
+the surface gets a console warning and a clear pin path before the
+removal lands.
+
+The decision to consolidate the three on the same 0.9.0 removal lets the
+0.9.0 CHANGELOG host one migration guide rather than three, and lets the
+breaking-cut commit be a single coherent diff against the slimmed surface.
+
+### Wire compatibility
+
+100% wire-compatible. No SAB byte layout change, no schema extension, no
+public-API change. The deprecation warnings are pure runtime side-effects
+in the deprecated constructors / functions; existing code keeps compiling
+and keeps producing bit-identical output. A 0.8.10 producer and a 0.8.11
+consumer over the same SAB exchange frames bit-identically; same in the
+reverse direction.
+
+### Tests
+
+All 21 suites green. No test changes — the existing tests that exercise
+the deprecated surfaces (`tests/Float64RingBuffer.test.ts`,
+`tests/Float64RingBuffer.concurrent.test.ts`,
+`tests/BridgeBlockConsumer.test.ts` for the `'throw'` arm) continue to
+pass with one informational `console.warn` per process in stderr. The
+deprecation messages do not affect the assertion-based test runner.
+
+### Bench
+
+push / pull / pullLatest medians unchanged (~1.20 μs at N=1000). The
+deprecation warns fire at most once per process — no hot-path cost.
+
+### Documentation
+
+- `src/Float64RingBuffer.ts` — header `@deprecated` JSDoc + constructor
+  warn (above).
+- `src/schemas/physics.ts` — function-level `@deprecated` JSDoc + once-on-
+  first-call warn + type-alias `@deprecated` tag (above).
+- `src/BridgeBlockConsumer.ts` — file-header policy section, type
+  docstrings, constructor warn (above).
+- `src/index.ts` — re-export section comments + per-export tags (above).
+- `README.md` — §Legacy API callout (above).
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/Float64RingBuffer.ts` — JSDoc + constructor warn.
+- `src/schemas/physics.ts` — JSDoc + function warn.
+- `src/BridgeBlockConsumer.ts` — JSDoc + constructor warn.
+- `src/index.ts` — re-export annotations.
+- `README.md` — §Legacy API callout.
+- `ROADMAP.md` — 0.8.11 row added.
+- `package.json` — version `0.8.10` → `0.8.11`.
+- `CHANGELOG.md` — this entry.
+
 ## [0.8.10] — 2026-05-27
 
 ### Added — `interpolationMode` union closed at 1.0 (audit cohort, pre-1.0 prune 1/N)

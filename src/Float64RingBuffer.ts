@@ -175,18 +175,28 @@ function isPowerOfTwo(x: number): boolean {
   return x > 0 && (x & (x - 1)) === 0;
 }
 
+/** Module-global one-shot guard for the constructor's runtime deprecation
+ *  warning. We warn at most once per process load so an app that creates a
+ *  dozen ring buffers doesn't drown stderr; the `@deprecated` JSDoc gives
+ *  the IDE-time strikethrough, and the warning is the runtime backstop for
+ *  anyone who imported via a non-typed path. */
+let _float64RingBufferDeprecationWarned = false;
+
 /**
  * @deprecated 0.3.0 — replaced by `Bridge<Schema>` with
  * `physicsControlFrameSchema(n)`. This class is preserved unchanged for
- * v0.1.x byte-compat (existing SAB layouts continue to work) and will be
- * removed no earlier than 2.0. New code should import:
+ * v0.1.x byte-compat (existing SAB layouts continue to work) and is
+ * **scheduled for removal at 0.9.0** (the pre-1.0 breaking cut). New code
+ * should import:
  *
  *   import { Bridge, physicsControlFrameSchema } from "webgpu-audio-bridge";
  *
  * If you specifically need byte-compatibility with a v0.1.x SAB produced
- * elsewhere, use `legacyPhysicsControlFrameSchema(n)` — its `seq`/`tMacroNs`
- * are stored as f64 lanes (matching this class's wire format) rather than
- * the cleaner u64 lanes of `physicsControlFrameSchema(n)`.
+ * elsewhere, the recommended migration is `Bridge` +
+ * `legacyPhysicsControlFrameSchema(n)` (also deprecated, also removed at
+ * 0.9.0). If you cannot migrate before the 0.9.0 cut, pin
+ * `webgpu-audio-bridge@0.8.x` (or the v0.1.1 npm tarball for the original
+ * surface) and treat this class as frozen at that version.
  */
 export class Float64RingBuffer {
   public readonly capacity: number;
@@ -198,6 +208,16 @@ export class Float64RingBuffer {
   private readonly capacityBig: bigint;
 
   constructor(sab: SharedArrayBuffer, capacity: number, n: number) {
+    if (!_float64RingBufferDeprecationWarned) {
+      _float64RingBufferDeprecationWarned = true;
+      console.warn(
+        "[webgpu-audio-bridge] Float64RingBuffer is deprecated and will be " +
+        "removed at 0.9.0 (the pre-1.0 breaking cut). Migrate to " +
+        "Bridge<Schema> + physicsControlFrameSchema(n); see CHANGELOG.md " +
+        "for the migration path. Pin webgpu-audio-bridge@0.8.x if you " +
+        "cannot migrate before 0.9.0.",
+      );
+    }
     if (!isPowerOfTwo(capacity)) {
       throw new Error(
         `Float64RingBuffer: capacity must be power of two, got ${capacity}`,
