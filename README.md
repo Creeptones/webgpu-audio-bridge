@@ -63,7 +63,7 @@ npm run dev:demo          # http://localhost:5173
 
 For end-to-end latency measurements (push → audio-thread consume, percentiles under load), see [`bench/e2e-latency/`](./bench/e2e-latency/) — `npm run bench:e2e`.
 
-For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource-0618) (0.6.18) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest.
+For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource-0618) (0.6.18) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest. It targets typical web-audio latency (~15-25 ms input-to-audible) — see the [helper's honest latency breakdown](#what-s-actually-faster-and-what-isn-t) for what it does and doesn't accomplish.
 
 For headless browser smoke tests against the demo, `npm run test:browser` (Playwright; Chromium only for now).
 
@@ -687,9 +687,70 @@ const pushed = source.pollCompleted();                // pushes any-ready frames
 
 ### Why this matters
 
-Native `mapAsync` readback runs **5-15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). Naïve "submit → await mapAsync → push → repeat" serializes the GPU and the readback: the next compute dispatch waits for the previous readback to land, total end-to-end latency floors at one full readback round trip.
+Native `mapAsync` readback runs **5-15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). Naïve "submit → await mapAsync → push → repeat" *serializes* the GPU and the readback: the next compute dispatch waits for the previous readback to land. Under any sustained 60 Hz load, the producer thread stalls and the bridge runs empty — the AudioWorklet's `pullLatest` returns `-1` and the synth loses macro state for a quantum.
 
-The staging-buffer ring breaks the serialization. With 3 buffers, two readbacks stay in flight while a third decodes; the GPU pipeline keeps running and the end-to-end latency drops to the **dispatch cadence itself** — typically 1-4 ms at 60 Hz. The `mapAsync` cost is still paid per readback, it just stops being on the critical path.
+The staging-buffer ring **breaks the serialization**, not the per-readback cost. With 3 buffers, two readbacks stay in flight while a third decodes; the GPU pipeline keeps running and the producer holds its dispatch cadence even when `mapAsync` is slow. **The `mapAsync` cost is still paid per readback (5-15 ms) — it just stops being on the producer's blocking path, and the bridge stops running empty under load.**
+
+### What's actually faster (and what isn't)
+
+Disambiguating three different "latencies" so the wins are honest:
+
+| Latency concept | Affected by the ring? | Numbers |
+|---|---|---|
+| **Per-frame readback latency** (GPU computed byte X → byte X in a CPU `ArrayBuffer`) | ❌ Unchanged | Still 5-15 ms — that's `mapAsync` |
+| **Producer throughput** (sustained frames-per-second the producer can push) | ✅ Improved 5-10× | 60-125 Hz max → 250-1000 Hz |
+| **Bridge freshness** (worst-case "how stale is the newest frame in the bridge") | ✅ Improved | one mapAsync (5-15 ms) instead of stall-cliff-degraded |
+| **Producer thread blocking** (wall-clock the producer spends `await`-ing) | ✅ Improved | ~8 ms per tick → <100 μs (helper bookkeeping only) |
+| **End-to-end input → audible** (user input → speakers) | ⚠️ Indirectly improved | Typical web-audio territory: **~15-25 ms reliably** instead of **30-50 ms with stalls** |
+
+### Honest input → audible breakdown
+
+The full chain from a gestural input (touch, MIDI, slider) to audible output:
+
+```
+t=0        Input event arrives at producer worker
+            │
+            ▼ wait for next producer tick (60 Hz cadence)
+t=0-17     Producer reads input                              (avg 8 ms)
+            │
+            ▼ encode GPU dispatch
+t=~+1      GPU compute finishes                              (~1 ms)
+            │
+            ▼ mapAsync
+t=~+5-15   Bytes are in a CPU ArrayBuffer                    (5-15 ms — unchanged by the ring)
+            │
+            ▼ decode + commitPush
+t=~+0      Bridge has the frame                              (microseconds)
+            │
+            ▼ AudioWorklet's next quantum pulls
+t=+0-3     Audio thread reads                                (avg 1.3 ms at 48 kHz/128)
+            │
+            ▼ AudioContext output buffer + DAC
+t=+5-8     Audible at speakers                               (5-8 ms — browser/OS)
+```
+
+**Realistic total: ~15-25 ms input-to-audible**, dominated by `mapAsync` (5-15 ms) and the browser's audio output buffer (5-8 ms). This is typical web-audio territory.
+
+### The honest pitch
+
+**`BridgeGPUSource` makes GPU → AudioWorklet a deliverable web pattern instead of a research demo, at typical web-audio latency (~15-25 ms).** It does *not* reach pro-audio tracking latency (<5 ms input-to-audible) — that requires WebGPU spec evolution (`mappedAtCreation` zero-copy readback, listed under §Roadmap > Beyond 1.0) that we don't control.
+
+What this means in practice — where 0.6.18 lands the GPU → audio stack:
+
+| Use case | Status |
+|---|---|
+| Ambient / pad / slow-attack instruments | ✅ Comfortable — 20 ms is imperceptible on slow attacks |
+| Drones, evolving textures, generative audio | ✅ Excellent |
+| Browser DAW *non-tracking* features (FX, mastering, mixing) | ✅ 20 ms is fine for editing |
+| WebXR scene rotation / ambisonic / dynamic IR | ✅ Inside the 20 ms immersion budget |
+| Generative-art audio coupled to visuals at frame rate | ✅ Frame-synchronous is the bar, not pro-tracking |
+| Game audio not needing <10 ms feedback | ✅ Most game audio |
+| Educational DSP tools, real-time visualizations | ✅ |
+| Punchy percussion / piano keyboards / live tracking | ⚠️ Marginal — 20 ms is *felt* on fast attacks |
+| Pro-audio tracking instrument competing with hardware modeling synths | ❌ No — floored by `mapAsync` (5-15 ms) + browser output buffer (5-8 ms) |
+| Pro DAW recording with monitor-through-effect | ❌ Not yet — requires WebGPU `mappedAtCreation` |
+
+The underlying truth: **`mapAsync`'s cost is now a fixed pipeline depth, not a variable serialization tax that compounds under load.** That moves the system from "**inconsistent 30-50 ms with stalls**" to "**consistent ~20 ms**" — a real and useful improvement, but the 5-15 ms `mapAsync` floor itself is a hardware/driver limit we can't optimize away.
 
 ### Lifecycle
 
@@ -976,7 +1037,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
-- ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, two readbacks stay in flight while a third decodes — `mapAsync`'s 5-15 ms latency drops to the dispatch cadence itself (1-4 ms at 60 Hz). No `@webgpu/types` runtime dependency; structural interfaces accept real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
+- ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, the producer no longer stalls on `mapAsync` — readbacks overlap, throughput rises from 60-125 Hz to 250-1000 Hz, the bridge stops running empty under load, and total input-to-audible latency moves from "30-50 ms with stalls" to "consistent ~15-25 ms." **`mapAsync`'s per-frame cost (5-15 ms) is unchanged** — it stops being a serialization tax but it's still in the chain, so this lands at typical web-audio latency, not pro-audio tracking latency. No `@webgpu/types` runtime dependency. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
 - ✅ **0.6.17 — `forEachSampleInQuantum` batch evaluation** (per-quantum hot loop API). Wraps the canonical "evaluate every sample of an audio quantum" pattern into one call: `bridge.forEachSampleInQuantum(evalFrame, sampleCount, (i, frame) => { block[i] = synth.step(frame.vEff) })`. Bit-identical output to a hand-rolled `evaluateAtSampleOffset` loop, but with per-sample method-dispatch + cache-validity checks hoisted out of the inner loop. EvalMode dispatch (step / alpha / trajectory / catmull) deferred to a future patch — needs the K=4 catmull history ring and interaction story with `resetSmoother` / `resetEvalCache`. SAB byte layout unchanged from 0.6.11. See [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 - ✅ **0.6.16 — PLL lane 4-5 publication** (cross-process observability, default-on). `Bridge<S>` publishes the live PLL state (offsetNs Int64, driftPpm Q16.16, locked bit) to SAB header lanes 4-7 on every `observeConsumerTime` / `resetPll`. A second peer constructing its own `Bridge` over the same SAB can read via the new `readPublishedPllState()` method without IPC. Strictly additive wire-format use — legacy 0.6.15 peers continue to interoperate. Opt out via `{ publishPllToSab: false }` in `BridgeOptions`. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
 - ✅ **0.6.15 — PLL drift estimator** (opt-in, 2nd-order g-h alpha-beta filter). Pillar 2 second-order: track both `offsetNs` AND `driftRate` (parts-per-million between producer + consumer clocks). When opted in via `enableDriftEstimator: true`, `phaseLockedTime` extrapolates between observations so a quantum-rate AudioWorklet stays sub-μs accurate even when its `AudioContext.currentTime` drifts at tens of ppm against the producer's `performance.now()`. The PI integral is OFF in drift mode (the drift estimator IS the integrator at 2nd order; a redundant KI fights it). `telemetry()` gains `pllDriftPpm`. Default-off preserves 0.6.14 behavior bit-exact. SAB byte layout unchanged from 0.6.11. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).

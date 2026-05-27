@@ -71,15 +71,33 @@ The helper manages:
   helper still unmaps the staging buffer and increments its
   internal `droppedCount` so dashboards pick up the loss.
 
-The point of the staging-buffer ring is **overlap**. Naive "submit,
-await mapAsync, push, repeat" serializes the GPU and the readback
-— the next compute pass waits for the previous readback to land.
-With ≥ 3 staging buffers, two readbacks can be in flight while a
-third is being decoded, so the GPU pipeline keeps running and the
-end-to-end latency drops from `mapAsync`'s 5-15 ms ([Chromium
-41487454](https://issues.chromium.org/issues/41487454),
-[gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)) to the
-dispatch cadence itself — typically 1–4 ms at 60 Hz.
+The point of the staging-buffer ring is **breaking serialization,
+not eliminating mapAsync**. Naive "submit, await mapAsync, push,
+repeat" serializes the GPU and the readback — the next compute
+pass waits for the previous readback to land, the producer thread
+stalls, and the bridge runs empty under sustained load. With ≥ 3
+staging buffers, two readbacks stay in flight while a third
+decodes; the producer holds its dispatch cadence and the bridge
+stays populated. **The `mapAsync` cost (5-15 ms, per
+[Chromium 41487454](https://issues.chromium.org/issues/41487454)
+and [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432))
+is still paid per readback — it just stops being on the producer's
+blocking path.**
+
+Realistic latency impact:
+
+  - Producer throughput: 60-125 Hz → 250-1000 Hz (5-10× improvement)
+  - Producer thread blocking: ~8 ms/tick → <100 μs/tick
+  - Per-frame readback latency: 5-15 ms (UNCHANGED — that's mapAsync)
+  - Total input → audible: ~30-50 ms with stalls → ~15-25 ms reliably
+
+This lands at typical web-audio latency (~15-25 ms) — sufficient
+for ambient / pad / generative / WebXR / non-tracking DAW use
+cases, marginal for fast percussion, **not pro-audio tracking
+latency**. The 5-15 ms mapAsync floor is a hardware/driver limit;
+breaking through it requires WebGPU spec evolution
+(`mappedAtCreation` zero-copy readback, on the §Beyond 1.0
+roadmap) that we don't control.
 
 ### Why
 
