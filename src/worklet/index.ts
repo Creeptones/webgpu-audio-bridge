@@ -165,6 +165,36 @@ export interface WorkletConsumer {
    *  readIdx + 1), notify. */
   commitPull(): void;
 
+  /** Scalar field decoders (0.7.7). One per FieldKind in the schema
+   *  DSL. Each takes the ABSOLUTE byte offset within the WASM memory
+   *  (= within the SAB) — typically
+   *  `RING_HEADER_BYTES + slot * frameByteSize + field.byteOffset` —
+   *  and returns the typed scalar value via the matching WebAssembly
+   *  load instruction. All loads tolerate arbitrary field alignment
+   *  (the bridge schema-compile packs fields tightly, so a u64 can
+   *  land on any 4-byte boundary). Endianness: little-endian, matching
+   *  the JS Bridge's TypedArray umbrella views.
+   *
+   *  Signedness:
+   *    - readI32 returns a Number with signed-i32 interpretation as-is.
+   *    - readU32 applies `value >>> 0` so values with the high bit set
+   *      surface as `[0, 2^32)` rather than negative.
+   *    - readI64 returns a signed BigInt.
+   *    - readU64 applies `BigInt.asUintN(64, value)` so values with the
+   *      high bit set surface as `[0, 2^64)` rather than negative.
+   *    - readI16/U16, readI8/U8 use the WAT instruction's built-in
+   *      sign-extension flavor; the JS-side result is already correct. */
+  readF64(byteOffset: number): number;
+  readF32(byteOffset: number): number;
+  readI64(byteOffset: number): bigint;
+  readU64(byteOffset: number): bigint;
+  readI32(byteOffset: number): number;
+  readU32(byteOffset: number): number;
+  readI16(byteOffset: number): number;
+  readU16(byteOffset: number): number;
+  readI8(byteOffset: number): number;
+  readU8(byteOffset: number): number;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -204,6 +234,16 @@ export function instantiateConsumer(
     readonly commit_pull_latest: () => void;
     readonly peek_pull: (mask: number) => number;
     readonly commit_pull: () => void;
+    readonly read_f64: (off: number) => number;
+    readonly read_f32: (off: number) => number;
+    readonly read_i64: (off: number) => bigint;
+    readonly read_u64: (off: number) => bigint;
+    readonly read_i32: (off: number) => number;
+    readonly read_u32: (off: number) => number;
+    readonly read_i16: (off: number) => number;
+    readonly read_u16: (off: number) => number;
+    readonly read_i8: (off: number) => number;
+    readonly read_u8: (off: number) => number;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -215,6 +255,16 @@ export function instantiateConsumer(
     "commit_pull_latest",
     "peek_pull",
     "commit_pull",
+    "read_f64",
+    "read_f32",
+    "read_i64",
+    "read_u64",
+    "read_i32",
+    "read_u32",
+    "read_i16",
+    "read_u16",
+    "read_i8",
+    "read_u8",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -223,6 +273,9 @@ export function instantiateConsumer(
       );
     }
   }
+  // BigInt mask for the u64 unsigned-cast. Computed once per instantiate,
+  // not per read, so the hot path stays branch-free.
+  const U64_MASK = (1n << 64n) - 1n;
   return {
     instance,
     readWriteIndex: () => exports.read_write_index(),
@@ -231,5 +284,20 @@ export function instantiateConsumer(
     commitPullLatest: () => exports.commit_pull_latest(),
     peekPull: (mask) => exports.peek_pull(mask),
     commitPull: () => exports.commit_pull(),
+    readF64: (off) => exports.read_f64(off),
+    readF32: (off) => exports.read_f32(off),
+    readI64: (off) => exports.read_i64(off),
+    // BigInt.asUintN(64, ...) reinterprets the signed BigInt the WASM
+    // i64 return path produces as unsigned [0, 2^64). The mask-and is
+    // equivalent and slightly faster than the helper-fn invocation.
+    readU64: (off) => exports.read_u64(off) & U64_MASK,
+    readI32: (off) => exports.read_i32(off),
+    // Unsigned cast — JS shifts treat the operand as i32, so `>>> 0`
+    // recovers the [0, 2^32) interpretation.
+    readU32: (off) => exports.read_u32(off) >>> 0,
+    readI16: (off) => exports.read_i16(off),
+    readU16: (off) => exports.read_u16(off),
+    readI8: (off) => exports.read_i8(off),
+    readU8: (off) => exports.read_u8(off),
   };
 }

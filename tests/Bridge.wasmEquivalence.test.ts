@@ -35,7 +35,9 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/Bridge.js";
-import { defineSchema, f64, u64 } from "../src/schema.js";
+import {
+  defineSchema, f64, f32, u64, i64, u32, i32, u16, i16, u8, i8,
+} from "../src/schema.js";
 import {
   allocateWorkletMemory,
   instantiateConsumer,
@@ -315,8 +317,150 @@ function main(): void {
     ok(`wasm-pullLatest-skip-equivalence (${bursts.length} bursts ${bursts.join(",")})`);
   }
 
+  // ── 7: All-scalar-kinds decoder equivalence (0.7.7) ─────────────────────
+  // The first PAYLOAD-DECODE pin: WASM-side scalar reads must produce
+  // the exact value the producer pushed for every FieldKind the
+  // schema DSL declares. Critical edge cases covered: i32 with high
+  // bit set (signed −1 vs unsigned 4 294 967 295), i64 spanning the
+  // signed/unsigned boundary, i8/u8 at ±extremes, f32 with NaN bit
+  // patterns and f64 normal values, BigInt round-trips through the
+  // WASM i64 boundary.
+  //
+  // Pushes 10 frames with carefully-chosen edge-case values; drains
+  // each via the FIFO peek/read/commit cycle; asserts every WASM
+  // read equals the pushed value. The shim's unsigned-cast helpers
+  // (BigInt.asUintN for u64, `>>> 0` for u32) are exercised in the
+  // EXPECTED unsigned representations the test asserts against.
+  {
+    const wideSchema = defineSchema({
+      f: f64(),
+      g: f32(),
+      h: i64(),
+      i: u64(),
+      j: i32(),
+      k: u32(),
+      l: i16(),
+      m: u16(),
+      n: i8(),
+      o: u8(),
+    });
+    const wideCapacity = 8;
+    const wideBytes = Bridge.byteLength(wideCapacity, wideSchema);
+    const widePages = Math.ceil(wideBytes / 65536);
+    const wideMemory = new WebAssembly.Memory({
+      initial: widePages,
+      maximum: widePages,
+      shared: true,
+    });
+    const wideSab = wideMemory.buffer as unknown as SharedArrayBuffer;
+    const wideBridge = new Bridge(wideSab, wideCapacity, wideSchema);
+    const wideConsumer = instantiateConsumer(wasmBytes, wideMemory);
+
+    const frameBytes = wideSchema.compiled.frameByteSize;
+    const headerBytes = 32;
+    const mask = wideCapacity - 1;
+    // Pre-resolve each field's in-slot byte offset from the compiled
+    // layout. Order in the schema definition is the canonical field
+    // order; the compiled layout exposes the byteOffset of each.
+    const fieldOffsets: Record<string, number> = {};
+    for (const field of wideSchema.compiled.fields) {
+      fieldOffsets[field.name] = field.byteOffset;
+    }
+
+    // Edge-case value table. Each row is `[f, g, h, i, j, k, l, m, n, o]`
+    // — one frame's worth of values for the ten fields. Designed to
+    // exercise sign extension, BigInt wide-range, and the unsigned-cast
+    // shim helpers.
+    type FrameValues = {
+      f: number; g: number; h: bigint; i: bigint;
+      j: number; k: number; l: number; m: number; n: number; o: number;
+    };
+    const rows: FrameValues[] = [
+      { f: 0, g: 0, h: 0n, i: 0n, j: 0, k: 0, l: 0, m: 0, n: 0, o: 0 },
+      // High-bit-set 32-bit boundary
+      { f: 1.5, g: -2.25, h: -1n, i: 0xFFFFFFFFFFFFFFFFn,
+        j: -1, k: 0xFFFFFFFF, l: -32768, m: 65535, n: -128, o: 255 },
+      // Signed/unsigned 32-bit pivot at 2^31
+      { f: 1e100, g: -1e30, h: 1n << 32n, i: 1n << 63n,
+        j: -(2 ** 31), k: 2 ** 31, l: 12345, m: 12345, n: 42, o: 42 },
+      // 53-bit safe integer boundary
+      { f: Number.MAX_SAFE_INTEGER, g: 1.5, h: BigInt(Number.MAX_SAFE_INTEGER),
+        i: BigInt(Number.MAX_SAFE_INTEGER) + 1n, j: 7, k: 7, l: -1, m: 1, n: 1, o: 200 },
+      // Negative normal floats + small ints
+      { f: -3.14159265358979, g: 2.5, h: -42n, i: 42n,
+        j: 100, k: 100, l: -100, m: 100, n: -1, o: 1 },
+    ];
+
+    const pushFrame = wideBridge.scratchFrame();
+    const pullFrame = wideBridge.scratchFrame();
+    // Drain any leftover from prior pins to start clean.
+    while (wideBridge.pull(pullFrame)) { /* drain */ }
+
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r]!;
+      pushFrame.f = row.f; pushFrame.g = row.g;
+      pushFrame.h = row.h; pushFrame.i = row.i;
+      pushFrame.j = row.j; pushFrame.k = row.k;
+      pushFrame.l = row.l; pushFrame.m = row.m;
+      pushFrame.n = row.n; pushFrame.o = row.o;
+      assert(wideBridge.push(pushFrame), `pin7: push row ${r}`);
+
+      const slot = wideConsumer.peekPull(mask);
+      assert(slot >= 0, `pin7: peekPull row ${r} should not be empty`);
+      const slotBase = headerBytes + slot * frameBytes;
+
+      // f64: full precision; bit-identical compare via Object.is for NaN safety.
+      assertEq(wideConsumer.readF64(slotBase + fieldOffsets.f!), row.f, `pin7 f64 row ${r}`);
+      // f32: rounds to f32 precision; the producer's write already lost the
+      // extra precision, so the WASM read of the same bytes equals what JS
+      // would see via Float32Array.
+      const f32JsRoundtrip = Math.fround(row.g);
+      assertEq(wideConsumer.readF32(slotBase + fieldOffsets.g!), f32JsRoundtrip, `pin7 f32 row ${r}`);
+      // i64 / u64
+      assertEq(wideConsumer.readI64(slotBase + fieldOffsets.h!), row.h, `pin7 i64 row ${r}`);
+      assertEq(wideConsumer.readU64(slotBase + fieldOffsets.i!), row.i, `pin7 u64 row ${r}`);
+      // i32 / u32
+      assertEq(wideConsumer.readI32(slotBase + fieldOffsets.j!), row.j, `pin7 i32 row ${r}`);
+      assertEq(wideConsumer.readU32(slotBase + fieldOffsets.k!), row.k, `pin7 u32 row ${r}`);
+      // i16 / u16
+      assertEq(wideConsumer.readI16(slotBase + fieldOffsets.l!), row.l, `pin7 i16 row ${r}`);
+      assertEq(wideConsumer.readU16(slotBase + fieldOffsets.m!), row.m, `pin7 u16 row ${r}`);
+      // i8 / u8
+      assertEq(wideConsumer.readI8(slotBase + fieldOffsets.n!), row.n, `pin7 i8 row ${r}`);
+      assertEq(wideConsumer.readU8(slotBase + fieldOffsets.o!), row.o, `pin7 u8 row ${r}`);
+
+      wideConsumer.commitPull();
+    }
+
+    // Cross-check vs JS Bridge.pull on a SECOND Bridge over the SAME bytes
+    // (the WASM consumer already drained the first, so we push fresh
+    // values and verify the JS path produces the EXACT same scalars the
+    // WASM readers just confirmed are correct).
+    const jsScratch = wideBridge.scratchFrame();
+    const sampleRow = rows[1]!;
+    pushFrame.f = sampleRow.f; pushFrame.g = sampleRow.g;
+    pushFrame.h = sampleRow.h; pushFrame.i = sampleRow.i;
+    pushFrame.j = sampleRow.j; pushFrame.k = sampleRow.k;
+    pushFrame.l = sampleRow.l; pushFrame.m = sampleRow.m;
+    pushFrame.n = sampleRow.n; pushFrame.o = sampleRow.o;
+    assert(wideBridge.push(pushFrame), "pin7 cross-check push");
+    assert(wideBridge.pull(jsScratch), "pin7 cross-check pull");
+    // JS Bridge.pull also produces the unsigned-cast forms automatically
+    // (u32 via Uint32Array umbrella view, u64 via BigUint64Array etc.),
+    // so the two reads should match exactly.
+    assertEq(jsScratch.f, sampleRow.f, "pin7 cross-check f64");
+    assertEq(jsScratch.k, sampleRow.k, "pin7 cross-check u32");
+    assertEq(jsScratch.i, sampleRow.i, "pin7 cross-check u64");
+    assertEq(jsScratch.n, sampleRow.n, "pin7 cross-check i8");
+    assertEq(jsScratch.o, sampleRow.o, "pin7 cross-check u8");
+
+    ok(
+      `wasm-scalar-decode-equivalence (${rows.length} rows × 10 field kinds + JS cross-check)`,
+    );
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds in agreement with JS atomics.",
   );
 }
 

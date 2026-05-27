@@ -4,6 +4,117 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.7] — 2026-05-27
+
+### Added — WASM scalar field decoders (Track 2 of the King roadmap, third patch)
+
+First payload-decode patch in the Track 2 cohort. The WASM
+consumer now decodes every scalar `FieldKind` the schema DSL
+declares — `f64`, `f32`, `i64`, `u64`, `i32`, `u32`, `i16`, `u16`,
+`i8`, `u8` — via the matching WebAssembly load instruction
+flavor. Each reader takes the absolute byte offset within the
+SAB and returns the typed scalar value; the caller composes
+`RING_HEADER_BYTES + slot * frameByteSize + field.byteOffset`
+once per (slot × field) pair.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`wasm/decoder.wat`** grows ten new exports:
+  - `read_f64(off) → f64` (uses `f64.load align=1`).
+  - `read_f32(off) → f32` (`f32.load align=1`).
+  - `read_i64(off) → i64`, `read_u64(off) → i64`
+    (both `i64.load align=1`; the unsigned cast happens JS-side).
+  - `read_i32(off) → i32`, `read_u32(off) → i32`
+    (both `i32.load align=1`; unsigned cast JS-side).
+  - `read_i16(off) → i32` (`i32.load16_s align=1`).
+  - `read_u16(off) → i32` (`i32.load16_u align=1`).
+  - `read_i8(off)  → i32` (`i32.load8_s`).
+  - `read_u8(off)  → i32` (`i32.load8_u`).
+
+  All loads use `align=1` to accept arbitrary field
+  alignment without trapping — the Bridge's schema compile
+  packs fields tightly without natural-alignment padding,
+  so a `u64` field can land on any 4-byte boundary.
+
+- **`src/worklet/index.ts`** `WorkletConsumer` interface grows
+  ten typed methods: `readF64`, `readF32`, `readI64`, `readU64`,
+  `readI32`, `readU32`, `readI16`, `readU16`, `readI8`, `readU8`.
+  Each accepts the absolute byte offset. The unsigned-cast shim
+  helpers (`BigInt.asUintN(64, …)` for u64, `value >>> 0` for u32)
+  live in the JS shim so the WASM instructions stay minimal.
+  The instantiation guard now validates all 16 exports.
+
+- **`tests/Bridge.wasmEquivalence.test.ts`** adds Pin 7:
+  - Defines a 10-field schema (one per kind) and pushes 5 rows
+    of carefully-chosen edge-case values: i32 with high bit set
+    (signed −1 vs unsigned 4 294 967 295), i64 spanning the
+    signed/unsigned boundary, the 53-bit `Number.MAX_SAFE_INTEGER`
+    pivot for BigInt boundary, i8/u8 at ±extremes, f64 with full
+    precision and f32 with `Math.fround`-roundtrip equivalence.
+  - For each frame: WASM `peekPull` → ten per-field WASM scalar
+    reads via the new methods → `commitPull`. Asserts every
+    read equals the pushed value.
+  - Cross-check: JS Bridge.pull on a fresh push of the same
+    edge-case row produces the EXACT same scalars, confirming
+    JS-side decode and WASM-side decode agree on the bytes.
+
+  All six 0.7.6 pins still pass.
+
+### Why
+
+The atomic dance (shipped in 0.7.6) routes through WASM but the
+slot's payload still lives in the JS hot path — every field read
+goes through a typed-array umbrella view + a property assignment
+on the scratch frame object. The scalar decoders move the first
+chunk of that work to WASM. Combined with subsequent patches
+(array fields, SIMD trajectory) they progressively retire the
+JS-side decode loop until the only JS hot-path work left is the
+two WASM calls (`peekPullLatest` / `commitPullLatest`) plus the
+post-decode interpretation step the caller chooses.
+
+The split also makes the WASM decoder COMPOSABLE — a future
+inspector that wants only the timestamp from a frame can call
+just `readU64` for `tMacroNs` without paying for the rest of
+the payload decode. The JS Bridge's `pull` decodes the whole
+frame eagerly; WASM's per-field readers are lazy by design.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout unchanged.
+The WASM load instructions produce bit-identical reads to the
+JS Bridge's umbrella TypedArray views (little-endian, no
+signedness disagreement after the JS-side cast shim). A 0.7.6
+producer interoperates bit-for-bit with a 0.7.7 consumer using
+the new readers, and vice-versa.
+
+### Tests
+
+Pin 7 covers all 10 scalar kinds × 5 edge-case rows = 50
+field-level equivalences plus the JS cross-check. All seven
+0.7.6 pins still green. The Bridge / BridgeFacades /
+BridgeInputLane / schema / environment / phaseLock (incl.
+Hermite) / concurrent stress / Float64RingBuffer legacy
+suites all green — purely additive.
+
+### Bench
+
+push/pull/pullLatest medians unchanged at 1.20 μs. The WASM
+path still has no end-to-end JS replacement, so no bench
+delta to report. Headline bench (WASM vs JS pullLatest)
+lands alongside the array + SIMD trajectory patches, when
+WASM owns the full decode loop and the comparison becomes
+meaningful.
+
+### Documentation
+
+`wasm/decoder.wat` gains a section header for the scalar
+decoders documenting the alignment policy (`align=1`),
+endianness contract (LE matching JS TypedArray views), and
+signedness/instruction mapping per kind. `WorkletConsumer`
+interface docstrings in `src/worklet/index.ts` cross-reference
+the WAT contract. README integration lands once the full
+pullLatest is WASM-backed.
+
 ## [0.7.6] — 2026-05-27
 
 ### Added — WASM-owned SPSC pull dance (Track 2 of the King roadmap, second patch)

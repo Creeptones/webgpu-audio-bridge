@@ -245,4 +245,80 @@
     i32.const 4
     i32.const 1
     memory.atomic.notify
-    drop))
+    drop)
+
+  ;; ─── Scalar field decoders (0.7.7) ────────────────────────────────────
+  ;;
+  ;; One reader per FieldKind in the schema DSL. Each takes the absolute
+  ;; byte offset within WASM memory (= within the SAB) and returns the
+  ;; typed value via the corresponding WebAssembly load instruction.
+  ;; Caller-side math: `byteOffset = RING_HEADER_BYTES + slot * frameByteSize
+  ;; + field.byteOffset` (the JS shim wraps this so callers pass the
+  ;; pre-resolved offset list).
+  ;;
+  ;; All loads use `align=1` to accept arbitrary field alignment without
+  ;; trapping — the Bridge's schema-compile packs fields tightly and
+  ;; does not pad to natural type alignment, so a u64 field can land on
+  ;; any 4-byte boundary (or worse). align=1 costs ~one cycle on x86
+  ;; for misaligned cases and is wire-correct on every spec-compliant
+  ;; runtime.
+  ;;
+  ;; Endianness: WebAssembly loads are little-endian by spec, matching
+  ;; the JS Bridge's umbrella TypedArray views (also LE on every
+  ;; current platform). The two surfaces produce bit-identical reads.
+  ;;
+  ;; Signedness: WAT i32/i64 are bit patterns. The shim splits signed
+  ;; vs unsigned at the JS boundary:
+  ;;   - read_i32 returns Number (signed interpretation as-is)
+  ;;   - read_u32: shim applies `value >>> 0` to recover unsigned
+  ;;   - read_i64 returns BigInt (signed)
+  ;;   - read_u64: shim applies BigInt.asUintN(64, value) for unsigned
+  ;; The narrower integer kinds use the WAT instructions' built-in
+  ;; sign-extension flavor (load8_s / load8_u / load16_s / load16_u)
+  ;; so the result is already the right sign at the JS boundary.
+
+  (func $read_f64 (export "read_f64") (param $off i32) (result f64)
+    local.get $off
+    f64.load align=1)
+
+  (func $read_f32 (export "read_f32") (param $off i32) (result f32)
+    local.get $off
+    f32.load align=1)
+
+  ;; 64-bit integer load — signed/unsigned interpretation happens in JS.
+  ;; Same WAT instruction backs read_i64 and read_u64.
+  (func $read_i64 (export "read_i64") (param $off i32) (result i64)
+    local.get $off
+    i64.load align=1)
+
+  (func $read_u64 (export "read_u64") (param $off i32) (result i64)
+    local.get $off
+    i64.load align=1)
+
+  ;; 32-bit integer load — same instruction for signed/unsigned.
+  (func $read_i32 (export "read_i32") (param $off i32) (result i32)
+    local.get $off
+    i32.load align=1)
+
+  (func $read_u32 (export "read_u32") (param $off i32) (result i32)
+    local.get $off
+    i32.load align=1)
+
+  ;; 16-bit integer load — separate instructions per signedness so the
+  ;; sign-extension happens in WAT (cheaper than a JS-side mask + shift).
+  (func $read_i16 (export "read_i16") (param $off i32) (result i32)
+    local.get $off
+    i32.load16_s align=1)
+
+  (func $read_u16 (export "read_u16") (param $off i32) (result i32)
+    local.get $off
+    i32.load16_u align=1)
+
+  ;; 8-bit integer load.
+  (func $read_i8 (export "read_i8") (param $off i32) (result i32)
+    local.get $off
+    i32.load8_s)
+
+  (func $read_u8 (export "read_u8") (param $off i32) (result i32)
+    local.get $off
+    i32.load8_u))
