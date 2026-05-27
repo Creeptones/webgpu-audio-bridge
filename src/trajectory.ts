@@ -271,3 +271,138 @@ function evaluateClamped(
     }
   }
 }
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Hermite cubic interpolation (0.7.3 — Track 1 of the King roadmap)
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * The Taylor path above reconstructs a sample value from ONE frame's
+ * derivatives. At frame boundaries that gives a C⁰-continuous signal — the
+ * value matches but the slope can step, which manifests as 60 Hz harmonic
+ * energy on slowly-varying envelopes (the "zipper" sound).
+ *
+ * Cubic Hermite interpolation between two consecutive frames matches BOTH
+ * position and velocity at each endpoint, so the reconstructed signal is
+ * C¹-continuous across frame boundaries. The first-derivative step is
+ * eliminated; the harmonic energy drops by ~the ratio of sinc² (linear) to
+ * sinc⁴ (cubic) per harmonic — measurable, audible, and worth the price
+ * of holding the previous frame's flat array.
+ *
+ * Standard cubic-Hermite basis on local parameter t ∈ [0, 1]:
+ *
+ *     h00(t) =  2t³ − 3t² + 1     (1 at t=0, 0 at t=1; deriv 0 at both)
+ *     h10(t) =       t³ − 2t² + t (0 at endpoints; deriv 1 at t=0, 0 at t=1)
+ *     h01(t) = −2t³ + 3t²         (0 at t=0, 1 at t=1; deriv 0 at both)
+ *     h11(t) =       t³ − t²      (0 at endpoints; deriv 0 at t=0, 1 at t=1)
+ *
+ *     p(t) = h00·P0 + h10·M0 + h01·P1 + h11·M1
+ *
+ * P0, P1 = position at the two endpoints (sample at frame N, frame N+1).
+ * M0, M1 = TANGENT in local-t space at the endpoints. The tangent in
+ *          producer units (e.g. units/second) equals the producer-stamped
+ *          velocity; to use it as a local-t tangent we scale by the
+ *          segment's wall-clock duration `segmentSeconds`. That's the only
+ *          place the time unit enters the math — once velocity is
+ *          re-expressed as "change per unit of t", the basis polynomials
+ *          are unit-free.
+ *
+ * Order=1 trajectories carry no velocity, so 'hermite' is rejected at
+ * schema-construction time. Order=3 trajectories carry acceleration; this
+ * first cut IGNORES it (standard cubic Hermite is C¹, not C²). A future
+ * patch can add a quintic Hermite path that consumes (p, v, a) at both
+ * endpoints for full C² continuity.
+ *
+ * Allocation-free: the caller owns prev/curr/out buffers. No clamp path
+ * yet — clamps land in a follow-up when there's a use case (the linear
+ * Taylor clamps were driven by real producer overflow incidents; we don't
+ * have those for hermite yet, so we don't pay the dispatch cost). */
+
+/** Cubic Hermite reconstruction between two consecutive trajectory frames.
+ *  Required `spec.order >= 2` (velocities at endpoints). `t` is the
+ *  normalized position in `[0, 1]` from `flatPrev` (the older frame) to
+ *  `flatCurr`; `segmentSeconds` is the wall-clock duration of the segment
+ *  in the producer's velocity units (typically seconds, matching
+ *  velocity-in-units-per-second). 0.7.3. */
+export function evaluateHermiteTrajectoryInto(
+  flatPrev: Float64Array,
+  flatCurr: Float64Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array,
+): void;
+export function evaluateHermiteTrajectoryInto(
+  flatPrev: Float32Array,
+  flatCurr: Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float32Array,
+): void;
+export function evaluateHermiteTrajectoryInto(
+  flatPrev: Float64Array | Float32Array,
+  flatCurr: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array | Float32Array,
+): void {
+  const { order, sampleCount } = spec;
+  if (order < 2) {
+    // Mirrors the schema-construction guard so direct callers that bypass
+    // the DSL get the same error.
+    throw new Error(
+      `evaluateHermiteTrajectoryInto: spec.order must be >= 2 (hermite needs endpoint velocities), got order=${order}`,
+    );
+  }
+  if (!Number.isFinite(t)) {
+    throw new Error(`evaluateHermiteTrajectoryInto: t must be finite, got ${t}`);
+  }
+  if (!Number.isFinite(segmentSeconds)) {
+    throw new Error(
+      `evaluateHermiteTrajectoryInto: segmentSeconds must be finite, got ${segmentSeconds}`,
+    );
+  }
+  if (out.length < sampleCount) {
+    throw new Error(
+      `evaluateHermiteTrajectoryInto: out length ${out.length} < sampleCount ${sampleCount}`,
+    );
+  }
+  const required = sampleCount * order;
+  if (flatPrev.length < required) {
+    throw new Error(
+      `evaluateHermiteTrajectoryInto: flatPrev length ${flatPrev.length} < sampleCount * order (${required})`,
+    );
+  }
+  if (flatCurr.length < required) {
+    throw new Error(
+      `evaluateHermiteTrajectoryInto: flatCurr length ${flatCurr.length} < sampleCount * order (${required})`,
+    );
+  }
+
+  // Resolve the basis once per call; the inner loop reuses these coefficients
+  // across every sample (the basis is signal-independent).
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h00 = 2 * t3 - 3 * t2 + 1;
+  const h10 = t3 - 2 * t2 + t;
+  const h01 = -2 * t3 + 3 * t2;
+  const h11 = t3 - t2;
+  // Velocity → local-t tangent: multiply once per coefficient so the hot
+  // loop is six multiplies + three adds per sample regardless of order.
+  const h10s = h10 * segmentSeconds;
+  const h11s = h11 * segmentSeconds;
+
+  // The per-sample stride is `order`; for order=2 it's (p, v), for order=3
+  // it's (p, v, a). The acceleration lane is ignored on the cubic path —
+  // see the file header note for the future quintic plan.
+  const stride = order;
+  for (let i = 0; i < sampleCount; i++) {
+    const j = i * stride;
+    const p0 = flatPrev[j]!;
+    const m0 = flatPrev[j + 1]!;
+    const p1 = flatCurr[j]!;
+    const m1 = flatCurr[j + 1]!;
+    out[i] = h00 * p0 + h10s * m0 + h01 * p1 + h11s * m1;
+  }
+}

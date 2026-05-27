@@ -221,7 +221,10 @@ import {
 } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
-import { evaluateTrajectoryInto } from "./trajectory.js";
+import {
+  evaluateTrajectoryInto,
+  evaluateHermiteTrajectoryInto,
+} from "./trajectory.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
 // tests) that import them from "./Bridge.js" continue to compile. The
@@ -895,6 +898,93 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       } else {
         // Scalar (number or BigInt) — direct copy.
         out[name] = src[name];
+      }
+    }
+  }
+
+  /**
+   * Per-frame Hermite cubic evaluator (0.7.3 — Track 1 of the King roadmap).
+   * Reconstructs trajectory fields between two consecutive frames using a
+   * C¹-continuous cubic Hermite spline; positions AND velocities match at
+   * both endpoints, so the reconstructed signal has no first-derivative
+   * step at frame boundaries. That eliminates the 60 Hz "zipper" harmonics
+   * the single-frame Taylor path can leave on slowly-varying envelopes.
+   *
+   * Requires every trajectory field in the schema to have `order >= 2`
+   * (need endpoint velocities). Order=1 fields throw at field encounter,
+   * mirroring the schema-construction guard for the `hermite` tag.
+   *
+   * Inputs:
+   *   - `prevFrame` — the older of the two consecutive pulls.
+   *   - `currFrame` — the newer of the two.
+   *   - `t` — normalized position in [0, 1] from prev to curr.
+   *   - `segmentSeconds` — wall-clock duration of the segment in the
+   *     producer's velocity time unit (typically seconds). The PLL's
+   *     phase-locked time difference between the two frames is the
+   *     natural source: `(currStampNs − prevStampNs) * 1e−9`.
+   *   - `outFrame` — sized via `scratchEvaluatedFrame()`; trajectory fields
+   *     receive the post-evaluation positions, non-trajectory fields
+   *     receive the value from `currFrame` (the latest state).
+   *
+   * Heap-only — no SAB access, no internal state. Allocation-free.
+   */
+  evaluateHermiteInto(
+    prevFrame: FrameFor<S>,
+    currFrame: FrameFor<S>,
+    t: number,
+    segmentSeconds: number,
+    outFrame: FrameFor<S>,
+  ): void {
+    if (!Number.isFinite(t)) {
+      throw new Error(`evaluateHermiteInto: t must be finite, got ${t}`);
+    }
+    if (!Number.isFinite(segmentSeconds)) {
+      throw new Error(
+        `evaluateHermiteInto: segmentSeconds must be finite, got ${segmentSeconds}`,
+      );
+    }
+    const prev = prevFrame as unknown as Record<string, unknown>;
+    const curr = currFrame as unknown as Record<string, unknown>;
+    const out = outFrame as unknown as Record<string, unknown>;
+    const fields = this.schema.compiled.fields;
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i]!;
+      const name = field.name;
+      if (field.trajectory) {
+        // Trajectory field. Both prev and curr must carry the same flat
+        // payload shape (the schema enforces this at construction).
+        if (field.kind === "f64") {
+          evaluateHermiteTrajectoryInto(
+            prev[name] as Float64Array,
+            curr[name] as Float64Array,
+            field.trajectory,
+            t,
+            segmentSeconds,
+            out[name] as Float64Array,
+          );
+        } else if (field.kind === "f32") {
+          evaluateHermiteTrajectoryInto(
+            prev[name] as Float32Array,
+            curr[name] as Float32Array,
+            field.trajectory,
+            t,
+            segmentSeconds,
+            out[name] as Float32Array,
+          );
+        } else {
+          // Defensive — the DSL only tags trajectory on f64/f32.
+          throw new Error(
+            `evaluateHermiteInto: trajectory field '${name}' has unexpected kind '${field.kind}'`,
+          );
+        }
+      } else if (field.isArray) {
+        // Non-trajectory array — pass through the LATEST (curr) state.
+        (out[name] as { set(s: ArrayLike<unknown>): void }).set(
+          curr[name] as ArrayLike<unknown>,
+        );
+      } else {
+        // Scalar — pass through curr.
+        out[name] = curr[name];
       }
     }
   }

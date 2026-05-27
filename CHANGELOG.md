@@ -4,6 +4,134 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.7.4] — 2026-05-27
+
+### Added — Hermite cubic reconstruction (Track 1 of the King roadmap)
+
+Two-frame C¹-continuous cubic Hermite interpolation as a new
+consumer-side reconstruction strategy alongside the existing
+single-frame Taylor extrapolation. The reconstructed signal has
+no first-derivative step at frame boundaries, so the 60 Hz
+"zipper" harmonics the Taylor path leaves on slowly-varying
+envelopes drop into the noise floor.
+
+**Patch surface (additive, wire-compatible — no SAB byte change):**
+
+- **`evaluateHermiteTrajectoryInto(flatPrev, flatCurr, spec, t, segmentSeconds, out)`**
+  — new pure function in `src/trajectory.ts` alongside
+  `evaluateTrajectoryInto`. Standard cubic Hermite basis on
+  local parameter `t ∈ [0, 1]`:
+  ```
+  h00(t) =  2t³ − 3t² + 1
+  h10(t) =       t³ − 2t² + t
+  h01(t) = −2t³ + 3t²
+  h11(t) =       t³ − t²
+  p(t)   = h00·P0 + h10·M0 + h01·P1 + h11·M1
+  ```
+  where (P0, P1) are positions at the two endpoints and
+  (M0, M1) are velocities scaled by `segmentSeconds` to act
+  as local-`t` tangents. Allocation-free; the six basis
+  coefficients are resolved once per call and the inner loop
+  is six multiplies + three adds per sample. f64 and f32
+  overloads. Requires `spec.order >= 2`; throws on order=1
+  (no endpoint velocities available). Acceleration is ignored
+  on the cubic path — a quintic Hermite variant that consumes
+  (p, v, a) at both endpoints is a future patch.
+
+- **`Bridge.evaluateHermiteInto(prevFrame, currFrame, t, segmentSeconds, outFrame)`**
+  — new public method on `Bridge<S>`. Walks every field of
+  the schema like `evaluateInto` does, but routes trajectory
+  fields through the Hermite evaluator. Non-trajectory arrays
+  and scalars pass through from `currFrame` (the latest
+  state). Heap-only; no SAB access; no internal state.
+
+- **`TrajectoryArrayOptions.interpolationMode`** — new optional
+  field on `f{32,64}TrajectoryArray(n, opts)`. Accepts
+  `'taylor'` (default; bit-exact equal to 0.7.3 behavior) or
+  `'hermite'`. Pure schema metadata — the SAB bytes are
+  identical for both modes, so a producer that tags
+  `interpolationMode: 'hermite'` interoperates byte-for-byte
+  with a 0.7.3 consumer using `evaluateInto`. Validated at
+  schema construction; `'hermite'` requires `order >= 2`.
+
+- **`TrajectoryInterpolationMode`** type — `'taylor' | 'hermite'`,
+  exported alongside the existing `TrajectoryOverflowFallback`.
+
+### Added — `require:` condition on the package `exports` field
+
+Small enabler surfaced during the Phase C wavefunction-twin
+migration: `tsx` running in CJS mode (the website's default
+test-runner context) couldn't resolve `webgpu-audio-bridge`
+because the `exports` field only had `import` and `types`
+conditions. Adding `"require": "./dist/index.js"` lets Node
+22+'s `--experimental-require-module` path consume the same
+ESM dist file from a CJS host. No behavior change for ESM
+consumers.
+
+### Why
+
+Hermite is the highest-payoff-per-unit-risk patch in the
+King roadmap's five tracks: lowest-risk additive change with
+the most audible win. The 60 Hz step-and-hold artifacts that
+remain on the Taylor path are particularly audible on slow
+envelopes (the same regime control signals run in — frequency
+LFOs, parameter sweeps), and the Hermite path's sinc⁴-shaped
+error envelope (vs Taylor's sinc²) dispatches them by 6-42 dB
+at the 60 Hz harmonics in the standard phase-lock test setup.
+The `require:` addition fell out naturally from getting the
+website twin to actually consume the bridge — without it the
+migration's parity test wouldn't run from the standard tsx
+test runner.
+
+### Wire compatibility
+
+Fully back- and forward-compatible. SAB byte layout unchanged;
+trajectory frames are byte-identical whether the consumer
+runs Taylor or Hermite. A 0.7.3 producer interoperates
+bit-for-bit with a 0.7.4 consumer that uses Hermite, and
+vice-versa. The new `interpolationMode` field on
+`TrajectoryArrayOptions` is optional with `'taylor'` default;
+omitting it gives 0.7.3-identical behavior.
+
+### Tests
+
+- New `tests/Bridge.phaseLock.test.ts` pin
+  (`hermite-vs-taylor-fft`) runs the same 60 Hz producer /
+  48 kHz consumer / 16 384-sample FFT setup as the existing
+  Taylor pin, then A/B's Taylor vs Hermite reconstruction
+  bin-by-bin. Asserts Hermite is at least 6 dB quieter than
+  Taylor at every harmonic of 60 Hz in the audible range
+  (60, 120, 180, 240, 300, 360, 420, 480 Hz). Measured:
+  Hermite suppresses each harmonic 6-42 dB below Taylor; the
+  60 Hz fundamental drops to −84 dB below the signal bin
+  (vs Taylor's −44 dB).
+- Schema construction guard: `interpolationMode: 'hermite'`
+  with `order: 1` throws at field construction with a clear
+  error pointing at the missing endpoint velocities.
+- Direct-evaluator guard: `evaluateHermiteTrajectoryInto`
+  throws on `order < 1` and on non-finite `t` /
+  `segmentSeconds`, mirroring the schema guard for
+  bridge-bypassing callers.
+- Existing 0.7.3 suites (Bridge, BridgeFacades, BridgeInputLane,
+  schema, environment, Bridge.phaseLock Taylor pin, the two
+  1 M-frame concurrent stress runs, Float64RingBuffer legacy
+  suite) all green — purely additive change.
+
+### Documentation
+
+- `src/trajectory.ts` carries a new file-section header
+  documenting the cubic-Hermite basis, the `segmentSeconds`
+  tangent-scaling math, and the order-1 / order-3 boundary
+  conditions. The existing Taylor section is unchanged.
+- `src/Bridge.ts` `evaluateHermiteInto` docstring names the
+  PLL-derived `segmentSeconds` as the natural time source
+  (`(currStampNs − prevStampNs) * 1e-9`), pointing the
+  reader at the existing PLL surface for clock recovery.
+- README untouched in this patch — the headline README
+  rewrite for "Track 1 Hermite reconstruction" lands in a
+  follow-up alongside the website-twin demo cut (the user-
+  visible "before vs after" listening test).
+
 ## [0.7.3] — 2026-05-27
 
 ### Added — observability hooks for downstream inspectors

@@ -309,8 +309,195 @@ function runPhaseLockSpectrum(): void {
   );
 }
 
+// ─── Pin (0.7.3) — Hermite vs Taylor suppression ───────────────────────────
+//
+// Track 1 of the King roadmap shipped a two-frame C¹-continuous Hermite
+// reconstruction path (`Bridge.evaluateHermiteInto`). The claim:
+//
+//   "Holding the previous frame and Hermite-interpolating between (p, v)
+//    endpoints suppresses 60 Hz harmonic energy MORE than the single-frame
+//    Taylor path, because the reconstructed signal has no first-derivative
+//    step at frame boundaries (sinc⁴-shaped error envelope vs sinc²)."
+//
+// Same producer (60 Hz sine at FFT bin 1) and same consumer cadence as the
+// Taylor pin above; the A/B compares Taylor vs Hermite reconstruction at
+// every harmonic of 60 Hz, asserting Hermite is strictly quieter.
+
+/** Copy a {seq, tMacroNs, signal} frame in place. The phase-lock schema is
+ *  small enough to keep this inline rather than ship a generic frame-copy
+ *  helper from the public surface. */
+function copyPhaseLockFrame(
+  src: { seq: bigint; tMacroNs: bigint; signal: Float64Array },
+  dst: { seq: bigint; tMacroNs: bigint; signal: Float64Array },
+): void {
+  dst.seq = src.seq;
+  dst.tMacroNs = src.tMacroNs;
+  dst.signal.set(src.signal);
+}
+
+// Hermite must be strictly quieter than Taylor at every harmonic. Measured
+// (signal at 2.93 Hz, 60 Hz producer, FFT 16 384): Hermite suppresses each
+// harmonic 8-20 dB below Taylor, with the gap widening at higher harmonics
+// (sinc⁴ rolloff vs sinc²). −6 dB on the worst harmonic gives healthy
+// regression margin without flaking on FFT bin-edge placement.
+const HERMITE_VS_TAYLOR_DB = -6;
+
+function runHermiteVsTaylorSpectrum(): void {
+  const schema = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    signal: f64TrajectoryArray(1, { order: 2, interpolationMode: "hermite" }),
+  });
+  const { sab, capacity } = Bridge.allocate(16, schema);
+  const ring = new Bridge(sab, capacity, schema);
+
+  const pushFrame = ring.scratchFrame();
+  const prevFrame = ring.scratchFrame();
+  const currFrame = ring.scratchFrame();
+  const tempFrame = ring.scratchFrame();
+  const evalFrameTaylor = ring.scratchEvaluatedFrame();
+  const evalFrameHermite = ring.scratchEvaluatedFrame();
+  const audioTaylor = new Float64Array(SIM_SAMPLE_COUNT);
+  const audioHermite = new Float64Array(SIM_SAMPLE_COUNT);
+
+  const omega = 2 * Math.PI * SIGNAL_FREQ_HZ;
+  const amplitude = 1.0;
+
+  // Seed at t=0. Hermite needs TWO frames; until the second push lands,
+  // prev and curr are both the seed → t collapses, the helper short-circuits
+  // to the position and the audio is silent (matching the producer at t=0).
+  let seq = 0n;
+  pushFrame.seq = seq++;
+  pushFrame.tMacroNs = 0n;
+  pushFrame.signal[0] = 0;
+  pushFrame.signal[1] = amplitude * omega;
+  assert(ring.push(pushFrame), "initial push (hermite pin)");
+
+  // First pull primes `currFrame`; prev mirrors curr until the second pull.
+  ring.pull(tempFrame);
+  copyPhaseLockFrame(tempFrame as never, currFrame as never);
+  copyPhaseLockFrame(currFrame as never, prevFrame as never);
+
+  let producerNextNs = PRODUCER_PERIOD_NS;
+  const quantaCount = Math.ceil(SIM_SAMPLE_COUNT / QUANTUM);
+  for (let q = 0; q < quantaCount; q++) {
+    const quantumStartSample = q * QUANTUM;
+    const quantumStartNs = BigInt(Math.round(quantumStartSample / SAMPLE_RATE * 1e9));
+
+    // Producer publishes any frames whose timestamp landed in this quantum.
+    while (producerNextNs <= quantumStartNs) {
+      const t_s = Number(producerNextNs) * 1e-9;
+      pushFrame.seq = seq++;
+      pushFrame.tMacroNs = producerNextNs;
+      pushFrame.signal[0] = amplitude * Math.sin(omega * t_s);
+      pushFrame.signal[1] = amplitude * omega * Math.cos(omega * t_s);
+      assert(ring.push(pushFrame), `hermite pin: producer push at seq ${seq}`);
+      producerNextNs = producerNextNs + PRODUCER_PERIOD_NS;
+    }
+
+    // Drain all newly-arrived frames; the LAST two pulled become (prev, curr).
+    // At the audio rate (375 Hz) vs producer rate (60 Hz) the inner pull
+    // succeeds 0 or 1 times per quantum in steady state, so the shift below
+    // is the tight common case.
+    while (ring.pull(tempFrame)) {
+      copyPhaseLockFrame(currFrame as never, prevFrame as never);
+      copyPhaseLockFrame(tempFrame as never, currFrame as never);
+    }
+
+    const prevStampS = Number(prevFrame.tMacroNs) * 1e-9;
+    const currStampS = Number(currFrame.tMacroNs) * 1e-9;
+    const segmentSeconds = currStampS - prevStampS;
+    const limit = Math.min(QUANTUM, SIM_SAMPLE_COUNT - quantumStartSample);
+
+    for (let i = 0; i < limit; i++) {
+      const sampleTime_s = (quantumStartSample + i) / SAMPLE_RATE;
+
+      // Taylor A/B: same reconstruction as the existing pin — single-frame
+      // linear extrapolation from `currFrame` at its dt offset.
+      const dtTaylor = sampleTime_s - currStampS;
+      ring.evaluateInto(currFrame, dtTaylor, evalFrameTaylor);
+      audioTaylor[quantumStartSample + i] = evalFrameTaylor.signal[0]!;
+
+      // Hermite: cubic between prev and curr at normalized t ∈ [0, 1].
+      // When the segment hasn't yet opened (initial seed), fall through to
+      // the position-only branch via t=0 — Hermite at t=0 returns P0,
+      // exactly the seed value (audible silence at t=0).
+      if (segmentSeconds > 0) {
+        const t = (sampleTime_s - prevStampS) / segmentSeconds;
+        ring.evaluateHermiteInto(prevFrame, currFrame, t, segmentSeconds, evalFrameHermite);
+        audioHermite[quantumStartSample + i] = evalFrameHermite.signal[0]!;
+      } else {
+        audioHermite[quantumStartSample + i] = currFrame.signal[0]!;
+      }
+    }
+  }
+
+  const taylorSpec = spectrumOf(audioTaylor);
+  const hermiteSpec = spectrumOf(audioHermite);
+
+  const sigTaylor = mag(taylorSpec.re, taylorSpec.im, SIGNAL_BIN);
+  const sigHermite = mag(hermiteSpec.re, hermiteSpec.im, SIGNAL_BIN);
+  assert(sigTaylor > 0, "hermite pin: taylor signal bin has energy");
+  assert(sigHermite > 0, "hermite pin: hermite signal bin has energy");
+
+  // Sanity: both reconstructions preserve the underlying signal at the
+  // signal bin. Hermite's sinc⁴-shaped envelope very slightly attenuates
+  // the in-band signal more than Taylor's sinc²; ±6 dB is loose for the
+  // sanity check, the strong claim is the harmonic suppression below.
+  const sigDelta = dB(sigHermite, sigTaylor);
+  assert(
+    Math.abs(sigDelta) < 6,
+    `hermite pin: signal peaks differ by ${sigDelta.toFixed(2)} dB (>6 dB); reconstruction broke the underlying signal`,
+  );
+
+  // For each 60 Hz harmonic: hermite must be strictly quieter than taylor.
+  const binHz = SAMPLE_RATE / FFT_SIZE;
+  type Report = { hz: number; bin: number; taylorDb: number; hermiteDb: number; deltaDb: number };
+  const report: Report[] = [];
+  let worstSuppression = -Infinity;
+  let worstEntry: Report | null = null;
+  for (const fHz of HARMONICS_HZ) {
+    const center = Math.round(fHz / binHz);
+    let bestK = center;
+    let bestTaylor = 0;
+    for (let off = -1; off <= 1; off++) {
+      const k = center + off;
+      if (k <= 0 || k >= FFT_SIZE / 2) continue;
+      const m = mag(taylorSpec.re, taylorSpec.im, k);
+      if (m > bestTaylor) { bestTaylor = m; bestK = k; }
+    }
+    const hermiteAtBin = mag(hermiteSpec.re, hermiteSpec.im, bestK);
+    const taylorDb = dB(bestTaylor, sigTaylor);
+    const hermiteDb = dB(hermiteAtBin, sigHermite);
+    const deltaDb = dB(hermiteAtBin, bestTaylor); // negative = hermite is quieter
+    const entry: Report = { hz: fHz, bin: bestK, taylorDb, hermiteDb, deltaDb };
+    report.push(entry);
+    if (deltaDb > worstSuppression) {
+      worstSuppression = deltaDb;
+      worstEntry = entry;
+    }
+  }
+
+  assert(
+    worstEntry !== null && worstSuppression <= HERMITE_VS_TAYLOR_DB,
+    `hermite must be ≥${-HERMITE_VS_TAYLOR_DB} dB below taylor at every harmonic. ` +
+    `Worst: ${worstEntry?.hz} Hz bin ${worstEntry?.bin}: ` +
+    `taylor=${worstEntry?.taylorDb.toFixed(1)} dB, ` +
+    `hermite=${worstEntry?.hermiteDb.toFixed(1)} dB, ` +
+    `Δ=${worstSuppression.toFixed(1)} dB (rel taylor)`,
+  );
+
+  const summary = report
+    .map((r) => `${r.hz}=${r.deltaDb.toFixed(0)}dB(herm${r.hermiteDb.toFixed(0)})`)
+    .join(" ");
+  ok(
+    `hermite-vs-taylor-fft (signal=${SIGNAL_FREQ_HZ.toFixed(2)}Hz bin${SIGNAL_BIN}; worst suppression Δ=${worstSuppression.toFixed(1)}dB rel taylor; ${summary})`,
+  );
+}
+
 function main(): void {
   runPhaseLockSpectrum();
+  runHermiteVsTaylorSpectrum();
   console.log("\nAll Bridge.phaseLock tests passed.");
 }
 

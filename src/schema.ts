@@ -207,6 +207,22 @@ export type TrajectoryOrder = 1 | 2 | 3;
  *                 `[out[i-1] - maxDelta, out[i-1] + maxDelta]`. */
 export type TrajectoryOverflowFallback = "hold" | "linear" | "saturate";
 
+/** Reconstruction strategy used by the consumer-side trajectory evaluator
+ *  (0.7.3). Wire-compatible: pure schema metadata, no SAB byte change.
+ *    'taylor' — single-frame extrapolation of the producer-stamped
+ *               derivatives. Default; bit-exact equal to 0.7.2 behavior.
+ *               `Bridge.evaluateInto(frame, dt, out)` is the entry point.
+ *    'hermite' — C¹-continuous cubic interpolation between two consecutive
+ *               frames using endpoint positions + velocities as the
+ *               Hermite spline tangents. Requires `order >= 2` (velocities
+ *               at both endpoints). Entry point is the two-frame
+ *               `Bridge.evaluateHermiteInto(prev, curr, t, segmentSec, out)`.
+ *               Tightens the spectral rolloff of the reconstructed signal
+ *               (continuous tangent at frame boundaries → no first-derivative
+ *               step), eliminating the "zipper" sound on slowly-varying
+ *               envelopes. */
+export type TrajectoryInterpolationMode = "taylor" | "hermite";
+
 /** Descriptive metadata attached to fields built via
  *  `f{32,64}TrajectoryArray(n, { order })`. The underlying storage is a flat
  *  interleaved array of `sampleCount * order` elements; this tag tells
@@ -238,6 +254,11 @@ export interface TrajectorySpec {
    *  band), the clamped evaluator uses the clamped derivatives as-is and never
    *  consults this field. */
   readonly overflowFallback?: TrajectoryOverflowFallback;
+  /** Consumer-side reconstruction strategy (0.7.3). Default `'taylor'` is
+   *  bit-exact equal to 0.7.2 behavior; `'hermite'` switches the consumer
+   *  to two-frame C¹ cubic interpolation (requires `order >= 2`). Pure
+   *  metadata — producer SAB bytes are identical for both modes. */
+  readonly interpolationMode?: TrajectoryInterpolationMode;
 }
 
 export interface FieldSpec<T = unknown> {
@@ -312,7 +333,14 @@ export interface TrajectoryArrayOptions {
   readonly accelerationClamp?: number;
   readonly maxDeltaPerSample?: number;
   readonly overflowFallback?: TrajectoryOverflowFallback;
+  /** Reconstruction strategy passed through to the consumer-side evaluator
+   *  (0.7.3). 'hermite' requires `order >= 2`. Default 'taylor'. */
+  readonly interpolationMode?: TrajectoryInterpolationMode;
 }
+
+const VALID_INTERPOLATION_MODES: ReadonlySet<TrajectoryInterpolationMode> = new Set<
+  TrajectoryInterpolationMode
+>(["taylor", "hermite"]);
 
 const VALID_OVERFLOW_FALLBACKS: ReadonlySet<TrajectoryOverflowFallback> = new Set<
   TrajectoryOverflowFallback
@@ -359,6 +387,19 @@ function trajectoryArray<T>(
       `Schema: trajectory overflowFallback must be 'hold' | 'linear' | 'saturate', got ${String(opts.overflowFallback)}`,
     );
   }
+  if (
+    opts.interpolationMode !== undefined &&
+    !VALID_INTERPOLATION_MODES.has(opts.interpolationMode)
+  ) {
+    throw new Error(
+      `Schema: trajectory interpolationMode must be 'taylor' | 'hermite', got ${String(opts.interpolationMode)}`,
+    );
+  }
+  if (opts.interpolationMode === "hermite" && order < 2) {
+    throw new Error(
+      `Schema: trajectory interpolationMode 'hermite' requires order >= 2 (need endpoint velocities), got order=${order}`,
+    );
+  }
   const flatLength = sampleCount * order;
   const trajectory: TrajectorySpec = Object.freeze({
     order,
@@ -367,6 +408,7 @@ function trajectoryArray<T>(
     ...(opts.accelerationClamp !== undefined ? { accelerationClamp: opts.accelerationClamp } : {}),
     ...(opts.maxDeltaPerSample !== undefined ? { maxDeltaPerSample: opts.maxDeltaPerSample } : {}),
     ...(opts.overflowFallback !== undefined ? { overflowFallback: opts.overflowFallback } : {}),
+    ...(opts.interpolationMode !== undefined ? { interpolationMode: opts.interpolationMode } : {}),
   });
   return Object.freeze({
     kind,

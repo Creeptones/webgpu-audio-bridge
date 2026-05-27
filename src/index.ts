@@ -139,6 +139,9 @@ export type {
   SchemaLayoutFieldDescription,
   TrajectoryOrder,
   TrajectorySpec,
+  TrajectoryOverflowFallback,
+  TrajectoryInterpolationMode,
+  TrajectoryArrayOptions,
   WithInvariantOptions,
 } from "./schema.js";
 
@@ -146,7 +149,8 @@ export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 
 // Trajectory evaluator — consumer-side Taylor extrapolation helper that
 // reads the f{32,64}TrajectoryArray tag. See src/trajectory.ts header.
-export { evaluateTrajectoryInto } from "./trajectory.js";
+// 0.7.3 adds the two-frame Hermite cubic reconstruction path.
+export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "./trajectory.js";
 
 // Canonical schemas — see src/schemas/physics.ts.
 export {
