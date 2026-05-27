@@ -4,6 +4,143 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.6.19] — 2026-05-26
+
+### Added — `BridgeInputLane<S>` + fast-lane pattern
+
+A new consumer-side facade for the **input lane** pattern that reaches
+pro-audio tracking latency (~3–6 ms input-to-audible on tuned hardware)
+by carving gestural input off the GPU macro path.
+
+```ts
+import { SpscRing, BridgeInputLane } from "webgpu-audio-bridge";
+
+// Main thread (producer side):
+const ring = new SpscRing(sab, capacity, InputEventSchema);
+const lane = new BridgeInputLane(ring);
+const ev   = lane.scratchFrame();
+midiInput.onmidimessage = (e) => {
+  ev.tInputNs   = BigInt(Math.floor(performance.now() * 1e6));
+  ev.eventType  = e.data[0] >> 4;
+  ev.noteOrCc   = e.data[1];
+  ev.velocityI  = e.data[2];
+  ev.value      = e.data[2] / 127;
+  lane.push(ev);                   // ~1 µs synchronous SAB write
+};
+
+// AudioWorklet (consumer side):
+const lane = new BridgeInputLane(ring);
+const eventBuf = lane.scratchEventBuffer(32);
+process(_inputs, outputs) {
+  const count = lane.pullAll(eventBuf);
+  for (let i = 0; i < count; i++) applyEvent(eventBuf[i]);
+  // ... per-sample synth ...
+  return true;
+}
+```
+
+The facade exposes both sides of the ring on one class (mirroring
+`Bridge<S>`):
+
+- **Producer side** — `push`, `beginPush` / `commitPush` / `abortPush`,
+  `scratchFrame`, `flowScaleHint`.
+- **Consumer side** — `pullAll(eventBuf, maxCount?) → number`,
+  `scratchEventBuffer(n)`. Drains every unread frame in FIFO order
+  into the caller's pre-allocated buffer; frames beyond
+  `eventBuf.length` or `maxCount` stay in the ring for the next call.
+
+A new `examples/fast-lane/` end-to-end demo shows the full architecture:
+- A slow macro envelope worker (CPU stub of the GPU path; ~60 Hz).
+- An input lane fed by computer keyboard, on-screen keys, and WebMIDI.
+- An AudioWorklet that pulls macro state via `pullLatest`, drains
+  events via the inlined SAB protocol equivalent of `pullAll`, places
+  events at their sub-sample offset, and synthesizes a polyphonic
+  saw + 1-pole LPF voice graph.
+
+Run with `npm run dev:fast-lane` (http://localhost:5174).
+
+### Why
+
+`BridgeGPUSource` (0.6.18) makes the GPU → AudioWorklet path
+deliverable at typical web-audio latency (~15–25 ms). The remaining
+gap — pro-audio tracking latency (<5 ms) — is **not** solvable on the
+GPU path even with future WebGPU spec evolution (the audio output
+buffer alone is 5–8 ms; the audio quantum boundary is another 0–3 ms).
+
+The fast-lane pattern solves it architecturally instead: recognize
+that there are TWO kinds of information feeding the synth — slow
+macro state (15–30 ms latency is fine) and discrete gestural input
+(<5 ms target) — and route them through TWO bridges. The macro path
+is unchanged from `BridgeGPUSource`'s contract; the input path runs
+~1 µs main-thread → SAB → next-quantum worklet, leaving only the
+output buffer (5–8 ms, or 3–5 ms with `latencyHint: 'interactive'`)
+and the quantum boundary as the floor.
+
+Naming `BridgeInputLane` and shipping a worked example makes the
+pattern citable. Without it, every project ends up rediscovering the
+"two SABs, drain-everything `pullAll` on one of them" trick.
+
+### Wire compatibility
+
+- **No SAB changes.** `BridgeInputLane` is a thin facade over the
+  existing `SpscRing<S>` SAB protocol. A `BridgeInputLane` peer
+  interoperates bit-for-bit with `Bridge<S>` / `BridgeProducer` /
+  `BridgeConsumer` peers over the same SAB.
+- **No public-API break.** One new class export
+  (`BridgeInputLane`) from `src/index.ts`. The four existing
+  facade exports and `Bridge<S>` itself are unchanged.
+- **Bench unchanged.** The facade is not on the existing bench
+  path (`push` / `pull` / `pullLatest` medians stay at 1.20 μs).
+  `pullAll` is a `ring.pull` loop, so each consumed frame
+  contributes the same ~1 μs cost as a standalone `pull`.
+
+### Tests
+
+One new test file `tests/BridgeInputLane.test.ts` with 9 pins:
+
+1. **Construction + scratch shapes.** Lane surfaces ring / schema /
+   capacity; `scratchFrame` produces typed initialized fields;
+   `scratchEventBuffer(n)` returns `n` distinct frame views.
+2. **Empty pullAll** returns 0 and leaves the buffer untouched.
+3. **Single push** drains 1; `available()` agrees pre/post; bigint
+   fields exact, f32 within epsilon.
+4. **N pushes** drain in FIFO order; second pullAll returns 0.
+5. **pullAll respects `eventBuf.length` cap** — overflow stays in
+   the ring and surfaces on the next call.
+6. **pullAll respects explicit `maxCount` cap** independent of
+   buffer length; maxCount=0 is a no-op; maxCount > buf.length
+   clamps to buf.length.
+7. **Cross-facade interop** — a `BridgeProducer` peer pushes,
+   `BridgeInputLane.pullAll` drains; reverse direction
+   `BridgeInputLane.push` → `BridgeConsumer.pull` also works.
+8. **scratchEventBuffer validation** — rejects non-positive /
+   non-integer / NaN.
+9. **pullAll validation** — rejects non-array; sparse-slot
+   undefined slot throws on first reach.
+
+The test is added to `npm test` and `npm run test:unit`. Run as
+`npx tsx tests/BridgeInputLane.test.ts`. All 8 suites green;
+bench medians unchanged.
+
+### Documentation
+
+- New `src/BridgeInputLane.ts` with a self-contained file header
+  covering the pattern, the wire-compat contract, the API shape,
+  and the notify-cost note.
+- `src/index.ts` widens the export surface by one class
+  (`BridgeInputLane`).
+- `README.md` gains a new top-level §Achieving pro-audio tracking
+  latency section with the dual-bridge architecture diagram, the
+  per-stage latency table, the canonical InputSchema shapes,
+  the sub-sample event placement code, and a use-case table.
+  §See it running and §BridgeGPUSource gain short paragraphs
+  pointing at the fast-lane demo and the new path.
+- New `examples/fast-lane/` directory with `index.html` /
+  `main.js` / `worker.js` / `worklet.js` / `schema.js` /
+  `serve.mjs`. Mirrors the structure of `examples/minimal/` so
+  the diff between the two demos is the architectural delta
+  (one bridge → two bridges) and nothing else.
+
 ## [0.6.18] — 2026-05-26
 
 ### Added — `BridgeGPUSource` — the headline GPU readback helper

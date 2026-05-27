@@ -66,6 +66,17 @@ export type {
 } from "./BridgeConsumer.js";
 export { BridgeProducer } from "./BridgeProducer.js";
 
+// ── Pro-audio tracking fast lane (0.6.19) ─────────────────────────────────
+//
+// Event-queue facade for the "input lane" pattern: a separate Bridge
+// dedicated to gestural input (MIDI / touch / slider events) that the
+// AudioWorklet drains every quantum via `pullAll`. Bypasses the GPU /
+// mapAsync chain entirely to reach ~3-6 ms input-to-audible latency on
+// tuned hardware. See the README's "Achieving pro-audio tracking latency"
+// section for the full pattern + latency math.
+
+export { BridgeInputLane } from "./BridgeInputLane.js";
+
 // ── GPU readback automation (0.6.18) ──────────────────────────────────────
 //
 // The headline helper that closes the loop from "compute pass on the GPU"

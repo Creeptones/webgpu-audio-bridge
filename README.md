@@ -65,6 +65,8 @@ For end-to-end latency measurements (push → audio-thread consume, percentiles 
 
 For the canonical WebGPU → AudioWorklet integration, the [`BridgeGPUSource` helper](#bridgegpusource-0618) (0.6.18) automates the staging-buffer + `mapAsync` orchestration; users provide a 5-line byte decoder and the helper handles the rest. It targets typical web-audio latency (~15-25 ms input-to-audible) — see the [helper's honest latency breakdown](#what-s-actually-faster-and-what-isn-t) for what it does and doesn't accomplish.
 
+A second demo at [`examples/fast-lane/`](./examples/fast-lane/) shows the **fast-lane pattern** for pro-audio tracking latency: a dedicated `Bridge<InputSchema>` for gestural events alongside the macro bridge, drained per quantum via `BridgeInputLane.pullAll`. `npm run dev:fast-lane` (http://localhost:5174). See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619) for the architecture + latency math.
+
 For headless browser smoke tests against the demo, `npm run test:browser` (Playwright; Chromium only for now).
 
 ## Quick start
@@ -307,6 +309,60 @@ When to reach for the composable surface:
 - **Custom invariant-failure policy** — `'throw'` to escalate hard errors to exceptions, `'pass-through'` to let corrupt payloads through with `tornFrames++` but no fallback, or a callback `(out, computed, stored) => void` to log / alert / mutate the output frame yourself.
 
 `Bridge<S>` itself is unchanged and remains the recommended monolithic entry point; the composable surface is purely additive.
+
+### `BridgeInputLane<S>` — event-queue facade (0.6.19)
+
+The producer/consumer facades in 0.6.10 handle the canonical "freshest macro frame wins" path. `BridgeInputLane<S>` is the symmetric primitive for **discrete events** — note-on / note-off / MIDI CC / slider drag / trigger — where every unread frame matters and `pullLatest`'s drop-the-old semantics would lose user intent.
+
+```ts
+import { SpscRing, BridgeInputLane, defineSchema, u32, u64, f32 } from "webgpu-audio-bridge";
+
+const InputEventSchema = defineSchema({
+  seq:        u64(),
+  tInputNs:   u64(),
+  eventType:  u32(),   // 0=note-on 1=note-off 2=cc 3=paramSet
+  noteOrCc:   u32(),
+  velocityI:  u32(),
+  value:      f32(),
+});
+
+// Main thread (producer side):
+const { sab, capacity } = SpscRing.allocate(64, InputEventSchema);
+const ring = new SpscRing(sab, capacity, InputEventSchema);
+const lane = new BridgeInputLane(ring);
+const ev   = lane.scratchFrame();
+
+midiInput.onmidimessage = (e) => {
+  const type = e.data[0] >> 4;
+  ev.seq        = ++seqCounter;
+  ev.tInputNs   = BigInt(Math.floor(performance.now() * 1e6));
+  ev.eventType  = type === 9 ? 0 : type === 8 ? 1 : 2;
+  ev.noteOrCc   = e.data[1];
+  ev.velocityI  = e.data[2];
+  ev.value      = e.data[2] / 127;
+  lane.push(ev);                       // ~1 µs synchronous SAB write
+};
+```
+
+The consumer side exposes `pullAll(eventBuf, maxCount?) → number` — drain every unread frame in FIFO order into a caller-provided typed buffer, returning the count. Frames beyond `eventBuf.length` (or beyond `maxCount`) stay in the ring for the next call.
+
+```ts
+// AudioWorklet (consumer side):
+const ring = new SpscRing(sab, capacity, InputEventSchema);
+const lane = new BridgeInputLane(ring);
+const eventBuf = lane.scratchEventBuffer(32);   // sized to worst-case events/quantum
+
+process(_inputs, outputs) {
+  const count = lane.pullAll(eventBuf);
+  for (let i = 0; i < count; i++) applyEvent(eventBuf[i]);
+  // ... per-sample synth ...
+  return true;
+}
+```
+
+Wire-compatible with every other facade — the SAB layout, SPSC counter protocol, Q16.16 flow-scale lane, and `__invariant` lane format are unchanged. A `BridgeInputLane` peer interoperates bit-for-bit with a `Bridge<S>` / `BridgeProducer` / `BridgeConsumer` peer over the same SAB.
+
+`BridgeInputLane` is the consumer-side specialization for the **fast-lane pattern** that reaches pro-audio tracking latency. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619) for the architecture, latency math, and worked end-to-end example.
 
 ### Canonical schemas
 
@@ -733,7 +789,9 @@ t=+5-8     Audible at speakers                               (5-8 ms — browser
 
 ### The honest pitch
 
-**`BridgeGPUSource` makes GPU → AudioWorklet a deliverable web pattern instead of a research demo, at typical web-audio latency (~15-25 ms).** It does *not* reach pro-audio tracking latency (<5 ms input-to-audible) — that requires WebGPU spec evolution (`mappedAtCreation` zero-copy readback, listed under §Roadmap > Beyond 1.0) that we don't control.
+**`BridgeGPUSource` makes GPU → AudioWorklet a deliverable web pattern instead of a research demo, at typical web-audio latency (~15-25 ms).** It does *not* reach pro-audio tracking latency (<5 ms input-to-audible) on the GPU path — that requires WebGPU spec evolution (`mappedAtCreation` zero-copy readback, listed under §Roadmap > Beyond 1.0) that we don't control.
+
+For use cases where input *response* must be <5 ms but the GPU's role is slowly-evolving state, the **fast-lane pattern** carves gestural input off the GPU path onto a dedicated `Bridge<InputSchema>`, reaching ~3–6 ms input-to-audible on tuned hardware. See [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619).
 
 What this means in practice — where 0.6.18 lands the GPU → audio stack:
 
@@ -776,6 +834,163 @@ The helper exposes simple counters:
 ### WebGPU type compatibility
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
+
+## Achieving pro-audio tracking latency (0.6.19)
+
+`BridgeGPUSource` lands GPU → AudioWorklet at typical web-audio latency (~15–25 ms input-to-audible) — comfortable for ambient, generative, WebXR, non-tracking DAW use. It does **not** reach **pro-audio tracking latency** (<5 ms), because `mapAsync`'s 5–15 ms cost is a hardware/driver limit on the WebGPU readback path. The "input → speakers" pipeline today, decomposed:
+
+| Stage | Cost | Eliminable? |
+|---|---|---|
+| 1. Wait for next 60 Hz producer tick | 0–17 ms (avg ~8) | Yes — event-drive |
+| 2. GPU compute | ~1 ms | No — intrinsic |
+| 3. `mapAsync` readback | 5–15 ms | Only via WebGPU `mappedAtCreation` spec evolution |
+| 4. Decode + commitPush | µs | — |
+| 5. AudioWorklet next quantum pull | 0–3 ms | No — 128-sample boundary |
+| 6. AudioContext output buffer + DAC | 5–8 ms typical | Partial — `latencyHint: 'interactive'` brings this to 3–5 ms |
+
+Stages 5 + 6 form a hard ~6–11 ms floor we don't control; stage 3 is blocked on WebGPU spec evolution. **The remaining ~9–24 ms is everything between the user's input arriving and the GPU finally publishing a frame.** The fast-lane pattern cuts all of that out by recognizing that *gestural input doesn't need the GPU*.
+
+### The fast-lane pattern
+
+Two bridges, not one:
+
+```
+  ┌─────────────────────────────────────┐
+  │  Main thread (UI / WebMIDI / touch) │
+  │  Event handler writes synchronously │
+  │  into SAB — no postMessage hop      │
+  └────────────┬────────────────────────┘
+               │ ~1 µs SAB write
+               ▼
+   ┌──────────────────────┐    ┌─────────────────────────┐
+   │ Bridge<InputSchema>  │    │  DedicatedWorker         │
+   │ small, event queue   │    │  GPU compute @ 60 Hz     │
+   │ pullAll on consumer  │    └─────────┬───────────────┘
+   └──────────┬───────────┘              │ ~15-25 ms (BridgeGPUSource)
+              │                          ▼
+              │                 ┌──────────────────────┐
+              │                 │ Bridge<MacroSchema>  │
+              │                 └──────────┬───────────┘
+              ▼                            ▼
+       ┌──────────────────────────────────────────────────┐
+       │  AudioWorklet.process() per 128-sample quantum:   │
+       │  1. macroBridge.pullLatest(macroFrame)            │
+       │  2. inputLane.pullAll(eventBuf)                   │
+       │  3. for sample 0..127: apply events at sub-sample │
+       │     offset, then synth.step(macroFrame.vEff)      │
+       └──────────────────────────────────────────────────┘
+                                │ 5-8 ms output buffer
+                                ▼
+                             🔊 Audible
+```
+
+The split is architectural, not a workaround. Two kinds of information flow into the synth:
+
+| Information | Update rate | Latency tolerance | Path |
+|---|---|---|---|
+| Slow macro state (GPU field, IR, scanning surface) | 60 Hz | 15–30 ms is fine | Existing `Bridge<MacroSchema>` |
+| Gestural input (note-on, MIDI CC, slider drag, trigger) | Event-driven | <5 ms target | **New `Bridge<InputSchema>` from main thread** |
+
+The synth blends them at audio rate: it reads the latest macro frame for slowly-evolving parameters and reads the input lane for "what did the user just do."
+
+### Latency budget for the fast lane
+
+```
+t=0      User input event fires on main thread (MIDI / pointer / keydown)
+          │
+          ▼ event handler writes to Bridge<InputSchema> (synchronous, no postMessage)
+t=~+1µs  Bridge has the input frame
+          │
+          ▼ AudioWorklet's next quantum boundary
+t=+0-3   Audio thread pulls and places at sub-sample offset (avg 1.3 ms)
+          │
+          ▼ AudioContext output buffer + DAC
+t=+5-8   Audible (5-8 ms — browser/OS)
+```
+
+**Total: ~6–11 ms typical, ~3–6 ms with `latencyHint: 'interactive'` and a tuned output buffer.** That's the same floor a native low-latency DAW hits on the same hardware.
+
+### Canonical InputSchema shapes
+
+Two shapes cover almost every use case. Event-queue (right for note-on / note-off / MIDI):
+
+```ts
+const InputEventSchema = defineSchema({
+  seq:        u64(),
+  tInputNs:   u64(),    // main-thread stamp at event arrival
+  eventType:  u32(),    // 0=note-on 1=note-off 2=cc 3=paramSet
+  noteOrCc:   u32(),
+  velocityI:  u32(),
+  value:      f32(),
+});
+```
+
+Flat current-state (right for sliders / knobs / continuous control):
+
+```ts
+const ControlStateSchema = defineSchema({
+  seq:        u64(),
+  tInputNs:   u64(),
+  cutoff:     f32(),
+  resonance:  f32(),
+  drive:      f32(),
+  mix:        f32(),
+  // up to ~64 floats stays well under one quantum
+});
+```
+
+Many apps need both — two input bridges plus one macro bridge is still cheap (each is a few KB of SAB).
+
+### Sub-sample event placement
+
+Without it, events get quantized to the 2.67 ms quantum boundary, adding up to 2.67 ms of timing jitter on fast percussive material. Stamp the offset at drain time:
+
+```ts
+process(_inputs, outputs) {
+  const quantumStartNs = currentTime * 1e9;
+  const count = lane.pullAll(eventBuf);
+  // Compute sample offset for each event from its main-thread timestamp.
+  for (let i = 0; i < count; i++) {
+    const ev = eventBuf[i];
+    const dtNs = Number(ev.tInputNs) - quantumStartNs;
+    ev.sampleOffset = Math.max(0, Math.min(127,
+      Math.round(dtNs * 1e-9 * sampleRate),
+    ));
+  }
+  // Sort + apply per-sample.
+  eventBuf.length = count;   // truncate view to drained count
+  eventBuf.sort((a, b) => a.sampleOffset - b.sampleOffset);
+  let evIdx = 0;
+  for (let s = 0; s < 128; s++) {
+    while (evIdx < count && eventBuf[evIdx].sampleOffset <= s) {
+      applyEvent(eventBuf[evIdx++]);
+    }
+    out[s] = synth.step(macroFrame);
+  }
+  return true;
+}
+```
+
+The worked end-to-end demo at [`examples/fast-lane/`](./examples/fast-lane/) implements exactly this loop (`npm run dev:fast-lane`).
+
+### Pitfalls and design constraints
+
+- **The macro state used by an input response is whatever was last published.** A key press during a GPU compute pass plays with the *previous* macro frame. This is almost always correct (it's how every modern synth engine works) but worth naming explicitly so callers know the contract.
+- **Events that need to modify the GPU compute itself** (e.g. "room geometry changed, recompute IR") fan out two ways: a `postMessage` to the producer worker to update the simulation, AND a write to the input lane for the immediate-response parameter. The user hears the change instantly with the old IR; the new IR slides in via `pullSmoothed` a few control ticks later.
+- **AudioContext output latency varies by platform.** Chrome on Windows often defaults to 20+ ms; Chrome on macOS Core Audio can hit 5–8 ms; Firefox is in between. Always `new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 })` — `'balanced'` and `'playback'` blow the budget by themselves. Surface `outputLatency` / `baseLatency` in your debug HUD.
+- **WebMIDI is naturally main-thread**, which makes it a perfect fit for this pattern. Touch + pointer events live on the same thread for free.
+- **Why not just `Bridge<S>.pull` in a loop?** Because the idiomatic worklet pattern is "drain everything that arrived this quantum into a fixed-size buffer in one call" — that's what `pullAll` encodes. Bridge's `pullLatest` collapses unread frames; on an event lane that would lose user intent.
+
+### Use case examples
+
+| Use case | Felt UX gain |
+|---|---|
+| MIDI keyboard tracking a GPU physics-modeling synth | ~3–6 ms key-to-sound vs 15–25 ms pre-fast-lane — the difference between "feels like a synth" and "feels broken" |
+| Generative pad with a live timbre slider | Slider glued to the finger; underlying wavefield refreshes invisibly at 30 ms |
+| GPU-rendered convolution reverb with immediate dry/wet | Mix knob is responsive; expensive IR recompute is invisible |
+| Game audio (GPU-driven materials + gunshot triggers) | Trigger fires inside next 2.67 ms quantum; never gated on the GPU pipeline |
+| WebXR controller as a percussion instrument | Trigger feels like real percussion; HRTFs catch up invisibly |
+| Live-coding sketch with a GPU-rendered visualizer | Audio swap is instant; visualizer can lag 50 ms without notice |
 
 ## Use cases
 
@@ -1037,6 +1252,7 @@ No torn-frame re-check is needed. The producer cannot be writing the slot the co
 - ✅ **0.6.4 — Trajectory × α-smoother fix + four headline test pins**. `pullSmoothed` / `pullLatestSmoothed` now blend only position lanes of trajectory fields, passing velocity + acceleration verbatim from curr (pre-fix: derivatives were elementwise-blended, which collapsed the very signal trajectories preserve). Test pins added: trajectory × smoother interop (#47), trajectory × invariant interop (#48), end-to-end pull-lag p95 < 3 ms (#49 — measured 2.01 ms), and the headline phase-lock FFT spectrum in a new `tests/Bridge.phaseLock.test.ts` with an inline Cooley-Tukey FFT (≈50 LOC, no dev-dep) measuring 12–19 dB suppression of 60 Hz aliasing harmonics from trajectory eval vs step-and-hold.
 - ✅ **0.6.5 — Timestamp roles + `pullEvaluatedLatest` sugar (Pillar 3 second cut)** (`defineSchema({...}).withTimestamps({ roleName: { field, unit, default? } })`, `bridge.pullEvaluatedLatest(out, baseNs, sampleRate?, opts?)`, `bridge.evaluateAtSampleOffset(out, sampleOffset)`, `bridge.setSampleRate(rate)`, `bridge.resetEvalCache()`). The canonical AudioWorklet pull+observe+per-sample-dt+evaluate loop collapses from five lines to two. Compile-time-checked role names via `TimestampRoleOf<S>`; per-call `{ timestamp: 'roleName' }` override; supports `'ns' | 'us' | 'ms' | 's' | 'samples'` units. Heap-only; SAB byte layout unchanged from 0.6.4. `EvalMode` dispatch and per-quantum batch API remain queued — see [Timestamp roles + pullEvaluatedLatest sugar](#timestamp-roles--pullevaluatedlatest-sugar-065).
 - ✅ **0.6.7 — Trajectory safety clamps**. `f{32,64}TrajectoryArray(n, opts)` accepts four optional safety fields: `velocityClamp`, `accelerationClamp`, `maxDeltaPerSample`, and `overflowFallback: 'hold' | 'linear' | 'saturate'` (default `'saturate'`). `evaluateTrajectoryInto` runs a separate clamped path when any clamp is set; when none are set the 0.6.6 fast path is preserved bit-exact across orders 1/2/3 (f64 + f32). Clamps are pure schema metadata — the SAB bytes are identical, so a 0.6.7 producer and a 0.6.6 consumer interoperate transparently. See [Trajectory arrays](#trajectory-arrays--pillar-1-of-phase-locked-extrapolation).
+- ✅ **0.6.19 — `BridgeInputLane` + fast-lane pattern** — a thin event-queue facade over `SpscRing<S>` for the input-lane pattern that reaches pro-audio tracking latency (~3–6 ms input-to-audible on tuned hardware). New class `BridgeInputLane<S>` exposes `pullAll(eventBuf, maxCount?) → number` on the consumer side (drain every unread frame in FIFO order) and the same `push` / `beginPush` / `commitPush` surface on the producer side; wire-compatible with every other facade. A new `examples/fast-lane/` end-to-end demo wires up computer keyboard + WebMIDI + on-screen keys against a dual-bridge architecture (macro + input) with sub-sample event placement in the AudioWorklet. New README §Achieving pro-audio tracking latency lays out the dual-bridge architecture, the latency math, and the canonical InputSchema shapes. SAB byte layout unchanged from 0.6.11. See [`BridgeInputLane`](#bridgeinputlanes--event-queue-facade-0619) and [Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency-0619).
 - ✅ **0.6.18 — `BridgeGPUSource`** — the headline GPU readback helper the library has been advertising since 0.3.0. `new BridgeGPUSource(device, bridge, decoder, opts?)` automates the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration; users provide a 5-line decoder that writes mapped bytes into a `beginPush()` SAB slot. With a default 3-buffer ring, the producer no longer stalls on `mapAsync` — readbacks overlap, throughput rises from 60-125 Hz to 250-1000 Hz, the bridge stops running empty under load, and total input-to-audible latency moves from "30-50 ms with stalls" to "consistent ~15-25 ms." **`mapAsync`'s per-frame cost (5-15 ms) is unchanged** — it stops being a serialization tax but it's still in the chain, so this lands at typical web-audio latency, not pro-audio tracking latency. No `@webgpu/types` runtime dependency. SAB byte layout unchanged from 0.6.11. See [`BridgeGPUSource`](#bridgegpusource-0618).
 - ✅ **0.6.17 — `forEachSampleInQuantum` batch evaluation** (per-quantum hot loop API). Wraps the canonical "evaluate every sample of an audio quantum" pattern into one call: `bridge.forEachSampleInQuantum(evalFrame, sampleCount, (i, frame) => { block[i] = synth.step(frame.vEff) })`. Bit-identical output to a hand-rolled `evaluateAtSampleOffset` loop, but with per-sample method-dispatch + cache-validity checks hoisted out of the inner loop. EvalMode dispatch (step / alpha / trajectory / catmull) deferred to a future patch — needs the K=4 catmull history ring and interaction story with `resetSmoother` / `resetEvalCache`. SAB byte layout unchanged from 0.6.11. See [Per-frame evaluator](#per-frame-evaluator--pillar-3-of-phase-locked-extrapolation-first-cut).
 - ✅ **0.6.16 — PLL lane 4-5 publication** (cross-process observability, default-on). `Bridge<S>` publishes the live PLL state (offsetNs Int64, driftPpm Q16.16, locked bit) to SAB header lanes 4-7 on every `observeConsumerTime` / `resetPll`. A second peer constructing its own `Bridge` over the same SAB can read via the new `readPublishedPllState()` method without IPC. Strictly additive wire-format use — legacy 0.6.15 peers continue to interoperate. Opt out via `{ publishPllToSab: false }` in `BridgeOptions`. See [Phase-locked loop](#phase-locked-loop--pillar-2-of-phase-locked-extrapolation).
