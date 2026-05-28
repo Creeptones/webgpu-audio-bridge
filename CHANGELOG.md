@@ -4,6 +4,101 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.38] — 2026-05-27
+
+### Added — Maintenance & operational status section (0.9.x soak)
+
+Third patch in the audit-response mini-cohort. Documentation-only;
+zero runtime surface change. Lands task #10 from the in-flight
+audit-response task list — the "Maintenance & scope" disclaimer that
+addresses the audit's bus-factor concern head-on.
+
+#### New `## Maintenance & operational status` README section
+
+Sits between `## Prior art` and `## Acknowledgments`. Five
+subsections:
+
+1. **Bus factor** — names it openly (= 1, single primary maintainer,
+   no organization backing). The "Ephemera contributors" entry in
+   `CITATION.cff` is clarified as informal-credit, not a co-maintainer
+   commitment. Frames the risk as real and worth factoring into an
+   adoption decision rather than dressing it up.
+
+2. **Scope discipline — what this library deliberately won't grow
+   into.** Six bulleted non-goals (synthesis engine, scheduling layer,
+   audio-graph abstraction, auto-detection between transports,
+   general-purpose IPC, WebGPU framework) with cross-links where an
+   alternative is the right answer. The narrower the surface, the
+   smaller the maintenance burden — this is the bus-factor mitigation
+   that does the most work.
+
+3. **Hand-off readiness — what makes this library pickup-able by a
+   stranger.** Six concrete artifacts that exist specifically for
+   forkability: header comment blocks on every public method,
+   22 test suites with numbered pins, the 1M-frame concurrent SPSC
+   stress test, cross-engine Playwright CI, the bench regression
+   budget, zero runtime dependencies, MIT license. Each is a
+   sentence with a file pointer.
+
+4. **What "abandoned" actually looks like for this library.** Honest
+   account of the failure mode: published versions on npm/Zenodo
+   keep working (SAB+Atomics+AudioWorklet are stable platform
+   features); browser-support matrix is the most-likely-to-drift
+   surface; no new features land; CVE-class bugs become the real
+   adoption risk. Closes with "this is not a comforting story; it
+   is the actual story."
+
+5. **Contributing** — moved into the new section (was absent from
+   the README before; previously only in `ROADMAP.md`). Names the
+   bar for landing changes: test pins, wire-compat notes, bench-gate
+   respect, versioning policy. Links to `CLAUDE.md` for the full
+   commit/test/release-cadence playbook.
+
+The existing Status & maturity bullet at the top of the README
+(formerly a paragraph-length single line covering all of this)
+shrinks to a one-liner: "single primary maintainer (bus factor = 1,
+named honestly); see §Maintenance & operational status for the
+full treatment." Keeps the title-page Status block scannable while
+the substantive treatment lives where readers go when they want it.
+
+### Why
+
+The audit flagged bus factor as one of three "high-impact" project
+risks (alongside versioning incoherence and stale browser docs — both
+addressed in 0.9.36). The honest response is not to hide the risk
+but to (a) name it openly and (b) document the mitigations
+explicitly. An evaluator who reads this section now has a clear
+picture of *what they're actually adopting* — not a polished
+single-maintainer-as-team posture.
+
+The "what abandoned looks like" subsection in particular is the
+piece that's hard to write but most useful. Most open-source
+libraries with bus factor 1 don't write this out; the audit's
+implicit complaint is that the reader has to guess. Now they don't.
+
+### Wire compatibility
+
+None affected. Documentation only. No SAB protocol change, no schema
+DSL change, no public-API change.
+
+### Tests
+
+22 Node suites green. `npm run typecheck` clean. `npm run bench`
+within all documented budgets. The `tests/readme-imports.test.ts`
+drift gate still holds — none of the README import blocks were
+touched.
+
+### Documentation
+
+- `README.md` — new `## Maintenance & operational status` section
+  (~110 lines) between Prior art and Acknowledgments. Status &
+  maturity bullet at line 15 shortened to a one-liner pointing at
+  the new section. Net +1 H2.
+- `CITATION.cff` — `version` bumped to 0.9.38.
+- `package.json` — `version` bumped to 0.9.38.
+- `CHANGELOG.md` — this entry.
+- `ROADMAP.md` — 0.9.38 row added to the cohort table.
+
 ## [0.9.37] — 2026-05-27
 
 ### Added — README readability for LLM-skim audits (0.9.x soak)

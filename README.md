@@ -12,7 +12,7 @@
 - **Tests**: 22 Node suites green on every push (schema / Bridge core / smoother / invariant / PLL / trajectory / backpressure / observability / facades / properties / recovery / WASM-equivalence / concurrent SPSC stress / typecheck-deprecations / readme-imports / and more). **Cross-engine browser CI**: Playwright runs the minimal-demo smoke + e2e-latency CPU-mode bench against Chromium, Firefox, and WebKit on every push and PR to `main` — `.github/workflows/browser.yml` gates merges (`continue-on-error` is off).
 - **Distribution**: [`webgpu-audio-bridge` on npm](https://www.npmjs.com/package/webgpu-audio-bridge); concept [DOI 10.5281/zenodo.20380886](https://doi.org/10.5281/zenodo.20380886) on Zenodo resolves to the latest release. MIT license. **Zero runtime dependencies.** Engines: Node ≥ 18 for the build / test toolchain; the published library itself is ESM with TypeScript types and runs anywhere `SharedArrayBuffer` + `Atomics` + `AudioWorklet` are available.
 - **Release artifacts**: per-patch history lives in [`CHANGELOG.md`](./CHANGELOG.md) (every patch has its own entry with rationale + wire-compat notes + test deltas). The GitHub Releases tab is intentionally sparse — only the v0.1.x foundation releases are tagged there; subsequent versions ship via npm + Zenodo. Cite the concept DOI or a specific version via the [`CITATION.cff`](./CITATION.cff) at the repo root.
-- **Maintainership**: single primary maintainer; contributions welcome at the [GitHub issues tracker](https://github.com/Creeptones/webgpu-audio-bridge/issues). The library is feature-frozen at the SAB+Atomics core — most polish work is documentation, test coverage, and bench-publication, not architectural drift. Every public method has a header comment block documenting invariants; 22 test suites pin behavior; MIT license + zero runtime deps means forking is one `git clone` away.
+- **Maintainership**: single primary maintainer (bus factor = 1, named honestly). See [§Maintenance & operational status](#maintenance--operational-status) for the full treatment — scope discipline, hand-off readiness, what "abandoned" would actually look like for this project, and how to contribute. Contributions welcome at the [GitHub issues tracker](https://github.com/Creeptones/webgpu-audio-bridge/issues).
 
 ```
                 ┌──────────────────────────┐
@@ -1590,6 +1590,65 @@ This library is a packaged primitive for one specific shape of the WebGPU-audio 
 
 **Standards and platform context:**
 - The **WebGPU working group** for the spec, and the Chromium / Firefox / WebKit teams for the implementations. GPUWeb meeting minutes from 2023–2024 record the audio-deadline preemption concern and the user demand for WebGPU-in-AudioWorklet that motivate this library's split.
+
+## Maintenance & operational status
+
+A library that touches real-time audio, `SharedArrayBuffer`, and `Atomics` deserves an honest answer to "what's the operational story here?" — not a polished one. The polished version is misleading; the honest one lets you make an actual adoption decision.
+
+### Bus factor
+
+**The project has a bus factor of 1.** Primary author and maintainer is one person ([Creeptone](https://github.com/Creeptones)). `CITATION.cff` lists "Ephemera contributors" as a second author, which is informal credit to the broader Ephemera research line — not a co-maintainer commitment. There is no organization, foundation, or company backing this work. If the maintainer steps away — illness, job change, sabbatical, lottery, lost interest, anything — there is currently no one queued up to land your critical bug fix on a deadline.
+
+This is normal for a single-author open-source library at this scale. It is also a real adoption risk that you should factor into your decision. The section below is what we've done to make that risk as bounded as possible.
+
+### Scope discipline — what this library deliberately won't grow into
+
+A library's bus factor is partly a function of how big its surface gets. We keep the surface small on purpose. **Things we deliberately won't add** (and that we'd politely push back on if someone proposed them as PRs):
+
+- **A synthesis engine.** This is a transport, not an instrument. If you want synthesis, use [Tone.js](https://tonejs.github.io/) on top, or write a DSP layer in [Faust](https://faustdoc.grame.fr/) / [Emscripten](https://emscripten.org/docs/api_reference/wasm_audio_worklets.html).
+- **A scheduling layer.** No transport, no clock, no quantization, no sequencing. The bridge moves frames; what's *in* the frames is the caller's domain.
+- **An audio-graph abstraction.** We don't wrap `AudioContext` or pretend to be a higher-level audio framework. The AudioWorklet is the user's; we just feed it frames.
+- **Auto-detection / transparent fallback between transports.** The user picks Turbo (`Bridge<S>`) or — when it ships — Standard (`MessageChannelBridge<S>`) at construction. Silent transport switching is a category of bug we won't ship.
+- **General-purpose IPC.** Not a Comlink replacement. SPSC over SAB is the only topology we serve; MPSC / SPMC / broadcast / pub-sub are explicit non-goals (the [`ROADMAP.md`](./ROADMAP.md#beyond-10) parks MPSC and SPMC behind a 2.0 wall on purpose).
+- **A WebGPU framework.** `BridgeGPUSource` is the *thinnest possible* helper that closes the GPU → AudioWorklet loop. We won't grow it into a full render-graph or shader-management layer.
+
+The narrower the surface, the smaller the maintenance burden, the lower the chance of getting stuck on a problem no one else can pick up. This is the bus-factor mitigation that does the most work.
+
+### Hand-off readiness — what makes this library pickup-able by a stranger
+
+If the maintainer disappears tomorrow and you need to fork-and-fix, the following exist specifically to make that survivable:
+
+- **Header comment blocks on every public method.** `src/Bridge.ts`, `src/SpscRing.ts`, `src/FrameSmoother.ts`, `src/ConsumerClockRecovery.ts`, `src/AdaptiveFlowController.ts`, `src/BridgeGPUSource.ts`, `src/BridgeInputLane.ts` — each carries a self-contained file header documenting invariants, the protocol math, and what would break if a given line changed. New methods that don't get this treatment fail review.
+- **22 Node test suites** pinning behavior. `tests/Bridge.core.test.ts` alone has 60+ numbered single-thread pins; concurrency, properties, recovery, WASM-equivalence, and observability each get their own suite. A regression that lands by accident in a refactor hits one of those pins; a stranger landing a fix can run `npm test` and trust the result.
+- **`tests/Bridge.concurrent.test.ts`** — a 1M-frame cross-thread SPSC stress that catches lost-notify / torn-frame regressions that single-threaded tests can't see. This is the test that protects you from the worst class of SAB+Atomics bugs.
+- **Cross-engine browser CI** (`.github/workflows/browser.yml`) — Playwright runs Chromium + Firefox + WebKit on every push. Engine-specific regressions get caught before merge.
+- **A `bench/Bridge.bench.ts` regression budget.** push / pull / pullLatest have a documented ~1.20 μs baseline + 10 μs hard budget; trajEval (fast) has a 1.25 μs fast-path budget; flow_scale recovery has a 100-cycle budget. A change that inflates any of these fails its gate.
+- **Zero runtime dependencies.** The published library has no `dependencies` in `package.json`; only `devDependencies` for the build/test toolchain. A fork is `git clone` + `npm install` + you're running the same code we ship.
+- **MIT license.** Forking is permitted and welcome.
+
+If you do fork, [`CLAUDE.md`](./CLAUDE.md) at the repo root documents the project's versioning policy, commit-message conventions, and test-gate cadence in detail — designed to be readable by a stranger picking up the project cold, not just by the maintainer.
+
+### What "abandoned" actually looks like for this library
+
+If the maintainer goes silent, here's what you get:
+
+- **The published versions on npm and Zenodo keep working.** SAB + Atomics + AudioWorklet are stable web platform features; they don't break under you. The library doesn't run a server, doesn't call out to a service, doesn't depend on a build pipeline you can't reproduce. The version you depend on today still works in 2030.
+- **The browser-support matrix may go stale.** That's the maintenance-needed surface most likely to drift first. We try to publish a "last verified" date alongside it (see [§Browser support matrix](#browser-support-matrix)) so you can tell at a glance whether the doc is fresh; if it's not, the fix is editing one table.
+- **No new features land.** The 0.9.x soak cohort's planned patches won't happen; the 0.8.0 Standard mode (`MessageChannelBridge<S>`) will not ship from upstream.
+- **CVE-class bugs get hard to land fast.** This is the real adoption risk: if a security issue surfaces in the SAB protocol or in a transitive concern (e.g. a Chrome-specific Atomics behavior change), nobody is on call to ship a patch on a deadline. Mitigation: the codebase is small enough that a security-conscious fork can audit and patch the relevant slice independently.
+
+This is not a comforting story. It is the actual story.
+
+### Contributing
+
+Issues and PRs welcome at the [GitHub tracker](https://github.com/Creeptones/webgpu-audio-bridge/issues). The bar for landing:
+
+- **Test pins**: any behavior change comes with a numbered test pin in the appropriate file (`tests/Bridge.*.test.ts`). Bug fixes come with a regression pin that fails before your fix and passes after.
+- **Wire-compat notes**: any change that touches the SAB byte layout, the schema DSL, or the public API surface needs an explicit `### Wire compatibility` section in the CHANGELOG entry. "None affected" is fine when true.
+- **Bench-gate respect**: if your change touches the hot path, run `npm run bench` and confirm push / pull / pullLatest medians are within the documented budgets.
+- **Versioning policy**: see [`CLAUDE.md`](./CLAUDE.md). TL;DR — patch bumps are the default; minor bumps require a wire-format or breaking public-API change.
+
+Disruptive proposals welcome, but expect them to be parked until the active cohort closes (see [`ROADMAP.md`](./ROADMAP.md)). That is the project's bandwidth speaking, not a refusal — the cohort discipline is what keeps the patch cadence honest at single-maintainer scale.
 
 ## Acknowledgments
 
