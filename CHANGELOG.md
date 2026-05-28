@@ -4,6 +4,183 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.32] — 2026-05-27
+
+### Added — `BridgeGPUSource.onError` opt-in callback for device-lost handling (0.9.x soak)
+
+The first slot in the post-cadence-reset envelope (0.9.31 → 0.9.99).
+`BridgeGPUSource` gains an opt-in `onError(err, kind)` callback on its
+constructor options for surfacing `mapAsync` rejections — most importantly
+the device-lost case that every WebGPU app needs to handle eventually
+(driver crash, OOM, tab-focus reset, user-agent shutdown). Default
+behavior on the success path is byte-for-byte unchanged; on the rejection
+path the helper now correctly routes the slot to drop-and-recycle instead
+of running `getMappedRange` + `unmap` against a never-mapped buffer.
+
+#### `onError` on `BridgeGPUSourceOptions`
+
+```ts
+readonly onError?: (err: unknown, kind: "transient" | "fatal") => void;
+```
+
+Fires when the slot's `beginMap` promise rejects. Classification is
+best-effort:
+
+- `'fatal'` — `device.lost` has resolved before the rejection lands.
+  The GPU is gone; further readbacks will keep rejecting until the
+  caller rebuilds the device. Typical response: `destroy()` the source,
+  surface a "device lost" state to the UI, await
+  `navigator.gpu.requestAdapter()`, rebuild.
+- `'transient'` — any other rejection. The buffer slot recycles; the
+  producer's next dispatch may succeed. Typical response: log + ignore.
+
+Omitting `onError` keeps the helper silent (the pre-0.9.32 default).
+Subscribing has zero hot-path cost — the callback fires only on the
+rejection branch, which never runs on healthy hardware.
+
+Device-lost detection requires the device exposing `lost` as a
+Promise-like (the real `GPUDevice` always has it; minimal
+`GpuDeviceLike` implementations and mocks may not). The constructor
+subscribes once at construction with `device.lost?.then(...)` and flips
+an internal `_deviceLost` flag on resolve. Absent or non-thenable
+`lost` → all rejections classify as `'transient'` (the best-effort
+fallback). The classification is observed at rejection time, not
+retroactively — if `device.lost` resolves AFTER a rejection has already
+fired, the prior callback gets `'transient'` and subsequent ones get
+`'fatal'`.
+
+`GpuDeviceLike` gains an optional `readonly lost?: PromiseLike<unknown>`
+field. The real `GPUDevice.lost` is `Promise<GPUDeviceLostInfo>`;
+`PromiseLike<unknown>` is structurally weaker and accepts it. Existing
+`GpuDeviceLike` implementers without a `lost` field continue to compile
+— the field is optional and the helper's subscription path is guarded.
+
+User-callback exceptions are swallowed. If the consumer's `onError`
+itself throws, the helper catches and discards the throw; the rejection
+path still recycles the slot. This preserves the invariant "the helper
+does not crash the producer thread on a `mapAsync` rejection" even
+when the user handler is misbehaving.
+
+#### Side-effect fix: rejection-path state machine
+
+Before this patch, a rejected `beginMap` left `slot.mapped = true` so
+`pollCompleted` would proceed to call `readMapped` (= `getMappedRange`)
++ `decoder` + `releaseMap` (= `unmap`) against a buffer that was never
+mapped. On a real GPU that's an unmap-of-unmapped throw inside
+`pollCompleted` (which would propagate to the producer's tick loop); on
+the existing mock-based tests it silently fed uninitialized bytes into
+the decoder. No shipping consumer hit this in practice because real-GPU
+`mapAsync` rejections without device-lost are vanishingly rare.
+
+The fix: capture the rejection's `err` on the slot (`StagingSlot.error`)
+and check it in `pollCompleted` before the readback path. When set, the
+slot routes to drop-and-recycle: `droppedCount` ticks, the
+`lastReadbackUs` timer still updates (the cycle "completed", just with
+nothing pushed), the slot returns to `idle`. No `readMapped` / `decoder`
+/ `releaseMap` calls on the error branch.
+
+This is technically a behavior change from the pre-0.9.32 buggy path,
+but the buggy path was unreachable in green tests — and on a real GPU
+it would have manifested as a runtime exception, not as observable
+behavior an app could depend on. Calling it a "fix" is more honest than
+"behavior change."
+
+### Why
+
+Two converging motivations:
+
+1. **Device-lost is the WebGPU app's single most-likely "expected
+   error" state.** Drivers crash, GPUs OOM, browsers reset adapters on
+   tab focus or after long-idle. Every production WebGPU app needs a
+   handler. Shipping `BridgeGPUSource` to 1.0 without a clean
+   opt-in for the case would force consumers to wrap the helper or
+   monkey-patch the rejection handler. `onError` is the canonical hook;
+   one line in the constructor, no other changes.
+2. **The latent state-machine bug needed fixing before 1.0.** The 1.0
+   stability commitment promises that the helper's documented behavior
+   matches its actual behavior. The pre-patch path "if mapAsync
+   rejects, the slot's lifecycle goes wrong and pollCompleted will
+   throw on a real GPU" wasn't documented anywhere because nobody had
+   exercised it. The `onError` patch is the natural place to surface
+   the path, audit it, and harden it.
+
+The classification-is-observed-at-rejection-time semantic is
+deliberate. The alternative — defer classification until poll time and
+re-read `device.lost`'s state — is more expensive (sync-checking a
+Promise's state isn't a thing; we'd have to maintain a parallel `then`
+chain per error). Observed-at-rejection-time is simpler, correct in
+practice (device-lost is irreversible; once flipped it stays flipped),
+and predictable for callers.
+
+### Wire compatibility
+
+**100% wire-compatible.** No SAB byte layout change, no schema-DSL
+extension, no protocol change. `Bridge<S>` is untouched. `BridgeGPUSource`'s
+public method surface is unchanged — only `BridgeGPUSourceOptions` and
+`GpuDeviceLike` gain optional fields.
+
+### Tests
+
+21 suites green; `tests/BridgeGPUSource.writeTarget.test.ts` grows from
+6 pins to 10:
+
+- Pin 7 — `onError` fires with `kind: 'transient'` on a generic
+  rejection (no device.lost set). Asserts the slot routes to
+  drop-and-recycle without calling `getMappedRange` / `unmap` on the
+  never-mapped buffer (the rejecting mock throws if those methods are
+  hit on the error path — the pin holds because the new error-routing
+  in `pollCompleted` skips them).
+- Pin 8 — `onError` fires with `kind: 'fatal'` after `device.lost`
+  resolves. The mock device exposes a resolvable `lost` promise; the
+  pin resolves it before flushing the rejection and asserts the
+  classification flipped.
+- Pin 9 — omitting `onError` leaves the helper silent on rejection.
+  Drop counter still ticks; slot still recycles; `pollCompleted` doesn't
+  throw despite the underlying mock methods throwing on unmapped
+  access.
+- Pin 10 — a user `onError` handler that throws is swallowed. The
+  helper's "don't crash the producer thread" invariant holds even with
+  a misbehaving consumer callback.
+
+The new pins added a small `makeRejectingMockDevice(error, opts)`
+helper inside the test file (mock methods throw if called; the helper
+exposes a `loseDevice()` trigger). `main()` becomes `async` so the
+microtask-flush awaits work; the existing sync pins (1-6) still run
+synchronously inside the async wrapper.
+
+### Bench
+
+Unaffected. The `BridgeGPUSource` helper itself isn't on the
+microbench surface (`bench/Bridge.bench.ts` covers `push` / `pull` /
+`pullLatest` on `Bridge<S>`); the onError path is heap-side error
+handling, off the hot loop.
+
+### Documentation
+
+- `src/BridgeGPUSource.ts` — file header gains a "0.9.32 Error handling"
+  section explaining the `onError` contract + the rejection-path
+  state-machine fix; `GpuDeviceLike.lost?`, `BridgeGPUSourceOptions.onError`,
+  and `StagingSlot.error` carry inline docstrings.
+- `README.md` — new "Device-lost handling (0.9.32)" subsection under
+  §BridgeGPUSource (between Diagnostics and WebGPU type compatibility)
+  with the canonical caller pattern.
+- `ROADMAP.md` — 0.9.32 row added to the cohort table.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/BridgeGPUSource.ts` — `GpuDeviceLike.lost?` field added,
+  `BridgeGPUSourceOptions.onError?` field added, `StagingSlot.error`
+  field added, constructor subscribes to `device.lost`, mapAsync
+  rejection handler captures error + fires `onError`, `pollCompleted`
+  routes around the error path. File header updated.
+- `tests/BridgeGPUSource.writeTarget.test.ts` — 4 new pins (7-10) +
+  `makeRejectingMockDevice` helper. `main()` is now `async`.
+- `README.md` — new §Device-lost handling subsection.
+- `package.json` — version `0.9.31` → `0.9.32`.
+- `ROADMAP.md` — 0.9.32 row.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.31] — 2026-05-27
 
 ### Added — `SpscRing.drainNoNotify` public promotion + cadence reset (0.9.x soak)

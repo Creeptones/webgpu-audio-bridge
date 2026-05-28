@@ -34,6 +34,21 @@
  *       Node — the canonical "platform doesn't expose zero-copy
  *       readback yet" signal callers should consult before passing
  *       `writeTarget: 'shared'`.
+ *   7.  (0.9.32) `onError` callback fires with `kind: 'transient'`
+ *       when `mapAsync` rejects on a device whose `lost` promise
+ *       hasn't resolved. The slot routes to drop-and-recycle without
+ *       calling `getMappedRange` / `unmap` on the never-mapped buffer
+ *       (asserted by mock methods that throw if called).
+ *   8.  (0.9.32) `onError` callback fires with `kind: 'fatal'` when
+ *       `mapAsync` rejects on a device whose `lost` promise has
+ *       resolved before the rejection lands. Classification is
+ *       observed at rejection time.
+ *   9.  (0.9.32) Omitting `onError` keeps the helper silent — the
+ *       rejection still cleans up the slot and ticks `droppedCount`
+ *       without crashing.
+ *   10. (0.9.32) A user `onError` handler that itself throws does not
+ *       crash the helper — the callback exception is swallowed and
+ *       the slot still recycles.
  *
  * No GPU is required; the test uses a tiny mock `GpuDeviceLike`.
  */
@@ -47,6 +62,7 @@ import {
   getEnvironmentReport,
   u64,
   type GpuBufferLike,
+  type GpuCommandEncoderLike,
   type GpuDeviceLike,
   type FrameFor,
 } from "../src/index.js";
@@ -282,14 +298,236 @@ function testEnvReportWebgpuZeroCopyFalse(): void {
   ok("6. getEnvironmentReport().webgpuZeroCopy is false on current Node");
 }
 
-function main(): void {
+// ── 0.9.32 onError pins ─────────────────────────────────────────────────
+//
+// A rejecting mock: every staging buffer's `mapAsync` returns a rejected
+// promise. The `getMappedRange` / `unmap` methods throw if called — this
+// is the assertion that `pollCompleted` skips the doomed read/release
+// path on the error branch. The device also optionally exposes a `lost`
+// promise that resolves on `loseDevice()` to drive the 'fatal' path.
+
+interface RejectingMockDevice extends GpuDeviceLike {
+  readonly createdBuffers: ReadonlyArray<GpuBufferLike & { destroyed: boolean }>;
+  readonly createCallCount: number;
+  /** Resolve the `lost` promise (transitions subsequent rejections to
+   *  the 'fatal' classification). No-op if `withLost: false`. */
+  loseDevice(): void;
+}
+
+function makeRejectingMockDevice(
+  rejectionError: unknown,
+  opts: { withLost?: boolean } = {},
+): RejectingMockDevice {
+  const createdBuffers: Array<GpuBufferLike & { destroyed: boolean }> = [];
+  let createCallCount = 0;
+  const withLost = opts.withLost ?? true;
+  let resolveLost: () => void = () => {};
+  const lostPromise = withLost
+    ? new Promise<unknown>((resolve) => {
+        resolveLost = () => resolve({ reason: "destroyed", message: "test" });
+      })
+    : undefined;
+
+  const device: GpuDeviceLike = {
+    createBuffer(desc) {
+      createCallCount++;
+      const buf: GpuBufferLike & { destroyed: boolean } = {
+        size: desc.size,
+        destroyed: false,
+        mapAsync(_mode) {
+          // Rejected synchronously — the helper still routes the rejection
+          // through its `.then(onFulfilled, onRejected)` handler on the
+          // microtask queue.
+          return Promise.reject(rejectionError);
+        },
+        getMappedRange(_offset, _size) {
+          throw new Error(
+            "RejectingMockDevice.getMappedRange: helper must NOT call this on the error path",
+          );
+        },
+        unmap() {
+          throw new Error(
+            "RejectingMockDevice.unmap: helper must NOT call this on the error path",
+          );
+        },
+        destroy() { this.destroyed = true; },
+      };
+      createdBuffers.push(buf);
+      return buf;
+    },
+    ...(lostPromise ? { lost: lostPromise } : {}),
+  };
+  Object.defineProperty(device, "createdBuffers", {
+    get: () => createdBuffers,
+    enumerable: true,
+  });
+  Object.defineProperty(device, "createCallCount", {
+    get: () => createCallCount,
+    enumerable: true,
+  });
+  Object.defineProperty(device, "loseDevice", {
+    value: () => resolveLost(),
+    enumerable: true,
+  });
+  return device as RejectingMockDevice;
+}
+
+// Dummy "source" buffer to pass to scheduleReadback. The mock encoder's
+// `copyBufferToBuffer` is a no-op; this buffer is never read from.
+const dummySrcBuffer: GpuBufferLike = {
+  size: 0,
+  mapAsync: () => Promise.resolve(undefined),
+  getMappedRange: () => new ArrayBuffer(0),
+  unmap: () => {},
+  destroy: () => {},
+};
+
+const noopEncoder: GpuCommandEncoderLike = {
+  copyBufferToBuffer(_s, _so, _d, _do, _size) { /* no-op */ },
+};
+
+/** Drain pending microtasks. `await Promise.resolve()` once per hop;
+ *  three hops cover the rejection handler chain (`p.then(...)` → user
+ *  callback) plus a small safety margin. */
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+// ── 7. onError fires with 'transient' on generic rejection ──────────────
+async function testOnErrorTransient(): Promise<void> {
+  const rejectError = new Error("mapAsync test rejection");
+  const device = makeRejectingMockDevice(rejectError, { withLost: true });
+  const bridge = makeBridge();
+  const captured: Array<{ err: unknown; kind: string }> = [];
+  const src = new BridgeGPUSource(device, bridge, noopDecoder, {
+    stagingBufferCount: 2,
+    onError: (err, kind) => {
+      captured.push({ err, kind });
+    },
+  });
+
+  const scheduled = src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  assert(scheduled, "schedule succeeded");
+  src.flushPending();
+  await flushMicrotasks();
+
+  assertEq(captured.length, 1, "onError fired exactly once");
+  assertEq(captured[0]!.kind, "transient", "kind is 'transient' (device not lost)");
+  assertEq(captured[0]!.err, rejectError, "err is the original rejection value");
+
+  // The slot routes to drop-and-recycle on pollCompleted. If the helper
+  // incorrectly called readMapped/unmap on the never-mapped buffer, the
+  // mock would throw and this call would propagate the error.
+  const pushed = src.pollCompleted();
+  assertEq(pushed, 0, "no frames pushed on error path");
+  assertEq(src.droppedCount(), 1, "drop counter ticked");
+  assertEq(src.inFlight(), 0, "slot recycled to idle after error path");
+
+  src.destroy();
+  ok("7. onError fires with 'transient' kind on generic rejection");
+}
+
+// ── 8. onError fires with 'fatal' after device.lost resolves ────────────
+async function testOnErrorFatal(): Promise<void> {
+  const rejectError = new Error("post-device-lost rejection");
+  const device = makeRejectingMockDevice(rejectError, { withLost: true });
+  const bridge = makeBridge();
+  const captured: Array<{ err: unknown; kind: string }> = [];
+  const src = new BridgeGPUSource(device, bridge, noopDecoder, {
+    stagingBufferCount: 2,
+    onError: (err, kind) => {
+      captured.push({ err, kind });
+    },
+  });
+
+  // Resolve `device.lost` BEFORE flushing the rejection so the helper's
+  // `_deviceLost` flag has flipped by the time the rejection handler runs.
+  device.loseDevice();
+  await flushMicrotasks();
+
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+
+  assertEq(captured.length, 1, "onError fired exactly once");
+  assertEq(captured[0]!.kind, "fatal", "kind is 'fatal' after device.lost resolved");
+  assertEq(captured[0]!.err, rejectError, "err is the original rejection value");
+
+  src.pollCompleted();
+  src.destroy();
+  ok("8. onError fires with 'fatal' kind after device.lost resolves");
+}
+
+// ── 9. Omitted onError: helper stays silent, slot recycles ──────────────
+async function testNoOnErrorSilent(): Promise<void> {
+  const device = makeRejectingMockDevice(new Error("silent"), { withLost: false });
+  const bridge = makeBridge();
+  // No `onError` option passed.
+  const src = new BridgeGPUSource(device, bridge, noopDecoder, {
+    stagingBufferCount: 2,
+  });
+
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+
+  // pollCompleted should NOT call readMapped/unmap on the unmapped slot.
+  // If the helper's error routing is broken, this propagates the throw
+  // from the rejecting mock's getMappedRange/unmap.
+  const pushed = src.pollCompleted();
+  assertEq(pushed, 0, "no frames pushed");
+  assertEq(src.droppedCount(), 1, "drop counter ticked despite no onError");
+  assertEq(src.inFlight(), 0, "slot recycled");
+
+  src.destroy();
+  ok("9. omitted onError: helper stays silent, slot recycles cleanly");
+}
+
+// ── 10. A throwing user onError handler does not crash the helper ───────
+async function testOnErrorUserThrowSwallowed(): Promise<void> {
+  const device = makeRejectingMockDevice(new Error("rej"), { withLost: false });
+  const bridge = makeBridge();
+  let fired = false;
+  const src = new BridgeGPUSource(device, bridge, noopDecoder, {
+    stagingBufferCount: 2,
+    onError: (_e, _k) => {
+      fired = true;
+      throw new Error("simulated user-handler bug");
+    },
+  });
+
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+
+  assert(fired, "user onError handler fired");
+  // The helper swallowed the user-handler exception; pollCompleted
+  // still observes the slot's error state and recycles it.
+  src.pollCompleted();
+  assertEq(src.droppedCount(), 1, "drop counter ticked despite user-handler throw");
+  assertEq(src.inFlight(), 0, "slot recycled despite user-handler throw");
+
+  src.destroy();
+  ok("10. user onError throwing is swallowed");
+}
+
+async function main(): Promise<void> {
   testDefaultResolvesToMapAsync();
   testAutoResolvesToMapAsync();
   testExplicitMapAsync();
   testExplicitSharedThrows();
   testValidationBeforeWriteTargetBuild();
   testEnvReportWebgpuZeroCopyFalse();
+  await testOnErrorTransient();
+  await testOnErrorFatal();
+  await testNoOnErrorSilent();
+  await testOnErrorUserThrowSwallowed();
   console.log("\nAll BridgeGPUSource.writeTarget.test.ts pins passed.");
 }
 
-main();
+main().catch((err) => {
+  console.error("BridgeGPUSource.writeTarget.test.ts FAILED:", err);
+  process.exit(1);
+});

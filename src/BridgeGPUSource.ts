@@ -86,6 +86,26 @@
  *   - `buffer.unmap()`
  *   - `buffer.destroy()`
  *
+ * ─── Error handling (0.9.32) ──────────────────────────────────────────────
+ *
+ * The optional `onError(err, kind)` callback (set in
+ * `BridgeGPUSourceOptions`) fires when a `beginMap` promise rejects.
+ * Classification is best-effort: `'fatal'` if `device.lost` has resolved
+ * by the time the rejection lands, else `'transient'`. The helper itself
+ * never throws on a rejection — the slot routes to drop-and-recycle and
+ * the `droppedCount` counter ticks. Omitting `onError` keeps the helper
+ * silent (the pre-0.9.32 default). Device-lost detection requires the
+ * device exposing `lost` as a Promise-like; mocks without `lost` see
+ * every rejection classified as `'transient'`.
+ *
+ * 0.9.32 also fixes a latent bug in the pre-rejection state machine:
+ * before this patch, a rejected `beginMap` left the slot's `mapped`
+ * flag true so `pollCompleted` would call `readMapped` + `decoder` +
+ * `releaseMap` against a never-mapped buffer (a real-GPU throw, or
+ * uninitialized bytes on a mock). The fix is to capture the error on
+ * the slot and have `pollCompleted` skip those calls — the slot still
+ * recycles, but via a clean drop-and-continue path.
+ *
  * ─── ───────────────────────────────────────────────────────────────────
  *
  * Wire compatibility. None — this is a heap-side helper on top of the
@@ -122,6 +142,13 @@ export interface GpuDeviceLike {
     usage: number;
     mappedAtCreation?: boolean;
   }): GpuBufferLike;
+  /** Optional. The real `GPUDevice.lost` is a Promise that resolves when
+   *  the device is lost (driver crash, OOM, user-agent reset). The 0.9.32
+   *  `onError` opt-in subscribes to this promise once at construction so
+   *  subsequent `mapAsync` rejections classify as `'fatal'` rather than
+   *  `'transient'`. Absent or non-thenable `lost` → all rejections after
+   *  construction classify as `'transient'` (best-effort fallback). */
+  readonly lost?: PromiseLike<unknown>;
 }
 
 /** Subset of `GPUCommandEncoder` the helper depends on. The real
@@ -354,6 +381,13 @@ interface StagingSlot {
    *  flight on the slot. Read by `pollCompleted` to compute the cycle
    *  duration into `_lastReadbackUs`. (0.7.3) */
   mapStartedAtMs: number;
+  /** If `beginMap` rejected, the captured error. `pollCompleted` checks
+   *  this before attempting `readMapped` / `decoder` / `releaseMap` —
+   *  the buffer was never mapped on the error path, so those calls
+   *  would fail (or, in the prior code path, return uninitialized
+   *  bytes from the mock). When set, the slot routes directly to
+   *  drop-and-recycle. Cleared on slot release. (0.9.32) */
+  error: unknown;
 }
 
 /** Constructor options for `BridgeGPUSource`. */
@@ -376,6 +410,32 @@ export interface BridgeGPUSourceOptions {
    *  `'shared'` throws — the W3C interface has not shipped. See
    *  `WriteTargetKind` for the contract. */
   readonly writeTarget?: WriteTargetKind;
+  /** Opt-in callback invoked when the underlying `beginMap` promise
+   *  rejects (0.9.32). Classification is best-effort:
+   *
+   *  - `'fatal'`  — the device's `lost` promise has resolved before the
+   *                 rejection lands. The GPU is gone; further readbacks
+   *                 will keep rejecting until the caller rebuilds the
+   *                 device. Typical caller response: `destroy()` the
+   *                 source, surface a "device lost" state to the UI,
+   *                 await `navigator.gpu.requestAdapter()` and rebuild.
+   *  - `'transient'` — any other rejection. The buffer slot recycles;
+   *                    the producer's next dispatch may succeed.
+   *                    Typical caller response: log + ignore (the
+   *                    helper has already dropped the frame).
+   *
+   *  Omit to keep the helper silent (the default, byte-for-byte unchanged
+   *  from the pre-0.9.32 behavior on the success path). Subscribing has
+   *  zero hot-path cost when the rejection path is not exercised.
+   *
+   *  Device-lost detection requires `device.lost` (the real `GPUDevice`
+   *  always has it; mocks and minimal `GpuDeviceLike` implementations
+   *  may not). Absent or non-thenable `lost` → all rejections classify
+   *  as `'transient'`. The classification is observed at rejection
+   *  time, not retroactively — if `device.lost` resolves AFTER a
+   *  rejection has already fired, the prior callback fires with
+   *  `'transient'` and the subsequent one with `'fatal'`. */
+  readonly onError?: (err: unknown, kind: "transient" | "fatal") => void;
 }
 
 /** Decoder callback shape (0.6.18). Receives the mapped staging-buffer
@@ -428,6 +488,17 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  5-15 ms, dominated by the GPU driver. */
   private _lastReadbackUs: number = 0;
 
+  /** Opt-in error callback (0.9.32). `undefined` when omitted from
+   *  options — the rejection path stays silent (the pre-0.9.32 default). */
+  private readonly _onError: ((err: unknown, kind: "transient" | "fatal") => void) | undefined;
+
+  /** Best-effort device-lost flag (0.9.32). Flipped by the `.then`
+   *  handler on `device.lost` at construction. Read by the mapAsync
+   *  rejection handler to classify the error as `'fatal'` (when set)
+   *  vs `'transient'` (when not). Never reset — device loss is
+   *  one-way. `false` when `device.lost` is absent or non-thenable. */
+  private _deviceLost: boolean = false;
+
   constructor(
     device: GpuDeviceLike,
     bridge: Bridge<S> | BridgeProducer<S>,
@@ -455,6 +526,20 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     // device.createBuffer() side effects.
     this.writeTarget = buildWriteTarget(kind, device, count, size, labelPrefix);
     this._writeTargetKind = resolveWriteTargetKind(kind);
+    this._onError = opts.onError;
+    // 0.9.32 — subscribe to `device.lost` once at construction. Both
+    // settlement branches flip `_deviceLost`: the spec's `lost` always
+    // resolves (never rejects) on device loss, but a defensive reject
+    // handler keeps us safe against future spec extensions or polyfill
+    // shapes that might reject. Device loss is one-way; the flag never
+    // un-sets.
+    const lost = device.lost;
+    if (lost && typeof lost.then === "function") {
+      lost.then(
+        () => { this._deviceLost = true; },
+        () => { this._deviceLost = true; },
+      );
+    }
     this.slots = new Array(count);
     for (let i = 0; i < count; i++) {
       this.slots[i] = {
@@ -462,6 +547,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         mapped: false,
         pending: null,
         mapStartedAtMs: 0,
+        error: undefined,
       };
     }
   }
@@ -520,10 +606,26 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
           () => {
             slot.mapped = true;
           },
-          (_err: unknown) => {
-            // beginMap rejected — treat as if the readback was lost.
-            // Mark the slot ready so pollCompleted can release it.
+          (err: unknown) => {
+            // beginMap rejected — capture the error so pollCompleted
+            // can route around the doomed readMapped+decoder+releaseMap
+            // sequence (the buffer was never mapped on this path).
+            // Mark the slot ready so pollCompleted picks it up next tick.
+            slot.error = err;
             slot.mapped = true;
+            // Surface the error to the opt-in callback. Classification
+            // is best-effort: 'fatal' if device.lost has resolved
+            // before this rejection lands, else 'transient'.
+            if (this._onError) {
+              const kind = this._deviceLost ? "fatal" : "transient";
+              try {
+                this._onError(err, kind);
+              } catch {
+                // User callback threw — swallow. The helper's invariant
+                // is "don't crash the producer thread on a rejection",
+                // and that overrides a misbehaving user handler.
+              }
+            }
           },
         );
       }
@@ -553,6 +655,24 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     for (let i = 0; i < this.slots.length; i++) {
       const slot = this.slots[i]!;
       if (slot.state !== "in-flight" || !slot.mapped) continue;
+      // 0.9.32 — error path. beginMap rejected; the buffer was never
+      // mapped. Skip readMapped + decoder + releaseMap (which would
+      // either throw on a real GPU or return uninitialized bytes on a
+      // mock) and recycle the slot directly. The drop counter still
+      // ticks so dashboards observe the loss; the onError callback
+      // (if any) already fired at rejection time.
+      if (slot.error !== undefined) {
+        this._droppedCount = (this._droppedCount + 1) | 0;
+        if (slot.mapStartedAtMs > 0) {
+          this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
+        }
+        slot.state = "idle";
+        slot.mapped = false;
+        slot.pending = null;
+        slot.mapStartedAtMs = 0;
+        slot.error = undefined;
+        continue;
+      }
       // The readback is ready. Try to acquire a push slot on the bridge.
       const frame = this.bridge.beginPush();
       if (frame !== null) {

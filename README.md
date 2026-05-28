@@ -836,6 +836,34 @@ The helper exposes simple counters:
 - `source.lastReadbackUs()` (0.7.3) — wall-time microseconds for the most recently completed `mapAsync → decode → push` cycle. `0` before the first completion; fractional μs thereafter. Heap-only; consumer-thread. Inspector use: render the GPU readback round-trip characteristic on-page; typical Chrome on Windows lands in 5-15 ms (5000-15000 μs), driver- and adapter-dependent.
 - `source.capacity()` — total staging buffer count
 
+### Device-lost handling (0.9.32)
+
+A real `GPUDevice` can be lost mid-session — GPU driver crashes, OOM, the browser resetting the adapter on tab focus events, or a user-agent shutdown of the WebGPU context. When that happens, every subsequent `mapAsync` rejects. `BridgeGPUSource` survives the rejection silently by default (the slot recycles, `droppedCount()` ticks), but most apps want to react: tear down the source, surface a "device lost" message to the UI, request a new adapter, rebuild.
+
+Opt in via the `onError` constructor option (0.9.32). Classification is best-effort: `'fatal'` if `device.lost` has resolved by the time the rejection lands; `'transient'` otherwise.
+
+```ts
+const source = new BridgeGPUSource(device, bridge, decoder, {
+  onError: (err, kind) => {
+    if (kind === "fatal") {
+      // Device is gone. Tear down, surface to UI, rebuild on next adapter.
+      console.error("GPU device lost:", err);
+      source.destroy();
+      uiState.setDeviceLost(true);
+      // ...request a new adapter, build a new BridgeGPUSource, etc.
+    } else {
+      // Transient — log + ignore. The helper has already dropped the frame
+      // and recycled the slot; the next dispatch may succeed.
+      console.warn("BridgeGPUSource transient error:", err);
+    }
+  },
+});
+```
+
+The helper itself never throws on a rejection — the slot routes to drop-and-recycle on the next `pollCompleted()` whether or not `onError` is provided. Subscribing has zero hot-path cost when the success path is exercised; the callback fires only on the rejection branch.
+
+Device-lost detection requires the device exposing `lost` as a Promise-like (the real `GPUDevice` always does; minimal `GpuDeviceLike` implementations may not). If `lost` is absent or non-thenable, every rejection classifies as `'transient'` — that's the best-effort fallback. The classification is observed at rejection time, not retroactively: if `device.lost` resolves AFTER a rejection has already fired, the prior callback fires with `'transient'` and the subsequent one with `'fatal'`.
+
 ### WebGPU type compatibility
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
