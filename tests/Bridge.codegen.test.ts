@@ -16,6 +16,13 @@
  *  3. testImportFree                 — no `import` / `require` in the string
  *  4. testAllKindsCoveredAndStrides  — accessor per kind + folded elemSize stride
  *  5. testInvariantOptIn             — default omits __invariant; opt-in emits it
+ *  6. testCompileWorkletReaderRoundTrip — compiled fn (not just string) ===
+ *                                      Bridge.pull bit-for-bit
+ *  7. testProcessorModuleShape       — emitWorkletProcessorModule: one
+ *                                      registerProcessor, embeds reader,
+ *                                      import-free, parses via new Function
+ *  8. testToWorkletModuleURL         — throws when createObjectURL absent;
+ *                                      returns blob: url + revoke when stubbed
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -38,6 +45,9 @@ import {
 } from "../src/schema.js";
 import {
   emitWorkletReader,
+  emitWorkletProcessorModule,
+  toWorkletModuleURL,
+  compileWorkletReader,
   type EmitWorkletReaderOptions,
 } from "../src/emitWorkletReader.js";
 
@@ -258,12 +268,154 @@ function testInvariantOptIn(): void {
   ok("invariant lane is opt-in and only when the schema has one");
 }
 
+// ── 6. compileWorkletReader round-trips the COMPILED fn vs Bridge.pull ──────
+function testCompileWorkletReaderRoundTrip(): void {
+  const schema = makeAllKindsSchema();
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  const frame = makeAllKindsFrame();
+  assert(bridge.push(frame), "push known frame succeeded");
+
+  // The existing pin #2 proves the emitted STRING is bit-exact; this proves the
+  // convenience-compiled FUNCTION (the helper callers actually use on the main
+  // thread / in tests) is too.
+  const reader = compileWorkletReader(schema);
+  assertEq(typeof reader, "function", "compileWorkletReader returns a function");
+  const dv = new DataView(sab);
+  const peeked = emptyAllKindsFrame();
+  reader(dv, 0, peeked); // peek slot 0 — does NOT advance read_index
+
+  const pulled = emptyAllKindsFrame();
+  assert(bridge.pull(pulled), "pull of slot 0 succeeded");
+
+  assertEq(peeked.a_u64, pulled.a_u64, "u64 bit-exact (compiled fn)");
+  assertEq(peeked.b_i64, pulled.b_i64, "i64 bit-exact (compiled fn)");
+  assert(Object.is(peeked.c_f64, pulled.c_f64), "f64 bit-exact (compiled fn)");
+  assert(Object.is(peeked.f_f32, pulled.f_f32), "f32 bit-exact (compiled fn)");
+  assert(Object.is(peeked.j_i8, pulled.j_i8), "i8 bit-exact (compiled fn)");
+  for (let k = 0; k < 3; k++) {
+    assert(Object.is(peeked.arr_f64[k], pulled.arr_f64[k]), `arr_f64[${k}] bit-exact (compiled fn)`);
+  }
+  for (let k = 0; k < 4; k++) {
+    assert(Object.is(peeked.traj[k], pulled.traj[k]), `traj[${k}] bit-exact (compiled fn)`);
+  }
+  ok("6 compileWorkletReader compiles a fn bit-exact vs Bridge.pull");
+}
+
+// ── 7. emitWorkletProcessorModule shape ─────────────────────────────────────
+function testProcessorModuleShape(): void {
+  const schema = makeAllKindsSchema();
+  const PROCESSOR = "macro-reader";
+  const BODY = "    const w = 0; readFrame(this._view, slotOf(w), out); return true;";
+  const mod = emitWorkletProcessorModule(schema, {
+    processorName: PROCESSOR,
+    processBody: BODY,
+  });
+
+  // (a) exactly one registerProcessor(<processorName>, …)
+  const regMatches = mod.match(/registerProcessor\(/g) ?? [];
+  assertEq(regMatches.length, 1, "exactly one registerProcessor call");
+  assert(
+    mod.includes(`registerProcessor(${JSON.stringify(PROCESSOR)},`),
+    "registerProcessor names the requested processorName",
+  );
+
+  // (b) embeds the reader fn (default name readFrame).
+  assert(/function readFrame\(view, slot, out\) \{/.test(mod), "module embeds the reader fn");
+  // The caller's body is spliced in verbatim.
+  assert(mod.includes(BODY), "module splices the caller's processBody");
+  // Pre-allocated reusable out frame (array fields → typed arrays).
+  assert(/arr_f64: new Float64Array\(3\)/.test(mod), "out frame pre-allocates the f64 array");
+  assert(/a_u64: 0n/.test(mod), "out frame inits bigint scalar to 0n");
+
+  // (c) import-free / require-free.
+  assert(!/\bimport\b/.test(mod), "processor module has no `import`");
+  assert(!/\brequire\b/.test(mod), "processor module has no `require`");
+
+  // (d) parses via new Function (smoke — won't RUN outside a worklet, but the
+  //     class body + registerProcessor call must be syntactically valid).
+  let parsed = false;
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function(mod);
+    parsed = true;
+  } catch {
+    parsed = false;
+  }
+  assert(parsed, "processor module parses via new Function");
+
+  // A non-empty processorName is required.
+  let threw = false;
+  try {
+    emitWorkletProcessorModule(schema, { processorName: "", processBody: BODY });
+  } catch {
+    threw = true;
+  }
+  assert(threw, "empty processorName throws");
+  ok("7 emitWorkletProcessorModule: one registerProcessor, embeds reader, import-free, parses");
+}
+
+// ── 8. toWorkletModuleURL guard + stubbed happy path ────────────────────────
+function testToWorkletModuleURL(): void {
+  const src = "function readFrame(){}";
+
+  // Save whatever this runtime has (some Node versions ship createObjectURL,
+  // some don't) so we can both force the ABSENT path and stub the PRESENT path
+  // deterministically, then restore.
+  const original = (URL as unknown as { createObjectURL?: unknown }).createObjectURL;
+  const originalRevoke = (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL;
+
+  // Force the guard: with createObjectURL removed, toWorkletModuleURL must throw
+  // a clear, actionable error pointing at the build-step path.
+  delete (URL as unknown as { createObjectURL?: unknown }).createObjectURL;
+  let threw = false;
+  try {
+    toWorkletModuleURL(src);
+  } catch (e) {
+    threw = true;
+    assert(/createObjectURL|build-step/.test((e as Error).message), "error mentions the missing API / build-step path");
+  }
+  assert(threw, "toWorkletModuleURL throws when createObjectURL is absent");
+
+  // Stub a minimal createObjectURL/revokeObjectURL and confirm the happy path.
+  let revoked: string | null = null;
+  (URL as unknown as { createObjectURL: (b: Blob) => string }).createObjectURL = () =>
+    "blob:stub-12345";
+  (URL as unknown as { revokeObjectURL: (u: string) => void }).revokeObjectURL = (u) => {
+    revoked = u;
+  };
+  try {
+    const handle = toWorkletModuleURL(src);
+    assert(handle.url.startsWith("blob:"), "stubbed createObjectURL yields a blob: url");
+    assertEq(typeof handle.revoke, "function", "handle carries a revoke fn");
+    handle.revoke();
+    assertEq(revoked, "blob:stub-12345", "revoke() calls URL.revokeObjectURL with the url");
+  } finally {
+    // Restore Node's pristine (absent) state so no other suite is affected.
+    if (original === undefined) {
+      delete (URL as unknown as { createObjectURL?: unknown }).createObjectURL;
+    } else {
+      (URL as unknown as { createObjectURL: unknown }).createObjectURL = original;
+    }
+    if (originalRevoke === undefined) {
+      delete (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL;
+    } else {
+      (URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = originalRevoke;
+    }
+  }
+  ok("8 toWorkletModuleURL guards absent createObjectURL + Blobs source when present");
+}
+
 function main(): void {
   testEmittedSourceParses();
   testBitExactVsLibraryPull();
   testImportFree();
   testAllKindsCoveredAndStrides();
   testInvariantOptIn();
+  testCompileWorkletReaderRoundTrip();
+  testProcessorModuleShape();
+  testToWorkletModuleURL();
   console.log("\nAll Bridge.codegen tests passed.");
 }
 

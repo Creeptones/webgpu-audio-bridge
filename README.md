@@ -1631,6 +1631,37 @@ Three additive, wire-equivalent helpers that compose existing machinery (the tra
 - **`TimelineRecorder` / `TimelinePlayer`** (`src/TimelineRecorder.ts`) — turns the live bridge into a recordable, **deterministic, re-renderable medium**. Capture pushed frames as `(tMacroNs, frameSnapshot)` tuples, `serialize()` to a compact schema-tagged `ArrayBuffer`, and replay **bit-identically across runs and machines, faster than real time** — an offline bounce. Replay drops the PLL from the loop (deterministic clock synthesized from `sampleIndex / sampleRate`), so output is a pure function of `(timeline, sampleRate)`. See [`docs/record-replay-design.md`](./docs/record-replay-design.md).
 - **`emitWorkletReader`** (`src/emitWorkletReader.ts`) — makes the schema *generate* the hottest read path: emits a **zero-import, monomorphized `DataView` reader as a source string**, byte offsets and strides folded in as literals, no library on the audio thread. Verified import-free and bit-exact against `Bridge.pull`. See [`docs/emit-worklet-reader-design.md`](./docs/emit-worklet-reader-design.md).
 
+#### Getting the reader into the worklet (0.9.47)
+
+`emitWorkletReader` returns a *bare function* source string — the caller still has to get it across the boundary into `AudioWorkletGlobalScope`. A 0.9.47 convenience layer ships that plumbing (the primitive is unchanged):
+
+```ts
+import { emitWorkletProcessorModule, toWorkletModuleURL } from "webgpu-audio-bridge";
+
+// main thread — wrap the reader in a self-registering processor module, Blob it,
+// and addModule. No hand-written template, no build step required.
+const module = emitWorkletProcessorModule(layout, {
+  processorName: "macro-reader",
+  processBody: `
+    const slot = slotOf(/* your write_index − 1 */);
+    readFrame(this._view, slot, out);
+    // …consume `out`…
+    return true;`,
+});
+const { url, revoke } = toWorkletModuleURL(module);
+await ctx.audioWorklet.addModule(url);
+revoke();
+const node = new AudioWorkletNode(ctx, "macro-reader", {
+  processorOptions: { sab, capacity },
+});
+```
+
+- **`emitWorkletProcessorModule(input, opts)`** bakes the reader, a ctor that takes the SAB via `processorOptions`, a pre-allocated reusable `out` frame, and your `processBody` into one import-free, self-registering `registerProcessor(...)` module. In scope inside `processBody`: the reader fn (`readFrame`), the reusable `out` object, `this._view`, `this._capacity`, and a `slotOf(writeIndexMinus1)` helper.
+- **`toWorkletModuleURL(source)`** Blobs *any* emitted source into an `addModule`-ready object URL `{ url, revoke }`. Throws a clear, build-step-pointing error when `Blob` / `URL.createObjectURL` are absent (SSR / Node).
+- **`compileWorkletReader(input, opts?)`** `new Function`s the reader into a live `(view, slot, out) => void` for **tests / Standard-mode main-thread consumers** — *not* the audio thread (eval is unavailable there).
+
+**The boundary + CSP are documented, not removed.** Source must cross into the worklet realm; the helpers remove the keystrokes, not the crossing. `toWorkletModuleURL` + `addModule` need `blob:` in `script-src`/`worker-src`; `compileWorkletReader` needs `unsafe-eval`. Apps with strict CSP should use the **build-step path** — write `emitWorkletProcessorModule(...)` output to a `.js` file the bundler serves (CSP-safe, production-correct, and always available).
+
 ### Real-time-safety role lattice — `Bridge<S, Role>` (0.9.45)
 
 A phantom `Role` type parameter promotes the per-method real-time-safety contract from JSDoc prose into the type system. The methods that are illegal on the audio render thread — `waitForData` / `waitForSpace` (they call `Atomics.wait`, which **throws `TypeError` on the browser main thread** and **stalls the render quantum** inside `process()`) and `subscribeTelemetry` (`setInterval` is absent from `AudioWorkletGlobalScope`) — are made **structurally absent** on the `"worklet"`-branded handle:
@@ -1666,6 +1697,23 @@ onmessage = (e) => {
 ```
 
 It probes the environment via `getEnvironmentReport()` and resolves **Turbo** (SAB) vs **Standard** (`MessageChannelBridge`) vs a graceful `ConnectUnsupportedError` that carries `report.fixes` — turning the opaque `SharedArrayBuffer is not defined` throw on a non-isolated page into an actionable, guided message. Ring capacity comes from a declared `latencyHint` (`'tracking' | 'balanced' | 'throughput'`) instead of a magic slot count — the macro path gets a small backlog (freshness; `pullLatest` collapses to newest) and the input lane a large one (completeness; `pullAll` preserves every event) — with a numeric per-ring `capacity` override as an escape hatch. Pure assembly over the shipped facades: no new wire format, no hot-path cost (`connect`/`mount` run once at setup). See [`docs/connect-topology-design.md`](./docs/connect-topology-design.md).
+
+#### Latency-budget sizing (0.9.47)
+
+The three string hints are buckets. For an audio-rate (block) schema you can instead declare a **millisecond budget** and let `connect()` derive the capacity from the *actual* audio one buffered frame represents (`frameByteSize` → samples → ms):
+
+```ts
+const topo = connect({
+  macro: blockSchema,                              // lone PCM array field
+  latencyHint: { latencyMs: 60, sampleRate: 48000 },
+});
+topo.handle.macro.capacity;                  // 4  (ceil(60 / 21.3ms) → nextPow2)
+topo.handle.macro.sizing.frameAudioMs;       // ≈ 21.3   (one frame @ 1024 samples)
+topo.handle.macro.sizing.estimatedLatencyMs; // ≈ 85     (capacity · frameAudioMs)
+topo.handle.macro.sizing.sabBytes;           // 4 · frameByteSize
+```
+
+The identity is `frameAudioMs · capacity = latency`, so a 60 ms budget on 1024-sample frames sizes to 4 frames — where the `'balanced'` bucket would over-allocate to 256. The ladder degrades cleanly: a **control-rate** schema (no lone PCM lane) sizes from a supplied `producerHz` (`{ latencyMs, producerHz }`), and with neither it falls back to the enum default (flagged `sizing.resolvedFromBudget === false`). `maxSabBytes` clamps capacity down as a memory guard, and the resolved `sizing` is surfaced on the handle so the choice is legible.
 
 With `connect()` and the `Bridge<S, Role>` lattice shipped, all five frontier tracks are landed — no remaining design-only specs.
 

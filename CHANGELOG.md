@@ -4,6 +4,123 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.47] — 2026-05-28
+
+### Added — closing the last rung on two frontier tracks (codegen seamlessness + connect() latency-budget sizing)
+
+Lands the `docs/frontier-10-handoff.md` spec (two small, additive,
+wire-equivalent refinements) that take the `emitWorkletReader` (0.9.44)
+and `connect()` (0.9.46) tracks from 9-ish to 10. Each was one rung short
+of seamless for a small, real reason; this patch closes both. Combined
+single patch — both are setup/codegen-time only, no hot-path or wire
+change.
+
+#### Part A — `emitWorkletReader`: close the source-string boundary
+
+`emitWorkletReader` returns a *bare function* source string the caller
+had to get into the worklet themselves (eval / Blob / build step), each
+with a footgun. Three additive helpers in `src/emitWorkletReader.ts` ship
+that plumbing (the `emitWorkletReader` primitive is unchanged):
+
+- **`emitWorkletProcessorModule(input, opts)`** — wraps the reader in a
+  self-registering, import-free `AudioWorkletProcessor` module string: it
+  bakes the reader fn, a ctor that takes the SAB + capacity via
+  `processorOptions`, a pre-allocated reusable `out` frame (typed arrays
+  for array fields, so `process()` is allocation-free), and the caller's
+  `processBody`. In scope inside `processBody`: the reader fn
+  (`readFrame`), the reusable `out`, `this._view`, `this._capacity`, and a
+  `slotOf(writeIndexMinus1)` helper. New `EmitWorkletProcessorOptions`
+  interface (`{ processorName, processBody, capacity?, …EmitWorkletReaderOptions }`).
+- **`toWorkletModuleURL(source)`** — Blobs *any* emitted source into an
+  `addModule`-ready `{ url, revoke }`. Throws a clear, build-step-pointing
+  error when `Blob` / `URL.createObjectURL` are absent (SSR / Node).
+- **`compileWorkletReader(input, opts?)`** — `new Function`s the reader
+  into a live `(view, slot, out) => void` for tests / Standard-mode
+  main-thread consumers (NOT the audio thread; eval is unavailable there).
+
+The caller's flow collapses to `toWorkletModuleURL(emitWorkletProcessorModule(…))`
+→ `addModule(url)` → `new AudioWorkletNode(ctx, name, { processorOptions })`.
+The unavoidable source-crossing boundary and the CSP trade-off
+(`blob:` in `script-src`/`worker-src` for the Blob path; `unsafe-eval`
+for `compileWorkletReader`; the build-step path stays the CSP-safe
+default) are documented in the JSDoc + README §codegen, not hidden.
+
+#### Part B — `connect()`: derive capacity from the latency budget, not a bucket
+
+`connect()`'s `latencyHint` accepts a new `LatencyBudget` object
+(`{ latencyMs, sampleRate?, outputBufferFrames?, producerHz?, maxSabBytes? }`)
+alongside the three string hints (union widened; the enum is unchanged and
+remains the default). For a **block schema** (a lone PCM array field), the
+macro ring is sized from the actual audio one frame represents via the
+identity `frameAudioMs · capacity = latency`:
+
+```
+samplesPerFrame = the lone PCM array field's flat length
+frameAudioMs    = 1000 · samplesPerFrame / sampleRate
+capacity        = nextPow2(ceil(latencyMs / frameAudioMs))
+```
+
+Worked example: 1024-sample f32 frames @ 48 kHz → `frameAudioMs ≈ 21.3`;
+a `latencyMs: 60` budget → capacity **4** (≈ 85 ms worst case), where the
+`'balanced'` bucket would over-allocate to **256**. Fallback ladder:
+block-math → `producerHz` (control schema) → enum default (flagged
+`sizing.resolvedFromBudget === false`). `maxSabBytes` clamps capacity DOWN
+as a memory guard. The resolved sizing is surfaced on the new
+`ConnectRingHandle.sizing` (`{ resolvedFromBudget, frameAudioMs?,
+estimatedLatencyMs, sabBytes }`) so the choice is legible. New pure helper
+`audioFramesPerSlot(schema)` is the block-shape detector.
+
+#### New exports (package root)
+
+`emitWorkletProcessorModule`, `toWorkletModuleURL`, `compileWorkletReader`,
+`audioFramesPerSlot` (values); `EmitWorkletProcessorOptions`,
+`LatencyBudget`, `RingSizing` (types). `LatencyHint` widened to include
+`LatencyBudget`.
+
+#### Refinement vs the spec
+
+The spec's `sizing.estimatedLatencyMs` was non-optional; on the fallback
+path (control schema, no `producerHz`) the per-frame audio duration is
+genuinely indeterminate, so the shipped field is `NaN` there (with
+`resolvedFromBudget === false` as the honest signal) rather than a
+fabricated value. Recorded in the design-note postscript.
+
+### Why
+
+Both are ergonomics + precision, not capability — the transports, the
+codec, and the protocol are untouched. Part A removes the eval/Blob
+keystrokes while staying honest that the source-crossing boundary and the
+CSP trade-off remain. Part B replaces a 3-bucket guess with the actual
+`frameAudioMs · capacity = latency` identity plus a clean fallback ladder
+so non-block schemas don't regress.
+
+### Wire compatibility
+
+Fully wire-equivalent and additive. No SAB lane, no frame-layout change,
+no change to any existing class or method. `emitWorkletReader` and the
+string `latencyHint` enum behave identically. Both refinements run at
+setup / codegen time, never in `process()` — bench unaffected.
+
+### Tests
+
+`tests/Bridge.codegen.test.ts` gains pins 6–8 (compiled-fn round-trip vs
+`Bridge.pull`; `emitWorkletProcessorModule` shape — one `registerProcessor`,
+embeds the reader, import-free, parses; `toWorkletModuleURL` guard +
+stubbed happy path). `tests/connect.test.ts` gains pins 103–108
+(block-schema worked example; `producerHz` control sizing; fallback
+ladder; `maxSabBytes` clamp; enum-still-works regression; `audioFramesPerSlot`
+unit test). Full suite green incl. the 1M-frame concurrent stress (0/10
+timeouts); typecheck clean; bench within budget (push/pull/pullLatest
+median 1.30 μs).
+
+### Documentation
+
+README §codegen gains a "Getting the reader into the worklet" subsection
+(the three paths + their CSP posture) and §connect gains a "Latency-budget
+sizing" subsection (the worked example + the ladder).
+`docs/frontier-10-handoff.md` status flipped to shipped with a postscript
+recording the actual landed API + the one deviation.
+
 ## [0.9.46] — 2026-05-28
 
 ### Added — `connect()` one-call topology constructor (final frontier track)

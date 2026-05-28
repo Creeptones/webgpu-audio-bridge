@@ -25,12 +25,23 @@
  * 100. testUnsupportedThrows
  * 101. testInvariantSchemaRejectedOnStandard
  * 102. testMountSchemaMismatchThrows
+ * 103. testLatencyBudgetBlockSchema   — frameAudioMs math (worked example)
+ * 104. testLatencyBudgetControlSchema — producerHz ladder step
+ * 105. testLatencyBudgetFallback      — control + no producerHz → enum default
+ * 106. testMaxSabBytesClamp           — memory guard clamps capacity DOWN
+ * 107. testEnumStillWorks             — string hints unchanged (no regression)
+ * 108. testAudioFramesPerSlotHelper   — pure block-detector unit test
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
-import { connect, mount, ConnectUnsupportedError } from "../src/connect.js";
+import {
+  connect,
+  mount,
+  ConnectUnsupportedError,
+  audioFramesPerSlot,
+} from "../src/connect.js";
 import { getEnvironmentReport, type EnvironmentReport } from "../src/environment.js";
-import { defineSchema, u64, f64, u32, f32 } from "../src/schema.js";
+import { defineSchema, u64, f64, u32, f32, f32Array } from "../src/schema.js";
 import { BridgeInputLane } from "../src/BridgeInputLane.js";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -257,6 +268,111 @@ function testMountSchemaMismatchThrows(): void {
   ok("102 mount() schema-mismatch (frameByteSize disagreement) throws");
 }
 
+// ── 103. latency-budget block-schema sizing (the worked example) ────────────
+
+// 1024-sample f32 block frame (the BridgeBlockConsumer shape): one scalar +
+// the lone PCM array → audioFramesPerSlot detects 1024 samples/frame.
+const blockSchema = defineSchema({ seq: u64(), pcm: f32Array(1024) });
+
+function approx(a: number, b: number, tol: number, msg: string): void {
+  assert(Math.abs(a - b) <= tol, `${msg} (got ${a}, expected ≈ ${b})`);
+}
+
+function testLatencyBudgetBlockSchema(): void {
+  const topo = connect({
+    macro: blockSchema,
+    latencyHint: { latencyMs: 60, sampleRate: 48000 },
+    environment: turbo(),
+  });
+  const macro = topo.handle.macro;
+  // 1024 samples @ 48 kHz → 21.333 ms/frame; ceil(60/21.333)=3 → nextPow2 = 4.
+  assertEq(macro.capacity, 4, "block-schema budget → macro capacity 4 (worked example)");
+  assert(macro.sizing !== undefined, "budget produces a sizing record");
+  const s = macro.sizing!;
+  assertEq(s.resolvedFromBudget, true, "resolvedFromBudget true for a block schema");
+  approx(s.frameAudioMs!, 21.333, 0.01, "frameAudioMs ≈ 21.3");
+  approx(s.estimatedLatencyMs, 85.333, 0.1, "estimatedLatencyMs ≈ 85 (capacity·frameAudioMs)");
+  assertEq(s.sabBytes, 4 * blockSchema.frameByteSize, "sabBytes = capacity·frameByteSize");
+  ok("103 latency-budget block schema (frameAudioMs · capacity = latency)");
+}
+
+// ── 104. latency-budget control-schema sizing via producerHz ────────────────
+
+function testLatencyBudgetControlSchema(): void {
+  const topo = connect({
+    macro: macroSchema, // scalar control schema (u64 + f64), no PCM array
+    latencyHint: { latencyMs: 50, producerHz: 60 },
+    environment: turbo(),
+  });
+  const macro = topo.handle.macro;
+  // ceil(50·60/1000)=ceil(3)=3 → nextPow2(3) = 4.
+  assertEq(macro.capacity, 4, "control-schema producerHz budget → capacity 4");
+  assert(macro.sizing !== undefined && macro.sizing.resolvedFromBudget, "resolvedFromBudget true");
+  assertEq(macro.sizing!.frameAudioMs, undefined, "no frameAudioMs for a control schema");
+  approx(macro.sizing!.estimatedLatencyMs, 66.667, 0.1, "estimatedLatencyMs = 1000·capacity/producerHz");
+  ok("104 latency-budget control schema sized from producerHz");
+}
+
+// ── 105. fallback ladder — control schema with no producerHz ────────────────
+
+function testLatencyBudgetFallback(): void {
+  const topo = connect({
+    macro: macroSchema,
+    latencyHint: { latencyMs: 50 }, // no producerHz, not block-shaped
+    environment: turbo(),
+  });
+  const macro = topo.handle.macro;
+  assertEq(macro.capacity, 256, "fallback uses the balanced enum default (256)");
+  assert(macro.sizing !== undefined, "fallback still records a sizing");
+  assertEq(macro.sizing!.resolvedFromBudget, false, "resolvedFromBudget false on the fallback path");
+  assert(Number.isNaN(macro.sizing!.estimatedLatencyMs), "estimatedLatencyMs is NaN when indeterminate");
+  ok("105 budget fallback ladder (control + no producerHz → enum default)");
+}
+
+// ── 106. maxSabBytes memory guard clamps capacity DOWN ──────────────────────
+
+function testMaxSabBytesClamp(): void {
+  // blockSchema.frameByteSize = 8 (u64) + 4096 (f32×1024) = 4104.
+  const fbs = blockSchema.frameByteSize;
+  // latencyMs 200 → ceil(200/21.333)=10 → nextPow2 = 16 (= 16·4104 bytes) absent
+  // the cap. maxSabBytes admits only 4 frames (4·fbs ≤ cap < 8·fbs).
+  const maxSabBytes = 5 * fbs;
+  const topo = connect({
+    macro: blockSchema,
+    latencyHint: { latencyMs: 200, sampleRate: 48000, maxSabBytes },
+    environment: turbo(),
+  });
+  const macro = topo.handle.macro;
+  assertEq(macro.capacity, 4, "maxSabBytes clamps 16 → 4 (largest pow2 whose ring fits)");
+  assert(macro.capacity >= 1, "clamp never drops below 1 frame");
+  assert(macro.sizing!.sabBytes <= maxSabBytes, "sabBytes respects the maxSabBytes cap");
+  assertEq(macro.sizing!.sabBytes, 4 * fbs, "sabBytes = clamped capacity · frameByteSize");
+  ok("106 maxSabBytes memory guard clamps capacity down to fit");
+}
+
+// ── 107. string enum hints unchanged (no regression) ────────────────────────
+
+function testEnumStillWorks(): void {
+  const macroOf = (hint: "tracking" | "balanced" | "throughput") =>
+    connect({ macro: macroSchema, latencyHint: hint, environment: turbo() }).handle.macro;
+  assertEq(macroOf("tracking").capacity, 64, "tracking still 64");
+  assertEq(macroOf("balanced").capacity, 256, "balanced still 256");
+  assertEq(macroOf("throughput").capacity, 1024, "throughput still 1024");
+  // The enum path attaches NO sizing record (only the budget path does).
+  assertEq(macroOf("balanced").sizing, undefined, "enum path has no sizing record");
+  ok("107 string enum hints produce 64/256/1024 unchanged");
+}
+
+// ── 108. audioFramesPerSlot pure detector ───────────────────────────────────
+
+function testAudioFramesPerSlotHelper(): void {
+  assertEq(audioFramesPerSlot(blockSchema), 1024, "lone PCM array → its flat length");
+  assertEq(audioFramesPerSlot(macroSchema), null, "scalars-only → null (control-rate)");
+  const twoArrays = defineSchema({ a: f32Array(8), b: f32Array(8) });
+  assertEq(audioFramesPerSlot(twoArrays), null, ">1 array field → null (ambiguous)");
+  ok("108 audioFramesPerSlot detects the lone-PCM block shape");
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────
 
 function main(): void {
@@ -268,6 +384,12 @@ function main(): void {
   testUnsupportedThrows();
   testInvariantSchemaRejectedOnStandard();
   testMountSchemaMismatchThrows();
+  testLatencyBudgetBlockSchema();
+  testLatencyBudgetControlSchema();
+  testLatencyBudgetFallback();
+  testMaxSabBytesClamp();
+  testEnumStillWorks();
+  testAudioFramesPerSlotHelper();
   console.log("\nAll connect() topology tests passed.");
 }
 

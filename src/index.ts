@@ -82,9 +82,15 @@ export type {
 // `postMessage`. Pure assembly over the shipped facades — no new wire format.
 // See docs/connect-topology-design.md.
 
-export { connect, mount, ConnectUnsupportedError } from "./connect.js";
+// 0.9.47 widens `latencyHint` to accept a precise `LatencyBudget` object
+// (derive capacity from the actual per-frame audio duration, not a 3-value
+// bucket) and surfaces the resolved `RingSizing` on `ConnectRingHandle.sizing`.
+// `audioFramesPerSlot` is the pure block-schema detector the ladder uses.
+export { connect, mount, ConnectUnsupportedError, audioFramesPerSlot } from "./connect.js";
 export type {
   LatencyHint,
+  LatencyBudget,
+  RingSizing,
   ConnectRingSpec,
   ConnectSpec,
   ConnectMode,
@@ -290,8 +296,21 @@ export type {
 // import on the audio thread. Paste the emitted string straight into a built
 // AudioWorklet module. See src/emitWorkletReader.ts.
 
-export { emitWorkletReader } from "./emitWorkletReader.js";
+// The convenience layer (0.9.47) closes the source-string boundary:
+// `emitWorkletProcessorModule` wraps the reader in a self-registering
+// `AudioWorkletProcessor` module; `toWorkletModuleURL` Blobs any emitted source
+// into an `addModule`-ready object URL; `compileWorkletReader` `new Function`s
+// the reader for tests / Standard-mode main-thread consumers (NOT the audio
+// thread). The source-crossing boundary + CSP trade-off remain documented
+// (build-step path stays the CSP-safe default). See README §codegen.
+export {
+  emitWorkletReader,
+  emitWorkletProcessorModule,
+  toWorkletModuleURL,
+  compileWorkletReader,
+} from "./emitWorkletReader.js";
 export type {
   EmitWorkletReaderOptions,
   EmitWorkletReaderInput,
+  EmitWorkletProcessorOptions,
 } from "./emitWorkletReader.js";

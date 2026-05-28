@@ -55,10 +55,12 @@
 
 import {
   kindByteSize,
+  kindTsType,
   type FieldKind,
   type Schema,
   type FieldsObject,
   type TimestampsConfig,
+  type FrameFor,
   type SchemaLayoutDescription,
   type SchemaLayoutFieldDescription,
   describeSchemaLayout,
@@ -218,4 +220,224 @@ export function emitWorkletReader(
     return body;
   }
   return `function ${fnName}(${view}, ${slot}, ${out}) {\n${body}\n}`;
+}
+
+// ─── Convenience layer (additive — `emitWorkletReader` above is the primitive) ─
+//
+// `emitWorkletReader` hands back a bare `function readFrame(...) {}` SOURCE
+// STRING. To actually run it on the audio thread the caller has to do the
+// plumbing themselves (eval / Blob+addModule / build step), and each path has a
+// footgun (CSP `unsafe-eval`; `addModule` of a bare fn does nothing; build-step
+// friction). The three helpers below ship that plumbing:
+//
+//   • emitWorkletProcessorModule — wrap the reader in a self-registering
+//     `AudioWorkletProcessor` module string ready for a Blob / build step.
+//   • toWorkletModuleURL          — Blob + object URL ready for `addModule`.
+//   • compileWorkletReader        — `new Function` the reader for tests /
+//     Standard-mode main-thread consumers (NOT the audio thread).
+//
+// ── The unavoidable boundary + CSP posture (documented, not hidden) ──────────
+//
+// Source MUST cross into the `AudioWorkletGlobalScope` realm; `addModule` takes
+// a URL and `toWorkletModuleURL` makes that URL from a Blob — the helper removes
+// the keystrokes, not the boundary. CSP: `blob:` in `script-src` / `worker-src`
+// is required for `toWorkletModuleURL` + `addModule`; `unsafe-eval` for
+// `compileWorkletReader`. Apps with strict CSP must use the BUILD-STEP path:
+// write `emitWorkletProcessorModule(...)` output to a `.js` file the bundler
+// serves. See README §codegen "Getting the reader into the worklet".
+
+/** Per-kind typed-array constructor name. Codegen-local — used to pre-allocate
+ *  the reusable `out` frame's array fields in the emitted processor ctor. */
+const TYPED_ARRAY_CTOR: Record<FieldKind, string> = {
+  f64: "Float64Array",
+  f32: "Float32Array",
+  u64: "BigUint64Array",
+  i64: "BigInt64Array",
+  u32: "Uint32Array",
+  i32: "Int32Array",
+  u16: "Uint16Array",
+  i16: "Int16Array",
+  u8: "Uint8Array",
+  i8: "Int8Array",
+};
+
+/** Literal initializer for a scalar field of `kind` in the pre-allocated `out`
+ *  frame: `0n` for the bigint kinds, `0` otherwise. */
+function scalarInit(kind: FieldKind): string {
+  return kindTsType(kind) === "bigint" ? "0n" : "0";
+}
+
+export interface EmitWorkletProcessorOptions extends EmitWorkletReaderOptions {
+  /** Name for `registerProcessor(name, …)` + the `AudioWorkletNode` ctor. */
+  readonly processorName: string;
+  /** The per-quantum body. Runs inside `process(inputs, outputs, parameters)`.
+   *  In scope when it runs: the emitted reader fn (default `readFrame`), a
+   *  reusable `out` frame object (pre-allocated in the ctor — NOT per quantum),
+   *  the `DataView` over the SAB (`this._view`), `this._capacity`, and a
+   *  `slotOf(writeIndexMinus1)` helper. The body returns `true`/`false` like a
+   *  normal processor. */
+  readonly processBody: string;
+  /** Optional capacity baked into the module as the fallback when
+   *  `processorOptions.capacity` is absent. When omitted the ctor requires
+   *  `processorOptions.capacity`. */
+  readonly capacity?: number;
+}
+
+/**
+ * Wrap the emitted reader in a self-registering AudioWorklet PROCESSOR module.
+ * Returns a complete, import-free ES module source string ready for a Blob
+ * (`toWorkletModuleURL`) or a build step. The ctor reads the SAB + capacity from
+ * `processorOptions` (`new AudioWorkletNode(ctx, name, { processorOptions: {
+ * sab, capacity } })`), builds the `DataView`, and pre-allocates the reusable
+ * `out` frame (typed arrays for array fields) so `process()` is allocation-free.
+ *
+ * CSP: the resulting module is loaded via `addModule(blobURL)` which needs
+ * `blob:` in `script-src`/`worker-src`, OR written to a file for the build-step
+ * path. See the convenience-layer banner above.
+ */
+export function emitWorkletProcessorModule(
+  input: EmitWorkletReaderInput,
+  opts: EmitWorkletProcessorOptions,
+): string {
+  if (typeof opts.processorName !== "string" || opts.processorName.length === 0) {
+    throw new Error(
+      "emitWorkletProcessorModule(): opts.processorName must be a non-empty string",
+    );
+  }
+  if (typeof opts.processBody !== "string") {
+    throw new Error("emitWorkletProcessorModule(): opts.processBody must be a string");
+  }
+  if (
+    opts.capacity !== undefined &&
+    (!Number.isInteger(opts.capacity) || opts.capacity < 1)
+  ) {
+    throw new Error(
+      `emitWorkletProcessorModule(): opts.capacity must be a positive integer, got ${opts.capacity}`,
+    );
+  }
+
+  const desc = normalizeLayout(input);
+  const fnName = opts.functionName ?? "readFrame";
+  const includeInvariant = opts.includeInvariant ?? false;
+
+  // The reader primitive — always the full `function …(view, slot, out) {}`
+  // form (never bodyOnly) so the module can call it by name.
+  const readerSrc = emitWorkletReader(input, { ...opts, bodyOnly: false });
+
+  // Pre-allocate the reusable `out` frame: a typed array per array field, a
+  // zero literal per scalar. Mirrors `scratchFrame()` so the reader's per-field
+  // writes (`out.x = …`, `a[i] = …`) never allocate on the audio thread.
+  const allocLines: string[] = [];
+  for (const name of Object.keys(desc.fields)) {
+    const field: SchemaLayoutFieldDescription = desc.fields[name]!;
+    if (field.length !== undefined) {
+      allocLines.push(
+        `      ${name}: new ${TYPED_ARRAY_CTOR[field.kind]}(${field.length}),`,
+      );
+    } else {
+      allocLines.push(`      ${name}: ${scalarInit(field.kind)},`);
+    }
+  }
+  if (includeInvariant && desc.invariantByteOffset !== null) {
+    allocLines.push(`      __invariant: 0,`);
+  }
+
+  const capacityFallback =
+    opts.capacity !== undefined ? String(opts.capacity) : "undefined";
+
+  // Anonymous class expression keeps `processorName` free of identifier rules
+  // (it can contain `-`); the module stays import-free.
+  return [
+    `// ── GENERATED by emitWorkletProcessorModule — DO NOT EDIT ─────────────`,
+    `// Self-registering AudioWorkletProcessor "${opts.processorName}".`,
+    `// frameByteSize=${desc.frameByteSize}, headerBytes=${desc.headerBytes}.`,
+    `// Import-free — load via addModule(blobURL) or a build step. See README §codegen.`,
+    ``,
+    readerSrc,
+    ``,
+    `registerProcessor(${JSON.stringify(opts.processorName)}, class extends AudioWorkletProcessor {`,
+    `  constructor(options) {`,
+    `    super();`,
+    `    const po = (options && options.processorOptions) || {};`,
+    `    this._sab = po.sab;`,
+    `    this._capacity = po.capacity != null ? po.capacity : ${capacityFallback};`,
+    `    if (this._sab == null) {`,
+    `      throw new Error(${JSON.stringify(
+      `${opts.processorName}: processorOptions.sab (SharedArrayBuffer) is required`,
+    )});`,
+    `    }`,
+    `    if (this._capacity == null) {`,
+    `      throw new Error(${JSON.stringify(
+      `${opts.processorName}: processorOptions.capacity is required`,
+    )});`,
+    `    }`,
+    `    this._view = new DataView(this._sab);`,
+    `    this._out = {`,
+    ...allocLines,
+    `    };`,
+    `  }`,
+    `  process(inputs, outputs, parameters) {`,
+    `    const out = this._out;`,
+    `    const slotOf = (w) => { const c = this._capacity; return ((w % c) + c) % c; };`,
+    `    ${fnName}; out; slotOf;` + ` // keep in scope for the spliced body`,
+    `${opts.processBody}`,
+    `  }`,
+    `});`,
+  ].join("\n");
+}
+
+/**
+ * Wrap ANY emitted source (a reader or a processor module) in a `Blob` and
+ * return an object URL ready for `audioWorklet.addModule(url)` (or dynamic
+ * `import(url)`). The caller calls `revoke()` after `addModule` resolves (or on
+ * teardown) to release the URL.
+ *
+ * Throws a clear error when `Blob` / `URL.createObjectURL` are absent (SSR /
+ * Node): there is no audio thread there, so use the build-step path instead.
+ *
+ * CSP: `addModule(blobURL)` requires `blob:` in `script-src`/`worker-src`.
+ */
+export function toWorkletModuleURL(source: string): {
+  url: string;
+  revoke: () => void;
+} {
+  if (
+    typeof Blob === "undefined" ||
+    typeof URL === "undefined" ||
+    typeof URL.createObjectURL !== "function"
+  ) {
+    throw new Error(
+      "toWorkletModuleURL(): Blob / URL.createObjectURL are unavailable in this " +
+        "environment (SSR / Node). Use the build-step path: write the emitted " +
+        "source to a .js file your bundler serves.",
+    );
+  }
+  const blob = new Blob([source], { type: "text/javascript" });
+  const url = URL.createObjectURL(blob);
+  return {
+    url,
+    revoke: () => URL.revokeObjectURL(url),
+  };
+}
+
+/**
+ * Compile the emitted reader to a live function via `new Function`. For
+ * NON-worklet threads only — tests + Standard-mode (main-thread) consumers.
+ *
+ * NOT for the audio thread: `new Function` is `eval`, which is unavailable in
+ * `AudioWorkletGlobalScope` and blocked by CSP without `unsafe-eval`. On the
+ * audio thread, use `emitWorkletProcessorModule` + `toWorkletModuleURL` (or a
+ * build step) instead.
+ */
+export function compileWorkletReader<
+  S extends Schema<FieldsObject, TimestampsConfig<FieldsObject> | null>,
+>(
+  input: S | SchemaLayoutDescription,
+  opts: EmitWorkletReaderOptions = {},
+): (view: DataView, slot: number, out: FrameFor<S>) => void {
+  const fnName = opts.functionName ?? "readFrame";
+  // Force the full `function …() {}` form so the factory can return it by name.
+  const src = emitWorkletReader(input, { ...opts, bodyOnly: false });
+  const factory = new Function(`${src}\nreturn ${fnName};`);
+  return factory() as (view: DataView, slot: number, out: FrameFor<S>) => void;
 }

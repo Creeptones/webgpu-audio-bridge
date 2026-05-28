@@ -47,6 +47,34 @@
  * A numeric `capacity` override per ring bypasses the table. Either way the
  * value is rounded UP to a power of two (SpscRing requires pow2) and clamped to
  * the ring's 2^30 ceiling. See docs/connect-topology-design.md.
+ *
+ * ─── Latency-budget sizing (0.9.47 — the precise alternative to the enum) ───
+ *
+ * Passing a `LatencyBudget` object (`{ latencyMs, sampleRate?,
+ * outputBufferFrames?, producerHz?, maxSabBytes? }`) as `latencyHint` sizes the
+ * macro ring from the ACTUAL audio one buffered frame represents instead of a
+ * fixed bucket. The identity is `frameAudioMs · capacity = latency`:
+ *
+ *   samplesPerFrame = the lone PCM array field's flat length (block schema)
+ *   frameAudioMs    = 1000 · samplesPerFrame / sampleRate
+ *   capacity        = nextPow2(ceil(latencyMs / frameAudioMs))
+ *
+ * Worked example: 1024-sample f32 frames @ 48 kHz → frameAudioMs ≈ 21.3 ms; a
+ * `latencyMs: 60` budget → ceil(60/21.3) = 3 → nextPow2 = 4 (≈ 85 ms worst
+ * case). The enum's "balanced" bucket would have over-allocated to 256.
+ *
+ * Fallback ladder when `samplesPerFrame` is indeterminate:
+ *   1. block schema (lone PCM array)        → the frameAudioMs math above.
+ *   2. caller supplies `producerHz`         → capacity = nextPow2(ceil(
+ *                                              latencyMs · producerHz / 1000)).
+ *   3. neither                              → the enum default (256/512), with
+ *                                              `sizing.resolvedFromBudget=false`.
+ *
+ * The macro ring takes the budget directly; the input lane floors at the
+ * balanced enum value (completeness > freshness for discrete events).
+ * `frameByteSize` also acts as a memory guard via `maxSabBytes` (capacity is
+ * clamped DOWN so `capacity·frameByteSize ≤ maxSabBytes`). The resolved sizing
+ * is surfaced on `ConnectRingHandle.sizing` so the choice is legible.
  */
 
 import { type BridgeOptions } from "./Bridge.js";
@@ -65,10 +93,33 @@ import {
 
 // ─── Public types ──────────────────────────────────────────────────────────
 
+/** Precise latency budget — the per-millisecond alternative to the coarse enum
+ *  (0.9.47). Sizes the macro ring from the ACTUAL audio a buffered frame
+ *  represents (`frameByteSize` → samples → ms) instead of a fixed bucket. See
+ *  the module header "Latency-budget sizing" + docs/frontier-10-handoff.md. */
+export interface LatencyBudget {
+  /** Target buffered-latency budget for the macro ring, in milliseconds. */
+  readonly latencyMs: number;
+  /** Consumer sample rate. Default 48000. */
+  readonly sampleRate?: number;
+  /** Audio render quantum (frames the consumer pulls per callback). Default
+   *  128. Used as the floor: capacity is never sized below one quantum's
+   *  worth of slack. */
+  readonly outputBufferFrames?: number;
+  /** Producer cadence (Hz) — required to size a CONTROL-rate (non-PCM) schema
+   *  from the budget; ignored when the schema is block-shaped. */
+  readonly producerHz?: number;
+  /** Optional memory ceiling: capacity is clamped so
+   *  `capacity·frameByteSize ≤ maxSabBytes`. Default: unbounded (only the 2^30
+   *  frame cap applies). */
+  readonly maxSabBytes?: number;
+}
+
 /** Declared latency intent — translated into a ring capacity by the sizing
  *  heuristic. Coarser than a raw slot count on purpose: the caller declares
- *  *what they want*, not *how many slots*. */
-export type LatencyHint = "tracking" | "balanced" | "throughput";
+ *  *what they want*, not *how many slots*. A `LatencyBudget` object (0.9.47) is
+ *  the precise alternative; the enum still works unchanged. */
+export type LatencyHint = "tracking" | "balanced" | "throughput" | LatencyBudget;
 
 /** Per-ring spec. `schema` is required; `capacity` is an OPTIONAL escape hatch
  *  that overrides the latencyHint-derived value (positive integer, rounded up
@@ -120,6 +171,29 @@ export interface ConnectRingHandle {
   /** Present iff `mode === "standard"`. The peer's `MessagePort`; the allocator
    *  keeps the other end internally for its own `mount`. */
   readonly port?: MessagePort;
+  /** Sizing provenance (0.9.47) — present iff `latencyHint` was a
+   *  `LatencyBudget` (absent for the string-enum path and for an explicit
+   *  `capacity` override). Clone-safe; crosses to the peer for diagnostics so
+   *  `topo.handle.macro.sizing.estimatedLatencyMs` tells the caller exactly what
+   *  their budget bought, and `sabBytes` exposes the memory footprint. */
+  readonly sizing?: RingSizing;
+}
+
+/** Legible sizing result attached to a `ConnectRingHandle` when sized from a
+ *  `LatencyBudget`. See `LatencyBudget` + the module header. */
+export interface RingSizing {
+  /** True when the budget was actually honored (block-math or `producerHz`);
+   *  false on the fallback path (control schema with no `producerHz`), where
+   *  the enum default was used and `estimatedLatencyMs` is `NaN`. */
+  readonly resolvedFromBudget: boolean;
+  /** Audio duration of ONE buffered frame, in ms. Present iff block-shaped
+   *  (a lone PCM array field was detected). */
+  readonly frameAudioMs?: number;
+  /** Worst-case buffered latency: `capacity · frameAudioMs` (block) or
+   *  `1000 · capacity / producerHz` (control). `NaN` on the fallback path. */
+  readonly estimatedLatencyMs: number;
+  /** SAB footprint this ring allocates: `capacity · frameByteSize`. */
+  readonly sabBytes: number;
 }
 
 /** The full clone-safe handle bag. `postMessage(topology.handle,
@@ -219,11 +293,14 @@ export class ConnectUnsupportedError extends Error {
 
 // ─── Sizing heuristic ───────────────────────────────────────────────────────
 
+/** The string-enum arm of `LatencyHint` (excludes the `LatencyBudget` object). */
+type LatencyHintEnum = "tracking" | "balanced" | "throughput";
+
 interface HintBudget {
   readonly macro: number;
   readonly input: number;
 }
-const HINT_TABLE: Record<LatencyHint, HintBudget> = {
+const HINT_TABLE: Record<LatencyHintEnum, HintBudget> = {
   tracking: { macro: 64, input: 256 },
   balanced: { macro: 256, input: 512 },
   throughput: { macro: 1024, input: 2048 },
@@ -237,6 +314,35 @@ function nextPow2(n: number): number {
   let p = 1;
   while (p < n && p < CAPACITY_CEILING) p <<= 1;
   return Math.min(p, CAPACITY_CEILING);
+}
+
+/** A `LatencyBudget` is the object arm of the `LatencyHint` union; the three
+ *  enum values are strings. */
+function isLatencyBudget(hint: LatencyHint): hint is LatencyBudget {
+  return typeof hint === "object" && hint !== null;
+}
+
+/**
+ * Detect a BLOCK (audio-rate) schema and return the number of audio samples one
+ * buffered frame carries, or `null` for a CONTROL-rate schema.
+ *
+ * A block schema has exactly one array field (the lone PCM lane — the
+ * `BridgeBlockConsumer` shape). Its flat `length` IS the samples-per-frame. Zero
+ * or more-than-one array fields → control-rate (scalars / multiple arrays), so
+ * there is no single "audio per frame" and the budget ladder falls through to
+ * the `producerHz` step. Pure + side-effect-free so it is unit-testable in
+ * isolation.
+ */
+export function audioFramesPerSlot(schema: Schema<FieldsObject, any>): number | null {
+  const arrayFields = schema.compiled.fields.filter((f) => f.isArray);
+  if (arrayFields.length !== 1) return null;
+  return arrayFields[0]!.length;
+}
+
+function validatePositive(label: string, v: number): void {
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+    throw new RangeError(`connect(): ${label} must be a finite positive number, got ${v}`);
+  }
 }
 
 // ─── Internal normalization ─────────────────────────────────────────────────
@@ -258,22 +364,113 @@ function normalizeRing<S extends Schema<FieldsObject, any>>(
   return { schema: x as S };
 }
 
-/** Resolve a ring's capacity: explicit override (pow2-rounded) wins, else the
- *  hint table's per-lane budget. */
-function resolveCapacity<S extends Schema<FieldsObject, any>>(
+/** Result of resolving one ring's capacity: the pow2 frame count plus, when the
+ *  caller passed a `LatencyBudget`, a legible `RingSizing` provenance record. */
+interface ResolvedRing {
+  readonly capacity: number;
+  readonly sizing?: RingSizing;
+}
+
+/** Resolve a ring's capacity. Precedence:
+ *   1. explicit `capacity` override (pow2-rounded) — no sizing record.
+ *   2. string enum hint → the fixed per-lane table — no sizing record.
+ *   3. `LatencyBudget` → the budget ladder (block-math → producerHz → fallback),
+ *      attaching a `RingSizing` record so the result is legible. */
+function resolveRing<S extends Schema<FieldsObject, any>>(
   ring: NormalizedRing<S>,
   hint: LatencyHint,
   lane: "macro" | "input",
-): number {
+): ResolvedRing {
   if (ring.capacity !== undefined) {
     if (!Number.isInteger(ring.capacity) || ring.capacity < 1) {
       throw new RangeError(
         `connect(): ${lane} capacity override must be a positive integer, got ${ring.capacity}`,
       );
     }
-    return nextPow2(ring.capacity);
+    return { capacity: nextPow2(ring.capacity) };
   }
-  return HINT_TABLE[hint][lane];
+  if (!isLatencyBudget(hint)) {
+    return { capacity: HINT_TABLE[hint][lane] };
+  }
+  return resolveFromBudget(ring.schema, hint, lane);
+}
+
+/** The budget ladder. See the module header "Latency-budget sizing". */
+function resolveFromBudget(
+  schema: Schema<FieldsObject, any>,
+  budget: LatencyBudget,
+  lane: "macro" | "input",
+): ResolvedRing {
+  validatePositive("latencyHint.latencyMs", budget.latencyMs);
+  const sampleRate = budget.sampleRate ?? 48000;
+  const outputBufferFrames = budget.outputBufferFrames ?? 128;
+  validatePositive("latencyHint.sampleRate", sampleRate);
+  validatePositive("latencyHint.outputBufferFrames", outputBufferFrames);
+  if (budget.maxSabBytes !== undefined) {
+    validatePositive("latencyHint.maxSabBytes", budget.maxSabBytes);
+  }
+
+  const frameByteSize = schema.frameByteSize;
+  const samples = audioFramesPerSlot(schema);
+
+  // Ladder step 3: control schema with no producerHz → fall back to the enum
+  // default (preserves the pre-0.9.47 behavior), flagged as not-from-budget.
+  if (samples === null && budget.producerHz === undefined) {
+    const capacity = HINT_TABLE.balanced[lane];
+    return {
+      capacity,
+      sizing: {
+        resolvedFromBudget: false,
+        estimatedLatencyMs: NaN,
+        sabBytes: capacity * frameByteSize,
+      },
+    };
+  }
+
+  let frameAudioMs: number | undefined;
+  let capacityTarget: number;
+  if (samples !== null) {
+    // Step 1: block schema — derive per-frame audio duration from the budget.
+    frameAudioMs = (1000 * samples) / sampleRate;
+    capacityTarget = Math.ceil(budget.latencyMs / frameAudioMs);
+    // Floor: never below one render quantum's worth of slack.
+    capacityTarget = Math.max(capacityTarget, Math.ceil(outputBufferFrames / samples));
+  } else {
+    // Step 2: control schema with producerHz — backlog = N producer frames.
+    validatePositive("latencyHint.producerHz", budget.producerHz!);
+    capacityTarget = Math.ceil((budget.latencyMs * budget.producerHz!) / 1000);
+  }
+
+  let capacity = nextPow2(Math.max(1, capacityTarget));
+  // The input lane wants completeness — never size it below the balanced enum
+  // floor, since dropping discrete events loses user intent. (Memory guard
+  // below still wins.)
+  if (lane === "input") {
+    capacity = Math.max(capacity, HINT_TABLE.balanced.input);
+  }
+  // Memory guard: clamp DOWN to the largest power of two whose ring fits within
+  // maxSabBytes (never below 1 frame).
+  if (budget.maxSabBytes !== undefined) {
+    while (capacity > 1 && capacity * frameByteSize > budget.maxSabBytes) {
+      capacity >>= 1;
+    }
+  }
+
+  const sabBytes = capacity * frameByteSize;
+  const estimatedLatencyMs =
+    frameAudioMs !== undefined
+      ? capacity * frameAudioMs
+      : (1000 * capacity) / budget.producerHz!;
+
+  return {
+    capacity,
+    sizing: {
+      resolvedFromBudget: true,
+      ...(frameAudioMs !== undefined ? { frameAudioMs } : {}),
+      estimatedLatencyMs,
+      sabBytes,
+    },
+  };
 }
 
 // ─── Ring allocation (per mode) ─────────────────────────────────────────────
@@ -289,9 +486,11 @@ interface RingPair {
 function allocateRing<S extends Schema<FieldsObject, any>>(
   mode: ConnectMode,
   ring: NormalizedRing<S>,
-  capacity: number,
+  resolved: ResolvedRing,
 ): RingPair {
   const layout = describeSchemaLayout(ring.schema);
+  const capacity = resolved.capacity;
+  const sizing = resolved.sizing;
   if (mode === "turbo") {
     const alloc = SpscRing.allocate(capacity, ring.schema);
     const handle: ConnectRingHandle = {
@@ -300,6 +499,7 @@ function allocateRing<S extends Schema<FieldsObject, any>>(
       layout,
       policy: ring.policy,
       sab: alloc.sab,
+      ...(sizing ? { sizing } : {}),
     };
     // Both peers share the same SAB; the handle and the local mount source are
     // identical. SABs are shared, never transferred — empty transfer list.
@@ -313,6 +513,7 @@ function allocateRing<S extends Schema<FieldsObject, any>>(
     layout,
     policy: ring.policy,
     port: alloc.port2,
+    ...(sizing ? { sizing } : {}),
   };
   const local: ConnectRingHandle = {
     mode,
@@ -320,6 +521,7 @@ function allocateRing<S extends Schema<FieldsObject, any>>(
     layout,
     policy: ring.policy,
     port: alloc.port1,
+    ...(sizing ? { sizing } : {}),
   };
   return { peer, local, transfer: [alloc.port2] };
 }
@@ -377,13 +579,13 @@ export function connect<
     }
   }
 
-  const macroCap = resolveCapacity(macroRing, hint, "macro");
-  const macroPair = allocateRing(mode, macroRing, macroCap);
+  const macroResolved = resolveRing(macroRing, hint, "macro");
+  const macroPair = allocateRing(mode, macroRing, macroResolved);
 
   let inputPair: RingPair | null = null;
   if (inputRing) {
-    const inputCap = resolveCapacity(inputRing, hint, "input");
-    inputPair = allocateRing(mode, inputRing, inputCap);
+    const inputResolved = resolveRing(inputRing, hint, "input");
+    inputPair = allocateRing(mode, inputRing, inputResolved);
   }
 
   const handle: ConnectHandle = Object.freeze({
