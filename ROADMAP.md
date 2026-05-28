@@ -47,6 +47,7 @@ question can be answered.
 | 0.8.11 | ✅ shipped | Deprecation-soak pass before 0.9.0 cut (pre-1.0 prune 2/N) |
 | 0.8.12 | ✅ shipped | `BridgeWebNNSource` experimental-status warning sharpening (pre-1.0 prune 3/N) |
 | **0.9.0** | ✅ **shipped** | **Breaking cut**: removed `Float64RingBuffer`, `legacyPhysicsControlFrameSchema`, and `underflowPolicy: 'throw'`. Migration guide in CHANGELOG. |
+| 0.9.1 | ✅ shipped | Shared heap helpers — extract `newHeapTypedArray` + `buildScratchFrame` into `src/_heap.ts`, dedupe 4 facade copies. Internal-only, wire-equivalent. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as

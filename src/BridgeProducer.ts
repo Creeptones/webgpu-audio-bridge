@@ -28,40 +28,12 @@
  */
 
 import {
-  kindTsType,
-  type FieldKind,
   type FieldsObject,
   type FrameFor,
   type Schema,
 } from "./schema.js";
 import { SpscRing } from "./SpscRing.js";
-
-type AnyTypedArray =
-  | Float64Array
-  | Float32Array
-  | Uint32Array
-  | Int32Array
-  | Uint16Array
-  | Int16Array
-  | Uint8Array
-  | Int8Array
-  | BigInt64Array
-  | BigUint64Array;
-
-function newHeapTypedArray(kind: FieldKind, length: number): AnyTypedArray {
-  switch (kind) {
-    case "u64": return new BigUint64Array(length);
-    case "i64": return new BigInt64Array(length);
-    case "f64": return new Float64Array(length);
-    case "u32": return new Uint32Array(length);
-    case "i32": return new Int32Array(length);
-    case "f32": return new Float32Array(length);
-    case "u16": return new Uint16Array(length);
-    case "i16": return new Int16Array(length);
-    case "u8":  return new Uint8Array(length);
-    case "i8":  return new Int8Array(length);
-  }
-}
+import { buildScratchFrame } from "./_heap.js";
 
 export class BridgeProducer<S extends Schema<FieldsObject, any>> {
   public readonly ring: SpscRing<S>;
@@ -77,15 +49,7 @@ export class BridgeProducer<S extends Schema<FieldsObject, any>> {
   /** Allocate a reusable frame view for `push(view)`. Mirror of
    *  `Bridge<S>.scratchFrame`. */
   scratchFrame(): FrameFor<S> {
-    const out: Record<string, unknown> = {};
-    for (const field of this.schema.compiled.fields) {
-      if (field.isArray) {
-        out[field.name] = newHeapTypedArray(field.kind, field.length);
-      } else {
-        out[field.name] = kindTsType(field.kind) === "bigint" ? 0n : 0;
-      }
-    }
-    return out as FrameFor<S>;
+    return buildScratchFrame(this.schema.compiled.fields) as FrameFor<S>;
   }
 
   /** Copy `view` into the next free slot, advance write_index, notify any

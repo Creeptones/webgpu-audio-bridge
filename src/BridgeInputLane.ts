@@ -106,40 +106,12 @@
  */
 
 import {
-  kindTsType,
-  type FieldKind,
   type FieldsObject,
   type FrameFor,
   type Schema,
 } from "./schema.js";
 import { SpscRing } from "./SpscRing.js";
-
-type AnyTypedArray =
-  | Float64Array
-  | Float32Array
-  | Uint32Array
-  | Int32Array
-  | Uint16Array
-  | Int16Array
-  | Uint8Array
-  | Int8Array
-  | BigInt64Array
-  | BigUint64Array;
-
-function newHeapTypedArray(kind: FieldKind, length: number): AnyTypedArray {
-  switch (kind) {
-    case "u64": return new BigUint64Array(length);
-    case "i64": return new BigInt64Array(length);
-    case "f64": return new Float64Array(length);
-    case "u32": return new Uint32Array(length);
-    case "i32": return new Int32Array(length);
-    case "f32": return new Float32Array(length);
-    case "u16": return new Uint16Array(length);
-    case "i16": return new Int16Array(length);
-    case "u8":  return new Uint8Array(length);
-    case "i8":  return new Int8Array(length);
-  }
-}
+import { buildScratchFrame } from "./_heap.js";
 
 export class BridgeInputLane<S extends Schema<FieldsObject, any>> {
   /** The composed ring. Multiple `BridgeInputLane` instances on the SAME
@@ -162,15 +134,7 @@ export class BridgeInputLane<S extends Schema<FieldsObject, any>> {
    *  fields are initialized to 0 / 0n. Use this once outside hot loops and
    *  reuse on every `push` call — zero GC pressure in steady state. */
   scratchFrame(): FrameFor<S> {
-    const out: Record<string, unknown> = {};
-    for (const field of this.schema.compiled.fields) {
-      if (field.isArray) {
-        out[field.name] = newHeapTypedArray(field.kind, field.length);
-      } else {
-        out[field.name] = kindTsType(field.kind) === "bigint" ? 0n : 0;
-      }
-    }
-    return out as FrameFor<S>;
+    return buildScratchFrame(this.schema.compiled.fields) as FrameFor<S>;
   }
 
   /** Allocate a fixed-size array of `n` reusable frame views — the canonical

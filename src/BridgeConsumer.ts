@@ -63,8 +63,6 @@
  */
 
 import {
-  kindTsType,
-  type FieldKind,
   type FieldsObject,
   type FrameFor,
   type Schema,
@@ -73,6 +71,7 @@ import { SpscRing } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 import type { SmoothedPullOptions } from "./Bridge.js";
+import { buildScratchFrame } from "./_heap.js";
 
 export type { SmoothedPullOptions };
 
@@ -82,33 +81,6 @@ export type { SmoothedPullOptions };
 const INVARIANT_OK_THRESHOLD = 1e-3;
 const INVARIANT_SOFT_THRESHOLD = 1.0;
 const INVARIANT_SOFT_ALPHA_BASE = 0.1;
-
-type AnyTypedArray =
-  | Float64Array
-  | Float32Array
-  | Uint32Array
-  | Int32Array
-  | Uint16Array
-  | Int16Array
-  | Uint8Array
-  | Int8Array
-  | BigInt64Array
-  | BigUint64Array;
-
-function newHeapTypedArray(kind: FieldKind, length: number): AnyTypedArray {
-  switch (kind) {
-    case "u64": return new BigUint64Array(length);
-    case "i64": return new BigInt64Array(length);
-    case "f64": return new Float64Array(length);
-    case "u32": return new Uint32Array(length);
-    case "i32": return new Int32Array(length);
-    case "f32": return new Float32Array(length);
-    case "u16": return new Uint16Array(length);
-    case "i16": return new Int16Array(length);
-    case "u8":  return new Uint8Array(length);
-    case "i8":  return new Int8Array(length);
-  }
-}
 
 /** Callback variant of `onInvariantFailure`. The handler runs on the HARD
  *  branch AFTER the ring's `tornFrameCount` has been incremented; mutate
@@ -191,15 +163,7 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
    *  initialized to 0 / 0n. Use this once outside hot loops and reuse the
    *  returned object on every pull call. Mirror of `Bridge<S>.scratchFrame`. */
   scratchFrame(): FrameFor<S> {
-    const out: Record<string, unknown> = {};
-    for (const field of this.schema.compiled.fields) {
-      if (field.isArray) {
-        out[field.name] = newHeapTypedArray(field.kind, field.length);
-      } else {
-        out[field.name] = kindTsType(field.kind) === "bigint" ? 0n : 0;
-      }
-    }
-    return out as FrameFor<S>;
+    return buildScratchFrame(this.schema.compiled.fields) as FrameFor<S>;
   }
 
   /**

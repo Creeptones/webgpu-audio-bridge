@@ -4,6 +4,128 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.1] — 2026-05-27
+
+### Added — shared heap helpers (0.9.x soak cohort, internal-only)
+
+First patch of the 0.9.x soak cohort. Pure-refactor: dedupes the
+`newHeapTypedArray` + `scratchFrame()`-body pair that had grown to four
+identical copies (one each on `Bridge<S>`, `BridgeProducer<S>`,
+`BridgeConsumer<S>`, `BridgeInputLane<S>`). New module-private utility
+`src/_heap.ts` is the single source of truth.
+
+**Surface.** Two helpers on `_heap.ts`:
+
+- `newHeapTypedArray(kind, length): AnyTypedArray` — fresh heap typed-
+  array dispatched on the 10 `FieldKind` values. Used by every facade's
+  `scratchFrame()` factory plus `Bridge.scratchEvaluatedFrame()`'s
+  trajectory-array allocation.
+- `buildScratchFrame(fields): Record<string, unknown>` — reusable
+  scratch frame from a schema's `compiled.fields` list. Iteration order
+  + per-kind dispatch match the prior inlined bodies bit-for-bit.
+
+Both are module-private by convention (the `_heap.ts` filename and the
+underscore mirror the `_pullNoNotify` / `_notifyReadAdvance` markers
+elsewhere — "internal cross-module surface, may change without a minor
+bump"). Not re-exported from `src/index.ts`.
+
+**Sites de-duplicated.**
+
+- `src/Bridge.ts` — drops `newHeapTypedArray`; `scratchFrame()` body
+  collapses to one delegating line; `scratchEvaluatedFrame()` keeps its
+  trajectory-aware loop but the inner allocator is now the imported
+  helper. Local `AnyTypedArray` type preserved (used by `ctorForKind` +
+  `TypedArrayCtor` elsewhere in the file).
+- `src/BridgeProducer.ts` — drops local `AnyTypedArray` + local
+  `newHeapTypedArray`; `scratchFrame()` body collapses to one
+  delegating line. `kindTsType` / `FieldKind` imports trimmed (no
+  longer referenced).
+- `src/BridgeConsumer.ts` — same pattern.
+- `src/BridgeInputLane.ts` — same pattern.
+
+`src/SpscRing.ts` keeps its own local `AnyTypedArray` declaration — the
+type is used in many places in that file beyond the scratch-frame path
+(`arrayViews`, `ctorForKind`, the `.set(src)` casts on the push/pull
+paths) and dropping the local declaration would touch ~12 unrelated
+sites. The type is structurally identical to `_heap.ts`'s
+`AnyTypedArray`; cross-module assignability holds via TypeScript's
+structural-typing rules.
+
+### Why
+
+The duplication had grown by accident: when 0.6.10 extracted
+`BridgeProducer<S>` / `BridgeConsumer<S>` from the monolithic
+`Bridge<S>`, the `newHeapTypedArray` + `scratchFrame()` pair was
+copy-pasted rather than shared. 0.6.19's `BridgeInputLane<S>` added a
+fourth copy. By the 0.8.7 audit there were four identical
+`newHeapTypedArray` functions and four identical `scratchFrame()`
+bodies across `src/`, each ~12 LOC, each silently drifting-prone — a
+classifier-shape change to `FieldKind` would have required four edits
+in lockstep with no compiler help.
+
+Per the pre-1.0 cohort plan §0.9.1, the dedup is internal-only and
+wire-equivalent: callers see exactly the same `scratchFrame()` shape +
+behavior, the SAB protocol is unchanged, and every facade's
+public-API surface is identical. The win is purely architectural —
+one source for the heap-allocation logic, fewer places where a future
+`FieldKind` extension can drift.
+
+### Wire compatibility
+
+**100% wire-compatible.** No SAB byte layout change, no schema-DSL
+extension, no protocol change, no public-API change. The
+`BridgeFacades.test.ts` symmetry pin (the load-bearing test for "the
+facades produce the same scratch frames + the same pull/push behavior
+as `Bridge<S>`") remains green bit-identically.
+
+### Tests
+
+20 suites green — same set + same outcomes as 0.9.0. The
+`BridgeFacades.test.ts` symmetry pin (facade-vs-Bridge bit-for-bit) is
+the canonical regression backstop for this refactor; it stays green.
+The `typecheck-deprecations.test.ts` pins from 0.9.0 also remain green
+(no removed surface accidentally re-introduced).
+
+### Bench
+
+push / pull / pullLatest medians unchanged at ~1.20 μs (N=1000). The
+extraction adds one function-call hop on the scratch-frame path
+(`scratchFrame()` → `buildScratchFrame()`), but scratch frames are
+allocated once outside hot loops by convention — never on the per-push
+/ per-pull path — so the hop is invisible at steady state.
+
+### Documentation
+
+- `src/_heap.ts` — new file with file-header documenting the extraction
+  + the wire-equivalence claim + the module-private convention.
+- `src/Bridge.ts` — imports `newHeapTypedArray` + `buildScratchFrame`
+  from `_heap`; local `newHeapTypedArray` deleted; `scratchFrame()`
+  body collapses to one line.
+- `src/BridgeProducer.ts` — local `AnyTypedArray` + `newHeapTypedArray`
+  deleted; imports `buildScratchFrame` from `_heap`; `scratchFrame()`
+  body collapses to one line.
+- `src/BridgeConsumer.ts` — same pattern.
+- `src/BridgeInputLane.ts` — same pattern.
+- `ROADMAP.md` — 0.9.1 row added.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/_heap.ts` — new file (~80 LOC including header).
+- `src/Bridge.ts` — drop ~14 LOC (local `newHeapTypedArray`); 
+  `scratchFrame()` body shrinks by ~9 LOC.
+- `src/BridgeProducer.ts` — drop ~25 LOC (local `AnyTypedArray` +
+  `newHeapTypedArray`); `scratchFrame()` body shrinks by ~9 LOC.
+- `src/BridgeConsumer.ts` — same shape.
+- `src/BridgeInputLane.ts` — same shape.
+- `package.json` — version `0.9.0` → `0.9.1`.
+- `ROADMAP.md` — row added.
+- `CHANGELOG.md` — this entry.
+
+Net diff is slightly negative (`_heap.ts` adds ~80 LOC, the four call-
+sites collectively drop ~120 LOC); the win is the single-source
+invariant, not the line count.
+
 ## [0.9.0] — 2026-05-27
 
 ### Removed — three legacy surfaces (pre-1.0 cohort 4/N, the breaking cut)
