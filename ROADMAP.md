@@ -32,6 +32,15 @@ the **0.9.0 breaking cut** that deleted them. The 0.9.x line is the soak
 window: deep patches against the slimmed surface until the 1.0 stability
 question can be answered.
 
+**Cadence reset at 0.9.31** (user-directed): the patch number jumped
+from 0.9.3 → 0.9.31, leaving 68 patch slots between 0.9.31 and 0.9.99
+for the rest of the 0.9.x soak. The original cohort plan's `0.9.4` →
+`0.9.7` items don't disappear — they shift right into the new envelope
+under different numbers. The cadence reset is a versioning signal to
+future readers (and to ourselves) that 1.0 isn't around the corner;
+the 0.9.x line is the substrate for everything that lands before the
+stability promise.
+
 | Slot | Status | Theme |
 |---|---|---|
 | 0.8.1 | ✅ shipped | Concurrency hardening + observability docstrings |
@@ -50,6 +59,7 @@ question can be answered.
 | 0.9.1 | ✅ shipped | Shared heap helpers — extract `newHeapTypedArray` + `buildScratchFrame` into `src/_heap.ts`, dedupe 4 facade copies. Internal-only, wire-equivalent. |
 | 0.9.2 | ✅ shipped | Centralize invariant thresholds — `INVARIANT_OK_THRESHOLD` / `INVARIANT_SOFT_THRESHOLD` / `INVARIANT_SOFT_ALPHA_BASE` become single-source in `src/Bridge.ts`, imported by `BridgeConsumer.ts`. Internal-only, wire-equivalent. |
 | 0.9.3 | ✅ shipped | Audit-response patch — fix `examples/minimal/worklet.js` + `bench/e2e-latency/worklet.js` SAB header view (`BigInt64Array` → `Int32Array`) to match the post-0.4 Int32-lane protocol; add `tests/readme-imports.test.ts` as a public-API drift gate. |
+| **0.9.31** | ✅ shipped | `SpscRing.drainNoNotify` public promotion + **cadence reset to 0.9.31**: the next 68 slots (0.9.31 → 0.9.99) carry the 0.9.x soak through to 1.0. The previously-planned `0.9.4 → 0.9.7` patches all shift right into the new envelope. `BridgeInputLane.pullAll` is now a one-line forwarder; the underscore-prefixed `_pullNoNotify` / `_notifyReadAdvance` stay internal but the headline drain primitive is now first-class on the public `SpscRing` surface. Wire-equivalent. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
@@ -76,7 +86,7 @@ channels, anything non-audio-critical. **Not for audio rate.**
 The minor-bump anchor that ships whenever the wire-format change is
 ready. Timing is flexible relative to 0.8.6–0.8.9.
 
-## Beyond the cohort (speculative, `0.9.1+`)
+## Beyond the cohort (speculative, `0.9.32+`)
 
 Surfaced as a parking lot; none of these is planned in detail yet.
 For the structured path to 1.0 — including the 0.9.x polish patches +

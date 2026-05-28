@@ -1369,6 +1369,86 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Drain every unread frame in the ring into successive entries of `out`,
+   * in FIFO order, until either the ring is empty or the buffer fills.
+   * Returns the number of frames written.
+   *
+   * Headline consumer primitive for the **event-burst** access pattern —
+   * one `Atomics.notify` per call (at burst end on the success branch),
+   * not per frame. Compared to a hand-rolled loop over public `pull()`,
+   * the trailing-notify shape cuts the per-burst notify cost from O(N)
+   * to O(1) while preserving the exact same per-frame protocol (acquire
+   * load on write_index, release store on read_index, drop-oldest CAS
+   * dispatch when policy demands it).
+   *
+   * Promoted from a `BridgeInputLane.pullAll`-internal pattern in 0.9.31
+   * (was 0.9.3 in the original cohort plan; renumbered when the cadence
+   * slowed). The body folds in the prior `pullAll` loop verbatim;
+   * `BridgeInputLane.pullAll` is now a one-line forwarder that
+   * preserves the input-lane facade's external contract.
+   *
+   * ─── Caller contract ────────────────────────────────────────────────
+   *
+   * - `out` must be an array of pre-allocated frame views (one per slot
+   *   the caller is prepared to handle this call). Use
+   *   `BridgeInputLane.scratchEventBuffer(n)` for the canonical shape,
+   *   or hand-roll with `bridge.scratchFrame()` × n.
+   * - `maxCount`, if provided, caps the drain
+   *   (`min(out.length, maxCount)`). Useful when the caller wants to
+   *   time-slice events across multiple quanta even if more are buffered.
+   * - Frames beyond the drain limit stay in the ring and are returned on
+   *   the next call. The ring's normal back-pressure (`'reject'` /
+   *   `'drop-oldest'` / `'drop-newest'` / `'block'`) applies on the
+   *   producer side if the consumer chronically under-drains.
+   *
+   * ─── Invariant note ─────────────────────────────────────────────────
+   *
+   * If the schema was declared with `.withInvariant(...)`, the stored
+   * invariant value is read but NOT classified — `drainNoNotify` is the
+   * raw-pull primitive and doesn't run the OK / SOFT / HARD classifier.
+   * Callers who want classification should use `BridgeConsumer.pull`
+   * one frame at a time (with the per-frame notify), or wrap the
+   * classifier around each drained frame here.
+   *
+   * ─── Backpressure-policy dispatch ────────────────────────────────────
+   *
+   * Internally dispatches to `_pullNoNotify` (which itself dispatches to
+   * `_pullOverrunAwareNoNotify` when `_needsOverrunAware` is true, i.e.
+   * the ring is configured with `'drop-oldest'`). Both fast paths share
+   * the same trailing-notify protocol; the difference is the CAS-commit
+   * retry loop on the drop-oldest path, not the notify shape.
+   */
+  drainNoNotify(out: FrameFor<S>[], maxCount?: number): number {
+    if (!Array.isArray(out)) {
+      throw new Error(
+        "SpscRing.drainNoNotify: out must be an array of pre-allocated frame views",
+      );
+    }
+    const bufLen = out.length;
+    const cap = maxCount === undefined
+      ? bufLen
+      : Math.min(bufLen, Math.max(0, maxCount | 0));
+    let count = 0;
+    while (count < cap) {
+      const slot = out[count];
+      if (slot === undefined) {
+        throw new Error(
+          `SpscRing.drainNoNotify: out[${count}] is undefined ` +
+          `(pre-allocate every slot before calling drainNoNotify; ` +
+          `BridgeInputLane.scratchEventBuffer(n) produces the canonical shape)`,
+        );
+      }
+      const r = this._pullNoNotify(slot);
+      if (!r.ok) break;
+      count++;
+    }
+    // Single trailing notify on the success branch. Empty-pull early
+    // returns skip — there's no state change to publish.
+    if (count > 0) this._notifyReadAdvance();
+    return count;
+  }
+
+  /**
    * Run one PI controller cycle against the pre-pull occupancy and publish
    * the new flow_scale on lane 2. Called from `pull` / `pullLatest` after
    * the release-store on read_index, only on the successful branch — empty-

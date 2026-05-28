@@ -208,34 +208,16 @@ export class BridgeInputLane<S extends Schema<FieldsObject, any>> {
    * pattern assumes discrete events with no continuous "previous frame"
    * fallback semantics. Callers who want classification should use
    * `BridgeConsumer` instead.
+   *
+   * Implementation: forwards to `this.ring.drainNoNotify(eventBuf, maxCount)`
+   * (promoted public method on `SpscRing` at 0.9.31). The validation,
+   * loop, and trailing-notify protocol all live on `SpscRing`; this
+   * method exists as the input-lane facade's named surface so callers
+   * who hold a `BridgeInputLane<S>` reference don't have to reach
+   * through to `.ring`.
    */
   pullAll(eventBuf: FrameFor<S>[], maxCount?: number): number {
-    if (!Array.isArray(eventBuf)) {
-      throw new Error(
-        "BridgeInputLane.pullAll: eventBuf must be an array of pre-allocated frame views",
-      );
-    }
-    const bufLen = eventBuf.length;
-    const cap = maxCount === undefined
-      ? bufLen
-      : Math.min(bufLen, Math.max(0, maxCount | 0));
-    let count = 0;
-    while (count < cap) {
-      const slot = eventBuf[count];
-      if (slot === undefined) {
-        throw new Error(
-          `BridgeInputLane.pullAll: eventBuf[${count}] is undefined ` +
-            `(use scratchEventBuffer to construct a dense array of frame views)`,
-        );
-      }
-      const r = this.ring._pullNoNotify(slot);
-      if (!r.ok) break;
-      count++;
-    }
-    // Single trailing notify on the success branch (0.8.2). Empty-pull
-    // early returns skip — there's no state change to publish.
-    if (count > 0) this.ring._notifyReadAdvance();
-    return count;
+    return this.ring.drainNoNotify(eventBuf, maxCount);
   }
 
   /** Frames currently buffered in the ring. */

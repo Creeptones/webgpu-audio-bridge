@@ -55,7 +55,7 @@ The concurrent test has a known timing-sensitive `emptyWaitTimeouts === 0` asser
 ## What lives where
 
 - `src/Bridge.ts` — the primary public surface. ~1,134 lines as of 0.6.9. Header comment blocks document every lane and every protocol invariant; keep them current when changing behavior. Bridge composes one `SpscRing<S>` (`this.ring`), one `FrameSmoother<S>` (`this.smoother`), and one `ConsumerClockRecovery` (`this.pll`) — every public method is either a delegator or the invariant-classifier orchestration.
-- `src/SpscRing.ts` — internal SAB / Atomics core (0.6.8 extract). ~866 LOC. Composes one `AdaptiveFlowController` for the lane-2 PI tick. Internal-only through 0.6.9; 0.6.10 is the promotion patch.
+- `src/SpscRing.ts` — internal SAB / Atomics core (0.6.8 extract). ~866 LOC. Composes one `AdaptiveFlowController` for the lane-2 PI tick. Internal-only through 0.6.9; 0.6.10 is the class-promotion patch. Public method surface grew at 0.9.31 with `drainNoNotify(out, maxCount?)`, the promoted form of the previously `BridgeInputLane.pullAll`-internal amortized-notify drain primitive — `BridgeInputLane.pullAll` is now a one-line forwarder.
 - `src/FrameSmoother.ts` / `src/ConsumerClockRecovery.ts` / `src/AdaptiveFlowController.ts` — the three internal heap-state machines extracted in 0.6.9. ~312 / ~134 / ~131 LOC. Each carries a self-contained file header documenting invariants + the math. Internal-only through 0.6.9.
 - `src/schema.ts` — DSL + compile pass. `.withInvariant(fn, { absoluteEpsilon? })` (0.6.6 added the epsilon opts).
 - `src/trajectory.ts` — order-1/2/3 Taylor evaluator with optional safety clamps (0.6.7). Fast / clamped paths split per-spec.

@@ -4,6 +4,179 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.31] — 2026-05-27
+
+### Added — `SpscRing.drainNoNotify` public promotion + cadence reset (0.9.x soak)
+
+**Two things in one patch.** First, the planned `SpscRing.drainNoNotify`
+promotion lands — a public method on `SpscRing<S>` that exposes the
+amortized-notify drain primitive that previously lived inside
+`BridgeInputLane.pullAll` and reached into the underscore-prefixed
+`_pullNoNotify` / `_notifyReadAdvance` internals. Second, **the patch
+number jumps from `0.9.3` to `0.9.31`** — a user-directed cadence reset
+that opens 68 patch slots between 0.9.31 and 0.9.99 for the rest of
+the 0.9.x soak before 1.0.
+
+#### `SpscRing.drainNoNotify(out, maxCount?)`
+
+New public method on `SpscRing<S>`:
+
+```ts
+drainNoNotify(out: FrameFor<S>[], maxCount?: number): number
+```
+
+Drains every unread frame in the ring into successive entries of `out`,
+in FIFO order, until either the ring is empty or the buffer fills.
+Returns the count. **One trailing `Atomics.notify` per call**, regardless
+of how many frames the burst drained; empty-pull early returns skip the
+notify entirely. Compared to a hand-rolled loop over public `pull()`,
+the trailing-notify shape cuts the per-burst notify cost from O(N) to
+O(1) while preserving the exact same per-frame protocol (acquire load
+on write_index, release store on read_index, drop-oldest CAS dispatch
+when policy demands it).
+
+`BridgeInputLane.pullAll(eventBuf, maxCount?)` is now a one-line
+forwarder:
+
+```ts
+pullAll(eventBuf: FrameFor<S>[], maxCount?: number): number {
+  return this.ring.drainNoNotify(eventBuf, maxCount);
+}
+```
+
+The cross-module `this.ring._pullNoNotify` + `this.ring._notifyReadAdvance`
+references at the prior body's lines 231 + 237 are gone. The
+underscore-prefixed methods on `SpscRing` (`_pullNoNotify`,
+`_notifyReadAdvance`, `_pullOverrunAwareNoNotify`) stay accessible via
+their existing underscore names — bench harnesses (`bench/Bridge.bench.ts`
++ `bench/notify-cost-browser/main.js`) and the
+`tests/BridgeInputLane.test.ts` notify-counting instrumentation both
+still reach through to them, and the bench harness is not a stability
+surface per the cohort plan §0.9.3.
+
+The validation contract from the prior `pullAll` body migrated into
+`drainNoNotify` verbatim:
+
+- `out` must be an `Array`; else throws `"SpscRing.drainNoNotify: out
+  must be an array of pre-allocated frame views"`.
+- Every slot in `out` up to `cap` must be defined; the first
+  `undefined` slot throws with the index in the message.
+- `maxCount` is coerced via `Math.min(out.length, Math.max(0, maxCount | 0))`
+  — non-finite, non-integer, or negative inputs clamp to 0 / `out.length`
+  rather than throwing, matching the prior `pullAll` semantics.
+
+Callers using `BridgeInputLane<S>` see no behavior change — `pullAll`'s
+external contract is byte-for-byte identical. Callers using the
+composable primitives (`SpscRing<S>` directly) gain a clean public
+drain primitive without needing to write the loop themselves or reach
+through the underscore convention.
+
+#### Cadence reset to 0.9.31
+
+Per the user's direction this session, the patch number jumps from
+`0.9.3` to `0.9.31`, skipping `0.9.4` through `0.9.30`. The rationale:
+the 0.9.x line is the soak window before 1.0, and the version-number
+distance between "we're soaking" and "we're ready" should reflect that
+soak's depth. Starting at 0.9.31 leaves 68 patches (0.9.31 → 0.9.99)
+for soak work — the original cohort plan's `0.9.4` → `0.9.7` items
+shift right into that envelope under different numbers.
+
+This is a numbering convention shift, not a SemVer manipulation. By
+SemVer, `0.9.31 > 0.9.3` (patch number 31 > 3), so the increment is
+strictly monotonic. The package's `engines.node`, exports map, and
+public-API surface are all unchanged from 0.9.3 → 0.9.31 — the jump
+is the **only** distinguishing change beyond the drainNoNotify
+promotion.
+
+CLAUDE.md's existing post-0.6 versioning policy already says "each
+minor cohort should reach deep into the patch space before promoting"
+(0.7.99 → 0.8.0 is the documented example envelope). The 0.9.31 reset
+extends that envelope explicitly into the 0.9.x line: 0.9.99 is the
+practical soak ceiling; 1.0.0 ships when the soak gate trips.
+
+### Why
+
+Two intersecting motivations:
+
+1. **The drainNoNotify surface is the right shape for composable callers.**
+   Through 0.9.3 the only way to use the amortized-notify drain
+   primitive on `SpscRing<S>` directly was to reach into the underscore-
+   prefixed internals — which the file header explicitly flags as unsafe
+   for direct external use ("Direct external use without a matching
+   trailing notify on the success branch is unsafe"). Wrapping it
+   correctly is a 12-line dance with two cross-module method calls.
+   Promoting `drainNoNotify` to a public method means composable-API
+   users get the same one-line ergonomics that `BridgeInputLane<S>`
+   callers have always had, AND get the protocol's safety
+   guarantees enforced by the method itself rather than by convention.
+2. **The cadence reset signals "we're not in a hurry."** The 0.8.x →
+   0.9.0 cohort moved fast (12 patches over a short window). The 0.9.x
+   soak deserves a different shape — many small patches, each a
+   checkpoint, no pressure to consolidate. Jumping the patch number to
+   0.9.31 makes the soak depth visible up front: future readers (and
+   future me) see the 68-slot envelope and know that 1.0 isn't around
+   the corner.
+
+### Wire compatibility
+
+**100% wire-compatible.** No SAB byte layout change, no schema-DSL
+extension, no protocol change, no test failures. The `drainNoNotify`
+method body is the prior `pullAll` body verbatim with `this.ring._*`
+→ `this._*` rewrites; the producer-side protocol is unchanged.
+
+`BridgeInputLane.pullAll`'s external behavior is byte-identical (same
+return value, same throw shapes, same notify cadence). The
+`tests/BridgeInputLane.test.ts` pin that instruments
+`_notifyReadAdvance` on the ring to count invocations still observes
+exactly one notify per non-empty burst — `drainNoNotify` calls
+`_notifyReadAdvance` internally.
+
+### Tests
+
+21 suites green, same set + same outcomes as 0.9.3. The
+`tests/BridgeInputLane.test.ts` notify-instrumentation pin is the
+load-bearing regression backstop for this refactor; it stays green.
+The `Bridge.concurrent.test.ts` 1M-frame cross-thread stress is the
+protocol regression backstop; it stays green.
+
+### Bench
+
+push / pull / pullLatest medians unchanged at ~1.20 μs (N=1000). The
+`pullAll (1 notify)` cell in `bench/Bridge.bench.ts` measures the
+drain primitive directly; the dispatch through `drainNoNotify` adds
+one extra function call on the host path that's invisible at steady
+state (the per-frame work is dominated by the SAB memcpy + the scalar-
+reader closure dispatch, not the function-call overhead).
+
+### Documentation
+
+- `src/SpscRing.ts` — new public `drainNoNotify` method with a
+  ~50-line docstring covering caller contract, invariant note,
+  back-pressure-policy dispatch, and a cross-reference to the
+  promoted-from history (0.8.2 internal → 0.9.31 public).
+- `src/BridgeInputLane.ts` — `pullAll` body collapses to one line; the
+  existing docstring gains an "Implementation: forwards to
+  `this.ring.drainNoNotify(...)`" paragraph at the end so callers can
+  trace the surface.
+- `CLAUDE.md` — "What lives where" section's `src/SpscRing.ts` line
+  updated to call out the 0.9.31 drainNoNotify promotion alongside the
+  prior 0.6.10 class-promotion patch.
+- `ROADMAP.md` — 0.9.31 row added; cohort header reworded to call out
+  the cadence reset + the 68-slot envelope; "Beyond the cohort"
+  speculative header bumped to `0.9.32+`.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/SpscRing.ts` — `drainNoNotify` method added (~30 LOC body +
+  ~50 LOC docstring).
+- `src/BridgeInputLane.ts` — `pullAll` body shrinks from ~25 LOC to
+  one line; docstring gains an implementation note.
+- `CLAUDE.md` — `SpscRing.ts` line updated.
+- `package.json` — version `0.9.3` → `0.9.31`.
+- `ROADMAP.md` — row added; cohort header reworded.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.3] — 2026-05-27
 
 ### Fixed — minimal-demo + e2e-latency worklet SAB header view (audit response, 0.9.x soak cohort)
