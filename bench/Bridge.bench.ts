@@ -69,6 +69,7 @@ import { hrtime } from "node:process";
 import { Bridge } from "../src/Bridge.js";
 import { SpscRing } from "../src/SpscRing.js";
 import { BridgeInputLane } from "../src/BridgeInputLane.js";
+import { BridgeBlockConsumer } from "../src/BridgeBlockConsumer.js";
 import {
   physicsControlFrameSchema,
   type PhysicsControlFrameSchema,
@@ -76,6 +77,7 @@ import {
 import {
   defineSchema,
   f32,
+  f32Array,
   f64,
   i32,
   u32,
@@ -573,6 +575,100 @@ function runPullAllAmortizationBench(): {
   return { pullAllSamples, pullLoopSamples };
 }
 
+/**
+ * 0.9.41 cell. `BridgeBlockConsumer.process` vs `processAdd` per-quantum cost.
+ *
+ * Goal: size the additive hot path on the worklet thread. The hybrid
+ * residual-on-carrier pattern (see BridgeBlockConsumer file header)
+ * calls `processAdd` once per `process()` callback alongside a cheap CPU
+ * carrier loop, so the per-quantum delta over the replace-mode
+ * `process()` is the cost the hybrid pattern asks the worklet to pay.
+ *
+ * Methodology: 1024-sample blocks, 128-sample quanta, ring capacity 16.
+ * Refill one block per `QUANTA_PER_BLOCK = 8` consumer calls so the
+ * cursor cycles through one pull-triggering call followed by seven
+ * cursor-hot calls (matching steady-state production at ~50 Hz against a
+ * 46.875 Hz consumption rate). Median is therefore dominated by the
+ * cursor-hot inter-pull cost — exactly the case where the per-sample
+ * arithmetic matters most.
+ *
+ * Three cells:
+ *
+ *   - `process` — baseline. `out.set(samples.subarray(...))` per quantum.
+ *   - `processAdd g=1` — fast path. `out[i] += samples[i]` per quantum.
+ *   - `processAdd g≠1` — general path. `out[i] += gain * samples[i]`.
+ *
+ * The deltas are the hybrid-mode tax over replace mode. At 48 kHz the
+ * worklet has ~2.67 ms of wall-clock budget per quantum on top of
+ * whatever the carrier loop costs; the cells confirm the addition
+ * stays orders of magnitude below that floor.
+ *
+ * Not gated. Documented in CHANGELOG[0.9.41].
+ */
+function runBlockConsumerBench(): {
+  processSamples: number[];
+  processAddSamples: number[];
+  processAddGainSamples: number[];
+} {
+  const BLOCK_SIZE = 1024;
+  const QUANTUM = 128;
+  const QUANTA_PER_BLOCK = BLOCK_SIZE / QUANTUM;
+  const CAP = 16;
+  const blockSchema = defineSchema({
+    blockIndex: u64(),
+    samples: f32Array(BLOCK_SIZE),
+  });
+
+  function setup() {
+    const { sab } = Bridge.allocate(CAP, blockSchema);
+    const bridge = new Bridge(sab, CAP, blockSchema);
+    const cons = new BridgeBlockConsumer(bridge);
+    const scratch = bridge.scratchFrame();
+    // Cheap deterministic content. Doesn't matter for timing but exercise
+    // the JIT properly on representative values.
+    for (let k = 0; k < BLOCK_SIZE; k++) scratch.samples[k] = Math.sin(k * 0.01);
+    scratch.blockIndex = 0n;
+    return { bridge, cons, scratch };
+  }
+
+  function timeCell(
+    drive: (cons: BridgeBlockConsumer<typeof blockSchema>, out: Float32Array) => void,
+  ): number[] {
+    const { bridge, cons, scratch } = setup();
+    const out = new Float32Array(QUANTUM);
+    // Pre-fill carrier sentinels so the additive path stays numerically
+    // meaningful (avoid optimizing-away patterns if any).
+    out.fill(0.1);
+
+    // Warmup.
+    for (let i = 0; i < WARMUP_ITERS; i++) {
+      if (i % QUANTA_PER_BLOCK === 0) {
+        scratch.blockIndex = BigInt(i);
+        bridge.push(scratch);
+      }
+      drive(cons, out);
+    }
+    const samples = new Array<number>(MEASURE_ITERS);
+    for (let i = 0; i < MEASURE_ITERS; i++) {
+      if (i % QUANTA_PER_BLOCK === 0) {
+        scratch.blockIndex = BigInt(WARMUP_ITERS + i);
+        bridge.push(scratch);
+      }
+      const t0 = hrtime.bigint();
+      drive(cons, out);
+      const t1 = hrtime.bigint();
+      samples[i] = Number(t1 - t0);
+    }
+    return samples;
+  }
+
+  const processSamples = timeCell((cons, out) => cons.process(out));
+  const processAddSamples = timeCell((cons, out) => cons.processAdd(out, 1.0));
+  const processAddGainSamples = timeCell((cons, out) => cons.processAdd(out, 0.5));
+
+  return { processSamples, processAddSamples, processAddGainSamples };
+}
+
 function runPullLatestBench(): { samples: number[]; misses: number } {
   const schema = physicsControlFrameSchema(N);
   const { sab } = Bridge.allocate(CAPACITY, schema);
@@ -694,6 +790,25 @@ function main(): void {
   console.log(
     `  pullAll notify-cost delta (pull-loop - pullAll) = ${fmt(amortDelta)}  ` +
       `(${INPUT_BURST_SIZE}-event burst; ≈ (N-1)× notify saved)`,
+  );
+  console.log();
+
+  // 0.9.41 cell — BridgeBlockConsumer.process vs processAdd per-quantum cost.
+  // Hybrid residual-on-carrier mode pays `processAdd - process` per quantum;
+  // the delta sizes that tax. Not gated.
+  const block = runBlockConsumerBench();
+  const processMed = summarize("process (replace)", block.processSamples);
+  const processAddMed = summarize("processAdd g=1", block.processAddSamples);
+  const processAddGainMed = summarize("processAdd g≠1", block.processAddGainSamples);
+  const addDelta = processAddMed - processMed;
+  const addGainDelta = processAddGainMed - processMed;
+  console.log(
+    `  processAdd hybrid tax g=1.0  = ${fmt(addDelta).padStart(8)}  ` +
+      `(vs process replace, 128-sample quantum)`,
+  );
+  console.log(
+    `  processAdd hybrid tax g≠1.0 = ${fmt(addGainDelta).padStart(8)}  ` +
+      `(general-gain path, same quantum)`,
   );
   console.log();
 

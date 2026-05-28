@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — hybrid residual-on-carrier demo</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 860px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      button.warn { background: #b45f0a; }
+      button.warn:hover:not(:disabled) { background: #e07a14; }
+      label { display: block; margin: 8px 0 6px; color: #9aa3ad; font-size: 12px; }
+      input[type=range] { width: 100%; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .row input[type=range] { flex: 1; }
+      .row .lbl { min-width: 80px; text-align: right; color: #d4d7dc; }
+      .modes { display: flex; gap: 16px; margin-top: 8px; }
+      .modes label { color: #d4d7dc; font-size: 13px; margin: 0; cursor: pointer; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k { color: #9aa3ad; }
+      .status .v { color: #d4d7dc; }
+      .status .err { color: #ff7a7a; }
+      .status .ok { color: #6ee69b; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      .callout { background: #15171c; border-left: 3px solid #2a6df4; padding: 12px 16px; margin: 16px 0; font-size: 13px; color: #c8cdd5; }
+      .callout strong { color: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — hybrid residual-on-carrier demo</h1>
+
+    <p>
+      Demonstrates <code>BridgeBlockConsumer.processAdd()</code> — the additive
+      sibling of the audio-rate <code>process()</code> path. The
+      <code>AudioWorklet</code> generates a cheap CPU sawtooth at the slider
+      frequency (zero-latency control response), then folds the
+      <strong>GPU-computed harmonic-partial residual</strong> on top.
+    </p>
+
+    <div class="callout">
+      <strong>What you're listening for.</strong> Move the freq slider — pitch follows
+      <em>instantly</em> because the fundamental lives on the CPU. Press
+      <em>"Simulate GPU stall"</em> — in <strong>Hybrid</strong> mode the upper harmonics fade out
+      for ~250 ms while the fundamental keeps playing (audible thinning, no click).
+      In <strong>Replace</strong> mode the same stall produces audible silence /
+      click because the worklet has nothing to write.
+    </div>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="stall" class="warn" disabled>Simulate GPU stall (250 ms)</button>
+
+    <h2>Mode</h2>
+    <div class="modes">
+      <label><input type="radio" name="mode" value="hybrid" checked /> Hybrid (carrier + processAdd)</label>
+      <label><input type="radio" name="mode" value="replace" /> Replace (pure block-mode process)</label>
+      <label><input type="radio" name="mode" value="carrier-only" /> Carrier only (no GPU)</label>
+    </div>
+
+    <h2>Carrier frequency</h2>
+    <div class="row">
+      <input id="freq" type="range" min="55" max="500" step="1" value="220" />
+      <span id="freq-label" class="lbl">220 Hz</span>
+    </div>
+
+    <h2>Residual gain</h2>
+    <div class="row">
+      <input id="rgain" type="range" min="0" max="1.2" step="0.01" value="0.5" />
+      <span id="rgain-label" class="lbl">0.50</span>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <h2>What this is showing</h2>
+    <p style="font-size: 13px; color: #c8cdd5;">
+      The pure block-mode <code>process()</code> path is the obvious "GPU samples → AudioWorklet"
+      pattern but it inherits the <code>mapAsync</code> latency floor (~85 ms at depth 4) and
+      glitches audibly when the producer stalls. The hybrid pattern splits responsibilities:
+      the <strong>fundamental</strong> stays on the CPU at zero latency, the
+      <strong>spectral richness</strong> rides the GPU lane with bounded latency. The ear
+      can't lock to upper-harmonic envelope phase, so the residual's lateness is inaudible
+      under steady-state; the carrier's zero-latency response covers the pitch dimension that
+      the ear <em>does</em> localize tightly.
+    </p>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      See <code>examples/audio-rate/</code> for the pure block-mode comparator
+      and <code>bench/hybrid-residual/</code> for programmatic underflow + CPU-cost measurements.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

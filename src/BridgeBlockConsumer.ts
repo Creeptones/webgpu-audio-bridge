@@ -89,6 +89,34 @@
  * producer-side jitter. The README's "Audio-rate mode" section documents
  * the math; this helper does not try to compensate for the floor.
  *
+ * ─── Hybrid residual-on-carrier mode (0.9.41) ────────────────────────────
+ *
+ * `processAdd(out, gain?, count?)` is the additive sibling of `process()`.
+ * Instead of REPLACING `out`, it SUMS `gain * sample[i]` into `out[i]`.
+ * Pattern: the AudioWorklet generates a cheap CPU "carrier" (e.g. a
+ * sawtooth at slider-controlled freq, zero latency by construction) into
+ * `out`, then calls `processAdd` to fold the GPU-computed "residual" (a
+ * spectrally rich layer that benefits from GPU parallelism) on top.
+ *
+ * The hybrid is **strictly more glitch-tolerant than `process()`**: when
+ * the ring runs dry mid-call, `processAdd` LEAVES the unfilled tail of
+ * `out` untouched (the carrier survives). Pure-replace `process()` has to
+ * pick between zero-fill (audible click) and hold-last (audible flat-line).
+ * Hybrid mode degrades by "the residual fades out" — audibly, the timbre
+ * thins, the fundamental keeps going.
+ *
+ * Latency story: the carrier's latency is the AudioWorklet quantum
+ * (~2.7 ms @ 128 samples + render-buffer headroom). The residual's
+ * latency is the block-mode floor above (~85 ms at D=4). Combined: the
+ * fundamental responds instantly to control changes; the residual lags.
+ * Since the residual is typically a slow-varying spectral layer (drones,
+ * pads, harmonic content), the human ear does not lock onto its phase
+ * — the audible latency is the carrier's.
+ *
+ * Telemetry: `processAdd` updates `framesConsumed` and `underflowSamples`
+ * identically to `process()`. The semantic difference is what happens to
+ * `out` on underflow, not what gets counted.
+ *
  * ─── Wire compatibility ──────────────────────────────────────────────────
  *
  * Zero change. BridgeBlockConsumer composes a `Bridge<S>` instance via its
@@ -237,6 +265,82 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       const take = Math.min(count - written, this.blockSize - this.cursor);
       out.set(this.samples.subarray(this.cursor, this.cursor + take), written);
       this.holdSample = this.samples[this.cursor + take - 1] as number;
+      this.cursor += take;
+      written += take;
+    }
+  }
+
+  /**
+   * Additive sibling of `process()`: SUM `gain * next_sample` into
+   * `out[i]` rather than overwriting. Designed for the residual-on-carrier
+   * hybrid (see file header "Hybrid residual-on-carrier mode").
+   *
+   * Underflow path: the unfilled tail of `out` is LEFT UNCHANGED — the
+   * caller's carrier in that tail survives the GPU-side stall.
+   * `underflowSamples()` still increments by the unfilled count for
+   * telemetry symmetry with `process()`. The configured `underflowPolicy`
+   * field is IGNORED by this method; "leave caller's data alone" is the
+   * hybrid mode's underflow semantics by construction.
+   *
+   * Hot-path cost: one `bridge.pull` per `blockSize` samples (one per 8
+   * calls for 1024-block / 128-quantum); the inter-pull body is a single
+   * fused-multiply-add over `take` elements, fast path when `gain === 1.0`.
+   *
+   * @param out    Caller-supplied buffer carrying the carrier. Modified
+   *               in place by `out[i] += gain * samples[cursor + i]`.
+   * @param gain   Multiplier applied to the residual on the fly. Default 1.
+   *               `gain = 0` is a no-op (still pulls + advances cursor +
+   *               increments telemetry, which mirrors `process()` advancing
+   *               the cursor even when the consumer ignores `out`).
+   * @param count  Number of samples to mix. Default `out.length`.
+   */
+  processAdd(
+    out: Float32Array,
+    gain: number = 1.0,
+    count: number = out.length,
+  ): void {
+    if (!Number.isFinite(count) || count < 0 || count > out.length) {
+      throw new Error(
+        `BridgeBlockConsumer.processAdd: count ${count} out of range [0, ${out.length}]`,
+      );
+    }
+    if (!Number.isFinite(gain)) {
+      throw new Error(
+        `BridgeBlockConsumer.processAdd: gain must be finite (got ${gain})`,
+      );
+    }
+    let written = 0;
+    while (written < count) {
+      if (!this.hasFrame || this.cursor >= this.blockSize) {
+        const ok = this.bridge.pull(this.frame);
+        if (!ok) {
+          const remaining = count - written;
+          this._underflowSamples += remaining;
+          // Hybrid mode: leave out[] untouched on underflow. Caller's
+          // carrier in the unfilled tail survives the GPU stall.
+          return;
+        }
+        this.cursor = 0;
+        this.hasFrame = true;
+        this._framesConsumed++;
+      }
+      const take = Math.min(count - written, this.blockSize - this.cursor);
+      const samples = this.samples;
+      const cur = this.cursor;
+      const off = written;
+      if (gain === 1.0) {
+        for (let i = 0; i < take; i++) {
+          out[off + i] = (out[off + i] as number) + (samples[cur + i] as number);
+        }
+      } else if (gain !== 0.0) {
+        for (let i = 0; i < take; i++) {
+          out[off + i] = (out[off + i] as number) + gain * (samples[cur + i] as number);
+        }
+      }
+      // gain === 0 path: cursor still advances, telemetry still updates,
+      // but `out` is untouched. Useful as a "drain the ring without
+      // mixing" toggle (e.g. user mutes the GPU residual layer).
+      this.holdSample = samples[cur + take - 1] as number;
       this.cursor += take;
       written += take;
     }

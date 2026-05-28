@@ -4,6 +4,241 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.41] — 2026-05-28
+
+### Added — `BridgeBlockConsumer.processAdd()` for hybrid residual-on-carrier audio
+
+The headline addition this patch: an additive sibling of the audio-rate
+`process()` path. `processAdd(out, gain?, count?)` sums
+`gain * sample[i]` into `out[i]` instead of overwriting. Designed for
+the **hybrid residual-on-carrier pattern** — the AudioWorklet generates
+a cheap CPU "carrier" (e.g. sawtooth at slider-controlled fundamental,
+zero-latency by construction) into `out`, then folds the GPU-computed
+"residual" (a spectrally rich layer that benefits from GPU parallelism)
+on top.
+
+```ts
+import { Bridge, BridgeBlockConsumer } from "webgpu-audio-bridge";
+
+class HybridProcessor extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    const bridge = new Bridge(opts.processorOptions.sab, /*…*/);
+    this.consumer = new BridgeBlockConsumer(bridge);
+    this.phase = 0;
+  }
+  process(_in, outputs) {
+    const out = outputs[0][0];
+    // 1. CPU carrier — fundamental sawtooth, zero latency.
+    const dphi = this.freq / sampleRate;
+    for (let i = 0; i < out.length; i++) {
+      out[i] = (2 * this.phase - 1) * 0.25;
+      this.phase = (this.phase + dphi) % 1;
+    }
+    // 2. GPU residual — harmonic partials, sums on top.
+    this.consumer.processAdd(out, this.residualGain);
+    return true;
+  }
+}
+```
+
+#### Underflow semantics — the headline win
+
+`processAdd` differs from `process` in exactly one place: **the
+underflow path leaves `out` untouched**. When the GPU producer stalls
+(`mapAsync` jitter, frame drop, browser tab throttling, deliberate
+`stallUntil`), `process()` has to zero-fill (audible click) or
+hold-last (audible flat-line). `processAdd()` leaves the unfilled tail
+alone — the **caller's CPU carrier in those samples survives the GPU
+outage**. Audibly: the timbre thins for the stall duration, the
+fundamental keeps playing. Same `underflowSamples()` telemetry; the
+semantic difference is what `out` looks like during the stall, not
+what the counter shows.
+
+The `underflowPolicy` field (`'zero-fill'` / `'hold-last'`) is
+IGNORED by `processAdd`. "Leave caller's data alone" is the hybrid
+mode's underflow semantics by construction; no per-method override.
+
+#### Why this matters — sizing the latency story
+
+Block-mode `process()` inherits the `mapAsync` latency floor: at
+depth D, blockSize B, sample rate R, the worst-case input-to-audible
+delay is `D * B / R` (~85 ms at D=4, B=1024, R=48000). For
+fundamentals — pitch-defining, ear-localized — that's audible lag.
+
+The hybrid pattern splits responsibilities by latency tolerance:
+
+- **Fundamental** (carrier) stays on the CPU at zero latency. Slider
+  events are heard within one quantum (~2.7 ms @ 128 samples).
+- **Spectral richness** (residual — upper harmonics, slow LFO
+  envelope, granular texture) rides the GPU lane with the block-mode
+  floor. The ear can't lock to upper-harmonic envelope phase as
+  tightly as to the fundamental's; the residual's lateness is
+  inaudible under steady state.
+
+Net: the perceptual latency is the carrier's (sub-quantum), not the
+block-mode floor. The 200 ns additive-tax cost of `processAdd` over
+`process` (see Bench cell below) is paid once per quantum and is
+0.0075% of the audio budget at 48 kHz.
+
+#### Public surface
+
+`BridgeBlockConsumer.processAdd(out: Float32Array, gain?: number, count?: number): void`
+
+- `out` — caller's buffer carrying the carrier. Modified in place:
+  `out[i] += gain * samples[cursor + i]`.
+- `gain` — multiplier applied to the residual. Default `1.0`. `0.0`
+  is a "drain the ring without mixing" path (cursor still advances,
+  telemetry still updates, `out` untouched). Non-finite gain throws.
+- `count` — samples to mix. Default `out.length`. Must be in
+  `[0, out.length]`.
+
+Telemetry parity with `process()`: `framesConsumed()` and
+`underflowSamples()` tick identically. The cursor is shared — you can
+interleave `process()` and `processAdd()` calls on the same consumer
+and the sample stream stays monotonic. (See test pin #21.)
+
+### Why a patch bump, not a minor bump
+
+Per the CLAUDE.md versioning policy and the extended-slowdown rule
+landed at 0.9.0: minor bumps are reserved for **wire-format changes**
+(new active lanes, frame-size additions, breaking SAB layout shifts)
+or **breaking public-API changes** (renamed/removed methods, changed
+return types).
+
+`processAdd` is a purely additive heap-side helper on an existing
+class. Zero SAB byte change. Zero schema change. The `Bridge<S>`
+producer side is unchanged. Existing callers continue to work
+unchanged — `processAdd` is opt-in; the default `process()` path is
+byte-for-byte identical to 0.9.40. A bridge driven by a
+`processAdd`-using consumer is bit-for-bit interoperable with one
+driven by `process` directly (the producer cannot tell which method
+the consumer calls).
+
+Default `0.9.x` patch.
+
+### Wire compatibility
+
+Zero change. `BridgeBlockConsumer.processAdd` composes the existing
+`bridge.pull` + `scratchFrame()` surface; uses the SAB layout exactly
+as `BridgeBlockConsumer.process` does. No SAB byte change, no schema
+extension, no protocol change, no new ring lanes.
+
+A 0.9.41 bridge interoperates with any 0.7.13–0.9.40 sibling driven
+through `BridgeBlockConsumer.process` directly. The producer side
+(`BridgeBlockProducer`) is unchanged.
+
+### Demo + benchmark
+
+`examples/hybrid-residual/` — runnable demo of the pattern. CPU
+sawtooth carrier at slider freq + GPU-computed harmonic-partial
+residual (16 partials, 1/k roll-off, per-partial slow LFO). Three
+modes selectable from the UI:
+
+- `hybrid` — carrier first, then `processAdd` (residual sums on top).
+  The headline path.
+- `replace` — `process()` overwrites with the ring contents. The
+  pure block-mode comparator; audibly worse on producer stalls.
+- `carrier-only` — carrier alone (no GPU). Reference path.
+
+"Simulate GPU stall (250 ms)" button drops producer ticks; in
+hybrid mode the harmonic layer fades out cleanly while the
+fundamental keeps going, in replace mode the worklet emits silence
+during the stall window (audible click). Run with
+`npm run dev:hybrid-residual` (port 5176).
+
+`bench/hybrid-residual/` — programmatic benchmark page. Drives a
+controlled stall sequence and reports baseline + stall-window output
+RMS for each mode. The **continuity ratio** (stall RMS / baseline
+RMS) is the headline result: ~0% for replace mode (zero-fill
+collapses RMS), ~95–100% for hybrid mode (carrier survives). Run
+with `npm run bench:hybrid-residual` (port 5177).
+
+### Tests
+
+`tests/BridgeBlockConsumer.test.ts` — extended with 8 new pins
+(#14–21) for the `processAdd` surface, on top of the 13 existing
+`process` pins:
+
+- #14 — additive ramp continuity. Carrier of 100; residual ramp;
+  output is `100 + ramp[i]` over 4 frames consumed.
+- #15 — gain scaling. `gain = 2.5` produces `2.5 * ramp[i]` from
+  zero carrier.
+- #16 — hybrid underflow preservation. Sentinel-filled `out`
+  survives a full-underflow `processAdd` call untouched.
+- #17 — mid-quantum hybrid underflow. Real adds for the head of the
+  quantum, carrier preserved for the tail past ring-exhaust
+  (distinguishes from zero-fill and hold-last).
+- #18 — telemetry parity. `framesConsumed` and `underflowSamples`
+  track identically to `process()` on identical traffic.
+- #19 — `gain = 0` cursor advance. `out` untouched, cursor still
+  advances, telemetry still increments — the "drain without mix"
+  semantics.
+- #20 — bounds + finite-gain validation. Out-of-range count and
+  non-finite gain (NaN, Infinity) throw.
+- #21 — `process` / `processAdd` cursor interop. Interleaved calls
+  on the same consumer share cursor state; sample stream is
+  monotonic across modes.
+
+21 pins total green; the previous 13 are unchanged.
+
+```
+$ npm test
+... 24 suites, all green
+all BridgeBlockConsumer pins green
+```
+
+`npm run typecheck` clean. `npm run bench` push / pull / pullLatest
+medians within the 10 μs hard budget; trajEval (fast) within the
+1.25 μs fast-path budget; flow_scale recovery within the 100-cycle
+budget.
+
+### Bench — processAdd hot-path cost
+
+New cell in `bench/Bridge.bench.ts` measures per-quantum cost of
+`process` vs `processAdd` over a 1024-sample block / 128-sample
+quantum cadence (one pull every 8 calls, mirroring steady-state
+audio consumption). Refill cadence: one block push per 8 quanta.
+
+Medians on a Node 22 dev laptop:
+
+```
+  process (replace) median=  100 ns  p99=  800 ns
+  processAdd g=1    median=  300 ns  p99=  800 ns
+  processAdd g≠1    median=  300 ns  p99=  800 ns
+  processAdd hybrid tax g=1.0  =   200 ns  (vs process replace)
+  processAdd hybrid tax g≠1.0  =   200 ns  (general-gain path)
+```
+
+The 200 ns hybrid-mode tax is the cost of the additive inner loop
+over the `Float32Array.set` baseline. At 48 kHz the worklet has
+~2.67 ms of wall-clock budget per quantum on top of whatever the
+carrier loop costs; 200 ns is 0.0075% of that budget. The
+`g = 1.0` fast path skips the multiply; the general-gain path is
+indistinguishable at the measured precision because the JIT folds
+the multiply into a fused-multiply-add. Not gated.
+
+### Documentation
+
+- `src/BridgeBlockConsumer.ts` — file header gains a "Hybrid
+  residual-on-carrier mode (0.9.41)" subsection documenting the
+  pattern, the latency story, the underflow semantics, and the
+  telemetry parity. JSDoc on `processAdd` itself documents the
+  underflow-leaves-out-untouched contract and the `gain = 0` and
+  `gain = 1` fast-path behaviors.
+- `tests/BridgeBlockConsumer.test.ts` — file header pin index
+  extended with #14–21.
+- `bench/Bridge.bench.ts` — new 0.9.41 cell + main-loop summary.
+- `examples/hybrid-residual/` — new demo directory (6 files:
+  `schema.js` / `main.js` / `worker.js` / `worklet.js` /
+  `index.html` / `serve.mjs`).
+- `bench/hybrid-residual/` — new bench page (4 files:
+  `main.js` / `index.html` / `serve.mjs` reusing the demo's worker
+  + worklet via direct path import).
+- `package.json` — `version` bumped to 0.9.41; new `dev:hybrid-residual`
+  and `bench:hybrid-residual` scripts.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.40] — 2026-05-28
 
 ### Added — Standard mode shipped: `MessageChannelBridge<S>` MVP1

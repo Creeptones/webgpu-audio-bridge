@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — hybrid residual bench</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 880px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      table.results { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+      table.results th, table.results td { padding: 8px 10px; border-bottom: 1px solid #21252d; text-align: right; }
+      table.results th { color: #9aa3ad; text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; font-weight: 600; text-align: right; }
+      table.results th:first-child, table.results td:first-child { text-align: left; }
+      table.results td.win { color: #6ee69b; }
+      table.results td.lose { color: #ff7a7a; }
+      .callout { background: #15171c; border-left: 3px solid #2a6df4; padding: 12px 16px; margin: 16px 0; font-size: 13px; color: #c8cdd5; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — hybrid residual bench</h1>
+
+    <p>
+      Programmatic measurement of the <strong>underflow-tolerance improvement</strong> of
+      <code>BridgeBlockConsumer.processAdd()</code> over the replace-mode
+      <code>process()</code>. Drives a controlled GPU-stall sequence against the same
+      producer, switches the worklet between <strong>Replace</strong> and <strong>Hybrid</strong>
+      modes back-to-back, and reports the output-RMS during a programmed stall window
+      in each. Replace-mode RMS drops near zero (zero-fill click); Hybrid-mode RMS
+      stays at the CPU-carrier floor (audible continuity).
+    </p>
+
+    <div class="callout">
+      Per-quantum hot-path cost is measured in <code>npm run bench</code> via the
+      <code>0.9.41 cell</code> in <code>bench/Bridge.bench.ts</code>. The headline number
+      is reproduced at the bottom of this page for reference; the dynamic measurement
+      below covers the semantic property the Node bench can't see.
+    </div>
+
+    <h2>Run</h2>
+    <button id="run">Run benchmark sequence</button>
+    <button id="stop" disabled>Stop</button>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <h2>Results</h2>
+    <div id="results"></div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Reuses the demo's worker.js / worklet.js verbatim — only the orchestration here is bench-specific.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -1227,6 +1227,57 @@ Over-producing fills the ring; under the default `'reject'` policy the surplus p
 
 (Pre-0.9.0 there was a third `'throw'` policy that threw a descriptive `Error` from `process()`. It was removed at 0.9.0 because an unhandled throw from `AudioWorklet.process()` permanently terminates the processor — bug-shaped semantics for a "production" policy choice. For strict-fail-on-underflow tests, construct with `'zero-fill'` and observe `underflowSamples()` after each `process()` call, throwing from caller code when the counter advances.)
 
+### Hybrid residual-on-carrier mode (0.9.41)
+
+The pure block-mode `process()` path inherits the `mapAsync` latency floor — at depth 4 and 1024-sample blocks, **~85 ms input-to-audible**. That's audible lag on a *fundamental* (pitch-defining, latency-critical) and the wrong tradeoff for any sound the listener can localize tightly. `BridgeBlockConsumer.processAdd()` is the additive sibling that opens the **residual-on-carrier** pattern: the AudioWorklet generates a cheap CPU carrier (sawtooth, simple FM, sample-and-hold — anything where zero latency matters more than spectral richness) into `out`, then folds the GPU-computed residual on top with one extra call:
+
+```ts
+class HybridProcessor extends AudioWorkletProcessor {
+  process(_in, outputs) {
+    const out = outputs[0][0];
+    // 1. CPU carrier — fundamental sawtooth, responds to slider in ~2.7 ms.
+    const dphi = this.freq / sampleRate;
+    for (let i = 0; i < out.length; i++) {
+      out[i] = (2 * this.phase - 1) * 0.25;
+      this.phase = (this.phase + dphi) % 1;
+    }
+    // 2. GPU residual — harmonic partials with slow LFO; lateness inaudible
+    //    because the ear can't localize upper-harmonic envelope phase as
+    //    tightly as the fundamental's pitch.
+    this.consumer.processAdd(out, this.residualGain);
+    return true;
+  }
+}
+```
+
+The win has two parts. First, **perceptual latency is the carrier's, not the block-mode floor** — the fundamental responds to control changes within one quantum (~2.7 ms @ 128 samples + render headroom), the residual lags by ~85 ms but the ear doesn't lock to its phase. Second, **`processAdd` is strictly more glitch-tolerant than `process`** on producer stalls: when the ring runs dry mid-call, `processAdd` leaves the unfilled tail of `out` UNTOUCHED — the caller's carrier in those samples survives the GPU outage. Audibly: the residual fades out for the stall duration, the fundamental keeps playing. The `underflowPolicy` field is ignored by `processAdd` — "leave caller's data alone" is the hybrid mode's underflow semantics by construction.
+
+| Method | Underflow behavior on `out` | Perceptual latency | When to use |
+|---|---|---|---|
+| `process(out)` | `underflowPolicy` controls — zero-fill (audible click) or hold-last (audible flat-line). | block-mode floor (~85 ms at D=4, B=1024, R=48000). | Pure GPU synthesis where the GPU IS the audio source; nothing else writes `out`. |
+| `processAdd(out, gain?)` | Leaves unfilled tail untouched (caller's carrier survives the stall). | Carrier's latency — sub-quantum if the carrier is a CPU oscillator. | Hybrid: GPU contributes a spectral layer on top of a CPU carrier. |
+
+Per-quantum hot-path cost (Node 22 dev laptop, 1024-sample blocks, 128-sample quanta, from `bench/Bridge.bench.ts`):
+
+```
+  process (replace) median=  100 ns
+  processAdd g=1    median=  300 ns
+  processAdd g≠1    median=  300 ns
+  ─────────────────────────────────────────────
+  Hybrid-mode tax  =   200 ns per quantum
+```
+
+At 48 kHz the worklet has ~2.67 ms of wall-clock budget per quantum on top of whatever the carrier loop costs; the 200 ns additive tax is **0.0075% of the budget**. The `gain = 1.0` and general-gain paths are indistinguishable at measured precision (the JIT folds the multiply into a fused-multiply-add). `gain = 0` is a "drain the ring without mixing" path — cursor still advances, telemetry still updates, `out` untouched.
+
+Telemetry parity: `framesConsumed()` and `underflowSamples()` tick identically across `process` and `processAdd`. The cursor is shared — interleaved calls on the same consumer produce a monotonic sample stream (test pin #21).
+
+[`examples/hybrid-residual/`](./examples/hybrid-residual/) ships the runnable demo (CPU sawtooth carrier + GPU-computed 16-partial harmonic residual, mode-toggle UI, programmable GPU stall). [`bench/hybrid-residual/`](./bench/hybrid-residual/) is the programmatic measurement page — drives a controlled stall sequence and reports baseline + stall-window output RMS for each mode. The **continuity ratio** (stall-window RMS / baseline RMS) is ~0% for replace mode (zero-fill collapses RMS) and ~95–100% for hybrid mode (carrier survives the GPU outage).
+
+```bash
+npm run build && npm run dev:hybrid-residual    # demo at http://localhost:5176/
+npm run build && npm run bench:hybrid-residual  # bench at http://localhost:5177/
+```
+
 ### Worked example
 
 [`examples/audio-rate/`](./examples/audio-rate/) ships the canonical end-to-end demo: a worker runs a WGSL additive-sine-bank compute shader that emits 1024 samples per tick; `BridgeBlockProducer` pipes them into the ring; an AudioWorklet drives them out through `BridgeBlockConsumer.process(outputs[0][0])`. CPU fallback when WebGPU isn't available; on-page status panel shows production rate, dropped readbacks, last-readback μs, frames consumed, and underflow samples.

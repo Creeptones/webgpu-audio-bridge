@@ -44,6 +44,21 @@
  *  11. Telemetry counters (framesConsumed, underflowSamples) track the
  *      observed lifecycle.
  *  12. Bounds: count > out.length throws; negative count throws.
+ *  14. processAdd ramp continuity — carrier pre-filled with C; residual ramp;
+ *      after F frames consumed at gain=1.0 every output sample is C + ramp.
+ *  15. processAdd gain scaling — carrier zero, gain=2.5; output is 2.5*ramp.
+ *  16. processAdd hybrid underflow preservation — ring empty; out pre-filled
+ *      with sentinel survives the call untouched (carrier survives).
+ *  17. processAdd mid-quantum hybrid underflow — head receives real adds,
+ *      tail is preserved (NOT zero-filled / NOT hold-last filled).
+ *  18. processAdd telemetry parity — framesConsumed + underflowSamples track
+ *      identically to process().
+ *  19. processAdd gain=0 cursor advance — out untouched, cursor still
+ *      advances, telemetry still increments.
+ *  20. processAdd bounds + finiteness — count out of range throws; non-
+ *      finite gain throws.
+ *  21. process / processAdd cursor interop — interleaved calls on the same
+ *      consumer share the cursor; sample stream is monotonic.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -383,6 +398,214 @@ function testPolicyRoundtrip(): void {
   ok("13. underflow policy round-trip");
 }
 
+// ── 14. processAdd ramp continuity (additive hybrid headline) ─────────────
+function testProcessAddRampContinuity(): void {
+  const { bridge } = makeBridge(8);
+  const cons = new BridgeBlockConsumer(bridge);
+  const scratch = bridge.scratchFrame();
+
+  // Push 4 ramp frames (4 * 1024 = 4096 samples — well under f32 mantissa
+  // precision so integer-valued ramp values are bit-exact).
+  const F = 4;
+  for (let f = 0; f < F; f++) {
+    assert(pushRampFrame(bridge, scratch, f), `frame ${f} pushed`);
+  }
+
+  // Carrier value. processAdd should produce out[i] = CARRIER + ramp[i].
+  const CARRIER = 100;
+  const out = new Float32Array(QUANTUM);
+  const quantaPerRun = (F * BLOCK_SIZE) / QUANTUM;
+  let observed = 0;
+  for (let q = 0; q < quantaPerRun; q++) {
+    out.fill(CARRIER); // refresh carrier every quantum (worklet-style)
+    cons.processAdd(out);
+    for (let i = 0; i < QUANTUM; i++) {
+      assertEq(out[i], CARRIER + observed, `q=${q} i=${i} additive ramp`);
+      observed++;
+    }
+  }
+  assertEq(observed, F * BLOCK_SIZE, "all samples additively consumed");
+  assertEq(cons.framesConsumed(), F, "framesConsumed === F (processAdd path)");
+  assertEq(cons.underflowSamples(), 0, "no underflow during the run");
+  ok("14. processAdd ramp continuity (additive hybrid)");
+}
+
+// ── 15. processAdd gain scaling ───────────────────────────────────────────
+function testProcessAddGain(): void {
+  const { bridge } = makeBridge(4);
+  const cons = new BridgeBlockConsumer(bridge);
+  const scratch = bridge.scratchFrame();
+  assert(pushRampFrame(bridge, scratch, 0), "frame 0 pushed");
+
+  const GAIN = 2.5;
+  const out = new Float32Array(QUANTUM);
+  out.fill(0);
+  cons.processAdd(out, GAIN);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], GAIN * i, `gain=${GAIN} sample ${i}`);
+  }
+  ok("15. processAdd gain scaling");
+}
+
+// ── 16. processAdd hybrid underflow preservation ──────────────────────────
+function testProcessAddUnderflowPreservation(): void {
+  const { bridge } = makeBridge();
+  const cons = new BridgeBlockConsumer(bridge);
+  const SENTINEL = 0xdead;
+  const out = new Float32Array(QUANTUM);
+  out.fill(SENTINEL);
+
+  cons.processAdd(out); // ring empty from the start
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], SENTINEL, `hybrid underflow sample ${i} preserved`);
+  }
+  assertEq(cons.underflowSamples(), QUANTUM, "underflow counter increments");
+  assertEq(cons.framesConsumed(), 0, "no frame consumed under full underflow");
+  ok("16. processAdd hybrid underflow preservation");
+}
+
+// ── 17. processAdd mid-quantum hybrid underflow ───────────────────────────
+function testProcessAddMidQuantumUnderflow(): void {
+  // Small block lets us straddle the underflow boundary mid-quantum.
+  const smallBlock = 80;
+  const { bridge } = makeBridge(4, smallBlock);
+  const cons = new BridgeBlockConsumer(bridge);
+  const scratch = bridge.scratchFrame();
+  scratch.blockIndex = 0n;
+  for (let k = 0; k < smallBlock; k++) scratch.samples[k] = k + 1; // 1..80
+  assert(bridge.push(scratch), "small-block frame pushed");
+
+  const CARRIER = 7;
+  const out = new Float32Array(QUANTUM);
+  out.fill(CARRIER);
+  cons.processAdd(out, 1.0, QUANTUM);
+
+  // First 80 samples should be carrier + real ramp.
+  for (let i = 0; i < smallBlock; i++) {
+    assertEq(out[i], CARRIER + (i + 1), `mid-quantum additive sample ${i}`);
+  }
+  // Remaining 48 should be the untouched carrier (NOT zero-fill, NOT hold-last).
+  for (let i = smallBlock; i < QUANTUM; i++) {
+    assertEq(out[i], CARRIER, `mid-quantum carrier-survives sample ${i}`);
+  }
+  assertEq(
+    cons.underflowSamples(),
+    QUANTUM - smallBlock,
+    "mid-quantum underflow tally"
+  );
+  ok("17. processAdd mid-quantum hybrid underflow");
+}
+
+// ── 18. processAdd telemetry parity with process() ────────────────────────
+function testProcessAddTelemetryParity(): void {
+  // Two consumers driven over identical bridges with identical traffic;
+  // one uses process(), one uses processAdd. framesConsumed and
+  // underflowSamples should track identically.
+  const { bridge: bA } = makeBridge();
+  const { bridge: bB } = makeBridge();
+  const consA = new BridgeBlockConsumer(bA);
+  const consB = new BridgeBlockConsumer(bB);
+  const sA = bA.scratchFrame();
+  const sB = bB.scratchFrame();
+
+  // Push 2 frames into each.
+  pushRampFrame(bA, sA, 0); pushRampFrame(bA, sA, 1);
+  pushRampFrame(bB, sB, 0); pushRampFrame(bB, sB, 1);
+
+  const outA = new Float32Array(QUANTUM);
+  const outB = new Float32Array(QUANTUM);
+  // Drain both fully (16 quanta) then one extra → underflow on both.
+  for (let q = 0; q < 2 * BLOCK_SIZE / QUANTUM + 1; q++) {
+    outA.fill(0); outB.fill(0);
+    consA.process(outA);
+    consB.processAdd(outB);
+  }
+  assertEq(
+    consA.framesConsumed(),
+    consB.framesConsumed(),
+    "framesConsumed parity"
+  );
+  assertEq(
+    consA.underflowSamples(),
+    consB.underflowSamples(),
+    "underflowSamples parity"
+  );
+  ok("18. processAdd telemetry parity with process()");
+}
+
+// ── 19. processAdd gain=0 advances cursor without modifying out ───────────
+function testProcessAddGainZero(): void {
+  const { bridge } = makeBridge();
+  const cons = new BridgeBlockConsumer(bridge);
+  const scratch = bridge.scratchFrame();
+  pushRampFrame(bridge, scratch, 0);
+
+  const SENTINEL = 0xbeef;
+  const out = new Float32Array(QUANTUM);
+  out.fill(SENTINEL);
+  cons.processAdd(out, 0.0);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], SENTINEL, `gain=0 leaves out[${i}] alone`);
+  }
+  // Cursor should have advanced: framesConsumed === 1 after one quantum
+  // of the first frame (cursor at 128 of 1024, frame still in flight).
+  assertEq(cons.framesConsumed(), 1, "frame pulled despite gain=0");
+  assertEq(cons.remainingInFrame(), BLOCK_SIZE - QUANTUM, "cursor advanced");
+  ok("19. processAdd gain=0 cursor advance");
+}
+
+// ── 20. processAdd bounds + finite-gain validation ────────────────────────
+function testProcessAddBounds(): void {
+  const { bridge } = makeBridge();
+  const cons = new BridgeBlockConsumer(bridge);
+  const out = new Float32Array(QUANTUM);
+  let threw = false;
+  try { cons.processAdd(out, 1.0, QUANTUM + 1); } catch { threw = true; }
+  assert(threw, "count > out.length throws");
+  threw = false;
+  try { cons.processAdd(out, 1.0, -1); } catch { threw = true; }
+  assert(threw, "negative count throws");
+  threw = false;
+  try { cons.processAdd(out, Number.NaN); } catch { threw = true; }
+  assert(threw, "NaN gain throws");
+  threw = false;
+  try { cons.processAdd(out, Number.POSITIVE_INFINITY); } catch { threw = true; }
+  assert(threw, "Infinity gain throws");
+  ok("20. processAdd bounds + finite-gain validation");
+}
+
+// ── 21. process / processAdd cursor interop ───────────────────────────────
+function testProcessAddCursorInterop(): void {
+  // Interleaving process() and processAdd() on the same consumer should
+  // produce a continuous ramp — the cursor is shared state.
+  const { bridge } = makeBridge();
+  const cons = new BridgeBlockConsumer(bridge);
+  const scratch = bridge.scratchFrame();
+  pushRampFrame(bridge, scratch, 0);
+  pushRampFrame(bridge, scratch, 1);
+
+  const out = new Float32Array(QUANTUM);
+  // Quantum 1: process() — out[i] = ramp[i] = i.
+  out.fill(0);
+  cons.process(out);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], i, `mixed q=0 sample ${i}`);
+  }
+  // Quantum 2: processAdd onto carrier 1000 — out[i] = 1000 + ramp[i].
+  out.fill(1000);
+  cons.processAdd(out);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], 1000 + (QUANTUM + i), `mixed q=1 sample ${i}`);
+  }
+  // Quantum 3: back to process() — out[i] = ramp[i].
+  out.fill(99);
+  cons.process(out);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], 2 * QUANTUM + i, `mixed q=2 sample ${i}`);
+  }
+  ok("21. process / processAdd cursor interop");
+}
+
 function main(): void {
   testConstruction();
   testSchemaValidation();
@@ -397,6 +620,14 @@ function main(): void {
   testTelemetry();
   testBounds();
   testPolicyRoundtrip();
+  testProcessAddRampContinuity();
+  testProcessAddGain();
+  testProcessAddUnderflowPreservation();
+  testProcessAddMidQuantumUnderflow();
+  testProcessAddTelemetryParity();
+  testProcessAddGainZero();
+  testProcessAddBounds();
+  testProcessAddCursorInterop();
   console.log("all BridgeBlockConsumer pins green");
 }
 
