@@ -70,17 +70,20 @@ import {
 import { SpscRing } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
-import type { SmoothedPullOptions } from "./Bridge.js";
+import {
+  INVARIANT_OK_THRESHOLD,
+  INVARIANT_SOFT_THRESHOLD,
+  INVARIANT_SOFT_ALPHA_BASE,
+  type SmoothedPullOptions,
+} from "./Bridge.js";
 import { buildScratchFrame } from "./_heap.js";
 
 export type { SmoothedPullOptions };
 
-// Schema-invariant recovery thresholds. Mirror of the constants in Bridge.ts
-// (which keeps them module-private). The BridgeFacades symmetry test pins
-// bit-identical behavior so drift surfaces immediately.
-const INVARIANT_OK_THRESHOLD = 1e-3;
-const INVARIANT_SOFT_THRESHOLD = 1.0;
-const INVARIANT_SOFT_ALPHA_BASE = 0.1;
+// Schema-invariant recovery thresholds are imported from `./Bridge.js`
+// as of 0.9.2 — single source of truth. Previously these were duplicated
+// module-private constants, with the `BridgeFacades` symmetry test as
+// the only drift backstop.
 
 /** Callback variant of `onInvariantFailure`. The handler runs on the HARD
  *  branch AFTER the ring's `tornFrameCount` has been incremented; mutate

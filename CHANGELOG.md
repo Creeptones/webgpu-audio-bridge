@@ -4,6 +4,104 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.2] — 2026-05-27
+
+### Added — centralize invariant thresholds (0.9.x soak cohort, internal-only)
+
+Second patch of the 0.9.x soak cohort. Pure-refactor: collapses the
+duplicated `INVARIANT_OK_THRESHOLD` / `INVARIANT_SOFT_THRESHOLD` /
+`INVARIANT_SOFT_ALPHA_BASE` trio (one copy each in `src/Bridge.ts` and
+`src/BridgeConsumer.ts`) into a single source on `Bridge.ts`. The
+companion 0.9.1 refactor closed the `newHeapTypedArray` /
+`buildScratchFrame` drift surface; this patch closes the next-largest
+one in the same category.
+
+**Surface.** The three constants in `src/Bridge.ts:290-292` gain `export`
+markers. `src/BridgeConsumer.ts` drops its three duplicated `const`
+declarations and imports the names from `./Bridge.js` instead. The
+existing `static readonly` exposes on the `Bridge` class
+(`Bridge.INVARIANT_OK_THRESHOLD` etc.) are unchanged — that's still the
+documented public-test pin; the named module-level exports are the
+internal cross-module-share mechanism.
+
+**Why this shape.** Per the pre-1.0 cohort plan §0.9.2, three options
+were on the table: (a) extract to a new `src/_invariant.ts` (mirrors the
+0.9.1 `_heap.ts` pattern), (b) hang the values off a shared base class,
+(c) export named constants from `Bridge.ts` and import them in
+`BridgeConsumer.ts`. (c) is the smallest diff and gives the same
+single-source guarantee — Bridge.ts is the canonical home for the
+classifier logic itself (`_classifyInvariant` is defined there at
+~line 1276); the thresholds are part of the classifier's contract and
+already documented in the file header. (a) would have added a third
+internal-only file for an even smaller share than `_heap.ts`'s; (b)
+would have demanded a class-extraction refactor for three numbers.
+
+### Why
+
+The duplication grew when `BridgeConsumer<S>` was extracted at 0.6.10:
+the constants were copy-pasted out of `Bridge.ts` rather than imported.
+A `BridgeFacades.test.ts` symmetry pin caught any drift downstream
+(facade `pull()` behavior vs `Bridge<S>` `pull()` behavior), but the
+drift surface itself — three numbers in two files — would have to
+break loudly for the test to fire, and "loudly" depends on the
+direction of the drift. A 0.5 → 0.6 widening of `INVARIANT_SOFT_THRESHOLD`
+in one file but not the other, for example, would leave the test pass
+on the OK + HARD boundaries but silently change the soft-band α
+schedule. Single-source eliminates the surface entirely.
+
+### Wire compatibility
+
+**100% wire-compatible.** No SAB byte layout change, no schema-DSL
+extension, no protocol change. The named constants are now reachable
+via `import { INVARIANT_OK_THRESHOLD } from "webgpu-audio-bridge"` …
+**wait — no, they are not**: `src/index.ts` does not re-export them, so
+the public-API surface (everything documented in `README.md` and
+exported from the package's entry) is unchanged. The constants are
+importable from the package's internal subpath only (e.g.
+`import { ... } from "webgpu-audio-bridge/dist/Bridge.js"`), which is
+not a documented surface and not stable across patches. The `Bridge.X`
+static readonlys remain the only documented public way to read these
+values.
+
+### Tests
+
+20 suites green. The `BridgeFacades.test.ts` symmetry pin remains the
+load-bearing regression backstop and stays green bit-identically — the
+classifier behavior on facade vs `Bridge<S>` is now structurally
+guaranteed to match (same constant source), not merely empirically
+checked. The `Bridge.invariant.test.ts` pins (which assert the exact
+OK / SOFT / HARD boundary values) stay green; the numbers are
+unchanged.
+
+### Bench
+
+push / pull / pullLatest medians unchanged at ~1.20 μs (N=1000). The
+constants are read-only globals; the dedup adds zero runtime cost.
+
+### Documentation
+
+- `src/Bridge.ts` — the comment above the constant block updated to
+  spell out the single-source contract; the three `const` declarations
+  gain `export` markers. The `Bridge.X` static readonly exposes
+  unchanged (still the public-test pin).
+- `src/BridgeConsumer.ts` — three duplicated `const` lines replaced by
+  named imports from `./Bridge.js`; the comment block above reworded
+  from "mirror of the constants in Bridge.ts" to "imported from
+  `./Bridge.js` — single source of truth."
+- `ROADMAP.md` — 0.9.2 row added.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/Bridge.ts` — three `const` → `export const` (3 lines touched);
+  preceding comment block reworded.
+- `src/BridgeConsumer.ts` — three `const` declarations deleted; named
+  imports added to the `./Bridge.js` import block; preceding comment
+  block reworded.
+- `package.json` — version `0.9.1` → `0.9.2`.
+- `ROADMAP.md` — row added.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.1] — 2026-05-27
 
 ### Added — shared heap helpers (0.9.x soak cohort, internal-only)

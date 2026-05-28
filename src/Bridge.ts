@@ -282,14 +282,17 @@ export const RING_HEADER_INT32_LANES = SPSC_RING_HEADER_INT32_LANES;
 // not re-exported.
 export type BridgeAllocation<S extends Schema<FieldsObject, any>> = SpscBridgeAllocation<S>;
 
-// Schema-invariant recovery thresholds. See the "Schema invariants" section
-// of the file header for the classification semantics and the smoother α
-// curve. All three are exported on the Bridge class as static readonly
-// constants so tests / callers can pin against them without reaching into
-// private state.
-const INVARIANT_OK_THRESHOLD = 1e-3;
-const INVARIANT_SOFT_THRESHOLD = 1.0;
-const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
+// Schema-invariant recovery thresholds — single source of truth (0.9.2).
+// See the "Schema invariants" section of the file header for the
+// classification semantics and the smoother α curve. All three are also
+// exported on the Bridge class as static readonly constants so tests /
+// callers can pin against them without reaching into module-internal
+// state. `BridgeConsumer` imports the named exports below; previously the
+// same trio was duplicated module-private in `BridgeConsumer.ts`, which
+// was a silent-drift hazard.
+export const INVARIANT_OK_THRESHOLD = 1e-3;
+export const INVARIANT_SOFT_THRESHOLD = 1.0;
+export const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
 
 // PLL controller gains + anti-windup constants now live on
 // `ConsumerClockRecovery` (see `./ConsumerClockRecovery.ts`). Bridge holds
