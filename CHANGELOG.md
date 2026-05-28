@@ -4,6 +4,156 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.44] — 2026-05-28
+
+### Added — frontier "King-track" cohort: predictive extrapolation, record/replay timeline, worklet codegen, formal SPSC proof
+
+A multi-track patch landing the net-new, wire-equivalent half of the
+frontier roadmap (the "10/10" analysis). Three additive public modules,
+two new correctness artifacts, a machine-checkable formal model, and two
+design-only specs for the public-surface changes that still need
+maintainer sign-off. No wire-format change; no breaking public-API
+change; every existing surface behaves bit-identically.
+
+#### `predictiveExtrapolateInto` — confidence-bounded forward extrapolation (`src/predictiveExtrapolation.ts`)
+
+Promotes the trajectory evaluator from *interpolation* (between two known
+frames) to bounded *extrapolation* (past the newest frame, to consumer
+time `t` or `t + outputBuffer` — where the sample will actually be
+audible). The new standalone pure function evaluates the Taylor/Hermite
+trajectory forward and, crucially, **clamps the extrapolation distance
+and blends back toward hold as the PLL's uncertainty grows**, so a
+low-confidence clock estimate can never let the prediction run wild. It
+maps the PLL's ns-domain uncertainty (`sigmaEstimateNs`, `driftPpm`)
+through the trajectory derivatives into a per-sample value band. Treats
+`sigma == 0` as "seeding/unknown" (conservative hold), not "zero
+uncertainty". Allocation-free hot path; reuses the existing
+`evaluateTrajectoryInto` math. Non-breaking — no `Bridge.ts` edit.
+Exports: `predictiveExtrapolateInto` + types `PllUncertainty`,
+`PredictiveExtrapolationConfig`, `PredictiveExtrapolationResult`.
+
+#### `TimelineRecorder` / `TimelinePlayer` — deterministic record/replay + offline bounce (`src/TimelineRecorder.ts`)
+
+Turns the live bridge into a recordable, deterministic, re-renderable
+medium. `TimelineRecorder<S>` captures pushed frames as
+`(tMacroNs, frameSnapshot)` tuples into a growable heap buffer (zero SAB,
+zero Atomics); `serialize()`/`deserialize()` pack them to a compact,
+**schema-tagged** `ArrayBuffer` (the tag is a hash of `describeLayout()`,
+so a mismatched-schema deserialize is rejected loudly rather than
+silently mis-decoding); `TimelinePlayer<S>` replays the tuples
+sample-accurately and **bit-identically across runs and machines**, far
+faster than real time. The insight: replay removes the PLL from the loop
+by synthesizing a deterministic consumer clock from
+`(sampleIndex, sampleRate)`, making replay a pure function of
+`(timeline, sampleRate)`. Exports: `TimelineRecorder`, `TimelinePlayer`,
+`deserialize`, `TimelineSchemaMismatchError`, `TimelineFormatError` +
+types `TimelineTuple`, `TimelineRecorderOptions`.
+
+#### `emitWorkletReader` — schema-derived zero-import worklet codegen (`src/emitWorkletReader.ts`)
+
+Makes the schema *generate* the hottest read path instead of describing
+it. `emitWorkletReader(schema, opts?)` emits, as a source-code **string**,
+a monomorphized zero-import `DataView` reader for that exact schema —
+fixed byte offsets and strides folded in as literals, no runtime offset
+math, no library import on the audio thread. Covers every `FieldKind`
+plus array fields; the invariant lane is opt-in. The emitted source is
+verified import-free and bit-exact against `Bridge.pull`. Exports:
+`emitWorkletReader` + types `EmitWorkletReaderOptions`,
+`EmitWorkletReaderInput`.
+
+#### Formal SPSC correctness artifacts (`formal/`, `docs/spsc-happens-before-proof.md`)
+
+- **`formal/SpscRing.tla` + `.cfg` + README** — a TLA+/PlusCal model of
+  the SPSC protocol under a weak-memory abstraction: producer push and
+  consumer pull as interleaved processes over the active `write_index` /
+  `read_index` lanes, with the payload-visibility ordering established by
+  the release-store/acquire-load pairing. Invariants `NoTornRead`,
+  `NoOverwrite`, `WakeLiveness`. Models the JS `Int32` counters as 32-bit
+  signed wrapping integers (not Naturals) and encodes both the `|0`
+  (ToInt32, signed diff) and `>>>0` (ToUint32, slot index) coercions
+  exactly. Checked offline (no TLC in the repo image).
+- **`docs/spsc-happens-before-proof.md`** — a written happens-before
+  proof, lane by lane, grounding each claim against the exact `Atomics`
+  call sites in `src/SpscRing.ts` with line numbers. Extends the informal
+  narrative in the `SpscRing.ts` header (lines 91–119) to the multi-frame
+  `pullLatest` jump and the drop-oldest CAS-commit consumer that the
+  header does not cover.
+
+#### Design-only specs (decision-pending, no `src/` change)
+
+- **`docs/rt-safety-lattice-design.md`** — phantom-typed `Bridge<S, Role>`
+  RT-safety lattice: `waitForData` / `waitForSpace` (blocking) made
+  *non-existent* on the worklet-branded type, turning the doc-comment
+  warning into a compile error. Recommends a non-breaking landing under
+  the existing `webgpu-audio-bridge/experimental` subpath. Changes the
+  public generic surface, so it ships as a spec pending sign-off.
+- **`docs/connect-topology-design.md`** — a one-call `connect({ macro,
+  input?, latencyHint? })` factory that assembles the dual-ring
+  macro + fast-lane topology, allocates and sizes the SABs, runs the
+  COOP/COEP precondition check, and hands back correctly-branded
+  producer/consumer pairs. Depends on the role lattice; spec only.
+
+### Why
+
+These tracks compose machinery the project already had (the trajectory
+evaluator, the clock-recovery PLL, the schema-as-truth layout, the
+documented Atomics protocol) into capabilities the control-rate-to-
+audio-rate category doesn't yet ship: extrapolating a frame that doesn't
+exist *yet* (collapsing control-rate latency for continuously-varying
+parameters), turning an ephemeral live bridge into a bounceable format,
+generating the audio-thread read path from the schema, and converting
+"we tested it hard" into a machine-checkable proof of the lock-free
+core. The public-surface tracks (role lattice, `connect()`) are
+deliberately held as specs because they touch the `Bridge<S>` generic
+signature and warrant explicit maintainer sign-off per the versioning
+policy.
+
+### Wire compatibility
+
+Fully wire-equivalent. No SAB header lane change, no frame-layout change,
+no change to any existing method's behavior. All three new modules are
+additive heap-side / build-time helpers; `src/index.ts` gained only
+additive re-exports. A 0.9.44 peer interoperates bit-for-bit with any
+0.3+ peer.
+
+### Tests
+
+Four new standalone suites (wired into both `test` and `test:unit`,
+before the concurrent stress):
+
+- `tests/Bridge.predict.test.ts` — pins 81–89: cold/unlocked PLL → hold,
+  confident path == bare evaluator, mid-σ lerp toward hold, deep-horizon
+  fade, order-1 zero-uncertainty, drift inflation shrinks horizon,
+  value-uncertainty formula, allocation-free reuse, f32/f64 parity.
+- `tests/Bridge.timeline.test.ts` — round-trip determinism (two
+  renders + two deserializes byte-identical), faster-than-real-time
+  replay (~9.98 s audio in ~0.26 s wall), schema-tag / magic / version /
+  monotonicity rejection, forward extrapolation past the last frame,
+  invariant-schema rejection at construction.
+- `tests/Bridge.codegen.test.ts` — emitted source parses via
+  `new Function`, bit-exact vs `Bridge.pull` across every kind,
+  import-free / require-free, literal-folded strides + loop bounds,
+  opt-in invariant lane.
+- `tests/Bridge.interleaving.test.ts` — loom-style deterministic
+  interleaving explorer: 12,870 interleavings / 48,619 states reproducibly
+  enumerated; `Int32` wrap coercions at the 2³¹ boundary; reject/drain
+  fast path; no torn read / no overwrite over the full state space;
+  consumer + producer lost-wake; `pullLatest` multi-frame jump;
+  drop-oldest two-writer CAS-fail-and-retry race with bounded retries.
+
+All 27 Node suites green (was 23), including the 1 M-frame concurrent
+stress (0/10 timeouts). `npm run typecheck` clean. `npm run bench`
+within budget — push/pull/pullLatest medians 1.30 μs, trajEval fast path
+within the documented 1.25 μs gate.
+
+### Documentation
+
+Seven new design notes under `docs/` (predictive-extrapolation,
+record-replay, emit-worklet-reader, formal-verification,
+interleaving-fuzzer, rt-safety-lattice, connect-topology) plus the
+happens-before proof, all matching the `docs/standard-mode-design.md`
+house style. `formal/` is a new top-level directory for the TLA+ model.
+
 ## [0.9.43] — 2026-05-28
 
 ### Added — `LLM_BUNDLE.md` regeneration script + refresh to 0.9.42 specs

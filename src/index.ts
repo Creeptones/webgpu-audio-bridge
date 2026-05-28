@@ -209,3 +209,54 @@ export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "./traject
 // Canonical schemas — see src/schemas/physics.ts.
 export { physicsControlFrameSchema } from "./schemas/physics.js";
 export type { PhysicsControlFrameSchema } from "./schemas/physics.js";
+
+// ── Confidence-bounded predictive extrapolation ───────────────────────────
+//
+// Wraps `evaluateTrajectoryInto` with a documented confidence→horizon curve
+// so forward prediction degrades gracefully as the consumer clock's
+// uncertainty grows: low confidence shrinks the effective horizon AND
+// crossfades back toward an order-1 hold; a cold/unlocked PLL collapses to
+// pure hold. Pure + decoupled — consumes a plain `PllUncertainty` snapshot,
+// not a `ConsumerClockRecovery` instance. See src/predictiveExtrapolation.ts.
+
+export { predictiveExtrapolateInto } from "./predictiveExtrapolation.js";
+export type {
+  PllUncertainty,
+  PredictiveExtrapolationConfig,
+  PredictiveExtrapolationResult,
+} from "./predictiveExtrapolation.js";
+
+// ── Deterministic record / replay timeline ────────────────────────────────
+//
+// `TimelineRecorder<S>` captures pushed frames as `(tMacroNs, frame)` tuples
+// and `serialize()`s them to a compact schema-tagged container; `deserialize`
+// rebuilds a `TimelinePlayer<S>` that re-renders bit-identically by feeding a
+// synthesized deterministic consumer clock through the pure Taylor evaluator
+// (the PLL is removed from the replay loop). Standalone additive module — zero
+// changes to the wire format. See src/TimelineRecorder.ts.
+
+export {
+  TimelineRecorder,
+  TimelinePlayer,
+  deserialize,
+  TimelineSchemaMismatchError,
+  TimelineFormatError,
+} from "./TimelineRecorder.js";
+export type {
+  TimelineTuple,
+  TimelineRecorderOptions,
+} from "./TimelineRecorder.js";
+
+// ── Worklet frame-reader codegen ───────────────────────────────────────────
+//
+// `emitWorkletReader` emits, as a SOURCE STRING, a zero-import, monomorphized
+// DataView frame reader specialized to one exact schema — every field byte
+// offset baked in as a numeric literal, no runtime offset math, no library
+// import on the audio thread. Paste the emitted string straight into a built
+// AudioWorklet module. See src/emitWorkletReader.ts.
+
+export { emitWorkletReader } from "./emitWorkletReader.js";
+export type {
+  EmitWorkletReaderOptions,
+  EmitWorkletReaderInput,
+} from "./emitWorkletReader.js";
