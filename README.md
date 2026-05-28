@@ -1273,6 +1273,8 @@ Telemetry parity: `framesConsumed()` and `underflowSamples()` tick identically a
 
 [`examples/hybrid-residual/`](./examples/hybrid-residual/) ships the runnable demo (CPU sawtooth carrier + GPU-computed 16-partial harmonic residual, mode-toggle UI, programmable GPU stall). [`bench/hybrid-residual/`](./bench/hybrid-residual/) is the programmatic measurement page — drives a controlled stall sequence and reports baseline + stall-window output RMS for each mode. The **continuity ratio** (stall-window RMS / baseline RMS) is ~0% for replace mode (zero-fill collapses RMS) and ~95–100% for hybrid mode (carrier survives the GPU outage).
 
+For the comparative claim — how the hybrid pattern measures up against the six alternative approaches to GPU-accelerated browser audio (pure CPU AudioWorklet, GPU → AudioBufferSourceNode, pure GPU block mode, Faust / Emscripten WASM, Tone.js + GPU side channel, `OfflineAudioContext` + GPU pre-render) — and a 15-item gap analysis covering stereo, polyphony, sample-accurate parameter binding, multi-resolution residual, latency-compensated sync, comparator benches, and more, see [`docs/hybrid-residual-comparison.md`](./docs/hybrid-residual-comparison.md).
+
 ```bash
 npm run build && npm run dev:hybrid-residual    # demo at http://localhost:5176/
 npm run build && npm run bench:hybrid-residual  # bench at http://localhost:5177/

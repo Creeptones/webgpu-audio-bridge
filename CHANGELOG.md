@@ -4,6 +4,165 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.42] — 2026-05-28
+
+### Added — Hybrid residual-on-carrier: comparison and gap analysis
+
+Documentation-only patch. Lands task #14 from the audit-response
+in-flight task list. The 0.9.41 hybrid pattern's comparative claim
+("marked upgrade against alternative GPU-accelerated browser audio
+approaches") has been asserted in the README but not characterized
+against the full landscape; the new design note does that and also
+maps the room to push the pattern further on the existing
+foundation.
+
+#### New `docs/hybrid-residual-comparison.md`
+
+Sibling to `docs/standard-mode-design.md` (0.9.39). ~700 lines.
+Three substantive parts:
+
+**1. The alternative landscape.** Six approaches characterized:
+
+- **A. Pure CPU AudioWorklet** — production-audio status quo.
+- **B. GPU compute → AudioBufferSourceNode** — the naïve attempt
+  most "WebGPU audio" tutorials take; fails the latency test
+  (30-65+ ms before zero-latency monitoring).
+- **C. Pure GPU block mode via `BridgeBlockConsumer.process()`** —
+  our own pre-0.9.41 pattern; ~85 ms block-mode floor.
+- **D. Faust / Emscripten WASM DSP in AudioWorklet** — universal
+  deployment; CPU-bound spectral richness.
+- **E. Tone.js + custom GPU side channel** — bespoke per project,
+  no packaged reference implementation.
+- **F. `OfflineAudioContext` + GPU pre-render** — fixed
+  compositions, non-interactive.
+
+Each scored across 7 axes (interactive latency / spectral richness
+/ glitch tolerance / browser deployment / implementation cost /
+polyphonic capability / maturity) with verdict paragraphs explaining
+when each is the right choice.
+
+**2. The hybrid pattern's three distinctive claims.** The
+comparative argument boils down to three things no alternative does
+simultaneously:
+
+- **Perceptual CPU/GPU split, not technical.** The carrier
+  (pitch-defining, latency-critical) is on CPU at sub-quantum
+  latency; the residual (spectrally rich, latency-tolerant) is on
+  GPU at the block-mode floor. The split is informed by the
+  psychoacoustic asymmetry between pitch perception (tight time
+  resolution) and spectral envelope perception (coarse time
+  resolution). No other public pattern in the WebGPU-audio space
+  exploits this asymmetry.
+- **Strict glitch-tolerance superiority via additive composition.**
+  `processAdd` leaves `out` untouched on underflow; the carrier
+  already written to `out` survives the GPU stall. Audibly: residual
+  fades out, fundamental keeps playing. Quantitatively: stall-window
+  RMS / baseline RMS at ~95-100% (hybrid) vs ~0% (replace), measured
+  by `bench/hybrid-residual/`. No alternative degrades this way.
+- **One-method-call composition.** The worklet change from pure
+  block-mode to hybrid is three lines. No new class, no schema
+  change, no protocol bump, no backward-compat break.
+
+Quantitative comparison table includes per-quantum cost (200 ns
+hybrid-mode tax = 0.0075% of 2.67 ms quantum budget), stall-window
+continuity ratio (~95-100% hybrid vs ~0% replace), and a
+latency-floor matrix showing hybrid is the only entry where the
+interactive component matches pure CPU AudioWorklet AND the
+spectral component matches full GPU compute.
+
+**3. Fifteen-item gap analysis.** Each gap has a one-line
+rationale, cost / complexity estimate, and dependency note:
+
+1. Stereo / multi-channel support (current pattern is mono).
+2. Polyphonic carrier / N-voice hybrid (current is monophonic).
+3. Sample-accurate carrier params via `BridgeInputLane` (current is
+   postMessage-poll).
+4. Sample-accurate residual gain envelope (current is scalar gain).
+5. Crossfade-on-stall (current is binary — drops instantly on
+   underflow).
+6. Predictive carrier from upcoming residual blocks (advanced —
+   carrier tracks GPU spectral evolution).
+7. Three-tier hybrid (CPU audio + GPU block + main-thread control).
+8. Stall-aware quality degradation (reverse `flow_scale` for
+   compute load).
+9. Latency-compensated synchronization mode (intentional carrier
+   delay for phase coherence).
+10. Multi-resolution residual (fast + slow GPU layers at different
+    block sizes).
+11. **Comparator bench harness — apples-to-apples vs alternatives
+    A / B / C.** Proves the marked-upgrade claim quantitatively.
+12. Subscribe-to-underflow callback (current is raw count polling).
+13. Residual envelope-follows-carrier (auto-ducking pattern).
+14. Cross-browser stall continuity measurement (current bench is
+    Chromium-only).
+15. Long-tail latency measurement under realistic load (current
+    bench is steady-state).
+
+The note ends with three highest-leverage gaps recommended to
+address first: **#11 comparator bench** (proves the claim
+quantitatively), **#1 stereo** (every adopter hits this in the
+first 30 seconds), **#3 sample-accurate carrier params via
+BridgeInputLane** (composes with existing primitives, lowest cost).
+
+The note also explicitly names **two non-gaps**: replacing the
+carrier with a higher-quality CPU oscillator (worklet-side concern,
+not library-side), and direct GPU→AudioWorklet shared memory
+(blocked on the WebGPU `mappedAtCreation` spec evolution, tracked
+under Beyond 1.0).
+
+#### README cross-link
+
+The §Hybrid residual-on-carrier mode section gains a paragraph
+linking the new design note for adopters who want the comparative
+analysis + gap roadmap.
+
+### Why
+
+The 0.9.41 release shipped a genuinely novel pattern — the
+perceptual CPU/GPU split is the kind of move that should be made
+explicit so future audits, contributors, and adopters can see the
+reasoning behind it rather than treating the pattern as
+self-explanatory. The comparison against six alternatives also
+serves as a defensible answer to the future audit question "is
+this approach actually better than X, or is it just different?"
+
+The gap analysis serves the same purpose looking forward — it
+documents the design surface the project is choosing not to
+exploit yet, with cost estimates, so the maintainer can decide
+which gaps to close as the 0.9.x soak continues toward 1.0. The
+three highest-leverage gaps (comparator bench / stereo /
+sample-accurate carrier params) are the most likely candidates for
+the next few patches.
+
+### Wire compatibility
+
+None affected. Documentation only — new design-note file + a
+README paragraph linking it. No SAB protocol change, no schema
+DSL change, no public-API change.
+
+### Tests
+
+23 Node suites green. `npm run typecheck` clean. `npm run bench`
+within all documented budgets. The `tests/readme-imports.test.ts`
+drift gate still holds — none of the README import blocks were
+touched.
+
+### Documentation
+
+- `docs/hybrid-residual-comparison.md` — new file, ~700 lines.
+  Six-alternative landscape characterization + three-claim
+  comparative argument + quantitative measurement table +
+  fifteen-gap roadmap + three highest-leverage recommendations +
+  two explicit non-goals + open questions for the gaps that need
+  separate design decisions before implementation.
+- `README.md` — §Hybrid residual-on-carrier mode gains a final
+  paragraph linking the new design note.
+- `ROADMAP.md` — new 0.9.41 row (backfilled — the 0.9.41 ship
+  didn't add it) and new 0.9.42 row in the cohort table.
+- `CITATION.cff` — `version` bumped to 0.9.42.
+- `package.json` — `version` bumped to 0.9.42.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.41] — 2026-05-28
 
 ### Added — `BridgeBlockConsumer.processAdd()` for hybrid residual-on-carrier audio

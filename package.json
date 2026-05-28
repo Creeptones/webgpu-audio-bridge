@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.9.41",
+  "version": "0.9.42",
   "description": "Schema-driven control-rate-to-audio-rate bridge for the browser. Two transport tiers share one schema DSL and one frame API: Turbo mode (SAB + Atomics, sub-microsecond push/pull, requires cross-origin isolation) and Standard mode (MessageChannel + transferable ArrayBuffer, 5-50ms latency floor, no COOP/COEP needed). Streams structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet.",
   "type": "module",
   "main": "./dist/index.js",
