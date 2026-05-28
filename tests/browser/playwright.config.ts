@@ -38,21 +38,62 @@ export default defineConfig({
   use: {
     baseURL: "http://localhost:5173",
     trace: "retain-on-failure",
-    // Required to let the page autoplay AudioContext without a user gesture
-    // in tests. We still click the Start button explicitly in each spec.
-    launchOptions: {
-      args: [
-        "--autoplay-policy=no-user-gesture-required",
-        // WebGPU may not be enabled headless — that's fine, the demo's CPU
-        // fallback kicks in. Leaving the flags out keeps CI predictable.
-      ],
-    },
+    // Per-project `launchOptions` carry browser-specific autoplay
+    // configuration; the top-level `use` stays free of browser-specific
+    // flags so Firefox / WebKit don't see Chromium-shaped `args`.
   },
 
+  // 0.9.33 — matrix expansion to Chromium + Firefox + WebKit.
+  // The browser smoke + e2e-latency specs use a CPU fallback (no WebGPU
+  // dependency) + a real #start click (no autoplay-without-gesture
+  // requirement), so the cross-browser surface is portable. Each project
+  // sets only the autoplay-defense flags its engine recognizes — passing
+  // Chromium-shaped `--autoplay-policy=...` to Firefox / WebKit either
+  // gets ignored or errors, so it's scoped to the Chromium project only.
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        // Defensive autoplay flag — the spec still drives `#start` with a
+        // real click, but this keeps the AudioContext from being blocked
+        // in launch modes that don't count the click as a gesture.
+        launchOptions: {
+          args: [
+            "--autoplay-policy=no-user-gesture-required",
+            // WebGPU may not be enabled headless — that's fine, the
+            // demo's CPU fallback kicks in. Leaving the flag out keeps
+            // CI predictable.
+          ],
+        },
+      },
+    },
+    {
+      name: "firefox",
+      use: {
+        ...devices["Desktop Firefox"],
+        // Firefox autoplay control lives in prefs, not args. `media.autoplay.default = 0`
+        // is "allow", matching Chromium's `--autoplay-policy=no-user-gesture-required`.
+        // The spec's `#start` click still provides a real user gesture, so this is
+        // defensive — covers headless-launch edge cases where the gesture window has
+        // already closed.
+        launchOptions: {
+          firefoxUserPrefs: {
+            "media.autoplay.default": 0,
+            "media.autoplay.blocking_policy": 0,
+          },
+        },
+      },
+    },
+    {
+      name: "webkit",
+      use: {
+        ...devices["Desktop Safari"],
+        // WebKit ships no autoplay-override knob analogous to Chromium's
+        // `--autoplay-policy=...`. Real user gestures unlock playback,
+        // and the spec's `#start` click is one — relying on that path
+        // keeps WebKit aligned with Safari production behavior.
+      },
     },
   ],
 

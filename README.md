@@ -60,6 +60,7 @@ The library will **never** auto-detect the environment and silently pick a trans
 | WebMIDI | ✅ | ✅ 108+ | ❌ | ❌ |
 | **Turbo mode** (`Bridge<S>`) | ✅ | ✅ | ✅ | ✅ |
 | **Standard mode** (`MessageChannelBridge<S>`, 0.8.x) | ✅ | ✅ | ✅ | ✅ |
+| Browser smoke (Playwright) | ✅ tested in CI | ✅ tested in CI | ✅ tested in CI | — (mobile not in CI matrix) |
 
 Notes:
 
@@ -67,6 +68,7 @@ Notes:
 - **WebGPU on Firefox** has been available behind `dom.webgpu.enabled` in Nightly through 2024–2026; stable rollout tracking [bug 1262052](https://bugzilla.mozilla.org/show_bug.cgi?id=1262052). The library has a CPU fallback in `examples/minimal/worker.js` for compute paths that need to degrade gracefully.
 - **WebMIDI on Safari** is not supported; the fast-lane pattern works without WebMIDI (pointer + keyboard suffice — see `examples/fast-lane/`).
 - **Standard mode** has no `Atomics` dependency and so does not require cross-origin isolation. The latency floor is ~5–50 ms (measured baseline in 0.8.3).
+- **Browser smoke matrix (0.9.33)**: `.github/workflows/browser.yml` runs `tests/browser/*.spec.ts` (the minimal-demo smoke + the e2e-latency CPU-mode bench) across Chromium, Firefox, and WebKit on every push + PR to `main`. The matrix gates merges — `continue-on-error` is off; a regression in any engine fails CI. Each engine's report uploads as `playwright-report-<browser>` on failure. The specs use a CPU fallback (no WebGPU dependency) so they're portable across all three Playwright-bundled engines on Linux.
 
 ## The macro/micro pattern
 

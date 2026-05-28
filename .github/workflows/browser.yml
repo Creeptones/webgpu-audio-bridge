@@ -6,15 +6,20 @@ on:
   pull_request:
     branches: [main]
 
-# Kept separate from test.yml so the Node matrix stays green while we iterate on
-# the browser smoke. This job is allowed to fail without blocking, until we've
-# tuned it on real CI hardware — once it's stable, drop the continue-on-error
-# below.
+# 0.9.33 — the browser smoke is now gating CI across Chromium + Firefox +
+# WebKit (was Chromium-only and `continue-on-error: true` through 0.9.32).
+# Each matrix slot installs only its own browser's binaries to keep job
+# runtime bounded. `fail-fast: false` so one engine regressing doesn't
+# mask the others; each slot uploads a uniquely-named report on failure.
 
 jobs:
   browser-smoke:
     runs-on: ubuntu-latest
-    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    name: browser-smoke (${{ matrix.browser }})
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,15 +27,15 @@ jobs:
           node-version: 22
       - run: npm ci
       - run: npm run build
-      - name: Install Playwright (chromium only)
-        run: npx playwright install --with-deps chromium
+      - name: Install Playwright (${{ matrix.browser }})
+        run: npx playwright install --with-deps ${{ matrix.browser }}
       - name: Browser smoke
-        run: npm run test:browser
+        run: npm run test:browser -- --project=${{ matrix.browser }}
       - name: Upload Playwright report on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.browser }}
           path: |
             playwright-report/
             test-results/

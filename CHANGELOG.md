@@ -4,6 +4,153 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.33] — 2026-05-27
+
+### Added — browser CI matrix gating: Chromium + Firefox + WebKit (0.9.x soak)
+
+The Playwright smoke that's been running Chromium-only and
+non-gating (`continue-on-error: true`) since the workflow first
+landed is now a real gate across the three Playwright-bundled
+engines. `.github/workflows/browser.yml` runs a matrix
+`browser: [chromium, firefox, webkit]` with `fail-fast: false`;
+each slot installs only its own browser, runs the smoke with
+`--project=<browser>`, and uploads a uniquely-named Playwright
+report on failure. `continue-on-error: true` is gone — a smoke
+regression in any engine fails the merge.
+
+#### Workflow shape
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    browser: [chromium, firefox, webkit]
+steps:
+  - run: npx playwright install --with-deps ${{ matrix.browser }}
+  - run: npm run test:browser -- --project=${{ matrix.browser }}
+```
+
+`fail-fast: false` is the deliberate choice — a Firefox-only
+regression shouldn't mask a separate Chromium regression in the
+same PR. Each engine's failure surface is independently visible.
+
+#### Playwright config shape
+
+`tests/browser/playwright.config.ts` ships three projects (was one).
+Each project carries only the autoplay configuration its engine
+recognizes:
+
+- **chromium** — `launchOptions.args: ['--autoplay-policy=no-user-gesture-required']`
+  (the prior config's top-level setting, scoped per-project).
+- **firefox** — `launchOptions.firefoxUserPrefs: { 'media.autoplay.default': 0, 'media.autoplay.blocking_policy': 0 }`
+  (Firefox autoplay control lives in prefs, not CLI args).
+- **webkit** — no autoplay launch option (WebKit has no
+  autoplay-override knob analogous to Chromium's; real user
+  gestures unlock playback, and the spec's `#start` click is one).
+
+The top-level `use` block no longer carries `launchOptions` — the
+defensive autoplay flag previously applied globally was
+Chromium-shaped and would have been an unrecognized arg on
+Firefox / WebKit. Per-project scoping fixes that.
+
+#### Why this works cross-browser
+
+The two browser specs (`tests/browser/minimal.spec.ts` +
+`tests/browser/latency.spec.ts`) were already written to be
+portable:
+
+- They don't depend on WebGPU — both specs force / accept the
+  CPU fallback path (`#backend=cpu` in latency, "either backend
+  ok" in minimal). Linux headless WebGPU varies across engines
+  and isn't the load-bearing concern.
+- They use `crossOriginIsolated` + `SharedArrayBuffer` only, which
+  all three engines support under COOP/COEP since the matrix's
+  documented floor (Chrome 113 / Firefox 113 / Safari 16.4).
+- They drive the `#start` button with `page.click(...)`, which is
+  a real user gesture by Playwright's semantics — that's what
+  WebKit needs to unlock AudioContext autoplay.
+
+### Why
+
+Two intersecting motivations:
+
+1. **The audit's punch-list item #5.** The 0.8.7 design audit
+   flagged `continue-on-error: true` on `browser.yml` as a real
+   gap: the matrix was running but its outcome wasn't gating
+   merges. The cohort plan slotted "remove continue-on-error +
+   expand matrix" together because expanding without gating
+   compounds the problem (more engines that aren't actually being
+   enforced). 0.9.33 closes both halves.
+2. **0.9.35 needs this.** The planned end-to-end audio Playwright
+   spec (e2e audio fingerprint match on `examples/minimal/`)
+   lands as a new spec under `tests/browser/`. That spec is only
+   useful if its outcome gates merges across the three engines —
+   shipping it under a non-gating matrix would be a regression
+   from the value of the existing specs. 0.9.33 is the
+   foundation; 0.9.35 builds on it.
+
+The decision NOT to gate Linux WebGPU specifically (Chromium's
+flagged-WebGPU path on Linux runners) is deliberate: Linux
+headless WebGPU varies across kernel + driver + Chromium-version
+combinations in ways that produce flake on the order of 5-15%.
+The CPU-fallback portability is the right gating surface today;
+a Chrome-Canary-WebGPU-only nightly job is the right shape for
+WebGPU-specific coverage and can land as a follow-up patch under
+a separate workflow file.
+
+### Wire compatibility
+
+**100% wire-compatible.** This is a CI + Playwright config patch
+only — no source change, no test change to the JS side, no API
+change. The `BridgeGPUSource.onError` 0.9.32 surface and every
+prior surface remain byte-identical.
+
+### Tests
+
+21 Node suites green; unaffected. The browser-smoke matrix runs
+in CI and exercises:
+
+- `tests/browser/minimal.spec.ts` — `examples/minimal/` loads,
+  reports `crossOriginIsolated`, accumulates frames, drains the
+  ring at the expected rate.
+- `tests/browser/latency.spec.ts` — `bench/e2e-latency/` runs in
+  CPU mode, accumulates ≥ 50 samples in a 5-second window,
+  reports a coherent histogram, doesn't blow past the loose 500ms
+  catastrophic-regression p99 budget.
+
+Both specs were portable before 0.9.33 — they just weren't being
+run on Firefox / WebKit. The matrix expansion exercises code
+paths that were previously latent.
+
+### Bench
+
+Unaffected.
+
+### Documentation
+
+- `README.md` — §Browser support matrix gains a "Browser smoke
+  (Playwright)" row marking Chromium / Firefox / WebKit as
+  "tested in CI" and a §Notes bullet describing the matrix shape
+  + the `playwright-report-<browser>` artifact naming.
+- `ROADMAP.md` — 0.9.33 row added to the cohort table.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `.github/workflows/browser.yml` — `continue-on-error: true`
+  removed; `strategy.matrix.browser: [chromium, firefox, webkit]`
+  added with `fail-fast: false`; per-browser `playwright install
+  --with-deps` + `--project=` flag; unique artifact name per
+  slot. File header comment updated.
+- `tests/browser/playwright.config.ts` — top-level
+  `use.launchOptions` removed; three `projects` (was one) with
+  per-project autoplay configuration scoped to the engine's
+  recognized API.
+- `README.md` — §Browser support matrix updated.
+- `package.json` — version `0.9.32` → `0.9.33`.
+- `ROADMAP.md` — 0.9.33 row.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.32] — 2026-05-27
 
 ### Added — `BridgeGPUSource.onError` opt-in callback for device-lost handling (0.9.x soak)
