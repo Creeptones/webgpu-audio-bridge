@@ -31,11 +31,14 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
     const { sab, capacity, n, audioStartPerfMs, layout } = options.processorOptions;
     this.n = n;
     this.capacity = capacity;
-    this.mask = BigInt(capacity - 1);
+    this.mask = capacity - 1; // Number, not BigInt — Int32 protocol (0.9.3 fix).
     // Reconstruct umbrella + per-field offsets from the layout description.
     // The bench uses an all-f64 schema (see ./schema.js), so a single
-    // Float64Array umbrella view covers every field.
-    this.indices = new BigInt64Array(sab, 0, 2);
+    // Float64Array umbrella view covers every field. The SAB header is
+    // viewed as Int32Array (mirrors src/SpscRing.ts — 8 lanes total,
+    // we touch lane 0 = write_index and lane 1 = read_index). The other
+    // six lanes (flow_scale, torn_frame, PLL) MUST NOT be touched.
+    this.indices = new Int32Array(sab, 0, 8);
     this.stride8 = layout.frameByteSize / 8;
     this.data = new Float64Array(sab, layout.headerBytes, capacity * this.stride8);
     this.seqElemOff = layout.fields.seq.byteOffset / 8;
@@ -70,16 +73,16 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
   }
 
   pullLatest() {
-    const readIdx = this.indices[1];
-    const writeIdx = Atomics.load(this.indices, 0);
+    const readIdx = this.indices[1];          // plain read, Int32 lane 1
+    const writeIdx = Atomics.load(this.indices, 0); // acquire, Int32 lane 0
     if (writeIdx === readIdx) return null;
-    const newestIdx = writeIdx - 1n;
-    const skipped = Number(newestIdx - readIdx);
-    const slot = Number(newestIdx & this.mask);
+    const newestIdx = (writeIdx - 1) | 0;     // Int32 wrap arithmetic
+    const skipped = (newestIdx - readIdx) | 0;
+    const slot = newestIdx & this.mask;
     const base = slot * this.stride8;
     const seq = this.data[base + this.seqElemOff];
     const tMacroNs = this.data[base + this.tMacroElemOff];
-    Atomics.store(this.indices, 1, writeIdx);
+    Atomics.store(this.indices, 1, writeIdx); // release: Int32 lane 1
     Atomics.notify(this.indices, 1, 1);
     return { seq, tMacroNs, skipped };
   }

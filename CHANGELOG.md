@@ -4,6 +4,240 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.3] — 2026-05-27
+
+### Fixed — minimal-demo + e2e-latency worklet SAB header view (audit response, 0.9.x soak cohort)
+
+**Real bug fix + public-API drift gate.** An external audit of the
+repo (run against a stale snapshot, but one finding was real against
+current `main`) identified that `examples/minimal/worklet.js` viewed
+the SAB header as `BigInt64Array(sab, 0, 2)` — wrong against the
+post-0.4 Int32-lane protocol that `src/SpscRing.ts` uses today. The
+`bench/e2e-latency/worklet.js` harness carried the same bug. Both are
+now fixed to use `Int32Array(sab, 0, 8)`, matching `RING_HEADER_INT32_LANES`.
+
+This patch also adds `tests/readme-imports.test.ts` as a gate against
+future drift between the README's documented imports and the actual
+`src/index.ts` public-export surface.
+
+#### The worklet bug
+
+The current SAB header is 32 bytes viewed as 8 Int32 lanes (mirrored
+in `src/SpscRing.ts`):
+
+```
+lane 0  write_index           (producer monotonic Int32 wrap counter)
+lane 1  read_index            (consumer monotonic Int32 wrap counter)
+lane 2  flow_scale            (Q16.16 consumer→producer hint, 0.5.0)
+lane 3  torn_frame_counter    (Int32 monotonic wrap-counter, 0.6.0)
+lane 4-5  PLL offset (Int64)  (0.6.16)
+lane 6  PLL drift (Q16.16)
+lane 7  PLL status word
+```
+
+Viewing the header as `BigInt64Array(sab, 0, 2)` collapses Int32
+lanes 0+1 into a single 64-bit word (`indices[0]`) and Int32 lanes 2+3
+into a second 64-bit word (`indices[1]`). The minimal-demo consumer's
+`pullLatest()`:
+
+- Read `writeIdx = Atomics.load(indices, 0)` → bytes 0-7 as an Int64
+  = `(read_index << 32) | write_index` on little-endian. Happens to
+  observe an upward-growing value because `read_index` stays 0 (see
+  next bullet).
+- Read `readIdx = indices[1]` → bytes 8-15 as an Int64
+  = `(torn_frame << 32) | flow_scale`. Both lanes start at 0; the
+  consumer thinks `readIdx === 0n` forever (or whatever those control
+  lanes happen to hold).
+- Compute `slot = (writeIdx - 1n) & mask` — picks the newest produced
+  frame. The demo's audio output therefore came out roughly correct
+  for the first few moments because the consumer was reading slot
+  `(write_index - 1) % capacity`, which IS the newest frame as long
+  as `write_index` advances.
+- Write `Atomics.store(indices, 1, writeIdx)` → bytes 8-15. This
+  corrupts the `flow_scale` (Int32 lane 2) and `torn_frame_counter`
+  (Int32 lane 3) lanes by overwriting them with the low and high 32-bit
+  halves of the Int64 `writeIdx` value. The `flow_scale` corruption
+  feeds the producer's adaptive backpressure controller false hints;
+  the `torn_frame_counter` corruption invalidates the canonical "have
+  any frames torn under contention" diagnostic.
+
+Downstream effects on the demo:
+
+1. The actual `read_index` lane (Int32 lane 1) **never advances**
+   because the consumer was writing to a different range of bytes.
+   From the producer's perspective the ring fills to capacity (16
+   frames at the demo's default) and then `bridge.push` rejects
+   every subsequent frame — producer-side `pushRejects` grows
+   unboundedly, masquerading as "the consumer can't keep up."
+2. The consumer's `Atomics.notify(indices, 1, 1)` targets a different
+   byte range than the lane the producer parks on, so the back-
+   pressure wake protocol silently fails. (The demo uses the default
+   `'reject'` policy, so this never triggers a missed wake-up
+   in practice — the producer doesn't park — but it would have for
+   `'block'` callers.)
+3. The audible output remained roughly correct because the consumer
+   kept reading `(write_index - 1) % capacity`, which IS the newest
+   frame for the first 16 frames. After that the consumer kept
+   reading slot 15 (the last slot the producer wrote to before it
+   started rejecting) and the audio output froze on that frame's
+   parameters — possibly indistinguishable from "the producer is
+   running steady-state" depending on what the WGSL shader emits.
+
+The fix is straightforward — swap `BigInt64Array(sab, 0, 2)` for
+`Int32Array(sab, 0, 8)` (covering the full header), convert `mask`
+from `BigInt` to `Number`, switch all index arithmetic from BigInt
+subtraction to Int32 wrap (`(x - 1) | 0`). Everything else stays the
+same. The producer side (`worker.js`) was already correct — it goes
+through the high-level `Bridge.push(scratch)` which uses the proper
+SpscRing protocol.
+
+`bench/e2e-latency/worklet.js` had a structurally identical bug; same
+fix applied. The bench's previously-reported latency numbers should
+be treated as approximate (the producer-side `bridge.push` was
+correctly stamping `tMacroNs`; the consumer-side read was at the
+correct slot for the first 16 frames; but the back-pressure /
+flow-scale corruption could have biased the bench's behavior under
+sustained load — at minimum, future calibration runs should compare
+against the fixed worklet).
+
+`examples/audio-rate/worklet.js` was always correct — it uses the
+high-level `BridgeBlockConsumer` class (which internally uses
+`bridge.pull` against the correct protocol). `examples/fast-lane/worklet.js`
+was also correct — it had been using `Int32Array(sab, 0, 2)` directly
+since 0.6.19. Only the two listed files carried the bug.
+
+#### The README-imports drift gate
+
+External audits sometimes flag stale claims about what's actually
+exported from the package root. The 0.9.3 audit's first "critical"
+finding was exactly this — though against the audit's stale snapshot,
+not against current `main`. `src/index.ts` exports every name the
+README's `from "webgpu-audio-bridge"` blocks document, and
+`package.json`'s `exports` map includes `.`, `./worklet`,
+`./worklet/decoder.wasm`, and `./experimental`. The 0.9.3 audit was
+based on a snapshot predating the 0.8.x cohort and missed all of
+that.
+
+But the failure mode the audit flagged is real **for future drift**:
+the README is hand-maintained, `src/index.ts` is hand-maintained, and
+nothing programmatically enforces consistency. A future patch could
+rename or remove an export without updating the README, or document a
+new symbol that's been moved to an internal file.
+
+`tests/readme-imports.test.ts` adds that gate. It imports every name
+documented in the README's `from "webgpu-audio-bridge"` blocks
+(Bridge, SpscRing, BridgeProducer, BridgeConsumer, FrameSmoother,
+ConsumerClockRecovery, AdaptiveFlowController, BridgeInputLane,
+BridgeBlockConsumer, BridgeBlockProducer, BridgeGPUSource,
+getEnvironmentReport, defineSchema, the 10 scalar + array
+constructors that appear in code blocks, f64TrajectoryArray,
+evaluateTrajectoryInto, physicsControlFrameSchema, and the
+TelemetrySnapshot type) and verifies each resolves to a non-`undefined`
+value at runtime + that the type-only references compile. The test
+also performs a tiny functional smoke (defineSchema → Bridge.allocate
+→ new Bridge round-trip) to catch the "exported but throws at
+construction" regression class.
+
+Adding a new public-API symbol now requires adding it to the README's
+import block AND to this test's import block; the compiler enforces
+the link. Removing one requires removing it from both. The test runs
+in `npm test` and `npm test:unit`; CI gates on it.
+
+### Why
+
+Per the cohort plan §0.9.3 the planned next patch was the
+`SpscRing.drainNoNotify` public promotion. That patch shifts to 0.9.4;
+this 0.9.3 patch is the audit-response slot.
+
+The audit's six findings broke down as:
+- (1) README imports vs `index.ts` exports — **stale claim**; resolved
+  pre-cohort. Hardened with the README-imports test in this patch
+  (gate against future drift).
+- (2) Test scripts run deleted `Float64RingBuffer.test.ts` — **stale
+  claim**; those entries were removed at 0.9.0.
+- (3) `examples/minimal/worklet.js` uses `BigInt64Array` for an Int32
+  header protocol — **real bug**; this patch fixes it, plus the
+  identical bug in `bench/e2e-latency/worklet.js`.
+- (4) `package.json` is 0.6.18 and CHANGELOG top is 0.6.5 — **stale
+  claim**; current is 0.9.2 (now 0.9.3 with this patch).
+- (5) Browser smoke tests have `continue-on-error: true` — **real but
+  already queued** at 0.9.5 per the cohort plan.
+- (6) README overclaims platform support — **partial / subjective**;
+  worth a polish pass but not in scope for this audit-response patch.
+
+The three real issues now have closed paths: (3) fixed in this patch,
+(1) hardened in this patch, (5) queued in the plan. (6) is a
+documentation-polish item that will land in a future patch when the
+language pass on the browser-support sections lands as part of the
+broader 1.0-readiness review.
+
+### Wire compatibility
+
+**100% wire-compatible.** The two `*.js` files that carried the bug
+were demos / bench harnesses, NOT part of the library's compiled
+distribution; their behavior was wrong, but the library's wire format
+and protocol were always Int32. A 0.9.2 producer feeding a 0.9.3
+consumer (or vice versa) over the same SAB exchanges frames bit-
+identically. The fix corrects the demo and bench to match the
+protocol that was already canonical in `src/SpscRing.ts`.
+
+The `readme-imports.test.ts` addition is test-only; it doesn't touch
+the library surface.
+
+### Tests
+
+21 suites green (up from 20: `readme-imports.test.ts` added). The new
+test asserts:
+
+1. Every documented value-shape root import resolves to a defined value.
+2. Type-only README imports (`TelemetrySnapshot`) compile.
+3. The Quick start import combination (`defineSchema` + `u64` + `f64` +
+   `Bridge.allocate` + `new Bridge`) round-trips functionally.
+4. `physicsControlFrameSchema(8)` produces the documented 6-field shape.
+
+The minimal-demo worklet itself runs only in a browser AudioWorklet
+context; this patch verifies the fix by code-review (the diff is
+textually equivalent to `examples/fast-lane/worklet.js`'s correct
+Int32 protocol) and by ensuring the Bridge.concurrent test (which
+already exercises the production Int32 protocol cross-thread)
+remains green at 1M frames.
+
+### Bench
+
+push / pull / pullLatest medians unchanged at ~1.20 μs (N=1000) — the
+bench harness changes don't touch the library hot path. The
+`bench/e2e-latency/` harness numbers will need a fresh calibration
+run against the fixed worklet; previously-reported numbers are
+approximate (see file-header rework above).
+
+### Documentation
+
+- `examples/minimal/worklet.js` — header view migrated; comment block
+  at the top rewritten to describe the post-0.4 Int32 protocol +
+  call out the lanes the consumer must NOT touch (flow_scale,
+  torn_frame, PLL). Explicit "Earlier versions ... fixed at 0.9.3"
+  note in the header for anyone diffing across versions.
+- `bench/e2e-latency/worklet.js` — header view + arithmetic migrated;
+  inline comments updated.
+- `tests/readme-imports.test.ts` — new file (~120 LOC including header)
+  with the four pins enumerated above.
+- `package.json` — `tests/readme-imports.test.ts` added to both `test`
+  and `test:unit` script chains; version `0.9.2` → `0.9.3`.
+- `ROADMAP.md` — 0.9.3 row added.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `examples/minimal/worklet.js` — full rewrite (header view +
+  arithmetic + comments).
+- `bench/e2e-latency/worklet.js` — header view + arithmetic fix; the
+  comment block was already updated in 0.9.0 to reference the all-f64
+  schema migration, so it only gets two new "0.9.3 fix" notes.
+- `tests/readme-imports.test.ts` — new file.
+- `package.json` — version + test/test:unit script entries.
+- `ROADMAP.md` — row added.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.2] — 2026-05-27
 
 ### Added — centralize invariant thresholds (0.9.x soak cohort, internal-only)

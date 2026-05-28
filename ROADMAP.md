@@ -49,6 +49,7 @@ question can be answered.
 | **0.9.0** | ✅ **shipped** | **Breaking cut**: removed `Float64RingBuffer`, `legacyPhysicsControlFrameSchema`, and `underflowPolicy: 'throw'`. Migration guide in CHANGELOG. |
 | 0.9.1 | ✅ shipped | Shared heap helpers — extract `newHeapTypedArray` + `buildScratchFrame` into `src/_heap.ts`, dedupe 4 facade copies. Internal-only, wire-equivalent. |
 | 0.9.2 | ✅ shipped | Centralize invariant thresholds — `INVARIANT_OK_THRESHOLD` / `INVARIANT_SOFT_THRESHOLD` / `INVARIANT_SOFT_ALPHA_BASE` become single-source in `src/Bridge.ts`, imported by `BridgeConsumer.ts`. Internal-only, wire-equivalent. |
+| 0.9.3 | ✅ shipped | Audit-response patch — fix `examples/minimal/worklet.js` + `bench/e2e-latency/worklet.js` SAB header view (`BigInt64Array` → `Int32Array`) to match the post-0.4 Int32-lane protocol; add `tests/readme-imports.test.ts` as a public-API drift gate. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as

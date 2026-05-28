@@ -10,23 +10,44 @@
 // typed-array views and reads frames inline. No library code runs on the
 // audio thread.
 //
-// Consumer protocol (mirrors src/Bridge.ts):
-//   - indices : BigInt64Array view over the first 32 bytes of the SAB.
+// SAB header layout (mirrors src/SpscRing.ts — the canonical protocol):
+//
+//   The 32-byte header is viewed as Int32Array(sab, 0, 8) — 8 lanes total.
+//   This worklet only touches the first two:
+//     lane 0: write_index (producer monotonic Int32 wrap counter)
+//     lane 1: read_index  (consumer monotonic Int32 wrap counter)
+//   The other six lanes (flow_scale Q16.16, torn_frame_counter, PLL
+//   offset/drift/status) are not used by this minimal demo and MUST NOT be
+//   touched — corrupting them would break the producer's back-pressure
+//   controller and the consumer's PLL.
+//
+//   Earlier versions of this file viewed the header as
+//   BigInt64Array(sab, 0, 2). That was wrong against the post-0.4 Int32
+//   protocol (the v0.1.x Float64RingBuffer used Int64 counters, but the
+//   schema-driven Bridge<S> uses Int32). The Int64 view collapsed lanes
+//   0+1 into a single 64-bit word and aliased the consumer's `read_index`
+//   updates onto lanes 2+3 (flow_scale + torn_frame), corrupting them
+//   silently. Fixed at 0.9.3.
+//
+// Consumer protocol (mirrors src/SpscRing.ts):
+//   - indices : Int32Array view over the first 32 bytes of the SAB.
 //   - umbrella views: one per element-size family present in the schema.
 //     For physicsControlFrameSchema(n) we need:
 //       u64View : BigUint64Array (for seq + tMacroNs)
 //       f64View : Float64Array   (for vMax + jMax + vEff + jEff)
 //   - On each process() call:
-//       writeIdx = Atomics.load(indices, 0)   // acquire
+//       writeIdx = Atomics.load(indices, 0)   // acquire, Int32 lane 0
 //       if (writeIdx === readIdx) → empty; hold last-known-good.
-//       newestIdx = writeIdx - 1
-//       slot = Number(newestIdx & mask)
+//       newestIdx = (writeIdx - 1) | 0        // Int32 wrap subtract
+//       slot = newestIdx & mask
 //       read fields at slot * stride + elemOffset per layout
-//       Atomics.store(indices, 1, writeIdx)   // release (consume up to writeIdx)
-//       Atomics.notify(indices, 1, 1)         // wake any producer parked
+//       Atomics.store(indices, 1, writeIdx)   // release, Int32 lane 1
+//       Atomics.notify(indices, 1, 1)         // wake any parked producer
 //
 // No torn-frame re-check needed — the producer push contract guarantees the
 // slot the consumer reads is not being written.
+
+const RING_HEADER_INT32_LANES = 8; // mirror of src/SpscRing.ts constant
 
 class BridgeConsumer extends AudioWorkletProcessor {
   constructor(options) {
@@ -34,11 +55,11 @@ class BridgeConsumer extends AudioWorkletProcessor {
     const { sab, capacity, n, layout } = options.processorOptions;
     this.n = n;
     this.capacity = capacity;
-    this.mask = BigInt(capacity - 1);
+    this.mask = capacity - 1; // Number, not BigInt — Int32 protocol.
 
     // Reconstruct umbrella views from the layout description.
     const payloadElems8 = (capacity * layout.frameByteSize) / 8;
-    this.indices = new BigInt64Array(sab, 0, 2);
+    this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
     this.u64View = new BigUint64Array(sab, layout.headerBytes, payloadElems8);
     this.f64View = new Float64Array(sab, layout.headerBytes, payloadElems8);
 
@@ -70,12 +91,12 @@ class BridgeConsumer extends AudioWorkletProcessor {
 
   // pullLatest, inlined and bare. Returns frames-skipped, or -1 if empty.
   pullLatest() {
-    const readIdx = this.indices[1];          // single-consumer; plain read
-    const writeIdx = Atomics.load(this.indices, 0); // acquire
+    const readIdx = this.indices[1];          // single-consumer; plain read, Int32 lane 1
+    const writeIdx = Atomics.load(this.indices, 0); // acquire, Int32 lane 0
     if (writeIdx === readIdx) return -1;
-    const newestIdx = writeIdx - 1n;
-    const skipped = Number(newestIdx - readIdx);
-    const slot = Number(newestIdx & this.mask);
+    const newestIdx = (writeIdx - 1) | 0;     // Int32 wrap arithmetic
+    const skipped = (newestIdx - readIdx) | 0;
+    const slot = newestIdx & this.mask;
     const base = slot * this.stride8;
     this.lastSeq = this.u64View[base + this.seqElemOff];
     // Skip tMacroNs/vMax/jMax in this minimal demo — we don't surface them here.
@@ -83,7 +104,7 @@ class BridgeConsumer extends AudioWorkletProcessor {
     const jEffElemOff = this.jEffByteOff / 8;
     for (let i = 0; i < this.n; i++) this.vEff[i] = this.f64View[base + vEffElemOff + i];
     for (let i = 0; i < this.n; i++) this.jEff[i] = this.f64View[base + jEffElemOff + i];
-    Atomics.store(this.indices, 1, writeIdx); // release: consume up to writeIdx
+    Atomics.store(this.indices, 1, writeIdx); // release: consume up to writeIdx, Int32 lane 1
     Atomics.notify(this.indices, 1, 1);
     return skipped;
   }
