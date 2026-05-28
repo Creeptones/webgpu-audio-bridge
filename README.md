@@ -39,36 +39,41 @@ The solution is to **stop trying to run audio rate on the GPU**. Instead:
 
 `mapAsync`'s 5–15 ms latency is fine at 60 Hz (16.6 ms cadence). It is fatal at 48 kHz. This library makes the difference concrete.
 
-### Two transport tiers (0.7.0)
+### Two transport tiers — Turbo (shipped) and Standard (reserved at 0.8.0)
 
-The library provides **Turbo mode** (SAB + Atomics, sub-microsecond push/pull) as the default — that's `Bridge<S>` and everything documented below. Turbo mode requires cross-origin isolation, which is a one-time deployment setup (see [Enabling Turbo mode](#enabling-turbo-mode)). The 0.6.x cohort's entire feature surface — `BridgeGPUSource`, `BridgeInputLane`, smoothers, PLL, evaluator, invariant classifier — lives on Turbo mode.
+The 0.7.0 release was a **framing pivot**, not a feature ship: it introduced the two-tier transport-name model that this section describes. As of the 0.9.x soak cohort, only one tier has actually shipped — Turbo mode. Standard mode is the deliberate second-tier sibling, reserved for the 0.8.0 minor bump, and has not landed yet.
 
-**Standard mode** (`MessageChannelBridge<S>`, reserved at 0.8.0) is a deliberate second tier with the **same schema DSL surface** and a **MessageChannel + transferable ArrayBuffer** transport. Measured 5–50 ms latency vs Turbo's sub-µs. Right for: prototyping before you've configured COOP/COEP, control-plane updates in unisolated embeds, telemetry channels, non-audio-critical paths. **NOT for audio rate.** See [Browser support matrix](#browser-support-matrix) for what works in each tier.
+**Turbo mode** (shipped — `Bridge<S>`) — SAB + Atomics, sub-microsecond push/pull. The default and only transport this library currently offers. Requires cross-origin isolation, which is a one-time deployment setup (see [Enabling Turbo mode](#enabling-turbo-mode)). The entire 0.6.x–0.9.x feature surface documented below — `BridgeGPUSource`, `BridgeInputLane`, smoothers, PLL, trajectory evaluator, invariant classifier — lives on Turbo mode.
 
-The library will **never** auto-detect the environment and silently pick a transport for you. The user picks `Bridge<S>` (Turbo) or `MessageChannelBridge<S>` (Standard) at construction — explicit choice, documented trade-offs, no transparent fallback.
+**Standard mode** (reserved at 0.8.0 — `MessageChannelBridge<S>`) — same schema DSL surface, **MessageChannel + transferable ArrayBuffer** transport, target latency floor 5–50 ms vs Turbo's sub-µs. Right for: prototyping before you've configured COOP/COEP, control-plane updates in unisolated embeds, telemetry channels, non-audio-critical paths. **Not for audio rate.** The 0.8.0 slot is reserved in [`ROADMAP.md`](./ROADMAP.md); timing is open. See [Browser support matrix](#browser-support-matrix) for what works in each tier once Standard ships.
+
+The library will **never** auto-detect the environment and silently pick a transport for you. The user picks `Bridge<S>` (Turbo) or — once it ships — `MessageChannelBridge<S>` (Standard) at construction. Explicit choice, documented trade-offs, no transparent fallback.
 
 ## Browser support matrix
 
-| Capability | Chrome ≥ 113 | Firefox ≥ 113 | Safari ≥ 16.4 | iOS Safari ≥ 16.4 |
+| Capability | Chrome / Edge ≥ 113 | Firefox | Safari (macOS / iPadOS / visionOS) | iOS Safari |
 |---|---|---|---|---|
 | `crossOriginIsolated` | ✅ with COOP/COEP | ✅ with COOP/COEP | ✅ with COOP/COEP | ✅ with COOP/COEP |
 | `SharedArrayBuffer` | ✅ (isolated only) | ✅ (isolated only) | ✅ (isolated only) | ✅ (isolated only) |
 | `Atomics.wait` | ✅ worker only | ✅ worker only | ✅ worker only | ✅ worker only |
 | `Atomics.waitAsync` | ✅ | ⚠️ flagged | ❌ | ❌ |
 | `AudioWorklet` | ✅ | ✅ | ✅ | ✅ |
-| `WebGPU` | ✅ | ⚠️ Nightly behind `dom.webgpu.enabled` | ✅ 18.0+ (16.4–17.x: Technology Preview) | ✅ 18.0+ |
+| `WebGPU` | ✅ (Android: ≥ 148) | ✅ 141+ Windows, ✅ 145+ macOS Apple Silicon (Tahoe 26+) — Linux/Android pending | ✅ Safari 26.0+ (macOS Tahoe 26 / visionOS 26) | ✅ iOS 26.0+ / iPadOS 26.0+ |
 | WebMIDI | ✅ | ✅ 108+ | ❌ | ❌ |
 | **Turbo mode** (`Bridge<S>`) | ✅ | ✅ | ✅ | ✅ |
-| **Standard mode** (`MessageChannelBridge<S>`, 0.8.x) | ✅ | ✅ | ✅ | ✅ |
+| **Standard mode** (`MessageChannelBridge<S>`, reserved at 0.8.0 — not shipped) | ✅ | ✅ | ✅ | ✅ |
 | Browser smoke (Playwright) | ✅ tested in CI | ✅ tested in CI | ✅ tested in CI | — (mobile not in CI matrix) |
 
 Notes:
 
+- **WebGPU is Baseline as of January 2026** across Chrome / Edge / Firefox-on-Windows-or-Apple-Silicon / Safari 26 (macOS Tahoe 26, iOS 26, iPadOS 26, visionOS 26). The library's Turbo-mode core only needs `SharedArrayBuffer` + `Atomics` + `AudioWorklet` and works wherever those are available; **the `BridgeGPUSource` helper specifically** is gated on WebGPU availability and so inherits the WebGPU rollout above.
 - **`Atomics.wait` is worker-only by spec** — never callable from the main thread or the AudioWorklet's `process()`. The library's `waitForData` / `waitForSpace` enforce this; AudioWorklet consumers poll via `pullLatest` and tolerate misses.
-- **WebGPU on Firefox** has been available behind `dom.webgpu.enabled` in Nightly through 2024–2026; stable rollout tracking [bug 1262052](https://bugzilla.mozilla.org/show_bug.cgi?id=1262052). The library has a CPU fallback in `examples/minimal/worker.js` for compute paths that need to degrade gracefully.
+- **WebGPU on Firefox Linux/Android** is still landing as of mid-2026; tracking [bug 1262052](https://bugzilla.mozilla.org/show_bug.cgi?id=1262052). The library has a CPU fallback in `examples/minimal/worker.js` for compute paths that need to degrade gracefully on still-unsupported Firefox platforms.
 - **WebMIDI on Safari** is not supported; the fast-lane pattern works without WebMIDI (pointer + keyboard suffice — see `examples/fast-lane/`).
-- **Standard mode** has no `Atomics` dependency and so does not require cross-origin isolation. The latency floor is ~5–50 ms (measured baseline in 0.8.3).
+- **Standard mode is reserved at 0.8.0 and has not shipped.** The row above describes the *target* compatibility for when it does ship — `MessageChannel` is universally supported, so Standard mode will work in any browser that has `AudioWorklet`. It has no `Atomics` dependency and will not require cross-origin isolation. Target latency floor is ~5–50 ms once shipped. Until then, the only transport this library offers is Turbo (`Bridge<S>`).
 - **Browser smoke matrix (0.9.33)**: `.github/workflows/browser.yml` runs `tests/browser/*.spec.ts` (the minimal-demo smoke + the e2e-latency CPU-mode bench) across Chromium, Firefox, and WebKit on every push + PR to `main`. The matrix gates merges — `continue-on-error` is off; a regression in any engine fails CI. Each engine's report uploads as `playwright-report-<browser>` on failure. The specs use a CPU fallback (no WebGPU dependency) so they're portable across all three Playwright-bundled engines on Linux.
+
+This matrix was last verified on 2026-05-27 against [caniuse/webgpu](https://caniuse.com/webgpu), the [WebKit Features in Safari 26.0](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/) post, and Firefox Windows/macOS shipping milestones in 141 / 145. Check current state at deployment time — the WebGPU landscape has been moving quickly.
 
 ## The macro/micro pattern
 

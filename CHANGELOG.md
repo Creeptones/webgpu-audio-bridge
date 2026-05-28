@@ -4,6 +4,110 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.36] — 2026-05-27
+
+### Added — Audit-response hygiene patch (0.9.x soak)
+
+Documentation-only patch responding to a third-party LLM audit that
+flagged three real concerns: a stale `CITATION.cff` version field, a
+browser-support matrix that hadn't tracked WebGPU's stable rollout into
+Firefox and Safari, and a "Two transport tiers (0.7.0)" section
+heading that conflated the 0.7.0 framing-pivot release with the 0.8.0
+reserved Standard-mode ship date. None of the runtime surface changes;
+this is the first patch in a doc-hygiene mini-cohort surfaced as
+tasks #1, #5, #9 in the audit-response task list.
+
+#### `CITATION.cff` version reconciliation
+
+`version` was pinned at `0.7.0` with `date-released: 2026-05-26` — both
+stale by ~30 patches. A skim auditor reading the file alongside the
+ROADMAP (which references `0.9.31` / `0.9.32` / `0.9.33` / `0.9.35`)
+naturally concludes the project's release artifact story is incoherent.
+The field now reads `0.9.36` / `2026-05-27`, matching `package.json`.
+Two `"TBD"`-DOI entries for v0.3.0 and v0.7.0 (which never landed at
+Zenodo) were removed; the file now lists only the concept DOI plus the
+two confirmed v0.1.x version DOIs.
+
+#### Browser-support matrix refresh
+
+WebGPU became Baseline in January 2026 — the README still described
+Firefox as "Nightly behind `dom.webgpu.enabled`" and Safari as "18.0+ /
+16.4–17.x Technology Preview", both stale. The matrix now reflects the
+actual rollout:
+
+- **Chrome / Edge** — stable since 113; **Android since Chrome 148**.
+- **Firefox 141+** — stable on Windows.
+- **Firefox 145+** — stable on macOS Apple Silicon (macOS Tahoe 26+).
+- **Firefox Linux / Android** — still landing; CPU fallback remains
+  the documented path for now.
+- **Safari 26.0+** — stable on macOS Tahoe 26, iOS 26, iPadOS 26,
+  visionOS 26.
+
+The matrix also gained a "last verified" date and a citation footnote
+pointing at [caniuse/webgpu](https://caniuse.com/webgpu) + the
+[WebKit Features in Safari 26.0](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/)
+post so the next refresh has a starting cite. The note row for
+Standard mode was rewritten to make it unambiguous that it's the
+**target** compatibility for a not-yet-shipped tier.
+
+#### Transport-tier narrative untangling
+
+The README's `### Two transport tiers (0.7.0)` heading was the
+loudest source of "is Standard mode shipped or not?" confusion: the
+parenthetical `(0.7.0)` reads as "shipped at 0.7.0", but the body
+text said Standard was "reserved at 0.8.0". Rewritten as:
+
+> Two transport tiers — Turbo (shipped) and Standard (reserved at 0.8.0)
+>
+> The 0.7.0 release was a **framing pivot**, not a feature ship:
+> it introduced the two-tier transport-name model that this section
+> describes. As of the 0.9.x soak cohort, only one tier has actually
+> shipped — Turbo mode. Standard mode is the deliberate second-tier
+> sibling, reserved for the 0.8.0 minor bump, and has not landed yet.
+
+The package.json `description` field carried the same ambiguity (it
+read "Standard mode (MessageChannel, 5-50ms — 0.8.x)") and was
+rewritten to explicitly say "is reserved for 0.8.0".
+
+### Why
+
+The 0.9.x soak is in the deliberate "polish toward 1.0" phase — the
+20% of work that buys 80% of perceived maturity. LLM-driven audits of
+the repo will keep happening, and each one represents a real evaluator
+forming an "adopt or avoid" opinion in minutes. The three flagged
+issues are all artifacts that an evaluator hits in the first 30
+seconds of skimming. Fixing them is cheap; the cost of leaving them is
+that the project keeps getting downgraded on hygiene rather than
+substance.
+
+This patch is the cheap-fix component of a broader audit-response
+plan (12 tasks total — see the in-flight task list). The other nine
+are larger doc reshapes that land in subsequent 0.9.3x patches.
+
+### Wire compatibility
+
+None affected. Documentation, version metadata, and `package.json`
+description-string changes only. No SAB protocol change, no schema
+DSL change, no public-API change.
+
+### Tests
+
+22 Node suites green. `npm run typecheck` clean. `npm run bench` push
+/ pull / pullLatest median sanity-check against the 0.6.x baseline
+(~1.20 μs at N=1000) unchanged. No new pins required — this patch
+adds zero runtime surface.
+
+### Documentation
+
+- `README.md` — `Browser support matrix` table + notes rewritten;
+  `Two transport tiers (0.7.0)` heading + paragraph rewritten.
+- `CITATION.cff` — `version` / `date-released` bumped; stale TBD DOI
+  identifiers removed.
+- `package.json` — `description` rewritten to remove the 0.7.0/0.8.x
+  conflation; `version` bumped to 0.9.36.
+- `CHANGELOG.md` — this entry.
+- `ROADMAP.md` — 0.9.36 row added to the cohort table.
+
 ## [0.9.35] — 2026-05-27
 
 ### Added — `BridgeConsumer.telemetry()` symmetry with `Bridge<S>.telemetry()` (0.9.x soak)

@@ -8,19 +8,13 @@ authors:
 repository-code: "https://github.com/Creeptones/webgpu-audio-bridge"
 url: "https://github.com/Creeptones/webgpu-audio-bridge"
 doi: "10.5281/zenodo.20380886"
-version: "0.7.0"
-date-released: "2026-05-26"
+version: "0.9.36"
+date-released: "2026-05-27"
 license: MIT
 identifiers:
   - type: doi
     value: "10.5281/zenodo.20380886"
     description: "Concept DOI — resolves to the latest release."
-  - type: doi
-    value: "TBD"
-    description: "Version DOI — v0.7.0 specifically (assigned at Zenodo deposit time; the framing-pivot release that introduces the two-tier transport model)."
-  - type: doi
-    value: "TBD"
-    description: "Version DOI — v0.3.0 specifically (assigned at Zenodo deposit time)."
   - type: doi
     value: "10.5281/zenodo.20382407"
     description: "Version DOI — v0.1.1 specifically."
