@@ -67,6 +67,7 @@ stability promise.
 | 0.9.36 | ✅ shipped | Audit-response hygiene patch — `CITATION.cff` `version` field reconciled (`0.7.0` → `0.9.36`; stale `"TBD"`-DOI entries trimmed), README §Browser support matrix refreshed for WebGPU Baseline (Firefox 141+ Windows / 145+ macOS Apple Silicon, Safari 26+ macOS Tahoe / iOS 26 / iPadOS 26 / visionOS 26, Chrome Android 148+), and `### Two transport tiers (0.7.0)` heading + paragraph rewritten so the 0.7.0 framing-pivot release is not confused with the 0.8.0 reserved Standard-mode ship date. `package.json` `description` updated to match. First patch in the audit-response mini-cohort (tasks #1, #5, #9 in the in-flight task list). Wire-equivalent; documentation only. |
 | 0.9.37 | ✅ shipped | Audit-response README readability patch — three new front-loaded README subsections that make the project's shape readable on a 30-second skim: `### Status & maturity` (version + tests + distribution + release-artifact policy + maintainership) under the title block; `### Is this the right tool for your problem?` (8-row decision table pointing TOWARD or AWAY from this library, with linked alternatives for each AWAY case) in `## The problem this solves`; and `### Overload policy: freshness over completeness` in `## BridgeGPUSource` naming the drop-on-full design choice + alternatives explicitly. The existing `### Overflow policies (0.6.12)` section gains a cross-link blockquote. Lands tasks #2 (release-artifact policy doc note in lieu of back-tagging missing GitHub releases), #3, #4, #6 from the audit-response task list. Wire-equivalent; documentation only. |
 | 0.9.38 | ✅ shipped | Audit-response maintenance & operational status patch — new `## Maintenance & operational status` README section between Prior art and Acknowledgments, addressing the audit's bus-factor concern head-on. Five subsections: **Bus factor** (named openly as 1; no organization backing); **Scope discipline** (six bulleted non-goals: synthesis engine / scheduling layer / audio-graph / auto-detection / general IPC / WebGPU framework, with cross-links to alternatives); **Hand-off readiness** (six artifacts that make forking survivable: header comments, 22 test suites, concurrent SPSC stress, cross-engine CI, bench budget, zero deps, MIT); **What "abandoned" actually looks like** (honest failure-mode walkthrough — npm/Zenodo versions keep working, browser matrix drifts first, CVE-class bugs are the real risk); **Contributing** (test-pin / wire-compat-note / bench-gate / versioning-policy bar for landing changes). Title-page Status & maturity bullet shrinks to a one-liner pointing at the new section. Lands task #10 from the audit-response task list. Wire-equivalent; documentation only. |
+| 0.9.39 | ✅ shipped | Audit-response Standard mode (`MessageChannelBridge<S>`) design note — new `docs/standard-mode-design.md` (~500 lines) covering the audit's "ship Standard mode" recommendation as **design analysis, not implementation**. Walks the decision space across three independent axes (API shape: full parity vs transport-only vs separate-name adapter; versioning slot: retro-fill 0.8.0 vs 0.10.0 vs 0.9.x patch — note recommends 0.10.0; MVP scope: minimal vs control-plane-complete vs full transport parity) with pro/con tables, LOC + effort estimates, decision criteria, and explicit ship / don't-ship next-steps playbooks. **Recommendation**: shape (b) transport-only parity at MVP1 scope, versioned as 0.10.0. Existing ROADMAP "Reserved slot — 0.8.0" subsection rewritten with a status callout linking the new doc. README's transport-tier section updated to link the design note. Lands task #11 from the audit-response task list. Wire-equivalent; documentation only. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
@@ -81,17 +82,32 @@ they landed first as the smallest 0.8.x patches still queued. 0.9.0 is
 the minor-bump anchor for the breaking cut; the slimmer surface is the
 substrate for the 0.9.x soak.
 
-## Reserved slot — 0.8.0 (MessageChannelBridge)
+## Reserved slot — Standard mode (`MessageChannelBridge<S>`)
 
-0.8.0 is reserved for `MessageChannelBridge<S>` — the **Standard
-mode** sibling to Turbo. Same schema DSL, same frame API, transport
-swapped to `MessageChannel` + transferable `ArrayBuffer`. Latency
-floor 5–50 ms (measured). Right for prototyping before COOP/COEP is
-configured, control-plane updates in unisolated embeds, telemetry
-channels, anything non-audio-critical. **Not for audio rate.**
+> **Status (2026-05-27, 0.9.39):** the "reserved at 0.8.0" framing is
+> now historically odd — the project shipped past 0.8.0 in name (no
+> npm 0.8.0 release exists; the cohort jumped from 0.7.17 to 0.8.1).
+> A full design note now lives at
+> [`docs/standard-mode-design.md`](./docs/standard-mode-design.md);
+> the design space covers API shape, versioning slot, MVP scope, and
+> implementation cost. **Decision pending.** Either ship the slot at
+> 0.10.0 (the design note's recommendation) or formally retire it
+> with a dated deferral. Adopters who want Standard mode built can
+> add a voice to the GitHub issue tracker.
 
-The minor-bump anchor that ships whenever the wire-format change is
-ready. Timing is flexible relative to 0.8.6–0.8.9.
+Standard mode is the **Turbo sibling** for environments where
+cross-origin isolation can't be deployed. Same schema DSL, same
+`Bridge`-style frame API surface, transport swapped from
+`SharedArrayBuffer` + `Atomics` to `MessageChannel` + transferable
+`ArrayBuffer`. Latency floor 5–50 ms (measured baseline in the
+0.8.3 design work — see `bench/notify-cost-browser/`). Right for
+prototyping before COOP/COEP is configured, control-plane updates
+in unisolated embeds, telemetry channels, anything
+non-audio-critical. **Not for audio rate.**
+
+The minor-bump anchor that ships whenever the design note's
+"Recommendation" or "Alternative recommendation" path is chosen.
+Timing is flexible.
 
 ## Beyond the cohort (speculative, `0.9.32+`)
 

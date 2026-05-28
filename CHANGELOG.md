@@ -4,6 +4,128 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.39] — 2026-05-27
+
+### Added — Standard mode (`MessageChannelBridge<S>`) design note (0.9.x soak)
+
+Fourth patch in the audit-response mini-cohort. Documentation-only;
+zero runtime surface change. Lands task #11 from the in-flight
+audit-response task list as a **design note**, not an implementation.
+
+#### New `docs/standard-mode-design.md`
+
+Substantial design analysis (~5-7 pages) covering the audit's
+"ship Standard mode" recommendation. Walks the decision space
+across three independent axes:
+
+1. **API shape**: full feature parity (shape a) / transport-only
+   parity (shape b) / separate-name adapter (shape c). Each option
+   gets a pro/con table and an LOC/effort estimate.
+
+2. **Versioning slot**: retroactively fill 0.8.0 / ship as 0.10.0 /
+   ship as a 0.9.x patch. The 0.8.0 reservation in ROADMAP turned
+   out to be historically odd — the cohort jumped from 0.7.17 to
+   0.8.1 with no 0.8.0 release ever on npm — and the note
+   recommends retiring the reserved slot in favour of 0.10.0.
+
+3. **MVP scope**: MVP1 (push/pull/scratchFrame only) vs MVP2
+   (adds pullLatest + policies + telemetry) vs Full transport
+   parity. Each scoped with concrete LOC + effort estimates for
+   a single-maintainer project.
+
+The note ends with:
+
+- **Concrete implementation cost** (file list with LOC estimates;
+  ~1180 LOC total for shape (b) MVP1 ship).
+- **Decision criteria** the maintainer should answer before
+  committing (real adopter vs speculative; willingness to
+  maintain two transports; 1.0 stability promise scope).
+- **Recommendation**: shape (b) "transport-only parity" at MVP1
+  scope, versioned as 0.10.0.
+- **Alternative recommendation** for "don't ship": dated honest
+  deferral notice in ROADMAP, leave environment-helper scaffolding
+  in place.
+- **Explicit non-goals** (not audio rate, not Turbo replacement,
+  not auto-detection, not a port of every Bridge feature).
+- **Open questions** (main entry vs subpath, BridgeBlockProducer
+  interaction, scratch-frame vs per-call ArrayBuffer allocation,
+  CI test placement).
+- **Next-steps playbook** for both the ship and don't-ship paths.
+
+The note's framing: this is options + recommendation, decision
+deferred to the maintainer. The deliverable is the analysis, not a
+commit to ship. The worst outcome is shipping Standard mode
+under-baked because an auditor said to; the second-worst is leaving
+the ROADMAP's reserved-slot promise dangling indefinitely. Either
+path is honest if chosen deliberately.
+
+#### `ROADMAP.md` reserved-slot subsection rewritten
+
+The "Reserved slot — 0.8.0 (MessageChannelBridge)" subsection at
+line 81 was outdated: it framed Standard mode as "the minor-bump
+anchor that ships whenever ready" without acknowledging that the
+0.8.0 slot is now historically odd. Rewritten as "Reserved slot —
+Standard mode (`MessageChannelBridge<S>`)" with a callout
+referencing the new design note and the slot's decision-pending
+status. Adopters who want Standard mode built are invited to add
+their voice to the GitHub issue tracker.
+
+#### `README.md` transport-tier paragraph updated
+
+The "Standard mode (reserved at 0.8.0 — `MessageChannelBridge<S>`)"
+paragraph in the `### Two transport tiers` section now links to
+the design note alongside the ROADMAP reference. Adopters reading
+the README's transport-tier section can follow the link to the
+full analysis without needing to dig through commit history.
+
+### Why
+
+The audit's "ship Standard mode" recommendation was real — the
+COOP/COEP burden does filter out a nontrivial chunk of potential
+adopters. But "ship Standard mode" is three independent decisions
+(API shape, versioning slot, scope cut) with multiplicative cost
+differences, and the wrong combination would land somewhere
+between "double the maintenance burden" and "fork the project's
+release line in half." A design note that lays out the trade-offs
+and recommends a concrete path is the right first deliverable,
+not a hasty implementation that has to be walked back later.
+
+The design note is also a forward-looking artifact: if the
+maintainer chooses to ship at any point in the next year, the note
+serves as the implementation spec; if they choose not to, the note
+explains the deferral honestly. Either way it removes the
+"unspecified future ship" ambiguity that the audit flagged.
+
+### Wire compatibility
+
+None affected. Documentation only — new design-note file +
+README/ROADMAP prose updates. No SAB protocol change, no schema
+DSL change, no public-API change.
+
+### Tests
+
+22 Node suites green. `npm run typecheck` clean. `npm run bench`
+within all documented budgets. The `tests/readme-imports.test.ts`
+drift gate still holds — none of the README import blocks were
+touched.
+
+### Documentation
+
+- `docs/standard-mode-design.md` — **new file**, ~500 lines.
+  Design space analysis with options, recommendation, decision
+  criteria, implementation cost estimate, non-goals, open
+  questions, next-steps playbook.
+- `ROADMAP.md` — `Reserved slot — 0.8.0 (MessageChannelBridge)`
+  subsection rewritten as `Reserved slot — Standard mode
+  (MessageChannelBridge<S>)` with a status callout linking the
+  design note. New 0.9.39 row in the cohort table.
+- `README.md` — Standard-mode paragraph in `### Two transport
+  tiers` updated to link the design note alongside the ROADMAP
+  reference.
+- `CITATION.cff` — `version` bumped to 0.9.39.
+- `package.json` — `version` bumped to 0.9.39.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.38] — 2026-05-27
 
 ### Added — Maintenance & operational status section (0.9.x soak)
