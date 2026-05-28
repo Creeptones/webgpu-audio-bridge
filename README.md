@@ -6,6 +6,14 @@
 
 > Schema-driven lock-free SPSC SharedArrayBuffer ring for streaming structured frames from a Web Worker (typically WebGPU compute) into an AudioWorklet — the control-rate / audio-rate bridge pattern.
 
+### Status & maturity
+
+- **Version**: 0.9.37 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
+- **Tests**: 22 Node suites green on every push (schema / Bridge core / smoother / invariant / PLL / trajectory / backpressure / observability / facades / properties / recovery / WASM-equivalence / concurrent SPSC stress / typecheck-deprecations / readme-imports / and more). **Cross-engine browser CI**: Playwright runs the minimal-demo smoke + e2e-latency CPU-mode bench against Chromium, Firefox, and WebKit on every push and PR to `main` — `.github/workflows/browser.yml` gates merges (`continue-on-error` is off).
+- **Distribution**: [`webgpu-audio-bridge` on npm](https://www.npmjs.com/package/webgpu-audio-bridge); concept [DOI 10.5281/zenodo.20380886](https://doi.org/10.5281/zenodo.20380886) on Zenodo resolves to the latest release. MIT license. **Zero runtime dependencies.** Engines: Node ≥ 18 for the build / test toolchain; the published library itself is ESM with TypeScript types and runs anywhere `SharedArrayBuffer` + `Atomics` + `AudioWorklet` are available.
+- **Release artifacts**: per-patch history lives in [`CHANGELOG.md`](./CHANGELOG.md) (every patch has its own entry with rationale + wire-compat notes + test deltas). The GitHub Releases tab is intentionally sparse — only the v0.1.x foundation releases are tagged there; subsequent versions ship via npm + Zenodo. Cite the concept DOI or a specific version via the [`CITATION.cff`](./CITATION.cff) at the repo root.
+- **Maintainership**: single primary maintainer; contributions welcome at the [GitHub issues tracker](https://github.com/Creeptones/webgpu-audio-bridge/issues). The library is feature-frozen at the SAB+Atomics core — most polish work is documentation, test coverage, and bench-publication, not architectural drift. Every public method has a header comment block documenting invariants; 22 test suites pin behavior; MIT license + zero runtime deps means forking is one `git clone` away.
+
 ```
                 ┌──────────────────────────┐
                 │  DedicatedWorker         │
@@ -38,6 +46,23 @@ The solution is to **stop trying to run audio rate on the GPU**. Instead:
 - A **lock-free SharedArrayBuffer ring** bridges the two, using `Atomics` release/acquire semantics. The audio worklet pulls the freshest macro frame each quantum and reads it without ever blocking.
 
 `mapAsync`'s 5–15 ms latency is fine at 60 Hz (16.6 ms cadence). It is fatal at 48 kHz. This library makes the difference concrete.
+
+### Is this the right tool for your problem?
+
+The library is intentionally **a control-rate-to-audio-rate bridge**, not a synthesizer, not a DSP framework, and not a full audio engine. It exists to move structured frames from a non-realtime producer (GPU compute, worker, main thread, WebMIDI, network) into an `AudioWorklet` with sub-microsecond overhead. Decide first whether that matches your problem, before reading further:
+
+| If you need … | Use … |
+|---|---|
+| **A schema-typed control bus from GPU/worker compute into an AudioWorklet**, where producer state evolves at control rate (~60 Hz) and the audio thread reads the freshest frame per quantum | **This library.** `Bridge<S>` + `BridgeGPUSource` is exactly that shape. |
+| **A raw SPSC ring buffer over SharedArrayBuffer** for moving samples or untyped Float32 blocks into an AudioWorklet, without a schema layer | [`padenot/ringbuf.js`](https://github.com/padenot/ringbuf.js). Lower-level than this library and the direct precedent we cite in `CITATION.cff`. If your data is "a stream of f32 samples" and you don't need a typed-frame layer, ringbuf.js is the simpler fit. |
+| **Custom DSP** — oscillators, filters, physical modeling, effects, neural inference at audio rate | Keep the DSP in the AudioWorklet itself. Compile from C/C++ via [Emscripten Wasm Audio Worklets](https://emscripten.org/docs/api_reference/wasm_audio_worklets.html), or from a DSP language via [Faust / FaustWasm](https://faustdoc.grame.fr/). This library doesn't do DSP; it moves control state into the thread that does. |
+| **Musical scheduling, instruments, effects composition** (sequencing notes, building a chord progression, wiring effect chains as a graph) | [`Tone.js`](https://tonejs.github.io/). Much higher-level than this library; not a competitor. You'd use Tone.js for the musical layer and (optionally) this library underneath if you want a GPU-computed parameter bus driving Tone instruments. |
+| **AudioParam automation** — envelopes, LFOs, parameter ramps, modulation curves expressible as native Web Audio nodes | The native [Web Audio API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API). If your "GPU control data" reduces to k-rate parameter values, the platform already has the right abstraction (`AudioParam.linearRampToValueAtTime`, `setValueCurveAtTime`, etc.) and you don't need shared memory at all. |
+| **Pro-audio tracking latency** (<5 ms input-to-audible, monitor-through-effect for live recording) | Not this library on the GPU path — `mapAsync` is a 5–15 ms hardware/driver floor and the browser audio output buffer is 5–8 ms on top of that. The library's [fast-lane pattern](#achieving-pro-audio-tracking-latency) carves *gestural input* off the GPU path onto a dedicated input bridge and reaches ~3–6 ms input-to-audible, but the GPU readback itself cannot beat `mapAsync`. |
+| **Direct GPU → audio synthesis** (compute-shader-generated PCM samples played back as audio) | Generally not viable in browsers today — `mapAsync`'s 5–15 ms cost is 2–6 audio render quanta, which is fatal for sample-accurate playback. The [WebGPU `mappedAtCreation` zero-copy proposal](https://github.com/gpuweb/gpuweb/issues/4432) would change this if/when it lands. Until then, the macro/micro split this library encodes (GPU at control rate, CPU at audio rate) is the path that actually works. |
+| **The broadest possible deployment with the least operational complexity** | Turbo-mode `Bridge<S>` requires cross-origin isolation (COOP + COEP headers). If you can't set those headers — e.g. inside a third-party embed that needs to load arbitrary cross-origin resources — Turbo mode won't work. Wait for Standard mode (reserved at 0.8.0; MessageChannel transport, no COOP/COEP required) or use a non-SAB approach like raw `postMessage` for now. |
+
+If a row above pulls you AWAY from this library, take it seriously — most projects don't need a GPU-compute control bus. If multiple rows pull you TOWARD it, the rest of this README documents how. The [§BridgeGPUSource](#bridgegpusource) section is the canonical first read for the GPU → AudioWorklet path; [§Achieving pro-audio tracking latency](#achieving-pro-audio-tracking-latency) covers the input-side fast-lane pattern.
 
 ### Two transport tiers — Turbo (shipped) and Standard (reserved at 0.8.0)
 
@@ -822,6 +847,26 @@ What this means in practice — where 0.6.18 lands the GPU → audio stack:
 
 The underlying truth: **`mapAsync`'s cost is now a fixed pipeline depth, not a variable serialization tax that compounds under load.** That moves the system from "**inconsistent 30-50 ms with stalls**" to "**consistent ~20 ms**" — a real and useful improvement, but the 5-15 ms `mapAsync` floor itself is a hardware/driver limit we can't optimize away.
 
+### Overload policy: freshness over completeness
+
+`BridgeGPUSource` is a **freshness-first** helper, not a lossless transport. When the bridge is full at `pollCompleted()` time — the consumer hasn't kept up — the helper **drops the decoded frame** (the slot recycles, `droppedCount()` ticks) and returns to the idle pool for the next dispatch. The newest frame the producer wanted to publish is gone; the next dispatch produces a fresher one.
+
+This is a deliberate design choice, not a missing feature. The alternatives — and why we don't take them:
+
+| Alternative on overload | What it costs | Why we don't do it |
+|---|---|---|
+| **Block the producer** until the consumer drains | Stalls the GPU side; the next compute dispatch is delayed by the consumer's drain time; throughput collapses under sustained pressure. Defeats the staging-buffer ring's whole point (decoupling producer cadence from `mapAsync` cost). | Wrong tradeoff for a control bus. The consumer doesn't actually want the *oldest* still-undelivered frame; it wants the *freshest* one. Delivering stale frames at the cost of producer throughput is a worse outcome than dropping them. |
+| **Queue the overflow** in heap memory until the bridge drains | Unbounded heap growth under sustained backpressure; loses the SPSC ring's zero-alloc steady-state guarantee. | Wrong shape for an audio-thread consumer. The audio thread pulls one frame per quantum and discards the rest — queueing makes the producer pay memory for frames the consumer will never read. |
+| **Crash / throw on overflow** | Maximally informative, but turns transient consumer-side jitter into a fatal app-level error. | Wrong reliability profile for a real-time audio system. Transient pressure (a single slow `mapAsync`, a GC pause on the audio thread) shouldn't take the whole bridge down. |
+
+The drop policy says: **for a control bus where the consumer reads the freshest frame each quantum, an older undelivered frame is just garbage in the way.** The `droppedCount()` counter surfaces drops as observable signal so a dashboard or telemetry overlay can flag sustained overload (vs transient).
+
+**If your use case demands lossless delivery** — every frame matters, dropping any of them is a correctness violation — `BridgeGPUSource` is the wrong shape. Either:
+
+1. Choose a different `policy` on the underlying `Bridge` (`'block'` for "the producer waits for the consumer", `'drop-newest'` for "keep the oldest undelivered frames", or `'reject'` for "let the producer back off explicitly"). See [§Overflow policies (0.6.12)](#overflow-policies-0612) for the full table. Note that `BridgeGPUSource`'s drop happens **before** the bridge's policy fires (the helper drops at `pollCompleted()` if the bridge is full at that moment); switching the bridge to `'block'` still doesn't make the GPU helper itself block, because the helper runs on a thread that may not be allowed to call `Atomics.wait`.
+2. Use [`BridgeBlockProducer`](#audio-rate-mode) for sample-accurate audio-rate transport (where every block matters); it pairs with a `Bridge` configured with `'block'` or `'reject'` for explicit producer backpressure.
+3. Don't use this library — see [§Is this the right tool for your problem?](#is-this-the-right-tool-for-your-problem) for alternatives.
+
 ### Lifecycle
 
 Each staging buffer goes through a 4-state cycle: `idle → scheduled → in-flight → idle` (with the buffer mapped and decoded between in-flight and idle). The three user-facing calls correspond to the state transitions:
@@ -1283,6 +1328,8 @@ Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic
 ### Overflow policies (0.6.12)
 
 0.6.12 adds a constructor option that selects what `push` does when the ring is full. With 0.5.0's soft `flowScaleHint` in front, the producer rarely overflows in practice — but the policies cover the cases where the producer cannot honor the hint at all.
+
+> **Note on `BridgeGPUSource`.** The GPU helper has its own drop-on-full step that runs **before** this `policy` fires (it drops the freshly-decoded frame at `pollCompleted()` time if the bridge is already full). That's a deliberate freshness-first choice — see [§Overload policy: freshness over completeness](#overload-policy-freshness-over-completeness) for why and when you'd want a different shape. The `policy` table below applies to direct `bridge.push(frame)` calls and to the [`BridgeBlockProducer`](#audio-rate-mode) audio-rate path; together they cover the lossless-delivery use cases the GPU helper deliberately doesn't.
 
 ```ts
 const bridge = new Bridge(sab, capacity, schema, {

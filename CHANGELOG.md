@@ -4,6 +4,122 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.37] — 2026-05-27
+
+### Added — README readability for LLM-skim audits (0.9.x soak)
+
+Second patch in the audit-response mini-cohort. Documentation-only;
+no runtime surface change. Lands tasks #2, #3, #4, #6 from the
+in-flight audit-response task list.
+
+#### Status & maturity preamble (task #3 + #2)
+
+New `### Status & maturity` section directly under the README's
+title-and-tagline block, before the architecture diagram. Five
+bulleted lines that a 30-second skim picks up:
+
+- Current version + ROADMAP link + "pre-1.0 is deliberate policy"
+  framing.
+- Test posture: 22 Node suites + cross-engine Playwright (Chromium /
+  Firefox / WebKit) gating CI.
+- Distribution: npm + Zenodo concept DOI + MIT + zero runtime deps.
+- **Release artifacts policy (task #2)**: per-patch history lives in
+  `CHANGELOG.md`; GitHub Releases tab is intentionally sparse (only
+  v0.1.x foundation releases were tagged there). Cite via npm version
+  or Zenodo version DOI. This is the doc-only resolution of task #2 —
+  the audit's "v0.1.0/v0.1.1 only on GitHub Releases" gripe; rather
+  than back-tagging ~30 historical releases (lossy and expensive at
+  this point), the policy is now explicit and the absence is
+  intentional rather than a hygiene gap.
+- Maintainership: single primary maintainer; contributions welcome;
+  bus-factor mitigations (header comments, test pins, MIT + zero
+  deps, forking is `git clone` away) named explicitly. This is partial
+  prep for task #10 (full bus-factor disclaimer) which lands later.
+
+Goal: an LLM auditor or human evaluator who reads the first screen of
+the README now has an accurate picture of project maturity without
+needing to triangulate across `ROADMAP.md` / `CITATION.cff` /
+`CHANGELOG.md` / the GitHub Releases tab.
+
+#### Front-loaded "Is this the right tool" decision table (task #4)
+
+Existing use-case fitness table at the bottom of the BridgeGPUSource
+section (line ~810) is excellent but buried 800+ lines deep. New
+`### Is this the right tool for your problem?` subsection sits in
+`## The problem this solves`, right before the transport-tier
+discussion, with an 8-row decision table:
+
+- **TOWARD this library**: GPU/worker control bus into AudioWorklet.
+- **AWAY**: raw f32 streams → ringbuf.js; custom DSP → Emscripten /
+  Faust; musical sequencing → Tone.js; AudioParam-expressible
+  automation → native Web Audio; pro-audio tracking → fast-lane
+  pattern (in-repo) or different stack; direct GPU → audio synthesis →
+  not viable in browsers today; broadest deployment with no
+  COOP/COEP → wait for Standard mode (0.8.0).
+
+Every "AWAY" row links to the actual alternative project so an
+auditor reading the table can verify the recommendation rather than
+having to invent one. This pre-empts the LLM-audit failure mode where
+the auditor synthesizes a comparison the library never offered.
+
+#### BridgeGPUSource drop-on-full as deliberate freshness policy (task #6)
+
+New `### Overload policy: freshness over completeness` subsection in
+the BridgeGPUSource documentation, between `### The honest pitch` and
+`### Lifecycle`. Names the design choice explicitly:
+
+> `BridgeGPUSource` is a **freshness-first** helper, not a lossless
+> transport. When the bridge is full at `pollCompleted()` time, the
+> helper drops the decoded frame.
+
+Three-row comparison table walks through the alternatives we
+explicitly don't take (block-the-producer / queue-overflow /
+crash-on-overflow) and why each is the wrong shape for a control bus
+into a real-time audio thread. Closes with an escape hatch: "If your
+use case demands lossless delivery, here are the three things to do
+instead" (switch the `Bridge` `policy`; use `BridgeBlockProducer`;
+or don't use this library — link back to the decision table).
+
+The existing `### Overflow policies (0.6.12)` section also gains a
+short blockquote noting that `BridgeGPUSource`'s drop step runs
+**before** the bridge `policy` fires, with a cross-link to the new
+subsection.
+
+### Why
+
+The first audit-response patch (0.9.36) was hygiene: CITATION + browser
+matrix + transport-tier narrative — the bare-minimum facts an auditor
+hits in the first 30 seconds. This patch is the next layer up:
+information *architecture* — making the README readable in the order an
+auditor or evaluator naturally consumes it. The "what / for whom / when
+not / what would I use instead" questions now have answers at the front
+of the document, not the back.
+
+### Wire compatibility
+
+None affected. Documentation, version metadata only. No SAB protocol
+change, no schema DSL change, no public-API change.
+
+### Tests
+
+22 Node suites green. `npm run typecheck` clean. `npm run bench`
+push / pull / pullLatest medians within the 10 μs hard budget. The
+`tests/readme-imports.test.ts` drift gate still holds — none of the
+README import blocks were touched.
+
+### Documentation
+
+- `README.md` — three new subsections (`### Status & maturity`,
+  `### Is this the right tool for your problem?`,
+  `### Overload policy: freshness over completeness`) and a
+  cross-link blockquote in `### Overflow policies (0.6.12)`. Net
+  +1 H3 on the title page, +1 H3 in `## The problem this solves`,
+  +1 H3 in `## BridgeGPUSource`.
+- `CITATION.cff` — `version` bumped to 0.9.37.
+- `package.json` — `version` bumped to 0.9.37.
+- `CHANGELOG.md` — this entry.
+- `ROADMAP.md` — 0.9.37 row added to the cohort table.
+
 ## [0.9.36] — 2026-05-27
 
 ### Added — Audit-response hygiene patch (0.9.x soak)
