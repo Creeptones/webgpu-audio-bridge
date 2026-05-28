@@ -4,6 +4,146 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.34] — 2026-05-27
+
+### Added — worklet error-recovery test pins (0.9.x soak)
+
+New test file `tests/Bridge.recovery.test.ts` (~330 LOC) covering
+three failure modes the audio thread can hit in production. The
+pins are pure observation — they don't change any source — but
+encode invariants the library has been relying on without explicit
+documentation: empty-pull behavior on a stalled producer,
+SAB-state survival across a consumer crash, and PLL drift /
+smoother prev resilience across a multi-second frame famine.
+
+The pin numbers (1 / 2 / 3 inside the file) are local to the
+recovery suite; numbered to keep the format consistent with the
+other 0.8.5-split feature files.
+
+#### Pin 1 — producer disappears mid-stream
+
+The consumer keeps polling via `pullLatest` + `pullLatestSmoothed`
+and gets clean `-1` returns for 200 empty quanta (400 total empty
+pulls). Asserts:
+
+- No exceptions across the empty-pull window.
+- `tornFrames` / `softFrames` counters do not move (no payload
+  ever materialises, so the invariant classifier never runs).
+- `pllOffsetNs` is unchanged across the famine — the PLL only
+  updates on explicit `observeConsumerTime` calls; no
+  observations → no estimate drift.
+- The smoother's `prev` frame is preserved. The pin verifies this
+  by pushing a single fresh frame with a distinct `vMax`,
+  pulling with `α = 0`, and asserting the output's `vMax` equals
+  the pre-famine prev's `vMax` (the prev wins the blend).
+
+#### Pin 2 — consumer crashes mid-quantum, SAB state survives
+
+The AudioWorklet's `process()` throwing is fatal to that worklet
+— the browser shuts down the audio thread. But the SAB owned by
+the Bridge is process-owned, not worklet-owned. Pin asserts the
+crash-and-reattach pattern:
+
+1. Producer pushes 10 frames into the bridge.
+2. Consumer A pulls 3 via `pull`, 1 via `pullSmoothed`, then
+   seeds smoother + PLL via local calls. SAB-side: 4 frames
+   consumed, 6 unread.
+3. Consumer A's reference is dropped (simulating worklet death).
+4. Consumer B attaches a fresh `Bridge<S>` over the same SAB.
+   Its `available()` reports `6` — the SAB cursors survived.
+5. Consumer B drains the remaining 6 frames; their `seq` values
+   are 5..10 in FIFO order.
+6. Consumer B's heap-only state (smoother prev, PLL offset) is
+   fresh — `pllLocked === false`, `pllOffsetNs === 0` — confirming
+   that crash-induced heap loss is the documented cost.
+
+This pin formalises the "SAB is the wire; heap is local" boundary
+the library has been relying on; the BridgeWebNNSource +
+BridgeGPUSource adapters all assume the same crash-safety property.
+
+#### Pin 3 — 5-second frame famine, PLL drift + smoother survive
+
+A drift-estimator-enabled `BridgeConsumer` is trained on 200
+observations at ~60 Hz with a 100-ppm producer↔consumer skew.
+After lock (drift estimate within 10 ppm of truth), a 5-second
+famine — no observations, no pushes, no pulls. Pin asserts:
+
+- `phaseLockedTime(consumerNsAtFamineEnd)` is finite (not
+  NaN/Inf) AND within 5 ms of truth. The drift estimator
+  extrapolates the offset across the gap; truth-vs-estimate is
+  bounded by the ppm difference between the converged estimate
+  and the true drift rate.
+- The post-famine recovery observation (at the consistent skew)
+  is admitted by the outlier gate. At most one rejection
+  permitted across the recovery.
+- Post-recovery `offsetNs` + `driftPpm` are both finite; drift
+  estimate still tracks truth within 50 ppm.
+- The smoother's `prev` frame is heap-state, retained across the
+  famine. A post-famine pull with `α = 0` against a fresh frame
+  yields the pre-famine vMax — the prev still wins the blend.
+
+`BridgeConsumer` doesn't expose `telemetry()`, so PLL inspection
+in the pin goes through a local `pll` reference passed to the
+constructor and read directly. This documents the BridgeConsumer
+inspection pattern alongside the wire-state assertion.
+
+### Why
+
+Two motivations:
+
+1. **Document failure modes that have been silent invariants.**
+   Through 0.9.33 the library's behavior on empty pulls, consumer
+   crash, and frame famine has been implementation-defined: it
+   works, but nothing pinned it. Pre-1.0 is the right moment to
+   make those invariants part of the regression backstop so a
+   future refactor that breaks them fails in CI rather than in a
+   shipped consumer.
+2. **Set up 0.9.35's e2e audio spec.** The Playwright
+   `tests/browser/audio-output.spec.ts` planned for 0.9.35 needs
+   confidence that the Node-side bridge invariants are pinned —
+   otherwise a browser-side regression could be mistaken for an
+   audio-output bug. With these pins in place, a future failure
+   in the e2e spec is unambiguously a worklet / browser-stack
+   issue, not a bridge protocol issue.
+
+The Node-as-simulator approach is intentional: a real
+AudioWorklet `process()` throw is fatal to the worklet and
+unobservable from outside the audio thread. What we own is the
+SAB protocol invariant, which is testable from a single-threaded
+Node script — and that's where the failure modes land.
+
+### Wire compatibility
+
+**100% wire-compatible.** New test file only. No source
+change, no public API change, no schema-DSL extension.
+
+### Tests
+
+21 → 22 Node suites. The new file is wired into the `test` +
+`test:unit` scripts after `Bridge.properties.test.ts` and before
+`BridgeFacades.test.ts` to keep the `Bridge.*` family
+contiguous.
+
+### Bench
+
+Unaffected.
+
+### Documentation
+
+- `tests/Bridge.recovery.test.ts` — new file with ~50-line
+  header docstring describing the three pins and their
+  rationale.
+- `ROADMAP.md` — 0.9.34 row added to the cohort table.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `tests/Bridge.recovery.test.ts` — new file (~330 LOC).
+- `package.json` — wire into `test` + `test:unit` scripts;
+  version `0.9.33` → `0.9.34`.
+- `ROADMAP.md` — 0.9.34 row.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.33] — 2026-05-27
 
 ### Added — browser CI matrix gating: Chromium + Firefox + WebKit (0.9.x soak)
