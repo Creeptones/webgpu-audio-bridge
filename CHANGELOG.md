@@ -4,6 +4,304 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.40] — 2026-05-28
+
+### Added — Standard mode shipped: `MessageChannelBridge<S>` MVP1
+
+The audit-response mini-cohort's headline feature. The 0.9.39 design
+note recommended shipping Standard mode at shape (b) "transport-only
+parity" + MVP1 scope; this patch lands the implementation directly to
+main. The design note's 0.10.0 versioning recommendation is overridden
+in favour of a 0.9.40 patch — see "Why a patch bump" below.
+
+#### New class: `MessageChannelBridge<S>`
+
+```ts
+import { MessageChannelBridge, defineSchema, u64, f64 } from "webgpu-audio-bridge";
+
+const TelemetrySchema = defineSchema({
+  seq: u64(),
+  cpuPercent: f64(),
+  fps: f64(),
+});
+
+const { port1, port2, capacity } = MessageChannelBridge.allocate(16);
+// Hand port2 to the consumer thread via worker.postMessage(msg, [port2]).
+
+const producer = new MessageChannelBridge(port1, capacity, TelemetrySchema);
+const consumer = new MessageChannelBridge(port2, capacity, TelemetrySchema);
+
+const frame = producer.scratchFrame();
+frame.seq = 1n;
+frame.cpuPercent = 47.3;
+frame.fps = 60;
+producer.push(frame);                  // queues for delivery on port2
+
+const out = consumer.scratchFrame();
+if (consumer.pull(out)) {              // dequeues the next frame
+  // out.seq === 1n, out.cpuPercent === 47.3, out.fps === 60
+}
+```
+
+Sibling tier to `Bridge<S>`'s Turbo mode. Same schema DSL surface
+(`defineSchema({ ... })`, `physicsControlFrameSchema(n)`,
+`FrameFor<typeof Schema>` inference). Transport is `MessageChannel` +
+transferable `ArrayBuffer` instead of `SharedArrayBuffer` +
+`Atomics`. **Does not require cross-origin isolation** — works in
+any environment with `globalThis.MessageChannel` (every modern
+browser + Node 15+).
+
+#### Public surface (MVP1)
+
+- `class MessageChannelBridge<S extends Schema<FieldsObject, any>>`
+- `static MessageChannelBridge.allocate(capacity: number) → MessageChannelBridgeAllocation`
+  — constructs a fresh `MessageChannel`; returns `{ port1, port2, capacity }`.
+- `constructor(port: MessagePort, capacity: number, schema: S)`
+- `scratchFrame(): FrameFor<S>` — reusable frame view, same shape as `Bridge<S>.scratchFrame()`.
+- `push(view: FrameFor<S>): boolean` — encodes the frame into a fresh
+  `ArrayBuffer`, transfers via `postMessage`. Returns false only if
+  the bridge is closed.
+- `pull(out: FrameFor<S>): boolean` — dequeues the oldest queued frame
+  into `out`. Returns false on empty queue or after close.
+- `describeLayout(): SchemaLayoutDescription` — same shape as
+  `Bridge<S>.describeLayout()`; JSON-safe for postMessage. The
+  `Bridge<S>` ↔ `MessageChannelBridge<S>` describeLayout symmetry is
+  pinned by `tests/MessageChannelBridge.test.ts` pin #4.
+- `available(): number` — queue depth on the consumer side.
+- `pushedCount() / pulledCount() / droppedCount(): number` — diagnostics.
+- `close(): void` — idempotent; unsubscribes the handler, closes the
+  port, clears the queue.
+
+New exported type: `MessageChannelBridgeAllocation` — frozen
+`{ port1: MessagePort, port2: MessagePort, capacity: number }`.
+
+#### Overflow policy: consumer-side drop-oldest (hard-coded for MVP1)
+
+When the consumer's queue is at `capacity` and an incoming frame
+would push it past, the OLDEST queued frame is silently evicted and
+`droppedCount()` ticks. Same freshness-over-completeness philosophy
+that `BridgeGPUSource` applies on the producer side — for a control
+bus where the consumer wants the freshest frame, an older
+undelivered frame is just garbage in the way.
+
+The producer receives no signal about consumer-side overflow
+(MessageChannel has no built-in flow control and MVP1 does not
+implement an ack channel). Adopters who care about the drop rate
+inspect `droppedCount()` on the consumer side. Adopters who need
+lossless delivery should use Turbo mode (`Bridge<S>` with
+`policy: 'block'` or `'reject'`).
+
+MVP2 will add producer-side capacity awareness via a lightweight
+ack channel; the API surface for that is reserved but unspecified
+in MVP1.
+
+#### Deliberately excluded from MVP1
+
+By design, the following `Bridge<S>` features do NOT have
+Standard-mode counterparts in 0.9.40:
+
+- **`pullLatest`** / **`pullAll`** — reserved for MVP2.
+- **Overflow `policy` option** (`reject` / `drop-newest` / `drop-oldest`
+  / `block`) — hard-coded to consumer-side drop-oldest for MVP1;
+  user-selectable in MVP2.
+- **PLL clock recovery** (`observeConsumerTime` / `phaseLockedTime`) —
+  SAB-header-lane concern; no equivalent shape on MessageChannel.
+- **Frame smoothing** (`pullSmoothed` / `pullLatestSmoothed`) —
+  reserved for MVP3+ if real demand surfaces.
+- **Invariant classification** (`.withInvariant(...)` schemas) — uses
+  the SAB header's `torn_frame` lane. Schemas built with
+  `.withInvariant(...)` are **rejected at construction with a
+  `TypeError`** rather than silently losing the invariant bytes.
+- **Adaptive flow-scale** (`flowScaleHint` / lane 2) — SAB-header
+  concern.
+- **`beginPush` / `commitPush`** zero-copy push — meaningless without
+  shared memory; every `push` allocates a fresh transferable buffer.
+
+See [`docs/standard-mode-design.md`](./docs/standard-mode-design.md)
+§"Deliberately excluded from MVP1" for the per-feature exclusion
+rationale and the MVP2 / MVP3 ladder for future ports.
+
+#### `tests/MessageChannelBridge.test.ts` — 9 pins
+
+New standalone tsx test file (~360 LOC), wired into both `npm test`
+and `npm run test:unit`. Pins:
+
+1. Construction validation — capacity must be a positive integer;
+   `.withInvariant(...)` schemas rejected with `TypeError`.
+2. `allocate(capacity)` returns two `MessagePort` instances + the
+   capacity in a frozen object.
+3. `scratchFrame()` produces the expected shape: scalar fields
+   zero-initialized (`0` / `0n`), array fields typed of the right
+   kind and length; per-call freshness (each call returns
+   independent typed arrays).
+4. **`describeLayout()` symmetry with `Bridge<S>.describeLayout()`** —
+   field-for-field equality (kind, byteOffset, length) for the same
+   schema across both transports. Catches future drift where one
+   transport's layout description diverges from the other.
+5. All-scalar push/pull round-trip bit-exact — every `FieldKind`
+   (u64, i64, u32, i32, u16, i16, u8, i8, f64, f32) round-trips with
+   the published bit pattern intact via the transferable ArrayBuffer.
+6. Array-field push/pull round-trip bit-exact — typed-array contents
+   round-trip via the byte-level copy in `_encodeFrame` / `_decodeFrame`.
+7. **Capacity respect under burst** — producer pushes 10 frames into
+   a capacity=4 bridge; consumer queue caps at 4; `droppedCount() === 6`;
+   the surviving frames are the FRESHEST 4 (sequence numbers 6, 7, 8, 9
+   rather than 0, 1, 2, 3). Pins the drop-oldest semantic explicitly.
+8. Empty-pull semantics + `available()` accuracy — empty pull returns
+   false; available() reports queue depth accurately as pulls drain it.
+9. `close()` lifecycle — idempotent; post-close push returns false;
+   post-close pull returns false; queued frames cleared.
+
+Total node test suite count: **23 suites green** (up from 22 — the
+`MessageChannelBridge.test.ts` script is wired into both `npm test`
+and `npm run test:unit`, sequenced after `BridgeWebNNSource.test.ts`
+and before `environment.test.ts`).
+
+#### README updates
+
+- **§Two transport tiers** — heading rewritten as "Turbo and Standard
+  (both shipped)"; lead paragraph updated to reflect that Standard
+  shipped at 0.9.40 as MVP1; per-tier paragraphs revised; the
+  "library will never auto-detect" invariant kept and re-stated.
+- **§Standard mode quick start** — new subsection with the canonical
+  producer / consumer two-port example shown above. Sits inside the
+  transport-tier discussion as the first concrete code block adopters
+  read after learning the two-tier framing.
+- **§Browser support matrix** — Standard mode row flipped from
+  "reserved at 0.8.0 — not shipped" to "shipped at 0.9.40";
+  accompanying notes paragraph rewritten.
+- **§Is this the right tool for your problem?** — the no-COOP/COEP
+  decision row updated to point TO `MessageChannelBridge<S>` instead
+  of recommending users wait. The other 7 decision rows are unchanged.
+
+#### ROADMAP updates
+
+The "Reserved slot — Standard mode" subsection is retitled as
+"Standard mode (`MessageChannelBridge<S>`) — shipped at 0.9.40" with
+a status callout documenting the 0.9.40-vs-0.10.0 version override.
+The cohort table gains a new 0.9.40 row.
+
+#### `docs/standard-mode-design.md` updates
+
+The status header flips from "design analysis, no commitment to
+ship" to "shipped at 0.9.40, MVP1 scope". A new "Shipped postscript"
+at the bottom of the file documents:
+
+- The 0.9.40-vs-0.10.0 version-slot override (and its rationale).
+- The drop-oldest-vs-ack-channel capacity-model deviation from the
+  analysis above.
+- The 9-pin-vs-6-pin test count (extras for construction
+  validation, empty-pull, close lifecycle).
+- The ~930-LOC-actual vs ~1180-LOC-estimate scoping delta.
+
+The design analysis above the postscript is preserved unchanged
+as the historical reasoning record.
+
+#### `package.json` updates
+
+- `version` bumped to 0.9.40.
+- `description` rewritten to say "Two transport tiers share one
+  schema DSL and one frame API" — Standard mode is no longer
+  "reserved" in the package metadata.
+- `test` + `test:unit` scripts gain `tsx tests/MessageChannelBridge.test.ts`
+  in sequence before `tests/environment.test.ts`.
+
+### Why a patch bump, not a minor bump
+
+The 0.9.39 design note recommended shipping Standard mode at 0.10.0
+on the grounds that "a new transport with a new public API class is
+a minor-bump trigger." Re-reading `CLAUDE.md`'s actual minor-bump
+triggers:
+
+> - **Wire-format changes** (new active lanes, frame-size additions, breaking SAB layout shifts).
+> - **Public-API breaking changes** (renamed/removed methods, changed return types).
+> - **Accumulated patches reaching a coherent "release moment"** worth calling out.
+
+None of those apply. `MessageChannelBridge<S>` is:
+
+- **Wire-format inert** — different transport, but the SAB protocol
+  Turbo mode uses is unchanged.
+- **Purely additive** — every existing `Bridge<S>` user can `npm
+  install webgpu-audio-bridge@0.9.40` without changing a line of
+  code. No renames, no removed methods, no changed return types.
+- **One feature, not a release-moment cohort** — single class,
+  single ship, fits the patch envelope.
+
+The recommendation's reasoning confused "substantial" with
+"breaking." Standard mode is substantial — it doubles the project's
+transport surface — but every existing surface keeps working
+identically. That's the test under semver, and it lands on patch.
+
+The 0.9.x soak cohort continues unchanged. Standard mode is one
+more additive-API improvement among the patches accumulating toward
+1.0.
+
+### Why
+
+The audit's "ship Standard mode" recommendation was real. The
+COOP/COEP burden filters out a nontrivial chunk of potential
+adopters (third-party embeds, SaaS-hosted apps, hosted-sandbox
+prototyping). For control-plane use cases where 5–50 ms latency is
+fine, Standard mode unlocks those audiences without changing how
+Turbo mode works for everyone else.
+
+The MVP1 scope cut is conservative on purpose. Shipping `pullLatest`,
+overflow policies, and PLL all on day one would have meant two-to-
+four times the LOC and four-to-six times the maintenance commitment
+for features the audit didn't actually ask for. MVP2 work lands
+when real adopter demand surfaces, not speculatively.
+
+### Wire compatibility
+
+**Fully wire-compatible with all existing `Bridge<S>` peers.**
+`MessageChannelBridge<S>` is a separate transport — the SAB protocol
+that Turbo mode uses is unchanged. A `Bridge<S>` peer and a
+`MessageChannelBridge<S>` peer cannot directly interoperate
+(different transports), but neither does any change in 0.9.40 affect
+an existing `Bridge<S>` ↔ `Bridge<S>` SAB session.
+
+### Tests
+
+23 Node suites green:
+
+```
+schema / Bridge.core / Bridge.smoother / Bridge.invariant / Bridge.pll /
+Bridge.trajectory / Bridge.backpressure / Bridge.observability /
+Bridge.facades / Bridge.properties / Bridge.recovery / BridgeFacades /
+BridgeInputLane / BridgeBlockConsumer / BridgeGPUSource.writeTarget /
+BridgeWebNNSource / MessageChannelBridge / environment /
+Bridge.phaseLock / Bridge.wasmEquivalence / Bridge.concurrent /
+typecheck-deprecations / readme-imports
+```
+
+`npm run typecheck` clean. `npm run bench` push / pull / pullLatest
+medians within the documented 10 μs hard budget; trajEval (fast)
+within the 1.25 μs fast-path budget; flow_scale recovery within the
+100-cycle budget.
+
+### Documentation
+
+- `src/MessageChannelBridge.ts` — new file, ~390 LOC, ships the class.
+- `src/index.ts` — new export block for `MessageChannelBridge` +
+  `MessageChannelBridgeAllocation`.
+- `tests/MessageChannelBridge.test.ts` — new file, ~360 LOC, 9 pins.
+- `README.md` — `### Two transport tiers` rewritten; new
+  `#### Standard mode quick start` subsection; browser-support
+  matrix Standard row flipped; decision-table no-COOP/COEP row
+  flipped.
+- `ROADMAP.md` — "Reserved slot" subsection retitled "shipped at
+  0.9.40" with the 0.9.40-vs-0.10.0 override rationale callout. New
+  0.9.40 row in the cohort table.
+- `docs/standard-mode-design.md` — status header flipped to
+  "shipped at 0.9.40"; new "Shipped postscript" subsection covering
+  the version-slot, capacity-model, test-count, and LOC deviations
+  from the analysis. The analysis itself is preserved unchanged.
+- `package.json` — `version` bumped; `description` updated to drop
+  the "reserved for 0.8.0" framing; `test` + `test:unit` scripts
+  wire in the new test file.
+- `CITATION.cff` — `version` bumped to 0.9.40; date 2026-05-28.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.39] — 2026-05-27
 
 ### Added — Standard mode (`MessageChannelBridge<S>`) design note (0.9.x soak)

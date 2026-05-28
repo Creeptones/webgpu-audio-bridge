@@ -1,8 +1,8 @@
 # Standard mode (`MessageChannelBridge<S>`) — design note
 
-**Status**: design analysis, no commitment to ship.
-**Author**: maintainer + Claude (2026-05-27).
-**Decision pending**: yes — this document lays out the options and a recommendation; the final call (ship / don't ship / ship a different shape) is the maintainer's.
+**Status**: **shipped at 0.9.40** (2026-05-28). MVP1 scope as recommended below; versioning slot is 0.9.40, not 0.10.0 — see [Shipped postscript](#shipped-postscript) at the bottom for the override rationale.
+**Author**: maintainer + Claude (2026-05-27 design, 2026-05-28 ship).
+**Decision pending**: no — the maintainer chose to ship MVP1 on the same day this note was written. The design analysis below stands as the rationale; the only deviation from the recommendation is the version slot (0.9.40 patch instead of 0.10.0 minor).
 
 ## Executive summary
 
@@ -275,4 +275,20 @@ Explicit non-goals for Standard mode, regardless of which shape ships:
 
 Either path is honest. The worst outcome is shipping Standard mode under-baked because an auditor said to and then watching it bit-rot. The second-worst is leaving the ROADMAP's reserved-slot promise dangling indefinitely. This design note exists to make either choice deliberate rather than default.
 
-— end of design note —
+— end of design analysis —
+
+## Shipped postscript
+
+Standard mode shipped on 2026-05-28 as the **0.9.40 patch**, not the 0.10.0 minor bump the analysis above recommended. The maintainer's override rationale:
+
+> Re-reading CLAUDE.md's minor-bump triggers (wire-format changes, breaking public-API changes, accumulated-patch promotion moments), a new additive public class with no wire-format change and no breaking change to existing surfaces is squarely in the "patch by default" category. The 0.10.0 framing was over-cautious. Treating Standard mode as one more additive-API improvement keeps the 0.9.x soak cohort intact and matches the existing patch cadence.
+
+The recommendation's reasoning ("a new transport with a new public API class is a minor-bump trigger") confused "substantial" with "breaking." Standard mode is substantial — it doubles the project's transport surface — but every existing `Bridge<S>` user can `npm install` 0.9.40 without changing a line of code. That's the test for patch-vs-minor under semver, and it lands on patch.
+
+Other deviations from the design analysis above:
+
+- **Capacity model**: the analysis suggested ack-channel-based producer-side capacity tracking ("silent reject when in-flight queue full"). The shipped implementation does **consumer-side drop-oldest** instead — simpler (no ack channel needed), matches `BridgeGPUSource`'s established freshness-first philosophy, and exposes drops via `droppedCount()`. The trade-off is that the producer has no direct backpressure signal; for MVP1 control-bus use cases that's fine.
+- **Test count**: 9 pins shipped, not the 6 the analysis sketched. The extras cover construction validation, empty-pull semantics, and close() lifecycle — necessary for a public class even if not headline functionality.
+- **LOC estimate**: shipped at ~390 LOC of class + ~360 LOC of tests + ~180 LOC of doc deltas = ~930 LOC, vs the analysis's ~1180 LOC estimate. The estimate was conservative; the actual implementation came in under budget because the schema DSL did most of the encoding/decoding heavy lifting.
+
+The design analysis above is preserved unchanged as the historical reasoning record. The decision criteria it laid out remain useful for evaluating MVP2 scope expansions when those land.

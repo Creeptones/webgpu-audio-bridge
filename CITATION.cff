@@ -8,8 +8,8 @@ authors:
 repository-code: "https://github.com/Creeptones/webgpu-audio-bridge"
 url: "https://github.com/Creeptones/webgpu-audio-bridge"
 doi: "10.5281/zenodo.20380886"
-version: "0.9.39"
-date-released: "2026-05-27"
+version: "0.9.40"
+date-released: "2026-05-28"
 license: MIT
 identifiers:
   - type: doi

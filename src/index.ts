@@ -44,6 +44,23 @@ export type {
   SubscribeTelemetryOptions,
 } from "./Bridge.js";
 
+// ── Standard mode (0.10.0) — MessageChannelBridge<Schema> ─────────────────
+//
+// Sibling tier to `Bridge<S>`'s Turbo mode. Same schema DSL surface,
+// `MessageChannel` + transferable `ArrayBuffer` transport instead of
+// `SharedArrayBuffer` + `Atomics`. Does NOT require cross-origin
+// isolation. Latency floor 5-50 ms per round trip (vs Turbo's sub-µs).
+// **Not for audio rate.** Right for prototyping before COOP/COEP is
+// configured, control-plane updates in unisolated embeds, telemetry
+// channels, anything non-audio-critical. See README §Standard mode for
+// the full picture and `docs/standard-mode-design.md` for the MVP1
+// scope decisions.
+
+export { MessageChannelBridge } from "./MessageChannelBridge.js";
+export type {
+  MessageChannelBridgeAllocation,
+} from "./MessageChannelBridge.js";
+
 // ── Composable primitives (0.6.10) ────────────────────────────────────────
 //
 // The four heap state machines that `Bridge<S>` composes internally, plus

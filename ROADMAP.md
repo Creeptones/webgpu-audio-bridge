@@ -68,6 +68,7 @@ stability promise.
 | 0.9.37 | ✅ shipped | Audit-response README readability patch — three new front-loaded README subsections that make the project's shape readable on a 30-second skim: `### Status & maturity` (version + tests + distribution + release-artifact policy + maintainership) under the title block; `### Is this the right tool for your problem?` (8-row decision table pointing TOWARD or AWAY from this library, with linked alternatives for each AWAY case) in `## The problem this solves`; and `### Overload policy: freshness over completeness` in `## BridgeGPUSource` naming the drop-on-full design choice + alternatives explicitly. The existing `### Overflow policies (0.6.12)` section gains a cross-link blockquote. Lands tasks #2 (release-artifact policy doc note in lieu of back-tagging missing GitHub releases), #3, #4, #6 from the audit-response task list. Wire-equivalent; documentation only. |
 | 0.9.38 | ✅ shipped | Audit-response maintenance & operational status patch — new `## Maintenance & operational status` README section between Prior art and Acknowledgments, addressing the audit's bus-factor concern head-on. Five subsections: **Bus factor** (named openly as 1; no organization backing); **Scope discipline** (six bulleted non-goals: synthesis engine / scheduling layer / audio-graph / auto-detection / general IPC / WebGPU framework, with cross-links to alternatives); **Hand-off readiness** (six artifacts that make forking survivable: header comments, 22 test suites, concurrent SPSC stress, cross-engine CI, bench budget, zero deps, MIT); **What "abandoned" actually looks like** (honest failure-mode walkthrough — npm/Zenodo versions keep working, browser matrix drifts first, CVE-class bugs are the real risk); **Contributing** (test-pin / wire-compat-note / bench-gate / versioning-policy bar for landing changes). Title-page Status & maturity bullet shrinks to a one-liner pointing at the new section. Lands task #10 from the audit-response task list. Wire-equivalent; documentation only. |
 | 0.9.39 | ✅ shipped | Audit-response Standard mode (`MessageChannelBridge<S>`) design note — new `docs/standard-mode-design.md` (~500 lines) covering the audit's "ship Standard mode" recommendation as **design analysis, not implementation**. Walks the decision space across three independent axes (API shape: full parity vs transport-only vs separate-name adapter; versioning slot: retro-fill 0.8.0 vs 0.10.0 vs 0.9.x patch — note recommends 0.10.0; MVP scope: minimal vs control-plane-complete vs full transport parity) with pro/con tables, LOC + effort estimates, decision criteria, and explicit ship / don't-ship next-steps playbooks. **Recommendation**: shape (b) transport-only parity at MVP1 scope, versioned as 0.10.0. Existing ROADMAP "Reserved slot — 0.8.0" subsection rewritten with a status callout linking the new doc. README's transport-tier section updated to link the design note. Lands task #11 from the audit-response task list. Wire-equivalent; documentation only. |
+| 0.9.40 | ✅ shipped | **Standard mode shipped** — `MessageChannelBridge<S>` lands as MVP1 (shape (b) transport-only parity from the 0.9.39 design note). New `src/MessageChannelBridge.ts` (~390 LOC) implements the `MessageChannel` + transferable-`ArrayBuffer` sibling to `Bridge<S>`: schema-driven `push` / `pull` / `scratchFrame` / `describeLayout`, static `allocate(capacity) → { port1, port2, capacity }` factory, drop-oldest overflow hard-coded for MVP1, schemas with `.withInvariant(...)` rejected at construction with `TypeError`. New `tests/MessageChannelBridge.test.ts` (9 pins, ~360 LOC): construction validation, allocate factory, scratchFrame shape, describeLayout symmetry with `Bridge<S>`, all-scalar round-trip bit-exact (every FieldKind), array-field round-trip bit-exact, capacity respect under burst (drop-oldest keeps freshest), empty-pull semantics + available() accuracy, close() lifecycle. 23 Node test suites green (was 22). The design note's 0.10.0 recommendation was over-cautious — a new additive class with no wire-format change and no breaking-API change is CLAUDE.md's "patch by default" category. README §Two transport tiers rewritten as "both shipped"; new §Standard mode quick start; browser support matrix Standard row flipped from "reserved" to "shipped"; decision-table row for no-COOP/COEP environments now points TO this library instead of recommending users wait. ROADMAP reserved-slot section retitled as "shipped at 0.9.40". `docs/standard-mode-design.md` status updated with a shipped-note postscript. Lands the implementation half of task #11 (task #13 captures the implementation work specifically). Wire-equivalent; purely additive public-API. |
 
 The closeout of the audit cohort is also the closeout of the major
 gaps to 1.0: tests parallel-runnable by topic, docs surfaced as
@@ -82,32 +83,36 @@ they landed first as the smallest 0.8.x patches still queued. 0.9.0 is
 the minor-bump anchor for the breaking cut; the slimmer surface is the
 substrate for the 0.9.x soak.
 
-## Reserved slot — Standard mode (`MessageChannelBridge<S>`)
+## Standard mode (`MessageChannelBridge<S>`) — shipped at 0.9.40
 
-> **Status (2026-05-27, 0.9.39):** the "reserved at 0.8.0" framing is
-> now historically odd — the project shipped past 0.8.0 in name (no
-> npm 0.8.0 release exists; the cohort jumped from 0.7.17 to 0.8.1).
-> A full design note now lives at
-> [`docs/standard-mode-design.md`](./docs/standard-mode-design.md);
-> the design space covers API shape, versioning slot, MVP scope, and
-> implementation cost. **Decision pending.** Either ship the slot at
-> 0.10.0 (the design note's recommendation) or formally retire it
-> with a dated deferral. Adopters who want Standard mode built can
-> add a voice to the GitHub issue tracker.
+> **Status (2026-05-28):** shipped as **patch 0.9.40**, MVP1 scope
+> (transport-only parity). The design note at
+> [`docs/standard-mode-design.md`](./docs/standard-mode-design.md)
+> originally recommended a 0.10.0 minor bump; the maintainer overrode
+> that recommendation on the basis that a new additive public class
+> with no wire-format change and no breaking-API change is squarely
+> in CLAUDE.md's "patch by default" category. The 0.10.0
+> recommendation was over-cautious. Shipping as 0.9.40 keeps the 0.9.x
+> soak cohort intact and treats Standard mode as one more
+> additive-API improvement among the patches accumulating toward 1.0.
 
 Standard mode is the **Turbo sibling** for environments where
 cross-origin isolation can't be deployed. Same schema DSL, same
-`Bridge`-style frame API surface, transport swapped from
-`SharedArrayBuffer` + `Atomics` to `MessageChannel` + transferable
-`ArrayBuffer`. Latency floor 5–50 ms (measured baseline in the
-0.8.3 design work — see `bench/notify-cost-browser/`). Right for
-prototyping before COOP/COEP is configured, control-plane updates
-in unisolated embeds, telemetry channels, anything
-non-audio-critical. **Not for audio rate.**
+`Bridge`-style frame API surface (`push` / `pull` / `scratchFrame` /
+`describeLayout`), transport swapped from `SharedArrayBuffer` +
+`Atomics` to `MessageChannel` + transferable `ArrayBuffer`.
+Measured round-trip latency floor 5–50 ms. Right for prototyping
+before COOP/COEP is configured, control-plane updates in unisolated
+embeds, telemetry channels, anything non-audio-critical. **Not for
+audio rate.**
 
-The minor-bump anchor that ships whenever the design note's
-"Recommendation" or "Alternative recommendation" path is chosen.
-Timing is flexible.
+MVP1 deliberately excludes `pullLatest`, overflow `policy` options,
+PLL clock recovery, frame smoothing, invariant classification, and
+adaptive flow-scale — all reserved for MVP2+ work if real demand
+surfaces. Schemas built with `.withInvariant(...)` are rejected at
+construction with a `TypeError`. See the design note for the
+exclusion rationale and the full MVP1 / MVP2 / Full transport parity
+scope-cut analysis.
 
 ## Beyond the cohort (speculative, `0.9.32+`)
 
