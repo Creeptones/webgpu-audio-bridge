@@ -15,3 +15,7 @@ coverage/
 playwright-report/
 test-results/
 .playwright/
+
+# LLM_BUNDLE.md is a generated artifact (scripts/regenerate-llm-bundle.mjs);
+# do not commit. Run `npm run llm-bundle` to (re)generate locally.
+LLM_BUNDLE.md

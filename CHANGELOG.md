@@ -4,6 +4,143 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.43] — 2026-05-28
+
+### Added — `LLM_BUNDLE.md` regeneration script + refresh to 0.9.42 specs
+
+The previously hand-maintained `LLM_BUNDLE.md` had drifted to version
+0.6.4 / 2026-05-26 — seven patches plus the entire audit-response
+cohort, Standard mode (0.9.40), the hybrid pattern (0.9.41), and two
+design notes (0.9.39, 0.9.42) behind. This patch closes the drift
+permanently by replacing the hand-maintained file with a generator
+script and refreshing the bundle in one shot. Lands task #12 from
+the audit-response in-flight task list.
+
+#### New `scripts/regenerate-llm-bundle.mjs`
+
+Node ESM script (no runtime dependencies). Reads the project's
+canonical files (`package.json`, `CITATION.cff`, `README.md`,
+`ROADMAP.md`, `QUICKSTART.md`, `MIGRATION.md`, recent `CHANGELOG.md`
+entries, both design notes, public-API source files, machinery
+file headers, the two canonical example demos) and assembles them
+into a single Markdown bundle at `LLM_BUNDLE.md`.
+
+Wired into `package.json` as `npm run llm-bundle`. Runs in well
+under a second on a dev laptop. The script supports three inline
+modes per file:
+
+- `full` — inline the whole file (most entries).
+- `header` — extract only the leading `/* ... */` JSDoc header. Used
+  for the seven extracted machinery files (`SpscRing.ts`,
+  `FrameSmoother.ts`, `ConsumerClockRecovery.ts`,
+  `AdaptiveFlowController.ts`, `BridgeConsumer.ts`,
+  `BridgeProducer.ts`, `BridgeWebNNSource.ts`) whose protocol math
+  + invariants live in the header and whose internals would triple
+  the bundle size for diminishing return.
+- `recent-changelog` — inline only `## [...]` entries at or above a
+  pinned version (currently 0.9.36). Older entries stay in the full
+  `CHANGELOG.md` at the repo.
+
+The `INCLUDES` array at the top of the script is the source of
+truth for what gets bundled. Adding a new file is a one-line
+addition; reordering is rearranging the array.
+
+#### `.gitignore` — `LLM_BUNDLE.md` marked as build artifact
+
+The bundle is now an `npm run llm-bundle` output, not a hand-edited
+checked-in file. Treating it as a build artifact (like `dist/`):
+
+- Prevents the historical drift problem — the file can't get stale
+  silently if it's generated on demand.
+- Avoids committing a 640 KB single-file blob that gets regenerated
+  every patch.
+- Lets adopters regenerate their own snapshot after `git pull` if
+  they want to feed the current project state to an LLM.
+
+#### README cross-link for LLM auditors
+
+The `### Status & maturity` preamble at the top of the README gains
+a final bullet pointing LLM auditors / search agents at the bundle
+and naming the regenerator. The audit-response framing assumed
+auditors would discover the bundle on their own (the file was at
+the repo root); making the pointer explicit costs one line and
+removes the "did the auditor find this?" ambiguity.
+
+#### `CLAUDE.md` — bundle entry added to "What lives where"
+
+Three new entries in the file inventory section so future Claude
+sessions know about `docs/standard-mode-design.md`,
+`docs/hybrid-residual-comparison.md`, and the `LLM_BUNDLE.md`
+regenerator. Treating these as first-class repo surface rather
+than implementation details.
+
+#### Bundle refreshed to 0.9.42
+
+First run of the new generator produces a 12,360-line / 641 KB
+bundle. Reflects all surfaces shipped through 0.9.42:
+
+- Two-tier transport story (Turbo + Standard, both shipped).
+- Hybrid residual-on-carrier pattern with the 0.9.41
+  `BridgeBlockConsumer.processAdd()` API.
+- Both design notes inlined.
+- Bus-factor disclaimer + scope discipline section from 0.9.38.
+- Audit-response decision table + freshness policy from 0.9.37.
+- WebGPU Baseline browser-support matrix from 0.9.36.
+
+The bundle is intentionally about 3× the size of the 0.6.4
+snapshot — the project surface has grown by Standard mode, the
+hybrid pattern, two design notes, and the entire audit-response
+README rework.
+
+### Why
+
+The audit's "an LLM auditor reading the first screen of the README
+should get an accurate picture" framing applies recursively: the
+bundle was supposed to be the single-shot snapshot for auditors
+who do want a full picture, but it had silently gone seven patches
+stale. A regeneration script removes the staleness as a class of
+problem — the bundle now matches the repo state at whatever moment
+the script was last run.
+
+This patch is the closeout of the audit-response cohort's
+documentation work. The remaining audit-response tasks (#7 cross-
+browser bench corpus, #8 alternatives comparison) are either
+substantial standalone work (Gap #11 from the hybrid-residual
+comparison covers #7 conceptually) or substantially overlapping
+with what's already shipped (the alternatives comparison in #8 was
+absorbed by the §"Is this the right tool for your problem?"
+decision table in 0.9.37 plus the §"The alternative landscape" in
+the hybrid-residual comparison doc).
+
+### Wire compatibility
+
+None affected. New script + .gitignore + README pointer + CLAUDE.md
+file inventory entries. No SAB protocol change, no schema DSL
+change, no public-API change.
+
+### Tests
+
+23 Node suites green. `npm run typecheck` clean. `npm run bench`
+within all documented budgets. `npm run llm-bundle` succeeds and
+produces a well-formed Markdown file.
+
+### Documentation
+
+- `scripts/regenerate-llm-bundle.mjs` — **new file**, ~240 LOC.
+  Reads inputs, assembles bundle, writes `LLM_BUNDLE.md`. No
+  runtime dependencies.
+- `package.json` — `version` bumped to 0.9.43; new `llm-bundle`
+  script entry.
+- `CITATION.cff` — `version` bumped to 0.9.43.
+- `.gitignore` — `LLM_BUNDLE.md` added with a one-line note.
+- `README.md` — final bullet in §Status & maturity points at the
+  bundle.
+- `CLAUDE.md` — three new entries in the §"What lives where" file
+  inventory (`docs/standard-mode-design.md`,
+  `docs/hybrid-residual-comparison.md`, `LLM_BUNDLE.md`).
+- `CHANGELOG.md` — this entry.
+- `ROADMAP.md` — 0.9.43 row in the cohort table.
+
 ## [0.9.42] — 2026-05-28
 
 ### Added — Hybrid residual-on-carrier: comparison and gap analysis

@@ -66,6 +66,9 @@ The concurrent test has a known timing-sensitive `emptyWaitTimeouts === 0` asser
 - `bench/Bridge.bench.ts` — push / pull / pullLatest cells + 0.5.0's `flow_scale recovery` characterization cell + 0.6.7's `trajEval (fast)` / `trajEval (clamp)` cells.
 - `CHANGELOG.md` — newest entry at top. Entries follow the established structure.
 - `README.md` — public docs; mirror CHANGELOG entries for shipped features under the relevant section (API reference, Back-pressure, Roadmap, etc.).
+- `docs/standard-mode-design.md` — 0.9.39 design note covering the `MessageChannelBridge<S>` (Standard mode) shape, versioning, and scope decisions; followed by a "Shipped postscript" documenting the actual 0.9.40 ship.
+- `docs/hybrid-residual-comparison.md` — 0.9.42 design note covering the hybrid residual-on-carrier pattern (0.9.41) vs six alternative GPU-audio approaches + a 15-item gap roadmap.
+- `LLM_BUNDLE.md` — generated single-file digest of README + ROADMAP + recent CHANGELOG + design notes + canonical source files. `.gitignore`d as a build artifact; regenerate via `npm run llm-bundle` (`scripts/regenerate-llm-bundle.mjs`). Useful for handing context to a new LLM session in one read.
 
 ## Where the bridge is consumed
 
