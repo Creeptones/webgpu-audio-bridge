@@ -1,8 +1,8 @@
 # One-call declarative `connect()` topology constructor — design note
 
-**Status**: **design + spec only** (decision-pending). Targets a future patch slot in the current `0.9.x` cohort — see [Scope & ship decision](#scope--ship-decision). Wire-compatible, additive, zero `src/` edits proposed against the existing classes; `connect()` is a new factory module that *composes* already-shipped pieces.
-**Author**: maintainer + Claude (2026-05-28 design).
-**Decision pending**: yes — this note specifies the shape; the maintainer decides whether to ship MVP1 as-specified, defer, or trim.
+**Status**: **shipped** (2026-05-28, patch **0.9.46**) as MVP1 shape (b). New module `src/connect.ts` + `tests/connect.test.ts`. Wire-compatible, additive, no hot-path cost.
+**Author**: maintainer + Claude (2026-05-28 design + ship).
+**Decision (resolved)**: shipped MVP1 as-specified (shape (b) "allocator + handle + mount"), as a `0.9.x` patch per the slowdown policy. See the [Shipped postscript](#shipped-postscript) for the two deviations from this spec.
 
 ## Executive summary
 
@@ -400,4 +400,30 @@ The recommendation stands: ship MVP1 (b). The COOP/COEP graceful-failure path al
 
 ## Shipped postscript
 
-_(Anchor reserved. To be filled in when/if the maintainer ships `connect()`, mirroring the standard-mode-design.md postscript convention: actual version slot, any deviations from this spec, and the README/CHANGELOG wiring the orchestrator performed.)_
+Shipped at **0.9.46** as MVP1 shape (b), exactly as specified above, with two
+deliberate deviations:
+
+1. **`ConnectRingHandle` carries `policy`.** The spec's handle did not include
+   the backpressure `policy`. The shipped handle does, because the peer's
+   `mount` reconstructs its own `SpscRing` over the shared SAB and must agree
+   with the allocator on the policy — so the value has to cross the wire (it is
+   a clone-safe string enum). `mount` forwards `handle.policy` to the
+   reconstructed ring.
+2. **`publishPllToSab` dropped from `ConnectRingSpec`.** The spec listed it
+   alongside `policy`. It is a `Bridge<S>`-level PLL-publication concern with no
+   equivalent on the `BridgeProducer` / `BridgeConsumer` facade reconstruction
+   path that `mount` uses, so accepting it and silently ignoring it would have
+   been dishonest. Only `schema`, `capacity`, and `policy` are accepted per
+   ring. If facade-level PLL publication is wanted later, it lands as an
+   additive `MountOptions` field, not a `ConnectRingSpec` one.
+
+Everything else matches: `connect` / `mount` / `ConnectUnsupportedError` + the
+`ConnectTopology` / `ConnectHandle` / `ConnectRingHandle` / `MountResult` types;
+macro required + optional input lane; Turbo with graceful Standard fallback
+gated by `allowStandardFallback`; the `latencyHint` backlog-budget table with
+numeric override; the COOP/COEP precondition via `getEnvironmentReport()` reuse;
+and the connect-time `.withInvariant`-on-Standard rejection. Tests landed as
+`tests/connect.test.ts` pins 95–102 (env injected via `spec.environment` for
+deterministic Node runs). The orchestrator wired the package-root exports in
+`src/index.ts`, the test into `test` / `test:unit` before the concurrent stress,
+and the CHANGELOG / ROADMAP / README entries.

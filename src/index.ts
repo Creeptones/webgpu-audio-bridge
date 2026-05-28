@@ -71,6 +71,31 @@ export type {
   MessageChannelBridgeAllocation,
 } from "./MessageChannelBridge.js";
 
+// ── One-call topology constructor (0.9.46) ────────────────────────────────
+//
+// `connect(spec)` collapses the multi-step Turbo setup recipe (allocate +
+// size + postMessage + reconstruct-per-peer + COOP/COEP guard) into one call
+// plus a symmetric `mount(handle, opts)`. It probes the environment via
+// `getEnvironmentReport()`, picks Turbo (SAB) vs Standard (MessageChannel) vs
+// a graceful `ConnectUnsupportedError` carrying `report.fixes`, sizes the
+// ring(s) from a `latencyHint`, and returns a clone-safe handle to
+// `postMessage`. Pure assembly over the shipped facades — no new wire format.
+// See docs/connect-topology-design.md.
+
+export { connect, mount, ConnectUnsupportedError } from "./connect.js";
+export type {
+  LatencyHint,
+  ConnectRingSpec,
+  ConnectSpec,
+  ConnectMode,
+  ConnectRingHandle,
+  ConnectHandle,
+  ConnectRole,
+  MountOptions,
+  MountResult,
+  ConnectTopology,
+} from "./connect.js";
+
 // ── Composable primitives (0.6.10) ────────────────────────────────────────
 //
 // The four heap state machines that `Bridge<S>` composes internally, plus

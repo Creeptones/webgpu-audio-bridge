@@ -1647,7 +1647,27 @@ const worker = forWorker(alloc);  // Bridge<S, "worker"> — full surface; block
 
 The brand is a phantom (`unique symbol`, type domain only): **zero bytes on the instance, zero ops on the hot path** — the runtime object is one ordinary `Bridge` regardless of role, so the bench is unchanged. `DefaultRole = "worker"`, so a bare `Bridge<S>` and every existing `new Bridge(...)` keep the full surface and compile unchanged. The allocating helpers (`scratchFrame` / `telemetry`) stay available on the worklet handle (a worklet *constructor* legitimately pre-allocates), so only the genuinely audio-thread-illegal methods are gated. The guarantee is regression-pinned: `tests/Bridge.roles.test.ts` carries `@ts-expect-error` conformance pins, so `npm run typecheck` fails if a blocking method ever leaks back onto the worklet surface. See [`docs/rt-safety-lattice-design.md`](./docs/rt-safety-lattice-design.md).
 
-One further frontier track ships as a **design spec pending maintainer sign-off**: a one-call `connect()` topology constructor ([`docs/connect-topology-design.md`](./docs/connect-topology-design.md)).
+### One-call topology — `connect()` (0.9.46)
+
+`connect(spec)` collapses the multi-step Turbo setup recipe — allocate a SAB, size the ring, allocate a *second* SAB for the fast input lane, `postMessage` the handles + `describeLayout()`, reconstruct a facade per peer, and guard the COOP/COEP precondition — into one call plus a symmetric `mount(handle, opts)`:
+
+```ts
+import { connect, mount } from "webgpu-audio-bridge";
+
+// allocator + producer thread
+const topo = connect({ macro: macroSchema, input: inputSchema, latencyHint: "tracking" });
+worker.postMessage(topo.handle, topo.transferList);
+const me = topo.mount({ role: "producer", macroSchema, inputSchema });
+
+// worker (consumer)
+onmessage = (e) => {
+  const them = mount(e.data, { role: "consumer", macroSchema, inputSchema });
+};
+```
+
+It probes the environment via `getEnvironmentReport()` and resolves **Turbo** (SAB) vs **Standard** (`MessageChannelBridge`) vs a graceful `ConnectUnsupportedError` that carries `report.fixes` — turning the opaque `SharedArrayBuffer is not defined` throw on a non-isolated page into an actionable, guided message. Ring capacity comes from a declared `latencyHint` (`'tracking' | 'balanced' | 'throughput'`) instead of a magic slot count — the macro path gets a small backlog (freshness; `pullLatest` collapses to newest) and the input lane a large one (completeness; `pullAll` preserves every event) — with a numeric per-ring `capacity` override as an escape hatch. Pure assembly over the shipped facades: no new wire format, no hot-path cost (`connect`/`mount` run once at setup). See [`docs/connect-topology-design.md`](./docs/connect-topology-design.md).
+
+With `connect()` and the `Bridge<S, Role>` lattice shipped, all five frontier tracks are landed — no remaining design-only specs.
 
 ## What this is, and what it isn't
 

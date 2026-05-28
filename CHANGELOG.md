@@ -4,6 +4,124 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.46] — 2026-05-28
+
+### Added — `connect()` one-call topology constructor (final frontier track)
+
+Lands the `connect-topology` design note (shipped at 0.9.44 as a
+decision-pending spec) as **shape (b) "allocator + handle + mount"** at
+MVP1 scope. New module `src/connect.ts`. With this, all five frontier
+tracks from the 10/10 roadmap are shipped; the two design-only specs
+(`Bridge<S,Role>` at 0.9.45, `connect()` here) are now both real.
+
+#### What it does
+
+`connect(spec)` collapses the multi-step Turbo setup recipe — pick a
+capacity, `Bridge.allocate`, allocate a second SAB for the fast input
+lane, `postMessage` the sab(s) + `describeLayout()`, reconstruct a facade
+per peer, and guard the COOP/COEP precondition — into one call plus a
+symmetric `mount(handle, opts)`:
+
+```ts
+// allocator + producer thread
+const topo = connect({ macro: macroSchema, input: inputSchema, latencyHint: "tracking" });
+worker.postMessage(topo.handle, topo.transferList);
+const me = topo.mount({ role: "producer", macroSchema, inputSchema });
+
+// worker (consumer)
+const them = mount(e.data, { role: "consumer", macroSchema, inputSchema });
+```
+
+It (1) probes the environment via the shipped `getEnvironmentReport()`,
+(2) resolves Turbo (SAB) vs Standard (`MessageChannelBridge`) vs a
+graceful throw, (3) sizes the ring(s) from a `latencyHint`, (4) allocates
+the macro ring + optional fast-input ring, and (5) returns a frozen,
+clone-safe `ConnectTopology` carrying the transferable `handle` plus a
+thread-local `mount(...)`.
+
+#### Sizing heuristic (`latencyHint` → capacity)
+
+Declared intent instead of a magic slot count. Per-lane backlog budgets
+(rounded up to a power of two, clamped to 2³⁰):
+
+| `latencyHint` | macro | input |
+|---|---|---|
+| `'tracking'` | 64 | 256 |
+| `'balanced'` *(default)* | 256 | 512 |
+| `'throughput'` | 1024 | 2048 |
+
+The macro path wants freshness (small backlog; `pullLatest` collapses to
+newest); the input lane wants completeness (large backlog; `pullAll`
+preserves every discrete event). A numeric per-ring `capacity` override
+bypasses the table (still pow2-rounded).
+
+#### Graceful COOP/COEP failure
+
+`crossOriginIsolated` was previously referenced only in
+`src/environment.ts`, never in the transport classes — a non-isolated
+page hit an opaque `SharedArrayBuffer is not defined` throw. `connect()`
+reads `report.suggestedMode`: `"unsupported"` (no AudioWorklet) throws
+`ConnectUnsupportedError("unsupported")`; `"standard"` either falls back
+to `MessageChannelBridge` (default) or, when `allowStandardFallback:
+false`, throws `ConnectUnsupportedError("isolation-required")`. The error
+carries the `EnvironmentReport` so the caller can render the actionable
+`report.fixes` (e.g. `"enable-coop-coep"`). A `.withInvariant(...)`
+schema that would resolve to Standard mode is rejected at `connect()`
+time (not deferred to `mount` on a worker), since `MessageChannelBridge`
+has no invariant lane.
+
+#### New exports (package root)
+
+`connect`, `mount`, `ConnectUnsupportedError` (values) and `LatencyHint`,
+`ConnectRingSpec`, `ConnectSpec`, `ConnectMode`, `ConnectRingHandle`,
+`ConnectHandle`, `ConnectRole`, `MountOptions`, `MountResult`,
+`ConnectTopology` (types).
+
+#### Refinement vs the spec
+
+The spec's `ConnectRingHandle` did not carry `policy`; the shipped handle
+does, so the peer's reconstructed `SpscRing` matches the allocator's
+backpressure policy (it must agree on both ends). `publishPllToSab` from
+the spec's `ConnectRingSpec` was dropped: it is a `Bridge<S>`-level PLL
+concern with no equivalent on the `BridgeProducer`/`BridgeConsumer`
+facade reconstruction path, so accepting-and-ignoring it would have been
+dishonest. Both noted in the design-note postscript.
+
+### Why
+
+`connect()` is ergonomics over capability — every piece it orchestrates
+already shipped. Its value is collapsing the hand-wired, twice-written
+two-ring recipe into one declarative call and converting the opaque
+non-isolated `SharedArrayBuffer` throw into a guided `report.fixes`
+message. The `latencyHint` removes a genuine magic-number papercut.
+
+### Wire compatibility
+
+Fully wire-equivalent and additive. No SAB lane, no frame-layout change,
+no change to any existing class. `connect`/`mount` run once at setup,
+never in `process()`; the returned facades' hot-path methods are the
+existing RT-safe ones unchanged — bench unaffected.
+
+### Tests
+
+New `tests/connect.test.ts` (pins 95–102), wired into `test` /
+`test:unit` before the concurrent stress: Turbo handle shape; latencyHint
+sizing table + numeric override; producer/consumer mount round-trip over
+one shared SAB; input-lane topology (`pullAll` drains every event in
+order); graceful Standard fallback (handle carries a `MessagePort` +
+`report.fixes`); unsupported + isolation-required throws; invariant
+schema rejected at `connect()` time on Standard; `mount` frameByteSize
+mismatch guard. The environment is injected via `spec.environment` for
+determinism under Node. 29 Node suites green (was 28); 1M-frame
+concurrent stress 0/10 timeouts; typecheck clean; bench within budget.
+
+### Documentation
+
+`docs/connect-topology-design.md` status flipped to shipped with the
+reserved postscript filled in. README's Frontier-primitives section gains
+a `### One-call topology — connect()` subsection; with this all frontier
+tracks are shipped (no remaining design-only specs).
+
 ## [0.9.45] — 2026-05-28
 
 ### Added — `Bridge<S, Role>` real-time-safety role lattice (frontier track ship 2/2)
