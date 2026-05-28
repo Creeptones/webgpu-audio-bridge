@@ -60,6 +60,19 @@
  * by reference — it does not allocate the SAB or own the schema. Multiple
  * BridgeConsumers over the same `SpscRing` are NOT supported (SPSC rules:
  * one consumer per ring).
+ *
+ * Telemetry (0.9.35). `telemetry()` returns the same `TelemetrySnapshot`
+ * shape `Bridge<S>.telemetry()` returns — same field set, same types,
+ * same semantics. Drift between the two implementations is gated by
+ * `tests/BridgeFacades.test.ts`'s `facade-telemetry-symmetry` pin
+ * (5/5 in the BridgeFacades suite). When the consumer was constructed
+ * with `pll: null`, the four PLL fields + `stallRecoveries` report
+ * `false` / `0` — matching `Bridge<S>`'s fresh-PLL output. The
+ * heap-side `softFrames` counter (added in 0.9.35) ticks identically
+ * to `Bridge._softFrames` on every soft-classified invariant
+ * deviation, so dashboards reading `telemetry().softFrames` on a
+ * `BridgeConsumer` see the same value they'd see on a `Bridge<S>`
+ * over the same traffic.
  */
 
 import {
@@ -75,6 +88,7 @@ import {
   INVARIANT_SOFT_THRESHOLD,
   INVARIANT_SOFT_ALPHA_BASE,
   type SmoothedPullOptions,
+  type TelemetrySnapshot,
 } from "./Bridge.js";
 import { buildScratchFrame } from "./_heap.js";
 
@@ -131,6 +145,13 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
 
   private readonly onInvariantFailure: InvariantFailurePolicy;
   private readonly invariantAbsoluteEpsilon: number;
+
+  /** Cumulative soft-classified invariant deviations that drove the
+   *  α-smoother rather than the hard-fallback path. Heap-side; consumer-
+   *  thread. Increments inside `_invariantHandleRaw` / `_invariantHandleSmoothed`
+   *  on the soft branch. Mirrors `Bridge<S>._softFrames`. Exposed via
+   *  `telemetry().softFrames`. (0.9.35) */
+  private _softFrames: number = 0;
 
   constructor(ring: SpscRing<S>, opts: BridgeConsumerOptions<S> = {}) {
     this.ring = ring;
@@ -298,6 +319,57 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
     return this.ring.tornFrameCount();
   }
 
+  /**
+   * Point-in-time `TelemetrySnapshot` for this consumer (0.9.35). Mirrors
+   * `Bridge<S>.telemetry()`'s field-for-field shape: ring state from the
+   * composed `SpscRing`, PLL state from the composed `ConsumerClockRecovery`
+   * (or zeros / `false` when the caller opted out with `pll: null`), and
+   * heap-side counters (`softFrames`) tracked on this facade.
+   *
+   * The returned object is `Object.freeze`d and safe to retain — every
+   * field is a primitive snapshot, no aliasing into mutable consumer
+   * state. The `tests/BridgeFacades.test.ts` symmetry pin asserts that
+   * a `BridgeConsumer<S>` and a `Bridge<S>` over the same SAB return
+   * field-for-field identical snapshots when driven through the same
+   * operations — that's the regression backstop for the
+   * `BridgeConsumer.telemetry === Bridge.telemetry` invariant.
+   *
+   * When `pll: null` was passed at construction: `pllLocked: false`,
+   * `pllOffsetNs: 0`, `pllOutliersRejected: 0`, `pllDriftPpm: 0`,
+   * `stallRecoveries: 0`. Same shape `Bridge<S>` reports on a freshly-
+   * constructed `ConsumerClockRecovery` before any `observeConsumerTime`
+   * call lands.
+   *
+   * All reads are O(1) and use `Atomics.load` underneath — safe to call
+   * from any thread. Under live producer / consumer activity the values
+   * are individually consistent but not mutually atomic. For diagnostic /
+   * dashboard use only.
+   */
+  telemetry(): TelemetrySnapshot {
+    return Object.freeze({
+      tornFrames: this.ring.tornFrameCount(),
+      softFrames: this._softFrames,
+      stallRecoveries: this.pll === null ? 0 : this.pll.stallRecoveries,
+      flowScale: this.ring.flowScaleHint(),
+      available: this.ring.available(),
+      capacity: this.capacity,
+      writeIndex: this.ring.writeIndexUnsigned(),
+      readIndex: this.ring.readIndexUnsigned(),
+      pllLocked: this.pll === null ? false : this.pll.locked,
+      pllOffsetNs: this.pll === null ? 0 : this.pll.offsetNs,
+      pllOutliersRejected: this.pll === null ? 0 : this.pll.outliersRejected,
+      pllDriftPpm: this.pll === null ? 0 : this.pll.driftPpm,
+      policy: this.ring.policy,
+      droppedFrames: this.ring.droppedCount(),
+      pushedFrames: this.ring.pushedCount(),
+      pulledFrames: this.ring.pulledCount(),
+      skippedFrames: this.ring.skippedCount(),
+      lastFullWaitNs: this.ring.lastFullWaitNanos(),
+      lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
+      maxOccupancyEverSeen: this.ring.maxOccupancy(),
+    });
+  }
+
   // ── Invariant classifier + dispatch (mirrors Bridge<S>) ──────────────────
 
   private _classifyInvariant(
@@ -340,6 +412,11 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
     if (kind === "ok") {
       if (this.smoother !== null) this.smoother.seedFrom(out);
     } else if (kind === "soft") {
+      // 0.9.35: count the soft branch (parity with Bridge<S>._softFrames).
+      // Exposed via telemetry().softFrames so a Bridge Inspector visualises
+      // soft "ride-over" events distinctly from hard fallbacks
+      // (telemetry().tornFrames).
+      this._softFrames = (this._softFrames + 1) | 0;
       if (this.smoother !== null) this.smoother.observe(out, alpha);
     } else {
       this.ring.incrementTornFrameCount();
@@ -363,6 +440,11 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
       this.ring.incrementTornFrameCount();
       this._invokeHardPolicy(out, computed, invariantStored);
       return;
+    }
+    if (kind === "soft") {
+      // 0.9.35: count the soft branch on the smoothed path too, matching
+      // Bridge<S>'s unified counter across raw + smoothed pulls.
+      this._softFrames = (this._softFrames + 1) | 0;
     }
     smoother.observe(out, alpha);
   }

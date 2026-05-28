@@ -26,6 +26,14 @@
  *      raises an Error from the pull call. `'pass-through'` lets the corrupt
  *      payload through unchanged but still increments tornFrames. A custom
  *      callback receives `(out, computed, stored)` and may mutate `out`.
+ *   5. (0.9.35) `BridgeConsumer.telemetry()` symmetry with `Bridge<S>.telemetry()`.
+ *      Two SABs of identical (capacity, schema), both driven through the
+ *      same producer→consumer→PLL→smoother pattern, must produce field-
+ *      for-field identical `TelemetrySnapshot`s. Catches drift in the new
+ *      `BridgeConsumer.telemetry()` (0.9.35) against the reference
+ *      `Bridge<S>.telemetry()` implementation. Includes a soft-invariant
+ *      sub-pin verifying the new `BridgeConsumer._softFrames` counter
+ *      ticks in lock-step with `Bridge._softFrames`.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -421,11 +429,202 @@ function testFacadeInvariantPolicies(): void {
   ok("facade-invariant-policies");
 }
 
+// ── 5. BridgeConsumer.telemetry() symmetry with Bridge<S>.telemetry() ────
+//
+// 0.9.35 patch. The new `BridgeConsumer.telemetry()` mirrors
+// `Bridge<S>.telemetry()`'s field-for-field shape. Driven through the
+// same producer/consumer/PLL/smoother sequence, both snapshots must
+// be identical — that's the regression backstop against future drift
+// in either implementation. Includes a soft-invariant sub-pin
+// verifying the new `BridgeConsumer._softFrames` counter ticks in
+// lock-step with `Bridge._softFrames`.
+function testTelemetrySnapshotSymmetry(): void {
+  // ── Phase A — no-invariant schema, healthy traffic ──────────────────────
+  {
+    const n = 4;
+    const schema = physicsControlFrameSchema(n);
+    const cap = 8;
+    const sabRef = new SharedArrayBuffer(SpscRing.byteLength(cap, schema));
+    const sabFac = new SharedArrayBuffer(SpscRing.byteLength(cap, schema));
+    const refBridge = new Bridge(sabRef, cap, schema);
+    const facRing = new SpscRing(sabFac, cap, schema);
+    const facProducer = new BridgeProducer(facRing);
+    const facConsumer = new BridgeConsumer(facRing);
+
+    const outRef = emptyPhysFrame(n);
+    const outFac = emptyPhysFrame(n);
+
+    // Identical traffic on both sides:
+    //   - 6 pushes
+    //   - 2 raw pulls
+    //   - fill again with 4 pushes (one will be dropped under default reject)
+    //   - 3 smoothed pulls (some with skipped > 0)
+    //   - 5 PLL observations
+    for (let i = 1; i <= 6; i++) {
+      refBridge.push(makePhysFrame(i, n));
+      facProducer.push(makePhysFrame(i, n));
+    }
+    for (let i = 0; i < 2; i++) {
+      refBridge.pull(outRef);
+      facConsumer.pull(outFac);
+    }
+    for (let i = 7; i <= 10; i++) {
+      refBridge.push(makePhysFrame(i, n));
+      facProducer.push(makePhysFrame(i, n));
+    }
+    for (let i = 0; i < 3; i++) {
+      refBridge.pullLatestSmoothed(outRef, 0.5);
+      facConsumer.pullLatestSmoothed(outFac, 0.5);
+    }
+    for (let i = 0; i < 5; i++) {
+      const cNs = 1_000_000_000 + i * 16_666_667;
+      const pNs = cNs + 1_500_000_000;
+      refBridge.observeConsumerTime(cNs, pNs);
+      facConsumer.observeConsumerTime(cNs, pNs);
+    }
+
+    const refSnap = refBridge.telemetry();
+    const facSnap = facConsumer.telemetry();
+
+    // Field-for-field equality. Iterating the keys means a future
+    // additive TelemetrySnapshot field automatically gets compared
+    // without touching this pin.
+    const fields = Object.keys(refSnap) as Array<keyof typeof refSnap>;
+    for (const k of fields) {
+      assertEq(
+        facSnap[k],
+        refSnap[k],
+        `Phase A: telemetry().${String(k)} matches`,
+      );
+    }
+    // Sanity floor — the test would still pass with both at default
+    // zeros if the snapshot constructors were both broken. The pull
+    // count is 2 raw + 1 smoothed = 3: the 2nd and 3rd
+    // pullLatestSmoothed find the ring empty after the 1st drained it
+    // to the newest (skipped=N), so they return -1 and don't increment
+    // pulledFrames.
+    assertEq(refSnap.pushedFrames, 10, "Phase A: 10 successful pushes");
+    assertEq(refSnap.pulledFrames, 3, "Phase A: 3 successful pulls (2 raw + 1 smoothed)");
+    assertEq(refSnap.pllLocked, true, "Phase A: PLL locked after observations");
+  }
+
+  // ── Phase B — invariant schema, exercise soft + hard branches ───────────
+  //
+  // Verifies the new BridgeConsumer._softFrames counter (added in 0.9.35
+  // alongside telemetry()) ticks in lock-step with Bridge<S>._softFrames.
+  // Pre-0.9.35, BridgeConsumer didn't track softFrames at all; this pin
+  // would catch any regression that drops the counter or miscounts the
+  // soft branch's invocations.
+  {
+    const schema = makeInvariantSchema();
+    const cap = 16;
+    const sabRef = new SharedArrayBuffer(SpscRing.byteLength(cap, schema));
+    const sabFac = new SharedArrayBuffer(SpscRing.byteLength(cap, schema));
+    const refBridge = new Bridge(sabRef, cap, schema);
+    const facRing = new SpscRing(sabFac, cap, schema);
+    const facProducer = new BridgeProducer(facRing);
+    const facConsumer = new BridgeConsumer(facRing);
+
+    const outRef = emptyInvFrame();
+    const outFac = emptyInvFrame();
+
+    // Seed with an OK frame on both rings.
+    const A = makeInvFrame(1, [10, 20, 30, 40]); // sum_sq = 100+400+900+1600 = 3000
+    refBridge.push(A);
+    facProducer.push(A);
+    refBridge.pull(outRef);
+    facConsumer.pull(outFac);
+    // Both sides: softFrames=0, tornFrames=0.
+
+    // Push frame B, then corrupt vEff[0]: 10 → 11. New sum_sq = 121+400+900+1600 = 3021.
+    // absErr = 21, delta = 21/3000 = 0.007.
+    //   ok threshold: 1e-3 * 3000 = 3 → 21 > 3 (not ok)
+    //   soft threshold: 1.0 * 3000 = 3000 → 21 < 3000 (soft, not hard)
+    // Both Bridge<S> and BridgeConsumer must classify identically and
+    // tick their respective softFrames counters by 1.
+    const B = makeInvFrame(2, [10, 20, 30, 40]);
+    refBridge.push(B);
+    facProducer.push(B);
+    // Corrupt slot 1's vEff[0] in both SABs identically. Schema layout:
+    // seq:u64 + vEff:f64Array(4) + __invariant:f64; stride8 = 6 elements;
+    // vEff[0] is f64-off 1.
+    const refView = new Float64Array(sabRef, RING_HEADER_BYTES, cap * 6);
+    const facView = new Float64Array(sabFac, RING_HEADER_BYTES, cap * 6);
+    refView[1 * 6 + 1] = 11;
+    facView[1 * 6 + 1] = 11;
+
+    assertEq(refBridge.pull(outRef), true, "Phase B: ref pull on soft-corrupt B");
+    assertEq(facConsumer.pull(outFac), true, "Phase B: fac pull on soft-corrupt B");
+
+    // softFrames must have ticked by exactly 1 on both sides. tornFrames
+    // must stay at 0 (soft, not hard).
+    assertEq(refBridge.telemetry().softFrames, 1, "Phase B: ref softFrames=1");
+    assertEq(facConsumer.telemetry().softFrames, 1, "Phase B: fac softFrames=1 (parity)");
+    assertEq(refBridge.telemetry().tornFrames, 0, "Phase B: ref tornFrames stays 0 on soft");
+    assertEq(facConsumer.telemetry().tornFrames, 0, "Phase B: fac tornFrames stays 0 on soft");
+
+    // Now push frame C, corrupt vEff[0] to a huge value — hard branch.
+    // tornFrames ticks; softFrames stays where it was.
+    const C = makeInvFrame(3, [10, 20, 30, 40]);
+    refBridge.push(C);
+    facProducer.push(C);
+    refView[2 * 6 + 1] = 99999;
+    facView[2 * 6 + 1] = 99999;
+
+    refBridge.pull(outRef);
+    facConsumer.pull(outFac);
+
+    assertEq(refBridge.telemetry().tornFrames, 1, "Phase B: ref tornFrames=1 after hard");
+    assertEq(facConsumer.telemetry().tornFrames, 1, "Phase B: fac tornFrames=1 (parity)");
+    assertEq(refBridge.telemetry().softFrames, 1, "Phase B: ref softFrames stays 1 on hard");
+    assertEq(facConsumer.telemetry().softFrames, 1, "Phase B: fac softFrames stays 1 on hard");
+
+    // Final field-for-field cross-check.
+    const refSnap = refBridge.telemetry();
+    const facSnap = facConsumer.telemetry();
+    const fields = Object.keys(refSnap) as Array<keyof typeof refSnap>;
+    for (const k of fields) {
+      assertEq(
+        facSnap[k],
+        refSnap[k],
+        `Phase B: telemetry().${String(k)} matches`,
+      );
+    }
+  }
+
+  // ── Phase C — opted-out PLL (pll: null) returns zero PLL fields ────────
+  //
+  // The 0.9.35 telemetry() implementation must handle the pll: null
+  // case explicitly — returning false / 0 for the four PLL fields plus
+  // stallRecoveries. Verify by constructing a consumer with no PLL and
+  // confirming the snapshot is well-formed (no NaN / undefined leaks
+  // through the union narrowing).
+  {
+    const n = 4;
+    const schema = physicsControlFrameSchema(n);
+    const cap = 8;
+    const sab = new SharedArrayBuffer(SpscRing.byteLength(cap, schema));
+    const ring = new SpscRing(sab, cap, schema);
+    const consumer = new BridgeConsumer(ring, { pll: null });
+    const snap = consumer.telemetry();
+    assertEq(snap.pllLocked, false, "pll:null → pllLocked false");
+    assertEq(snap.pllOffsetNs, 0, "pll:null → pllOffsetNs 0");
+    assertEq(snap.pllOutliersRejected, 0, "pll:null → pllOutliersRejected 0");
+    assertEq(snap.pllDriftPpm, 0, "pll:null → pllDriftPpm 0");
+    assertEq(snap.stallRecoveries, 0, "pll:null → stallRecoveries 0");
+    // Ring-side fields still populate normally.
+    assertEq(snap.capacity, cap, "pll:null → capacity still reported");
+  }
+
+  ok("facade-telemetry-symmetry");
+}
+
 function main(): void {
   testFacadeConstructionDefaults();
   testFacadeRoundTrip();
   testFacadeSymmetryWithBridge();
   testFacadeInvariantPolicies();
+  testTelemetrySnapshotSymmetry();
   console.log("\nAll BridgeFacades tests passed.");
 }
 

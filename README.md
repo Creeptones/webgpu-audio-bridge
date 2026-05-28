@@ -319,6 +319,8 @@ consumer.pullLatestSmoothed(out, 0.1);
 
 Behavior compatibility is bit-exact when default options are used. `BridgeConsumer` and `Bridge<S>` reach the same blend math, the same PLL convergence, and the same invariant classification on the same SAB. The `tests/BridgeFacades.test.ts#facade-symmetry-with-bridge` pin enforces this against a `Bridge<S>` reference.
 
+`BridgeConsumer.telemetry()` (0.9.35) mirrors `Bridge<S>.telemetry()` field-for-field — same `TelemetrySnapshot` shape, same per-field semantics. Drift between the two is gated by the additional `facade-telemetry-symmetry` pin in the same suite. The PLL fields (`pllLocked`, `pllOffsetNs`, `pllOutliersRejected`, `pllDriftPpm`, `stallRecoveries`) report `false` / `0` when the consumer was constructed with `pll: null`. The `softFrames` counter (added on `BridgeConsumer` in 0.9.35) ticks identically to `Bridge._softFrames` on every soft-classified invariant deviation. Dashboards subscribing via `subscribeTelemetry(...)` on either facade see the same snapshot shape.
+
 When to reach for the composable surface:
 
 - **Pluggable smoother / PLL** — pass your own subclass or alternative implementation. Pass `null` to opt out entirely (e.g. a clock-recovery-free consumer; raw pulls work, PLL methods throw).

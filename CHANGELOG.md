@@ -4,6 +4,146 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.35] — 2026-05-27
+
+### Added — `BridgeConsumer.telemetry()` symmetry with `Bridge<S>.telemetry()` (0.9.x soak)
+
+Closes the composable-surface telemetry gap. `Bridge<S>` has had
+`telemetry()` returning a frozen `TelemetrySnapshot` since 0.6.13;
+`BridgeConsumer<S>` (the composable equivalent) was missing the method
+entirely. Composable-API users had to either hold their own
+`ConsumerClockRecovery` reference and read its getters piecemeal, or
+construct a separate `Bridge<S>` over the same SAB just for telemetry.
+Neither was a great pre-1.0 shape.
+
+#### `BridgeConsumer.telemetry()`
+
+```ts
+telemetry(): TelemetrySnapshot
+```
+
+Returns the same `TelemetrySnapshot` shape `Bridge<S>.telemetry()`
+returns — same field set, same types, same semantics. Ring-side
+fields delegate to the composed `SpscRing` (`tornFrames`,
+`flowScale`, `available`, `capacity`, `writeIndex`, `readIndex`,
+`policy`, `droppedFrames`, `pushedFrames`, `pulledFrames`,
+`skippedFrames`, `lastFullWaitNs`, `lastEmptyWaitNs`,
+`maxOccupancyEverSeen`). PLL-side fields delegate to the composed
+`ConsumerClockRecovery` (`pllLocked`, `pllOffsetNs`,
+`pllOutliersRejected`, `pllDriftPpm`, `stallRecoveries`), or report
+`false` / `0` when the consumer was constructed with `pll: null`.
+
+The snapshot is `Object.freeze`d and safe to retain. Subscribing
+dashboards see the same shape on a `BridgeConsumer` as they would on
+a `Bridge<S>` over identical traffic.
+
+#### `BridgeConsumer._softFrames` counter
+
+Pre-0.9.35, `BridgeConsumer`'s `_invariantHandleRaw` and
+`_invariantHandleSmoothed` ran the soft branch but did NOT increment
+any counter — so `Bridge<S>._softFrames` and a hypothetical
+`BridgeConsumer.softFrames` would have diverged. The patch adds a
+`private _softFrames: number = 0` field on `BridgeConsumer` that
+increments on every soft-classified invariant deviation, mirroring
+`Bridge._softFrames` exactly. The `facade-telemetry-symmetry` pin
+asserts the two values match field-for-field through a soft-corruption
+sequence.
+
+#### Symmetry pin
+
+`tests/BridgeFacades.test.ts` grows from 4 pins to 5. The new
+`facade-telemetry-symmetry` pin builds:
+
+1. **Phase A** — no-invariant schema. Two SABs of identical shape
+   driven through identical pushes + raw pulls + smoothed pulls + PLL
+   observations. Compares `Bridge.telemetry()` and
+   `BridgeConsumer.telemetry()` field-for-field via
+   `Object.keys(refSnap)` iteration — additive future fields get
+   covered automatically.
+2. **Phase B** — invariant schema. Pushes a frame, mutates the SAB
+   slot's `vEff[0]` from 10 to 11 (relative deviation 21/3000 ≈
+   0.7% — well past the 0.1% ok threshold, well under the 100%
+   hard threshold, so soft). Both `Bridge._softFrames` and
+   `BridgeConsumer._softFrames` tick to 1. Then mutates a different
+   slot's `vEff[0]` to 99999 (hard) and asserts both `tornFrames`
+   tick to 1 while `softFrames` stays at 1.
+3. **Phase C** — `pll: null` opt-out. Constructs a `BridgeConsumer`
+   without a PLL and asserts `telemetry().pllLocked === false`,
+   `pllOffsetNs === 0`, `pllOutliersRejected === 0`, `pllDriftPpm ===
+   0`, `stallRecoveries === 0`. Ring-side fields still populate.
+
+The Phase A field-for-field loop is the load-bearing assertion. The
+sanity floor (`pushedFrames === 10`, `pulledFrames === 3`) catches the
+trivial-zero case where both snapshots happen to be empty.
+
+### Why
+
+Two motivations:
+
+1. **Composable-API parity is a 1.0 contract concern.** Pre-1.0 is the
+   right window to close asymmetries between `Bridge<S>` and the
+   composable surfaces (`BridgeProducer` / `BridgeConsumer`). The
+   composable shape's whole value proposition is "you can build the
+   same thing yourself"; the moment a method exists on `Bridge<S>` but
+   not on the composable equivalent, that promise breaks.
+2. **Soft-frame counting was a latent invariant gap.** The
+   `_softFrames` counter on `BridgeConsumer` was never wired — only
+   surfaced by the absence of `telemetry()`. Adding `telemetry()`
+   forced the audit; `_softFrames` lands as part of the same patch.
+
+The discovery came out of 0.9.34's test-writing session: the recovery
+test for the 5-second frame famine pin needed PLL state inspection
+on a `BridgeConsumer`, and the missing `telemetry()` forced a local
+PLL-reference hack documented in the test's pin 3 comment. 0.9.35 is
+the patch that removes the need for that hack.
+
+### Wire compatibility
+
+**100% wire-compatible.** No SAB byte layout change, no schema-DSL
+extension, no protocol change. `Bridge<S>` is untouched. `BridgeConsumer`
+gains a method + a private field; the public API addition is purely
+additive.
+
+### Tests
+
+`tests/BridgeFacades.test.ts` grows from 4 pins to 5 — the
+suite-count stays at 22 (`facade-telemetry-symmetry` is a sub-pin
+inside the existing `BridgeFacades.test.ts` file). All other 21 Node
+suites unaffected. `tests/Bridge.observability.test.ts`'s
+`telemetry-snapshot` pin (which asserts the `Bridge<S>` snapshot
+shape) is now also indirectly the shape-anchor for `BridgeConsumer`:
+any field added there must also land on `BridgeConsumer` to keep the
+symmetry pin green.
+
+### Bench
+
+Unaffected. `telemetry()` is heap-side observability, off the hot
+loop.
+
+### Documentation
+
+- `src/BridgeConsumer.ts` — file header gains a "Telemetry (0.9.35)"
+  paragraph; `telemetry()` method gets a ~25-line docstring; the
+  new `_softFrames` field carries an inline doc.
+- `README.md` — §Composable primitives gains a paragraph describing
+  `BridgeConsumer.telemetry()`'s symmetry with `Bridge<S>.telemetry()`
+  and the `pll: null` zero-fill behavior.
+- `ROADMAP.md` — 0.9.35 row added to the cohort table.
+- `CHANGELOG.md` — this entry.
+
+### Patch surface
+
+- `src/BridgeConsumer.ts` — `telemetry()` method added (~30 LOC
+  including docstring); `_softFrames` field added + wired into the
+  two invariant handlers; `TelemetrySnapshot` type re-exported from
+  `./Bridge.js`; file header expanded.
+- `tests/BridgeFacades.test.ts` — new `testTelemetrySnapshotSymmetry`
+  pin (~155 LOC) with three phases; main() wires it in.
+- `README.md` — §Composable primitives paragraph added.
+- `package.json` — version `0.9.34` → `0.9.35`.
+- `ROADMAP.md` — 0.9.35 row.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.34] — 2026-05-27
 
 ### Added — worklet error-recovery test pins (0.9.x soak)
