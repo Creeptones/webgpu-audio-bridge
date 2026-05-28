@@ -4,6 +4,97 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.45] — 2026-05-28
+
+### Added — `Bridge<S, Role>` real-time-safety role lattice (frontier track ship 2/2)
+
+Lands the `rt-safety-lattice` design note (shipped at 0.9.44 as a
+decision-pending spec) as **option (c)**: a phantom `Role` type parameter
+on the canonical `Bridge`. The maintainer chose option (c) over the
+spec's hedged option (b) — the hedge existed only to dodge the
+public-generic-arity change, which is moot at **zero users**. Stays in
+the `0.9.x` soak line (patch, not the `0.10.0` minor the spec
+anticipated) on the same override basis as Standard mode (0.9.40).
+
+#### What it does
+
+`Bridge<S, Role>` brands a handle with the thread it lives on. On the
+`"worklet"` brand the methods that are illegal on the audio render
+thread are **structurally absent** — calling them is a compile error:
+
+- `waitForData` / `waitForSpace` (Axis 1) — call `Atomics.wait`, which
+  throws `TypeError` on the browser main thread and stalls the render
+  quantum inside `process()`.
+- `subscribeTelemetry` (Axis 3) — uses `setInterval`, absent from
+  `AudioWorkletGlobalScope`.
+
+```ts
+const worklet = forWorklet(Bridge.allocate(1024, schema)); // Bridge<S,"worklet">
+worklet.pullLatest(frame);   // ✅ RT-safe
+worklet.waitForData(50);     // ❌ TS2339: Property 'waitForData' does not exist
+const worker = forWorker(alloc);   // Bridge<S,"worker"> — full surface
+```
+
+The allocating Axis-2 helpers (`scratchFrame` / `scratchEvaluatedFrame`
+/ `telemetry`) stay present on the worklet handle — a worklet
+constructor legitimately pre-allocates scratch frames before entering
+`process()`, so those are documented-discouraged, not gated.
+
+#### How it's built
+
+The class was renamed to an exported `BridgeImpl<S>`; `Bridge` is now a
+conditional **type alias** (`Role extends "worklet" ? Omit<…, blocking> :
+BridgeImpl<S>`) plus a retyped **`const` constructor**, so the gated
+methods are genuinely **absent** ("Property does not exist") rather than
+present-but-`never`. The phantom brand is a required `unique symbol`
+field — erased at runtime (zero bytes, zero ops; the runtime object is
+one ordinary `Bridge`), but nominally distinct so a `"worker"` handle
+cannot up-assign into a `"worklet"` slot and re-expose the blocking
+surface through structural subtyping. `forWorklet` / `forWorker`
+role-stamp a handle from a single `Bridge.allocate(...)`.
+
+#### New exports (package root)
+
+`forWorklet`, `forWorker` (values) and `BridgeRole`, `DefaultRole`
+(types). `BridgeImpl` is exported from the module for declaration-emit
+nameability but is not part of the package root surface.
+
+### Why
+
+Promotes a class of real-time-safety violations from production runtime
+(a thrown `TypeError` or an audible render-quantum stall) to a compile
+error at the keystroke. The per-method RT contract previously lived only
+in JSDoc prose; `Bridge<S, Role>` makes the compiler enforce it. Zero
+runtime cost keeps it free for the hot path.
+
+### Wire compatibility
+
+Fully wire-equivalent and source-compatible. No SAB/header/frame change.
+`DefaultRole = "worker"`, so `Bridge<S>`, every `new Bridge(...)` call
+site, all static members, and `instanceof Bridge` are unchanged. The
+only removed capability is `class X extends Bridge` (subclassing the
+now-`const` `Bridge`) — used nowhere in the repo.
+
+### Tests
+
+New `tests/Bridge.roles.test.ts` (pins 90–94 + a `_typeLevelPins`
+block of `@ts-expect-error` conformance pins), wired into `test` /
+`test:unit` before the concurrent stress. Runtime pins: worklet↔worker
+round-trip over one allocation, brand-erased-at-runtime, statics
+reachable through the retyped const, worker keeps the blocking surface.
+Type-level pins (enforced by `npm run typecheck`): `waitForData` /
+`waitForSpace` / `subscribeTelemetry` absent on worklet, and role-brand
+invariance on assignment — `tsc` fails if any regresses. 28 Node suites
+green (was 27); 1M-frame concurrent stress 0/10 timeouts; typecheck
+clean; bench unchanged (phantom brand adds no runtime).
+
+### Documentation
+
+`docs/rt-safety-lattice-design.md` status flipped to shipped (option c)
+with a shipped postscript. README gains a `### Real-time-safety role
+lattice — Bridge<S, Role>` subsection under Frontier primitives;
+`connect()` remains the one outstanding design-only spec.
+
 ## [0.9.44] — 2026-05-28
 
 ### Added — frontier "King-track" cohort: predictive extrapolation, record/replay timeline, worklet codegen, formal SPSC proof

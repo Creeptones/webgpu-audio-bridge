@@ -1,9 +1,14 @@
 # Phantom-typed real-time-safety lattice — `Bridge<S, Role>`
 
-**Status:** design / spec only — **decision pending** maintainer sign-off (changes the public generic surface `Bridge<S>` → `Bridge<S, Role>`).
-**Author:** RT-safety-lattice track (architect).
-**Decision pending:** whether to land the phantom-`Role` parameter on the canonical `Bridge<S>` class (option c, requires touching `src/Bridge.ts`) or to land it non-breakingly as a typed view under the existing `webgpu-audio-bridge/experimental` subpath (option b, **recommended** — zero `src/` edits beyond a net-new module).
-**Scope guard:** this note does NOT modify `src/`. It specifies the branding mechanism, the factory shape, the migration path, and the compile-pass / compile-fail snippets. Implementation is gated on sign-off.
+**Status:** **shipped** (2026-05-28, patch **0.9.45**) as **option (c)** — the phantom `Role` parameter landed on the canonical `Bridge` on `src/Bridge.ts`.
+**Author:** RT-safety-lattice track (architect) + Claude (ship).
+**Decision (resolved):** the maintainer chose **option (c)** over the originally-recommended option (b). The recommendation hedged toward (b) only to avoid the breaking public-generic-arity change; with **zero users** that concern is moot, so the param landed on the canonical `Bridge` directly rather than as a separate `experimental` view. The change is source-compatible (`DefaultRole = "worker"`, so `Bridge<S>` is unchanged) and the project stays in its `0.9.x` soak line — shipped as patch 0.9.45 rather than the `0.10.0` minor the spec anticipated, on the same maintainer-override basis as Standard mode (0.9.40).
+
+### Shipped postscript (0.9.45)
+
+Implemented exactly as option (c) specifies, with one refinement for clean IntelliSense: rather than conditional `never`-typed methods (which leave the property *present* but uncallable), the class was renamed to an exported `BridgeImpl<S>` and `Bridge` is now a conditional **type alias** + a retyped **`const` constructor**, so the gated methods are genuinely **absent** ("Property does not exist") on the worklet handle. Gated: `waitForData` / `waitForSpace` (Axis 1) + `subscribeTelemetry` (Axis 3). Kept on the worklet handle: the allocating Axis-2 helpers (`scratchFrame` / `telemetry`), since a worklet constructor legitimately pre-allocates. Factories `forWorklet` / `forWorker` + the `BridgeRole` / `DefaultRole` types are exported from the package root. The brand is required (not optional) so the two roles are nominally distinct. Regression-pinned by `tests/Bridge.roles.test.ts` (runtime pins 90–94 + `@ts-expect-error` type-level pins enforced by `npm run typecheck`).
+
+The remainder of this note is the original architect spec; the migration-path "experimental first" framing below is **superseded** by the option-(c) ship above.
 
 ## Executive summary
 

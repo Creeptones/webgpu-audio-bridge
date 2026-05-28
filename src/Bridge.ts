@@ -474,7 +474,7 @@ function ctorForKind(kind: FieldKind): TypedArrayCtor<AnyTypedArray> {
   }
 }
 
-export class Bridge<S extends Schema<FieldsObject, any>> {
+export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   public readonly capacity: number;
   public readonly schema: S;
   /** Frame size in bytes; matches schema.frameByteSize. */
@@ -1610,4 +1610,122 @@ export class Bridge<S extends Schema<FieldsObject, any>> {
       }
     }
   }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Real-time-safety role lattice — `Bridge<S, Role>` (0.9.45)
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * The phantom `Role` parameter promotes the per-method RT-safety contract that
+ * previously lived only in JSDoc prose into the type system. The MAY-BLOCK
+ * methods — `waitForData` / `waitForSpace`, which call `Atomics.wait` (a
+ * `TypeError` on the browser main thread and a hard render-quantum stall inside
+ * `AudioWorkletGlobalScope.process()`) — and the interval-based
+ * `subscribeTelemetry` (`setInterval` is absent from the AudioWorklet global
+ * scope) are made **structurally absent** on the `"worklet"`-branded handle:
+ *
+ *     const b = forWorklet(Bridge.allocate(1024, schema));
+ *     b.pullLatest(frame);   // ✅ RT-safe hot path
+ *     b.waitForData(50);     // ❌ TS2339: Property 'waitForData' does not exist
+ *
+ * The brand is a phantom (`unique symbol`, type domain only): erased at emit,
+ * zero bytes on the instance, zero ops on the hot path. It makes the two roles
+ * *nominally* distinct so a `"worker"` handle cannot silently up-assign into a
+ * `"worklet"`-typed slot and re-expose the blocking surface through structural
+ * subtyping. `DefaultRole = "worker"`, so a bare `Bridge<S>` — and every
+ * existing `new Bridge(...)` call site — keeps the full surface and compiles
+ * unchanged.
+ *
+ * Scope: only Axis-1 (`Atomics.wait`) + Axis-3 (`setInterval`) methods are
+ * gated. The allocating helpers (`scratchFrame` / `scratchEvaluatedFrame` /
+ * `telemetry`) stay present on the worklet handle — a worklet *constructor*
+ * legitimately pre-allocates scratch frames before entering `process()`, so
+ * they are documented-discouraged-in-the-hot-loop, not a hard error. The
+ * runtime object is a single `BridgeImpl<S>` regardless of role; the brand is
+ * the only difference, and it does not exist at runtime. See
+ * docs/rt-safety-lattice-design.md.
+ */
+
+/** RT-safety role brand. Erased at runtime (phantom — type domain only). */
+export type BridgeRole = "worklet" | "worker";
+
+/** Default role. `Bridge<S>` with no second arg resolves to `"worker"`, so the
+ *  full surface — including the MAY-BLOCK methods — stays available exactly as
+ *  before. Existing call sites are unaffected. */
+export type DefaultRole = "worker";
+
+declare const ROLE_BRAND: unique symbol;
+
+/** The worklet-legal surface: the full `Bridge` instance minus the methods that
+ *  throw or stall on the audio render thread. */
+type WorkletBridge<S extends Schema<FieldsObject, any>> = Omit<
+  BridgeImpl<S>,
+  "waitForData" | "waitForSpace" | "subscribeTelemetry"
+>;
+
+/**
+ * `Bridge<S, Role>` — schema-driven SPSC SAB ring, branded with the thread role
+ * its handle lives on. `Role` is a phantom: the runtime object is one
+ * `BridgeImpl<S>` regardless of role. On `"worklet"` the MAY-BLOCK + interval
+ * methods are absent (compile error if called); on `"worker"` (the default) the
+ * full surface is present.
+ */
+export type Bridge<
+  S extends Schema<FieldsObject, any>,
+  Role extends BridgeRole = DefaultRole,
+> = (Role extends "worklet" ? WorkletBridge<S> : BridgeImpl<S>) & {
+  /** Phantom role marker — never present on the runtime instance. Required in
+   *  the type domain so the two roles are nominally distinct: a `"worker"`
+   *  handle cannot up-assign into a `"worklet"`-typed slot and re-expose the
+   *  blocking surface through structural subtyping. */
+  readonly [ROLE_BRAND]: Role;
+};
+
+/**
+ * `Bridge` value: the constructor + statics, retyped so `new Bridge(...)`
+ * returns the role-branded `Bridge<S, Role>` view. The runtime class is the
+ * unchanged `BridgeImpl`; the cast narrows the construct signature's return
+ * type and is sound because the brand is phantom and the worklet view is a
+ * structural subset of the real instance.
+ */
+export const Bridge = BridgeImpl as unknown as {
+  new <S extends Schema<FieldsObject, any>, Role extends BridgeRole = DefaultRole>(
+    sab: SharedArrayBuffer,
+    capacity: number,
+    schema: S,
+    opts?: BridgeOptions,
+  ): Bridge<S, Role>;
+  byteLength<S extends Schema<FieldsObject, any>>(capacity: number, schema: S): number;
+  allocate<S extends Schema<FieldsObject, any>>(
+    capacity: number,
+    schema: S,
+  ): BridgeAllocation<S>;
+  readonly INVARIANT_OK_THRESHOLD: number;
+  readonly INVARIANT_SOFT_THRESHOLD: number;
+  readonly INVARIANT_SOFT_ALPHA_BASE: number;
+};
+
+/**
+ * Construct a **worklet-side** handle from a `Bridge.allocate(...)` result. The
+ * returned type lacks `waitForData` / `waitForSpace` / `subscribeTelemetry` —
+ * calling them is a compile error. The runtime object is a plain `Bridge`
+ * instance; the brand is erased.
+ */
+export function forWorklet<S extends Schema<FieldsObject, any>>(
+  alloc: BridgeAllocation<S>,
+  opts?: BridgeOptions,
+): Bridge<S, "worklet"> {
+  return new Bridge<S, "worklet">(alloc.sab, alloc.capacity, alloc.schema, opts);
+}
+
+/**
+ * Construct a **worker / Node-thread** handle — the full surface, blocking
+ * `waitForData` / `waitForSpace` allowed (e.g. a producer draining a GPU
+ * readback queue under the `'block'` backpressure policy).
+ */
+export function forWorker<S extends Schema<FieldsObject, any>>(
+  alloc: BridgeAllocation<S>,
+  opts?: BridgeOptions,
+): Bridge<S, "worker"> {
+  return new Bridge<S, "worker">(alloc.sab, alloc.capacity, alloc.schema, opts);
 }

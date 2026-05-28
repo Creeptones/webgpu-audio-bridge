@@ -32,6 +32,16 @@
 // ── Recommended: Bridge<Schema> ───────────────────────────────────────────
 
 export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
+// Real-time-safety role lattice (0.9.45). `Bridge<S, Role>` brands a handle
+// with the thread role it lives on; on `"worklet"` the MAY-BLOCK methods
+// (`waitForData` / `waitForSpace`) and the interval-based `subscribeTelemetry`
+// are structurally absent — calling them is a compile error. The brand is a
+// phantom (zero runtime cost); `DefaultRole = "worker"` keeps a bare
+// `Bridge<S>` fully compatible. `forWorklet` / `forWorker` are role-stamping
+// factories over a single `Bridge.allocate(...)`. See
+// docs/rt-safety-lattice-design.md.
+export { forWorklet, forWorker } from "./Bridge.js";
+export type { BridgeRole, DefaultRole } from "./Bridge.js";
 export type {
   BridgeAllocation,
   BridgeOptions,

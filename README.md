@@ -1631,7 +1631,23 @@ Three additive, wire-equivalent helpers that compose existing machinery (the tra
 - **`TimelineRecorder` / `TimelinePlayer`** (`src/TimelineRecorder.ts`) — turns the live bridge into a recordable, **deterministic, re-renderable medium**. Capture pushed frames as `(tMacroNs, frameSnapshot)` tuples, `serialize()` to a compact schema-tagged `ArrayBuffer`, and replay **bit-identically across runs and machines, faster than real time** — an offline bounce. Replay drops the PLL from the loop (deterministic clock synthesized from `sampleIndex / sampleRate`), so output is a pure function of `(timeline, sampleRate)`. See [`docs/record-replay-design.md`](./docs/record-replay-design.md).
 - **`emitWorkletReader`** (`src/emitWorkletReader.ts`) — makes the schema *generate* the hottest read path: emits a **zero-import, monomorphized `DataView` reader as a source string**, byte offsets and strides folded in as literals, no library on the audio thread. Verified import-free and bit-exact against `Bridge.pull`. See [`docs/emit-worklet-reader-design.md`](./docs/emit-worklet-reader-design.md).
 
-Two further frontier tracks ship as **design specs pending maintainer sign-off** because they change the public generic surface: a phantom-typed `Bridge<S, Role>` RT-safety lattice that makes blocking methods a compile error on the worklet-branded type ([`docs/rt-safety-lattice-design.md`](./docs/rt-safety-lattice-design.md)), and a one-call `connect()` topology constructor ([`docs/connect-topology-design.md`](./docs/connect-topology-design.md)).
+### Real-time-safety role lattice — `Bridge<S, Role>` (0.9.45)
+
+A phantom `Role` type parameter promotes the per-method real-time-safety contract from JSDoc prose into the type system. The methods that are illegal on the audio render thread — `waitForData` / `waitForSpace` (they call `Atomics.wait`, which **throws `TypeError` on the browser main thread** and **stalls the render quantum** inside `process()`) and `subscribeTelemetry` (`setInterval` is absent from `AudioWorkletGlobalScope`) — are made **structurally absent** on the `"worklet"`-branded handle:
+
+```ts
+import { Bridge, forWorklet, forWorker } from "webgpu-audio-bridge";
+
+const worklet = forWorklet(Bridge.allocate(1024, schema)); // Bridge<S, "worklet">
+worklet.pullLatest(frame);   // ✅ RT-safe hot path
+worklet.waitForData(50);     // ❌ compile error: Property 'waitForData' does not exist
+
+const worker = forWorker(alloc);  // Bridge<S, "worker"> — full surface; blocking allowed off-thread
+```
+
+The brand is a phantom (`unique symbol`, type domain only): **zero bytes on the instance, zero ops on the hot path** — the runtime object is one ordinary `Bridge` regardless of role, so the bench is unchanged. `DefaultRole = "worker"`, so a bare `Bridge<S>` and every existing `new Bridge(...)` keep the full surface and compile unchanged. The allocating helpers (`scratchFrame` / `telemetry`) stay available on the worklet handle (a worklet *constructor* legitimately pre-allocates), so only the genuinely audio-thread-illegal methods are gated. The guarantee is regression-pinned: `tests/Bridge.roles.test.ts` carries `@ts-expect-error` conformance pins, so `npm run typecheck` fails if a blocking method ever leaks back onto the worklet surface. See [`docs/rt-safety-lattice-design.md`](./docs/rt-safety-lattice-design.md).
+
+One further frontier track ships as a **design spec pending maintainer sign-off**: a one-call `connect()` topology constructor ([`docs/connect-topology-design.md`](./docs/connect-topology-design.md)).
 
 ## What this is, and what it isn't
 
