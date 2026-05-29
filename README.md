@@ -821,6 +821,20 @@ source.flushPending();                                // starts mapAsync on sche
 const pushed = source.pollCompleted();                // pushes any-ready frames
 ```
 
+#### Skip the decoder entirely — `"raw"` mode (0.9.63)
+
+When the producing shader's struct came from `emitWgslStruct(schema)`, the mapped GPU bytes are already byte-for-byte one SAB frame, so the hand-written decoder above is redundant. Pass the sentinel `"raw"` instead of a decoder closure and `BridgeGPUSource` memcpys each completed readback straight into the ring via `bridge.pushRaw` (see the zero-decode `pushRaw` section above) — no `beginPush` / decode / `commitPush`:
+
+```ts
+const source = new BridgeGPUSource(device, bridge, "raw", { stagingBufferCount: 3 });
+// scheduleReadback / flushPending / pollCompleted exactly as above —
+// pollCompleted() calls bridge.pushRaw(mappedRange) for you per frame.
+```
+
+- **Requires** `stagingBufferSize === schema.frameByteSize` (the default), since the whole mapped range is treated as one frame; a mismatch throws at construction.
+- Slot recycling, `droppedCount()` on a full bridge, `onError`, and device-lost handling behave exactly as in closure mode (the `releaseMap`/`finally` recycle path is shared). `decoderMode()` reports `'raw'` vs `'closure'`.
+- This is the ergonomic endpoint of the WGSL↔TS bridge: **define the schema once → `emitWgslStruct` generates the shader struct → `"raw"` mode wires the GPU→SAB readback with zero decode boilerplate.** For PCM block matrices (not macro-control frames) keep using `BridgeBlockProducer`, which automates the f32-block injection separately.
+
 ### Why this matters
 
 Native `mapAsync` readback runs **5-15 ms** ([Chromium 41487454](https://issues.chromium.org/issues/41487454), [gpuweb #4432](https://github.com/gpuweb/gpuweb/issues/4432)). Naïve "submit → await mapAsync → push → repeat" *serializes* the GPU and the readback: the next compute dispatch waits for the previous readback to land. Under any sustained 60 Hz load, the producer thread stalls and the bridge runs empty — the AudioWorklet's `pullLatest` returns `-1` and the synth loses macro state for a quantum.

@@ -458,7 +458,13 @@ export type GpuReadbackDecoder<S extends Schema<FieldsObject, any>> = (
  */
 export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   private readonly bridge: Bridge<S> | BridgeProducer<S>;
-  private readonly decoder: GpuReadbackDecoder<S>;
+  /** User decoder closure, or null in `"raw"` mode (the mapped range is
+   *  memcpy'd straight into the SAB via `bridge.pushRaw`). */
+  private readonly decoder: GpuReadbackDecoder<S> | null;
+  /** True when constructed with the `"raw"` decoder sentinel (0.9.63). Skips
+   *  the beginPush → decoder → commitPush dance in favor of one
+   *  `bridge.pushRaw(mappedRange)` per completed readback. */
+  private readonly _rawMode: boolean;
   private readonly slots: StagingSlot[];
   /** The strategy implementation owning the GPU staging buffers + the
    *  byte-transport mechanics (0.7.15). `'map-async'` today; `'shared'`
@@ -502,7 +508,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   constructor(
     device: GpuDeviceLike,
     bridge: Bridge<S> | BridgeProducer<S>,
-    decoder: GpuReadbackDecoder<S>,
+    decoder: GpuReadbackDecoder<S> | "raw",
     opts: BridgeGPUSourceOptions = {},
   ) {
     const count = opts.stagingBufferCount ?? 3;
@@ -517,9 +523,24 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         `BridgeGPUSource: stagingBufferSize must be a positive integer (got ${size})`,
       );
     }
+    const rawMode = decoder === "raw";
+    // 0.9.63 — "raw" mode memcpys the WHOLE mapped range into one SAB slot via
+    // bridge.pushRaw, so the staging buffer must be exactly one frame. Reject a
+    // mismatched stagingBufferSize at construction (before any device.createBuffer
+    // side effects) rather than silently mis-copying at readback time. Pair raw
+    // mode with an emitWgslStruct(schema)-generated producer struct so the GPU
+    // bytes already match the SAB layout.
+    if (rawMode && size !== bridge.schema.frameByteSize) {
+      throw new Error(
+        `BridgeGPUSource: "raw" decoder mode requires stagingBufferSize === ` +
+          `schema.frameByteSize (${bridge.schema.frameByteSize}); got ${size}. ` +
+          `In raw mode the mapped range is memcpy'd as one frame via pushRaw.`,
+      );
+    }
     const kind = opts.writeTarget ?? "auto";
     this.bridge = bridge;
-    this.decoder = decoder;
+    this._rawMode = rawMode;
+    this.decoder = rawMode ? null : (decoder as GpuReadbackDecoder<S>);
     const labelPrefix = opts.bufferLabelPrefix ?? "BridgeGPUSource";
     // Build the strategy AFTER validation so a `stagingBufferCount: 1`
     // or `stagingBufferSize: 0` rejection doesn't leak partial
@@ -673,45 +694,76 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         slot.error = undefined;
         continue;
       }
-      // The readback is ready. Try to acquire a push slot on the bridge.
-      const frame = this.bridge.beginPush();
-      if (frame !== null) {
-        // 0.9.54 — readMapped + decoder run USER code against the mapped
-        // range and can throw (malformed range, a decode bug, OOM in a
-        // heavy decoder). If anything throws AFTER beginPush() we must not
-        // leak: abortPush() so write_index never advances on the
-        // half-written frame, tick the drop counter, and surface the error
-        // to the opt-in callback. The releaseMap + slot reset below (the
-        // try/finally after this if/else) then recycle the staging slot on
-        // every outcome — success, decoder throw, or bridge-full skip. Prior
-        // to this, a single decoder throw stranded the slot in "in-flight"
-        // with its GPU buffer still mapped, eventually starving the pipeline.
+      // The readback is ready.
+      if (this._rawMode) {
+        // 0.9.63 — zero-decode path. The mapped range is byte-for-byte one SAB
+        // frame (enforced at construction: stagingBufferSize === frameByteSize),
+        // so memcpy it straight in via pushRaw — no beginPush/decoder/commitPush.
+        // pushRaw publishes atomically: there is no half-written frame to abort,
+        // so a readMapped/pushRaw throw just ticks the drop counter + surfaces
+        // the error; the releaseMap + slot reset below recycle the slot on every
+        // outcome, exactly as in the closure path.
         try {
           const range = this.writeTarget.readMapped(i);
-          this.decoder(range, frame);
-          this.bridge.commitPush();
-          this._pushedCount = (this._pushedCount + 1) | 0;
-          count++;
+          if (this.bridge.pushRaw(range)) {
+            this._pushedCount = (this._pushedCount + 1) | 0;
+            count++;
+          } else {
+            // Bridge full / policy declined — observe the loss.
+            this._droppedCount = (this._droppedCount + 1) | 0;
+          }
         } catch (err) {
-          this.bridge.abortPush();
           this._droppedCount = (this._droppedCount + 1) | 0;
           if (this._onError) {
             const kind = this._deviceLost ? "fatal" : "transient";
             try {
               this._onError(err, kind);
             } catch {
-              // User callback threw — swallow; the helper's invariant is
-              // "don't crash the producer thread on a decode failure",
-              // which overrides a misbehaving handler (mirrors the
-              // beginMap-reject path above).
+              // Misbehaving user handler — swallow (same invariant as below).
             }
           }
         }
       } else {
-        // Bridge full — drop the readback. The push policy on the
-        // bridge already accounted for whatever policy-driven drop
-        // semantics are active; we just observe the failure here.
-        this._droppedCount = (this._droppedCount + 1) | 0;
+        // Try to acquire a two-step push slot on the bridge.
+        const frame = this.bridge.beginPush();
+        if (frame !== null) {
+          // 0.9.54 — readMapped + decoder run USER code against the mapped
+          // range and can throw (malformed range, a decode bug, OOM in a
+          // heavy decoder). If anything throws AFTER beginPush() we must not
+          // leak: abortPush() so write_index never advances on the
+          // half-written frame, tick the drop counter, and surface the error
+          // to the opt-in callback. The releaseMap + slot reset below (the
+          // try/finally after this if/else) then recycle the staging slot on
+          // every outcome — success, decoder throw, or bridge-full skip. Prior
+          // to this, a single decoder throw stranded the slot in "in-flight"
+          // with its GPU buffer still mapped, eventually starving the pipeline.
+          try {
+            const range = this.writeTarget.readMapped(i);
+            this.decoder!(range, frame);
+            this.bridge.commitPush();
+            this._pushedCount = (this._pushedCount + 1) | 0;
+            count++;
+          } catch (err) {
+            this.bridge.abortPush();
+            this._droppedCount = (this._droppedCount + 1) | 0;
+            if (this._onError) {
+              const kind = this._deviceLost ? "fatal" : "transient";
+              try {
+                this._onError(err, kind);
+              } catch {
+                // User callback threw — swallow; the helper's invariant is
+                // "don't crash the producer thread on a decode failure",
+                // which overrides a misbehaving handler (mirrors the
+                // beginMap-reject path above).
+              }
+            }
+          }
+        } else {
+          // Bridge full — drop the readback. The push policy on the
+          // bridge already accounted for whatever policy-driven drop
+          // semantics are active; we just observe the failure here.
+          this._droppedCount = (this._droppedCount + 1) | 0;
+        }
       }
       // 0.7.3 — compute the wall-time cycle duration before clearing
       // the timestamp. `performance.now()` returns fractional
@@ -821,6 +873,13 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  this method always returns a concrete implementation kind. */
   writeTargetKind(): "map-async" | "shared" {
     return this._writeTargetKind;
+  }
+
+  /** Decoder mode (0.9.63): `'raw'` when constructed with the `"raw"` sentinel
+   *  (each readback is memcpy'd into the SAB via `bridge.pushRaw`), else
+   *  `'closure'` (the user decoder runs per frame). Exposed for telemetry. */
+  decoderMode(): "closure" | "raw" {
+    return this._rawMode ? "raw" : "closure";
   }
 
   /** Internal: find a slot in IDLE state, return its index. Returns -1

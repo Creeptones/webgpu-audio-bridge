@@ -4,6 +4,67 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.63] — 2026-05-29
+
+### Added — `BridgeGPUSource` `"raw"` decoder mode
+
+`BridgeGPUSource`'s `decoder` constructor argument now accepts the sentinel
+string `"raw"` in addition to a `GpuReadbackDecoder<S>` closure. In raw mode the
+helper skips the `beginPush` → decoder → `commitPush` dance and instead memcpys
+each completed readback straight into the ring via `bridge.pushRaw(mappedRange)`
+(0.9.62). Pairs with an `emitWgslStruct(schema)`-generated producer struct so the
+GPU bytes already match the SAB frame layout — the ergonomic endpoint of the
+WGSL↔TS bridge: **define the schema once → generate the shader struct →
+`"raw"` wires the GPU→SAB readback with zero decode boilerplate.**
+
+- The token is `"raw"`, deliberately NOT `"auto"` — `"auto"` is already the
+  `writeTarget` transport selector (map-async vs a future shared-memory path)
+  and the two must not collide. The new `decoderMode()` accessor reports
+  `'raw'` vs `'closure'` for telemetry.
+- **Construction validation:** raw mode requires `stagingBufferSize ===
+  schema.frameByteSize` (the default), since the whole mapped range is treated
+  as one frame. A mismatch throws before any `device.createBuffer` side effects.
+- Slot recycling, `droppedCount()` on a full bridge (pushRaw returns false),
+  `onError`, the device-lost classification, and the literal-`finally`
+  `releaseMap` recycle path all behave exactly as in closure mode — the raw
+  branch reuses the shared post-dispatch release block. Since `pushRaw` publishes
+  atomically there is no half-written frame to `abortPush` on a `readMapped`
+  throw; the error path just ticks the drop counter and recycles the slot.
+
+### Why
+
+With `emitWgslStruct` guaranteeing byte-isomorphism and `pushRaw` providing the
+zero-decode copy, the remaining boilerplate was the hand-written
+`GpuReadbackDecoder` closure — pure ceremony when the bytes already match.
+`"raw"` removes it, completing the "schema is the single source of truth"
+pipeline for GPU macro-control frames. Third pillar of the WGSL↔TS bridge track.
+
+### Wire compatibility
+
+Zero. Purely additive: the `decoder` parameter type widened from
+`GpuReadbackDecoder<S>` to `GpuReadbackDecoder<S> | "raw"` (existing closure
+callers compile and behave identically — verified by a regression pin). No
+schema, SAB byte, or protocol change; a raw-mode producer writes the exact same
+slot bytes a closure-mode producer would.
+
+### Tests
+
+New `tests/BridgeGPUSource.raw.test.ts` (5 pins, wired into `npm test` /
+`test:unit` next to the existing `BridgeGPUSource.writeTarget` suite): raw
+dispatch lands a frame via `pushRaw` with no closure (payload round-trips,
+`decoderMode()==='raw'`); full bridge → `droppedCount++` + slot recycled;
+throwing `releaseMap` after a successful `pushRaw` keeps the frame and recycles
+the slot via `finally`; `stagingBufferSize !== frameByteSize` throws with no
+buffers leaked; closure mode unaffected (regression). Mandatory gates green:
+`npm run typecheck`, `npm test` (33 suites), `npm run bench` (~1.20 µs `push`,
+unchanged).
+
+### Documentation
+
+This entry; a "Skip the decoder entirely — `"raw"` mode" subsection in the
+README `BridgeGPUSource` section; method JSDoc on the widened constructor +
+`decoderMode()`; an inline rationale block at the `pollCompleted` raw branch.
+
 ## [0.9.62] — 2026-05-29
 
 ### Added — `pushRaw(src, srcOffset?)`: zero-decode raw-byte push
