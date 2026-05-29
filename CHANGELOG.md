@@ -4,6 +4,38 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.76] — 2026-05-29
+
+### Added — `TelemetryRing<T>` rolling history (SIMD harvest, Stage 2)
+
+`Bridge.subscribeTelemetry((snap) => …)` fires a fresh `TelemetrySnapshot` per
+tick but keeps no history — when a glitch feels timing-dependent you want the
+last N ticks, not just the current one. `TelemetryRing<T>` is that history
+layer, harvested from the website's `universe/debug/telemetryRing.ts` (the 60 s
+HUD trace) and generalized off the modal sample shape.
+
+#### What shipped
+
+- **`TelemetryRing<T>`** (`src/TelemetryRing.ts`, root export) — fixed-size,
+  allocation-free circular buffer. `push(sample, t?)` is O(1) (overwrites the
+  oldest slot once full; stamps `performance.now()` or a caller `t`, or a push
+  ordinal when no clock exists); `export()` returns the retained samples
+  **oldest-first**; `latest()` / `size` / `capacity` / `clear()`. Decoupled
+  from `Bridge` (no import) so it works for any telemetry stream — composes in
+  one line:
+  `const ring = new TelemetryRing(); bridge.subscribeTelemetry((s) => ring.push(s));`
+- **`tests/TelemetryRing.test.ts`** (6 pins): fill→cap, oldest-first across the
+  wrap, deterministic timestamps via injected clock + explicit-`t` override,
+  `clear`, snapshot composition, capacity validation.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive root export only.
+
+### Tests
+
+43 Node suites green (`TelemetryRing.test.ts` added). `npm run typecheck` clean.
+
 ## [0.9.75] — 2026-05-29
 
 ### Added — WASM consumer wired into a real worklet + capture-probe equivalence harness (SIMD harvest, Stage 1)

@@ -60,6 +60,12 @@ export type {
   SubscribeTelemetryOptions,
 } from "./Bridge.js";
 
+// ── Telemetry history ring (0.9.76) — rolling diagnostic buffer ───────────
+// Fixed-size, allocation-free history layer that composes with
+// `Bridge.subscribeTelemetry` (the push-callback) to retain the last N ticks.
+export { TelemetryRing } from "./TelemetryRing.js";
+export type { TelemetryRingSample, TelemetryRingOptions } from "./TelemetryRing.js";
+
 // ── Standard mode (0.10.0) — MessageChannelBridge<Schema> ─────────────────
 //
 // Sibling tier to `Bridge<S>`'s Turbo mode. Same schema DSL surface,
