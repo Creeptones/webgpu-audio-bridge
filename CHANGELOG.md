@@ -4,6 +4,55 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.52] — 2026-05-29
+
+### Changed — public-facing metadata sync (docs / packaging only)
+
+The repo-facing story had drifted behind the code: the README status block
+still read `0.9.37` / "22 Node suites", `CITATION.cff` still read `0.9.43`, and
+the `package.json` description/keywords still described only the original
+control-rate ring rather than the three-lane architecture that shipped across
+0.9.48–0.9.51 (stereo block consumer, sample-accurate input lane, additive GPU
+residual, graceful degradation). This patch resyncs the metadata to match the
+shipped surface.
+
+- **`package.json`**: description reframed to the reference-bridge architecture;
+  keywords expanded from 11 to 20 topics (adds `realtime-audio`,
+  `low-latency-audio`, `browser-audio`, `gpu-compute`, `audio-dsp`,
+  `audio-synthesis`, `audio-engine`, `typescript`, `web-worker`,
+  `messagechannel`, `audio-rate`).
+- **`README.md`**: hero blockquote reframed to "realtime CPU synthesis,
+  latency-tolerant WebGPU compute, and lock-free lanes for macro state, input
+  events, and additive residual blocks"; status corrected to **0.9.52** and
+  **30 Node/TypeScript suites in `npm test`** (was 22) plus the cross-engine
+  Playwright browser CI line.
+- **`CITATION.cff`**: `version` `0.9.43` → `0.9.52`, `date-released` →
+  `2026-05-29`.
+- **GitHub repo description** updated to match (out-of-tree).
+
+### Why
+
+Packaging + citation metadata are the project's outward-facing front door for
+npm search, Zenodo/DOI citation, and LLM auditors. Letting them lag the code
+under-sells the current architecture and misreports the test count. No code,
+schema, or wire change — this is a documentation/packaging patch.
+
+### Wire compatibility
+
+Zero. No `src/` change, no schema change, no SAB byte change. Bit-for-bit
+identical runtime to 0.9.51.
+
+### Tests
+
+No new pins (metadata-only). Mandatory gates re-run green before the bump:
+`npm run typecheck`, `npm test` (30 suites), `npm run bench` (push/pull/pullLatest
+~1.20 µs baseline).
+
+### Documentation
+
+This entry; README status + hero; `CITATION.cff`; `package.json`
+description/keywords. `LLM_BUNDLE.md` regenerated (build artifact, `.gitignore`d).
+
 ## [0.9.51] — 2026-05-29
 
 ### Added — underflow telemetry + graceful-degradation controller
