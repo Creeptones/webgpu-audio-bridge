@@ -364,3 +364,26 @@ export type {
   WgslMember,
   WgslLayout,
 } from "./emitWgslStruct.js";
+
+// ── WASM whole-frame decoder codegen ───────────────────────────────────────
+//
+// `emitWasmDecoder` emits, as a SOURCE STRING, a monomorphized WAT module that
+// decodes one ring slot into a scratch region with every field offset baked in
+// as an `i32.const` literal — the WAT sibling of `emitWorkletReader` (JS) and
+// `emitWgslStruct` (WGSL). Unlike the packaged GENERIC `decode_frame` (which
+// loops a runtime descriptor table), a generated decoder is straight-line: no
+// descriptor blit, no loop, and contiguous fields coalesce into a single
+// `memory.copy`. Byte-identical to the generic path; bit-exact to Bridge.pull.
+// Compile with any WAT→wasm compiler (e.g. `wabt`) and instantiate against the
+// shared SAB memory. See src/emitWasmDecoder.ts.
+export {
+  emitWasmDecoder,
+  planWasmDecoder,
+} from "./emitWasmDecoder.js";
+export type {
+  EmitWasmDecoderOptions,
+  EmitWasmDecoderInput,
+  WasmDecoderField,
+  WasmDecoderCopy,
+  WasmDecoderPlan,
+} from "./emitWasmDecoder.js";

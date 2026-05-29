@@ -4,6 +4,78 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.78] — 2026-05-29
+
+### Added — `emitWasmDecoder(schema)`: monomorphized whole-frame WAT decoder codegen (SIMD harvest, Stage 4)
+
+The packaged `decode_frame` (0.9.74) is GENERIC: one binary decodes any schema
+by looping a runtime `(srcRel, dstAbs, byteCount)` descriptor table that JS
+blits into memory (`buildFrameDescriptors`) — one loop iteration + three
+`i32.load`s + one `memory.copy` per field. This adds the schema-generated,
+straight-line counterpart, completing the codegen trio alongside
+`emitWorkletReader` (JS) and `emitWgslStruct` (WGSL): the TS `Schema` is the
+single source of truth, and the emitted artifact is monomorphized to one exact
+layout.
+
+#### What shipped
+
+- **`emitWasmDecoder(input, opts?)`** (`src/emitWasmDecoder.ts`, root export) —
+  emits, as a SOURCE STRING, a WAT module exporting a whole-frame decoder with
+  every field's `srcRel`/`dstRel`/`byteCount` baked in as `i32.const` literals.
+  No descriptor table, no loop, no `descPtr`/`descCount` params. A **copy-
+  coalescing** pass (default on) fuses fields that are contiguous in BOTH the
+  source frame and the destination region into a single `memory.copy` — so a
+  schema whose user payload packs contiguously (the common case) decodes in
+  **one bulk move**. The "SAB is the memory" import (`(import "env" "memory"
+  … shared)`) matches the packaged decoder so one `WebAssembly.Memory`
+  instantiates both. Pure string emitter — imports no compiler, same boundary
+  `emitWorkletReader` documents.
+- **`planWasmDecoder(input, opts?)`** — the structured spine behind the text
+  (per-field src/dst map + coalesced copy list + `totalDstBytes`), analogous to
+  `computeWgslLayout`. Destination packing is byte-identical to
+  `buildFrameDescriptors` (descending alignment), which is what makes the
+  generated decoder a drop-in for the generic one.
+- **Four address forms** via `opts.slotInput` (`"slotBase"` | `"slotIndex"`)
+  and `opts.dstBase` (param | baked literal). `slotInput: "slotIndex"` bakes
+  the frame stride so the export takes the slot INDEX and derives `slotBase`
+  internally; baking `dstBase` folds the scratch base into every destination
+  `i32.const`. Combined, the export collapses to a single-arg
+  `decode_frame(slot)`.
+
+#### Why
+
+The 0.9.74 decode-path comparator selected WASM `decode_frame` as the canonical
+consumer but left it GENERIC. Monomorphizing it removes the per-field loop +
+`i32.load`s entirely. The benched win (`npm run bench:emit-wasm-decoder`,
+decode-only, batched to beat the host hrtime tick): **1.78× p50** on a 1.8 KB
+9-field macro frame (76 → 43 ns; memcpy-bound), rising to **2.21× p50** on a
+24 B 3-field control frame (33 → 15 ns; loop-overhead-bound). The win scales
+inversely with frame size — largest for the small, high-frequency control-rate
+decodes where it matters most. The structural finding: decode-side relocation
+is now a single `memory.copy`, so there is no further SIMD harvest there —
+the remaining WASM leverage is purely in trajectory *evaluation*.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API only (`emitWasmDecoder` /
+`planWasmDecoder` + their types on the root export). No SAB-layout, protocol,
+or packaged-binary change — the generated module is the caller's build-time
+artifact, compiled with their own WAT→wasm toolchain.
+
+### Tests
+
+44 Node suites green (`emitWasmDecoder.test.ts` added). It compiles the emitted
+WAT in-process with `wabt` and diffs the generated decoder against TWO oracles
+at once: **byte-identical** to the generic `decode_frame` and **bit-exact** to
+`Bridge.pull`, across scalar / mixed+array+trajectory / invariant schemas,
+fuzzed + wrap-covering, and all four address forms (incl. single-arg). `npm run
+typecheck` clean. `npm run bench` push/pull/pullLatest 1.20 µs (unchanged).
+
+### Documentation
+
+`emitWasmDecoder` added to the README codegen section; new
+`bench/emit-wasm-decoder.bench.ts` (`npm run bench:emit-wasm-decoder`).
+
 ## [0.9.77] — 2026-05-29
 
 ### Added — clamped trajectory evaluators in WASM (scalar + SIMD) (SIMD harvest, Stage 3)
