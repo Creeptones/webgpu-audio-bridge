@@ -681,8 +681,8 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         // heavy decoder). If anything throws AFTER beginPush() we must not
         // leak: abortPush() so write_index never advances on the
         // half-written frame, tick the drop counter, and surface the error
-        // to the opt-in callback. The unconditional releaseMap + slot reset
-        // below (lines after this if/else) then recycle the staging slot on
+        // to the opt-in callback. The releaseMap + slot reset below (the
+        // try/finally after this if/else) then recycle the staging slot on
         // every outcome — success, decoder throw, or bridge-full skip. Prior
         // to this, a single decoder throw stranded the slot in "in-flight"
         // with its GPU buffer still mapped, eventually starving the pipeline.
@@ -722,11 +722,31 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (slot.mapStartedAtMs > 0) {
         this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
       }
-      this.writeTarget.releaseMap(i);
-      slot.state = "idle";
-      slot.mapped = false;
-      slot.pending = null;
-      slot.mapStartedAtMs = 0;
+      // 0.9.58 — releaseMap() calls buffer.unmap(), which can itself throw on a
+      // real GPUDevice (an already-unmapped/destroyed buffer, or a device lost
+      // between map and unmap). Reset the slot to idle in a literal `finally`
+      // so a throwing unmap can NEVER strand the slot in "in-flight" — the same
+      // recycle guarantee the decoder-fault path (0.9.54) gives, now extended
+      // to the release step. The frame, if any, was already committed above, so
+      // this is not a drop; we surface the unmap error via onError (so the app
+      // can react to a likely device-lost) but recycle the slot regardless.
+      try {
+        this.writeTarget.releaseMap(i);
+      } catch (err) {
+        if (this._onError) {
+          const kind = this._deviceLost ? "fatal" : "transient";
+          try {
+            this._onError(err, kind);
+          } catch {
+            // Misbehaving user handler — swallow (same invariant as above).
+          }
+        }
+      } finally {
+        slot.state = "idle";
+        slot.mapped = false;
+        slot.pending = null;
+        slot.mapStartedAtMs = 0;
+      }
     }
     return count;
   }

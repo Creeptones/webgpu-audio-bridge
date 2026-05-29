@@ -54,6 +54,10 @@
  *       does not advance), unmaps the buffer, recycles the slot to idle,
  *       ticks droppedCount, and fires onError('transient'). The next
  *       readback succeeds on the recycled slot (no permanent starvation).
+ *   12. (0.9.58) A throwing releaseMap()/unmap() (AFTER a successful commit)
+ *       still recycles the slot via the literal finally: the committed frame
+ *       is kept (push not rolled back), the slot returns to idle, onError
+ *       fires, and the next readback succeeds on the recycled slot.
  *
  * No GPU is required; the test uses a tiny mock `GpuDeviceLike`.
  */
@@ -596,6 +600,68 @@ async function testDecoderThrowRecovers(): Promise<void> {
   ok("11. (0.9.54) decoder throw aborts the push, unmaps, recycles, and recovers");
 }
 
+// ── 12. (0.9.58) A throwing releaseMap()/unmap() does not strand the slot ───
+// releaseMap() runs AFTER a successful commitPush(), so the frame is already
+// published. If buffer.unmap() then throws (already-unmapped/destroyed buffer,
+// or a device lost between map and unmap), the slot reset must still run — it's
+// in a literal `finally`. Asserts: the committed frame is readable (push was
+// NOT rolled back), the slot recycles to idle, onError fires, and the next
+// readback succeeds on the recycled slot.
+async function testReleaseMapThrowRecovers(): Promise<void> {
+  let throwOnUnmap = true;
+  const device: GpuDeviceLike = {
+    createBuffer(desc) {
+      const buf: GpuBufferLike = {
+        size: desc.size,
+        mapAsync: () => Promise.resolve(undefined),
+        getMappedRange: (_offset, size) => new ArrayBuffer(size ?? desc.size),
+        unmap: () => {
+          if (throwOnUnmap) throw new Error("unmap blew up (e.g. buffer already destroyed)");
+        },
+        destroy: () => {},
+      };
+      return buf;
+    },
+  };
+  const bridge = makeBridge();
+  const captured: Array<{ err: unknown; kind: string }> = [];
+  const decoder = (_range: ArrayBuffer, frame: FrameFor<typeof schema>): void => {
+    frame.seq = 7n;
+  };
+  const src = new BridgeGPUSource(device, bridge, decoder, {
+    stagingBufferCount: 2,
+    onError: (err, kind) => captured.push({ err, kind }),
+  });
+
+  // Frame 1 — decode + commit succeed, but unmap throws.
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed1 = src.pollCompleted();
+
+  assertEq(pushed1, 1, "frame committed before unmap threw (push is not rolled back)");
+  assertEq(src.pushedCount(), 1, "pushedCount reflects the committed frame");
+  assertEq(src.inFlight(), 0, "slot still recycled to idle despite the unmap throw (finally ran)");
+  assertEq(captured.length, 1, "onError fired once for the unmap failure");
+  assertEq(captured[0]!.kind, "transient", "unmap failure classified 'transient' (device not lost)");
+  const out = bridge.scratchFrame();
+  assert(bridge.pull(out), "the committed frame is readable");
+  assertEq(out.seq, 7n, "the committed frame carries the decoder's payload");
+
+  // Frame 2 — unmap now succeeds; the recycled slot accepts the next readback.
+  throwOnUnmap = false;
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed2 = src.pollCompleted();
+
+  assertEq(pushed2, 1, "recycled slot accepts the next readback after a throwing unmap");
+  assertEq(src.pushedCount(), 2, "second frame committed");
+
+  src.destroy();
+  ok("12. (0.9.58) throwing releaseMap()/unmap() recycles the slot in finally (frame kept)");
+}
+
 async function main(): Promise<void> {
   testDefaultResolvesToMapAsync();
   testAutoResolvesToMapAsync();
@@ -608,6 +674,7 @@ async function main(): Promise<void> {
   await testNoOnErrorSilent();
   await testOnErrorUserThrowSwallowed();
   await testDecoderThrowRecovers();
+  await testReleaseMapThrowRecovers();
   console.log("\nAll BridgeGPUSource.writeTarget.test.ts pins passed.");
 }
 

@@ -967,6 +967,8 @@ The user-supplied `decoder(range, frame)` runs inside `pollCompleted()` — it's
 
 `pollCompleted()` now contains decoder faults symmetrically with the device-lost path: a throw triggers `abortPush()` (so the ring's `write_index` does **not** advance on the half-written frame — no torn frame is ever published), ticks `droppedCount()`, unmaps and recycles the staging slot, and surfaces the error through the same `onError(err, 'transient')` channel. The next `scheduleReadback` reuses the recycled slot — one bad decode costs one dropped frame, not the whole pipeline. Pinned by `tests/BridgeGPUSource.writeTarget.test.ts#11`.
 
+The release step is hardened the same way (0.9.58): `releaseMap()` calls `buffer.unmap()`, which can itself throw on a real `GPUDevice` (an already-unmapped/destroyed buffer, or a device lost between map and unmap). The unmap + slot reset run in a literal `try/finally`, so a throwing unmap can never strand the slot in `in-flight` — the slot always recycles to idle and the unmap error surfaces through `onError`. Because the unmap runs *after* `commitPush()`, the already-published frame is kept (the push is not rolled back). Pinned by `tests/BridgeGPUSource.writeTarget.test.ts#12`.
+
 ### WebGPU type compatibility
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.

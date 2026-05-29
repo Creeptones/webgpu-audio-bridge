@@ -4,6 +4,53 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.58] — 2026-05-29
+
+### Fixed — `releaseMap()` slot reset moved into a literal `finally`
+
+0.9.54 contained decoder faults in `BridgeGPUSource.pollCompleted()`, but the
+`releaseMap()` (`buffer.unmap()`) + slot-state reset still ran as plain
+statements *after* the decode try/catch — not inside a `finally`. So a throwing
+`unmap()` (an already-unmapped/destroyed buffer, or a device lost between map and
+unmap) would escape before the slot reset and strand the slot in `in-flight`
+again — the same leak class 0.9.54 closed for the decoder, left open for the
+release step.
+
+The unmap + slot reset now run in a literal `try { releaseMap } finally { reset }`,
+so the slot **always** recycles to idle regardless of whether `unmap()` throws.
+The unmap error is surfaced through the same `onError(err, kind)` channel
+(classified `'transient'` unless `device.lost` has resolved). Because `unmap()`
+runs *after* `commitPush()`, the already-published frame is kept — the push is
+**not** rolled back; this is a release-time failure, not a dropped frame.
+
+### Why
+
+Closes the last sharp edge the audit flagged on the decode/push/unmap path:
+"releaseMap() + slot reset are after the decode try/catch, not inside a literal
+finally; a throwing releaseMap() would still escape before slot reset." Real-time
+helpers must guarantee slot recycle on *every* exit path, including a throwing
+release.
+
+### Wire compatibility
+
+Zero. No schema, SAB-byte, or public-API change — internal control flow in
+`pollCompleted()`. A non-throwing `unmap()` behaves bit-for-bit as in 0.9.57.
+
+### Tests
+
+New `tests/BridgeGPUSource.writeTarget.test.ts` pin **12**
+(`testReleaseMapThrowRecovers`): a mock whose `unmap()` throws after a successful
+decode + commit. Asserts the committed frame is readable (push not rolled back),
+the slot recycles to idle (the `finally` ran), `onError('transient')` fires, and
+the recycled slot accepts the next readback once `unmap()` recovers. Mandatory
+gates re-run green: `npm run typecheck`, `npm test` (30 suites), `npm run bench`
+(~1.20 µs baseline).
+
+### Documentation
+
+This entry; README §BridgeGPUSource "Decoder-fault containment" subsection
+extended with the release-step hardening.
+
 ## [0.9.57] — 2026-05-29
 
 ### Changed — reconcile stale "reserved" lane comments with the shipped PLL lanes
