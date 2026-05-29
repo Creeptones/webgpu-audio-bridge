@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — four-tier hybrid stack demo</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 900px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      button.warn { background: #b45f0a; }
+      button.warn:hover:not(:disabled) { background: #e07a14; }
+      label { display: block; margin: 8px 0 6px; color: #9aa3ad; font-size: 12px; }
+      input[type=range] { width: 100%; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .row input[type=range] { flex: 1; }
+      .row .lbl { min-width: 96px; text-align: right; color: #d4d7dc; }
+      .modes { display: flex; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+      .modes label { color: #d4d7dc; font-size: 13px; margin: 0; cursor: pointer; }
+      .toggle { display: inline-flex; align-items: center; gap: 8px; color: #d4d7dc; font-size: 13px; margin: 8px 16px 0 0; cursor: pointer; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k { color: #9aa3ad; }
+      .status .v { color: #d4d7dc; }
+      .status .err { color: #ff7a7a; }
+      .status .ok { color: #6ee69b; }
+      .meters { display: grid; grid-template-columns: 24px 1fr; gap: 6px 10px; align-items: center; margin-top: 8px; }
+      .meters .ch { color: #9aa3ad; font-size: 12px; }
+      .meter-track { background: #15171c; border: 1px solid #21252d; border-radius: 4px; height: 14px; overflow: hidden; }
+      .meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2a6df4, #6ee69b); transition: width 60ms linear; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      .callout { background: #15171c; border-left: 3px solid #2a6df4; padding: 12px 16px; margin: 16px 0; font-size: 13px; color: #c8cdd5; }
+      .callout strong { color: #fff; }
+      table.tiers { border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+      table.tiers td { padding: 3px 12px 3px 0; vertical-align: top; }
+      table.tiers .t { color: #6ee69b; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — four-tier hybrid stack demo</h1>
+
+    <p>
+      The full hybrid stack composed in one demo. Four tiers, each owning a
+      different latency class — <strong>the CPU carrier owns the latency-critical
+      action; the GPU adds residual/timbre/space; a predictive macro layer
+      forward-compensates the smooth controls</strong>:
+    </p>
+
+    <table class="tiers">
+      <tr><td class="t">Tier 1</td><td><code>BridgeInputLane</code></td><td>note / gesture / carrier params</td><td>~1 µs SAB</td></tr>
+      <tr><td class="t">Tier 2</td><td>CPU <code>AudioWorklet</code></td><td>pitch, attack, fundamental</td><td>sub-quantum</td></tr>
+      <tr><td class="t">Tier 3</td><td>GPU residual bridge</td><td>upper harmonics + spatial field</td><td>~85 ms</td></tr>
+      <tr><td class="t">Tier 4</td><td><code>pullPredictedLatest</code></td><td>smooth macro fields (cutoff, azimuth)</td><td>"negative"</td></tr>
+    </table>
+
+    <div class="callout">
+      <strong>What you're listening for.</strong> Move the <em>freq</em> slider —
+      pitch follows <em>instantly</em> (fundamental on the CPU, tier 1+2). The
+      <em>cutoff</em> sweep and <em>auto-pan</em> are tier-4 SMOOTH MACROS, pulled
+      with <code>pullPredictedLatest</code> and led forward by the measured GPU
+      readback wall. Toggle <strong>"Predict (negative latency)"</strong> off and
+      on: with predict <em>off</em>, the cutoff/pan lag the gesture by the readback
+      latency; with it <em>on</em>, they snap forward onto the gesture even though
+      the GPU residual body is still ~85 ms behind. Press <em>"Simulate GPU
+      stall"</em> — the harmonics fade for ~250 ms while the (centered)
+      fundamental keeps playing; the carrier survives, no click.
+    </div>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="stall" class="warn" disabled>Simulate GPU stall (250 ms)</button>
+
+    <h2>Mode</h2>
+    <div class="modes">
+      <label><input type="radio" name="mode" value="hybrid" checked /> Hybrid (all four tiers)</label>
+      <label><input type="radio" name="mode" value="replace" /> Replace (residual only)</label>
+      <label><input type="radio" name="mode" value="carrier-only" /> Carrier only (no GPU)</label>
+    </div>
+
+    <h2>Tier 1+2 — carrier (instant pitch)</h2>
+    <label>Carrier frequency</label>
+    <div class="row">
+      <input id="freq" type="range" min="55" max="500" step="1" value="220" />
+      <span id="freq-label" class="lbl">220 Hz</span>
+    </div>
+
+    <h2>Tier 3 — GPU residual</h2>
+    <label>Residual gain</label>
+    <div class="row">
+      <input id="rgain" type="range" min="0" max="1.2" step="0.01" value="0.5" />
+      <span id="rgain-label" class="lbl">0.50</span>
+    </div>
+    <label>Stereo width (intrinsic residual width)</label>
+    <div class="row">
+      <input id="width" type="range" min="0" max="1" step="0.01" value="0.5" />
+      <span id="width-label" class="lbl">0.50</span>
+    </div>
+
+    <h2>Tier 4 — predictive smooth macros</h2>
+    <label class="toggle"><input id="predict" type="checkbox" checked /> Predict (negative latency) — lead macros by the readback wall</label>
+    <label>Cutoff base (low-pass on the mix)</label>
+    <div class="row">
+      <input id="cutoff" type="range" min="200" max="16000" step="10" value="6000" />
+      <span id="cutoff-label" class="lbl">6000 Hz</span>
+    </div>
+    <label class="toggle"><input id="sweep" type="checkbox" checked /> Auto-sweep cutoff (gives the macro a real velocity)</label>
+    <label>Auto-pan rate (azimuth)</label>
+    <div class="row">
+      <input id="panrate" type="range" min="0" max="1.5" step="0.01" value="0.25" />
+      <span id="panrate-label" class="lbl">0.25 Hz</span>
+    </div>
+
+    <h2>L / R output</h2>
+    <div class="meters">
+      <span class="ch">L</span>
+      <div class="meter-track"><div id="meter-l" class="meter-fill"></div></div>
+      <span class="ch">R</span>
+      <div class="meter-track"><div id="meter-r" class="meter-fill"></div></div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <h2>What this is showing</h2>
+    <p style="font-size: 13px; color: #c8cdd5;">
+      Three of the four tiers already shipped as primitives; this demo is their
+      <em>composition</em>. The one genuinely new wire is <strong>tier 4</strong>:
+      a control-rate <code>Bridge&lt;S&gt;</code> of smooth macro fields carried as
+      order-2 trajectories (position + <em>velocity</em>), pulled each quantum with
+      <code>pullPredictedLatest</code> so each macro is rendered where it
+      <em>will be</em> once the block is heard. The lead is the live
+      <code>lastReadbackMedianMs()</code>, fed from the worker's measured GPU
+      readback. <strong>Predict smooth macros, never the carrier</strong> —
+      pitch/attack/note-on are discontinuous and stay on tiers 1+2;
+      forward-extrapolating a step would pre-echo it. Safe by construction: a
+      cold or jittery clock collapses tier 4 to a plain hold, leaving the carrier
+      untouched.
+    </p>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      See <code>examples/hybrid-residual-stereo/</code> for the stereo base and
+      <code>docs/hybrid-four-tier-handoff.md</code> for the design.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

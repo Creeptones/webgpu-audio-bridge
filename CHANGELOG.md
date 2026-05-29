@@ -4,6 +4,83 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.72] — 2026-05-29
+
+### Added — the four-tier hybrid stack composed in one demo (`examples/hybrid-four-tier/`)
+
+A runnable demo + regression pin that composes all four tiers of the hybrid
+residual-on-carrier pattern, each owning a different latency class:
+
+```
+TIER                     OWNS                                   LATENCY
+──────────────────────── ────────────────────────────────────  ──────────
+1 BridgeInputLane      → note / gesture / carrier params        ~1 µs SAB
+2 CPU AudioWorklet     → pitch, attack, transient, fundamental  sub-quantum
+3 GPU residual bridge  → upper harmonics + spatial field        ~85 ms
+4 predictive macro     → smooth forward compensation            "negative"
+```
+
+Three of the four tiers already shipped as primitives — this ship is their
+**composition**. The one genuinely new wire is **tier 4**: a control-rate
+`Bridge<S>` of SMOOTH macro fields (filter cutoff, spatial azimuth) carried as
+order-2 trajectories (position + velocity), pulled each quantum with
+`pullPredictedLatest` and led forward by the live `lastReadbackMedianMs()`. The
+worklet renders each macro where it *will be* once the block is heard, so the
+perceived control surface (carrier pitch + macro envelopes) is current even while
+the GPU spectral body still lags ~85 ms inside the perceptual integration window.
+
+#### What shipped
+
+- **`examples/hybrid-four-tier/`** — `index.html` / `serve.mjs` / `main.js` /
+  `worker.js` / `worklet.js` / `schema.js`, plus a `dev:four-tier` npm script
+  (demo at `http://localhost:5179/`). Built on the stereo residual base; adds the
+  tier-1 carrier input lane, the tier-4 macro bridge + `~60 Hz` position+velocity
+  producer, the predictive pull, a cutoff one-pole low-pass + equal-power azimuth
+  pan, and a **"Predict (negative latency)" A/B toggle** so the predictive layer
+  is audible on/off. The worker's already-measured `lastReadbackUs` is relayed
+  main → worklet → `recordReadbackLatency()` to drive the tier-4 lead (handoff
+  §3.3 plumbing — no new measurement code).
+- The **spatial field** (tier-3 "space") is driven by the tier-4 `azimuth` macro
+  as an equal-power L/R pan applied predictively in the worklet — no GPU
+  round-trip for the pan gesture.
+
+### Why
+
+Roadmap follow-on to 0.9.71's `pullPredictedLatest`: nothing yet *used* the
+predictive pull inside the hybrid stack, even though it is the exact primitive
+the brief's "predictive macro layer → smooth forward compensation" describes.
+The demo makes the headline claim — "the CPU carrier owns the latency; the GPU
+adds residual/timbre/space, not the fundamental action" — legible and
+regression-pinnable. The convolution / room tail (handoff §3.4) is the documented
+follow-on; it needs a two-pass persistent-history WGSL dispatch and is deferred
+so this ship stays composition, not new GPU DSP.
+
+### Wire compatibility
+
+**Wire-equivalent.** Examples + a test pin + docs; no library source change, no
+SAB header / payload / size change, no public-API change. The macro bridge reuses
+the shipped trajectory-schema DSL (`f64TrajectoryArray` + `.withTimestamps`) and
+the 0.9.71 consumer pull. Same patch posture as the 0.9.49 sample-accurate-carrier
+ship.
+
+### Tests
+
+39 Node suites green. New `tests/Bridge.fourTier.test.ts` (4 pins, 110–113)
+pins the tier-4 contract against the demo's actual macro schema (scalar order-2
+fields): a cold PLL holds the macro open (the demo seeds an open filter for
+exactly this), a warm PLL leads a sweeping field forward by the
+`w·(p+v·dtEff)+(1−w)·p` blend, a held field (velocity 0) collapses to a pure hold
+while a co-resident sweeping field still leads, and the readback-median lead
+source drives a real forward step end-to-end. `push`/`pull`/`pullLatest` bench
+medians unchanged at ~1.20 μs.
+
+### Documentation
+
+README §"Hybrid residual-on-carrier mode" gains a "Four-tier stack" subsection
+(topology table + the tier-4 worklet snippet + the "predict smooth macros, never
+the carrier" rule); CHANGELOG (this block); ROADMAP shipped row;
+`docs/hybrid-four-tier-handoff.md` flipped to a shipped postscript.
+
 ## [0.9.71] — 2026-05-29
 
 ### Added — first-class "negative latency" mode: `pullPredictedLatest` + readback-median lead source

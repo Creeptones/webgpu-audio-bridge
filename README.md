@@ -1474,6 +1474,41 @@ Because the wire format is unchanged, `BridgeBlockProducer` works as-is (it copi
 npm run build && npm run dev:hybrid-residual-stereo    # demo at http://localhost:5178/
 ```
 
+#### Four-tier stack (0.9.72)
+
+The full hybrid pattern is **four tiers, each owning a different latency class**. Three of them already ship as primitives; the fourth — predictive smooth macros — is the one new wire, and [`examples/hybrid-four-tier/`](./examples/hybrid-four-tier/) composes all four in one demo.
+
+```
+TIER                     OWNS                                   LATENCY
+──────────────────────── ────────────────────────────────────  ──────────
+1 BridgeInputLane      → note / gesture / carrier params        ~1 µs SAB
+2 CPU AudioWorklet     → pitch, attack, transient, fundamental  sub-quantum
+3 GPU residual bridge  → upper harmonics + spatial field        ~85 ms
+4 predictive macro     → smooth forward compensation            "negative"
+```
+
+The headline: **the CPU carrier owns the latency-critical action (pitch, attack); the GPU adds residual/timbre/space; a predictive macro layer forward-compensates the smooth controls.** Tier 4 is a control-rate `Bridge<S>` of *smooth macro fields* — filter cutoff, spatial azimuth — carried as order-2 trajectories (position + **velocity**) and pulled each quantum with [`pullPredictedLatest`](#pullpredictedlatest--first-class-negative-latency-mode-0971), led forward by the live `lastReadbackMedianMs()`. Each macro is rendered where it *will be* once the block is heard, so the perceived control surface tracks the gesture even while the GPU spectral body it modulates is still ~85 ms behind:
+
+```ts
+// worklet, per quantum — the SOLE macro pull (warms the PLL via consumerNs)
+const r = this.macro.pullPredictedLatest(this.macroOut, {
+  leadMs: this.macroLeadMs,        // = macro.lastReadbackMedianMs(), relayed
+  maxLeadMs: 20,                   //   from the worker's measured GPU readback
+  confidenceFloor: 0.25,           // jittery clock → hold, don't wobble
+  consumerNs: currentTime * 1e9,   // warms the PLL (sole per-quantum observe)
+});
+const cutoffHz = this.macroOut.cutoff[0];   // already led forward
+const azimuth  = this.macroOut.azimuth[0];  // → equal-power L/R pan (tier-3 space)
+```
+
+> **Predict smooth macros, never the carrier.** Pitch / attack / note-on are discontinuous and latency-critical — they ride tiers 1+2 (the input lane + the CPU carrier). Forward-extrapolating a step pre-echoes it. Tier 4 is for continuous, band-limited fields only; the producer writes `velocity = 0` for a held value, and prediction then collapses to a hold (correct). Safe by construction: a cold or jittery clock degrades tier 4 to a plain latest-frame hold, leaving the carrier untouched.
+
+The demo's **"Predict (negative latency)" toggle** A/Bs the layer: with it off, the cutoff sweep and auto-pan lag the gesture by the readback latency; with it on, they snap forward onto the gesture. See [`docs/hybrid-four-tier-handoff.md`](./docs/hybrid-four-tier-handoff.md) for the full design (incl. the deferred convolution/room-tail follow-on).
+
+```bash
+npm run build && npm run dev:four-tier    # demo at http://localhost:5179/
+```
+
 ### Worked example
 
 [`examples/audio-rate/`](./examples/audio-rate/) ships the canonical end-to-end demo: a worker runs a WGSL additive-sine-bank compute shader that emits 1024 samples per tick; `BridgeBlockProducer` pipes them into the ring; an AudioWorklet drives them out through `BridgeBlockConsumer.process(outputs[0][0])`. CPU fallback when WebGPU isn't available; on-page status panel shows production rate, dropped readbacks, last-readback μs, frames consumed, and underflow samples.
