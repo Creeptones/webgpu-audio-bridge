@@ -1621,8 +1621,99 @@ function main(): void {
     ok(`wasm-decode-frame-equivalence (${ROWS} rows, ${plan.descCount} fields/frame, wrap ${Math.floor(ROWS / dfCapacity)}×)`);
   }
 
+  // ── 17: Clamped Taylor evaluators match evaluateTrajectoryInto (0.9.77) ──
+  // The derivative-clamp-only case (velocityClamp [+ accelerationClamp], no
+  // maxDeltaPerSample). Derivatives are deliberately driven past the clamp so
+  // the min/max actually fires. f64 paths (scalar + SIMD) bit-exact; f32 scalar
+  // bit-exact; f32 SIMD within a few ULP.
+  {
+    const CN = 24;            // samples per trajectory (17 SIMD + 7 tail for f32; mix for f64)
+    const VC = 5.0;           // velocity clamp magnitude
+    const AC = 50.0;          // acceleration clamp magnitude
+    const cSchema = defineSchema({
+      seq: u64(),
+      o2: f64TrajectoryArray(CN, { order: 2, velocityClamp: VC }),
+      o3: f64TrajectoryArray(CN, { order: 3, velocityClamp: VC, accelerationClamp: AC }),
+      o2f: f32TrajectoryArray(CN, { order: 2, velocityClamp: VC }),
+    });
+    const o2Spec = { order: 2 as const, sampleCount: CN, velocityClamp: VC };
+    const o3Spec = { order: 3 as const, sampleCount: CN, velocityClamp: VC, accelerationClamp: AC };
+    const cCap = 4;
+    const cSab = Bridge.byteLength(cCap, cSchema);
+    const dstBytes = CN * 8;
+    const cAlloc = allocateWorkletMemory({ sabBytes: cSab, scratchBytes: dstBytes * 4 + 64 });
+    const cBridge = new Bridge(cAlloc.sab, cCap, cSchema);
+    const cConsumer = instantiateConsumer(wasmBytes, cAlloc.memory);
+    const cFrameBytes = cSchema.compiled.frameByteSize;
+    const cMask = cCap - 1;
+    const cOff: Record<string, number> = {};
+    for (const f of cSchema.compiled.fields) cOff[f.name] = f.byteOffset;
+
+    const sBase = cAlloc.scratchByteOffset!;
+    const dA = sBase, dB = sBase + dstBytes, dC = sBase + dstBytes * 2, dD = sBase + dstBytes * 3;
+    const viewA = new Float64Array(cAlloc.sab, dA, CN);   // f64 o2 scalar
+    const viewB = new Float64Array(cAlloc.sab, dB, CN);   // f64 o3 scalar
+    const viewC = new Float64Array(cAlloc.sab, dC, CN);   // f64 o2 SIMD
+    const viewDf = new Float32Array(cAlloc.sab, dD, CN);  // f32 o2 (scalar + SIMD reuse)
+
+    const cPush = cBridge.scratchFrame();
+    const cPull = cBridge.scratchFrame();
+    while (cBridge.pull(cPull)) { /* drain */ }
+    const jsRef = new Float64Array(CN);
+    const jsRefF = new Float32Array(CN);
+
+    const dts = [0.5, 1.7, 3.0];
+    let worstF32Simd = 0;
+    for (let r = 0; r < 5; r++) {
+      // Big derivatives so the clamp fires on most samples.
+      for (let k = 0; k < CN; k++) {
+        const p = Math.sin((k + 1) * (r + 1) * 0.05) * 10;
+        const v = Math.cos((k + 1) * (r + 1) * 0.07) * 40;  // |v| up to 40 >> VC=5
+        const a = Math.sin((k + 1) * (r + 1) * 0.03) * 300; // |a| up to 300 >> AC=50
+        cPush.o2[k * 2] = p; cPush.o2[k * 2 + 1] = v;
+        cPush.o3[k * 3] = p; cPush.o3[k * 3 + 1] = v; cPush.o3[k * 3 + 2] = a;
+        cPush.o2f[k * 2] = Math.fround(p); cPush.o2f[k * 2 + 1] = Math.fround(v);
+      }
+      cPush.seq = BigInt(r);
+      assert(cBridge.push(cPush), `pin17 push ${r}`);
+      const slot = cConsumer.peekPull(cMask);
+      const slotBase = slotByteBase(slot, cFrameBytes);
+      const dt = dts[r % dts.length]!;
+
+      // f64 o2 scalar + SIMD
+      cConsumer.evalTaylorF64O2Clamped(slotBase + cOff.o2!, dA, CN, dt, VC);
+      cConsumer.evalTaylorF64O2ClampedSimd(slotBase + cOff.o2!, dC, CN, dt, VC);
+      evaluateTrajectoryInto(cPush.o2, o2Spec, dt, jsRef);
+      for (let k = 0; k < CN; k++) {
+        assertEq(viewA[k], jsRef[k], `pin17 f64-o2-scalar[${k}] r${r}`);
+        assertEq(viewC[k], jsRef[k], `pin17 f64-o2-simd[${k}] r${r}`);
+      }
+
+      // f64 o3 scalar
+      cConsumer.evalTaylorF64O3Clamped(slotBase + cOff.o3!, dB, CN, dt, VC, AC);
+      evaluateTrajectoryInto(cPush.o3, o3Spec, dt, jsRef);
+      for (let k = 0; k < CN; k++) assertEq(viewB[k], jsRef[k], `pin17 f64-o3-scalar[${k}] r${r}`);
+
+      // f32 o2 scalar — bit-exact to JS f32 clamped path
+      cConsumer.evalTaylorF32O2Clamped(slotBase + cOff.o2f!, dD, CN, dt, VC);
+      evaluateTrajectoryInto(cPush.o2f, o2Spec, dt, jsRefF);
+      for (let k = 0; k < CN; k++) assertEq(viewDf[k], jsRefF[k], `pin17 f32-o2-scalar[${k}] r${r}`);
+
+      // f32 o2 SIMD — within a few ULP (f32 math)
+      cConsumer.evalTaylorF32O2ClampedSimd(slotBase + cOff.o2f!, dD, CN, dt, VC);
+      for (let k = 0; k < CN; k++) {
+        const d = Math.abs(viewDf[k]! - jsRefF[k]!);
+        if (d > worstF32Simd) worstF32Simd = d;
+        const tol = 4 * Math.max(1e-6, Math.abs(jsRefF[k]!)) * 1.19e-7; // ~4 ULP rel
+        assert(d <= tol + 1e-6, `pin17 f32-o2-simd[${k}] r${r}: |Δ|=${d} > tol=${tol}`);
+      }
+      cConsumer.commitPull();
+    }
+    ok(`wasm-clamped-taylor-equivalence (5 rows × 3 dts × {f64 o2/o3 scalar+simd, f32 o2 scalar+simd}; f32-simd worstΔ=${worstF32Simd.toExponential(2)})`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
   );
 }
 

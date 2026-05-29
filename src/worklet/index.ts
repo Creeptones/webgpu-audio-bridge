@@ -405,6 +405,28 @@ export interface WorkletConsumer {
   evalTaylorF32O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
   evalTaylorF64O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
 
+  /** Clamped Taylor evaluators (0.9.77). Port of `evaluateTrajectoryInto`'s
+   *  clamped path for the **derivative-clamp-only** case: each loaded velocity
+   *  (and, at order 3, acceleration) is clamped to `[-clamp, +clamp]` before
+   *  the Taylor multiply. `maxDeltaPerSample` is NOT handled (it's sequential +
+   *  branchy — keep using `evaluateTrajectoryInto` when that clamp is set).
+   *
+   *  Bit-exactness: the f64 paths (scalar + SIMD) are bit-exact to the JS
+   *  clamped path for finite derivatives; the f32 scalar path is bit-exact
+   *  (f64-promoted math); the f32 SIMD path agrees within a few ULP (f32 math,
+   *  like the unclamped f32 SIMD evaluator).
+   *
+   *  `vClamp` / `aClamp` are the positive clamp magnitudes (the schema's
+   *  `velocityClamp` / `accelerationClamp`). */
+  evalTaylorF64O2Clamped(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
+  evalTaylorF64O3Clamped(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number, aClamp: number): void;
+  evalTaylorF32O2Clamped(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
+  evalTaylorF32O3Clamped(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number, aClamp: number): void;
+  /** SIMD-vectorized clamped order-2 (f64x2 / f32x4). f64 is bit-exact to the
+   *  scalar clamped path; f32 agrees within a few ULP. */
+  evalTaylorF64O2ClampedSimd(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
+  evalTaylorF32O2ClampedSimd(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
+
   /** Descriptor-driven whole-frame decode (0.9.74). Decodes an ENTIRE frame
    *  in ONE call by looping over a pre-built descriptor table (one
    *  `memory.copy` per field, slot → scratch). This is the hot-path frame
@@ -496,6 +518,12 @@ export function instantiateConsumer(
     readonly eval_taylor_f32_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly eval_taylor_f64_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly decode_frame: (slotBase: number, descPtr: number, descCount: number) => void;
+    readonly eval_taylor_f64_o2_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
+    readonly eval_taylor_f64_o3_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number, ac: number) => void;
+    readonly eval_taylor_f32_o2_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
+    readonly eval_taylor_f32_o3_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number, ac: number) => void;
+    readonly eval_taylor_f64_o2_clamped_simd: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
+    readonly eval_taylor_f32_o2_clamped_simd: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -531,6 +559,12 @@ export function instantiateConsumer(
     "eval_taylor_f32_o2_simd",
     "eval_taylor_f64_o2_simd",
     "decode_frame",
+    "eval_taylor_f64_o2_clamped",
+    "eval_taylor_f64_o3_clamped",
+    "eval_taylor_f32_o2_clamped",
+    "eval_taylor_f32_o3_clamped",
+    "eval_taylor_f64_o2_clamped_simd",
+    "eval_taylor_f32_o2_clamped_simd",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -591,6 +625,18 @@ export function instantiateConsumer(
       exports.eval_taylor_f64_o2_simd(srcOff, dstOff, n, dt),
     decodeFrame: (slotBase, descPtr, descCount) =>
       exports.decode_frame(slotBase, descPtr, descCount),
+    evalTaylorF64O2Clamped: (srcOff, dstOff, n, dt, vc) =>
+      exports.eval_taylor_f64_o2_clamped(srcOff, dstOff, n, dt, vc),
+    evalTaylorF64O3Clamped: (srcOff, dstOff, n, dt, vc, ac) =>
+      exports.eval_taylor_f64_o3_clamped(srcOff, dstOff, n, dt, vc, ac),
+    evalTaylorF32O2Clamped: (srcOff, dstOff, n, dt, vc) =>
+      exports.eval_taylor_f32_o2_clamped(srcOff, dstOff, n, dt, vc),
+    evalTaylorF32O3Clamped: (srcOff, dstOff, n, dt, vc, ac) =>
+      exports.eval_taylor_f32_o3_clamped(srcOff, dstOff, n, dt, vc, ac),
+    evalTaylorF64O2ClampedSimd: (srcOff, dstOff, n, dt, vc) =>
+      exports.eval_taylor_f64_o2_clamped_simd(srcOff, dstOff, n, dt, vc),
+    evalTaylorF32O2ClampedSimd: (srcOff, dstOff, n, dt, vc) =>
+      exports.eval_taylor_f32_o2_clamped_simd(srcOff, dstOff, n, dt, vc),
   };
 }
 

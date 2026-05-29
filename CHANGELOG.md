@@ -4,6 +4,56 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.77] — 2026-05-29
+
+### Added — clamped trajectory evaluators in WASM (scalar + SIMD) (SIMD harvest, Stage 3)
+
+The WASM decoder evaluated the *unclamped* Taylor/Hermite paths but the
+**clamped** trajectory path (`velocityClamp` / `accelerationClamp`, 0.6.7) had
+**no WASM equivalent** — it lived only in JS `evaluateTrajectoryInto`. This ports
+the vectorizable subset, using the website modal kernel's lane-wise min/max
+clamp idiom.
+
+#### What shipped
+
+- **Six clamped evaluators** in `wasm/decoder.wat`, surfaced on
+  `WorkletConsumer`: `evalTaylorF64O2Clamped` / `…F64O3Clamped` /
+  `…F32O2Clamped` / `…F32O3Clamped` (scalar) + `…F64O2ClampedSimd` (f64x2) /
+  `…F32O2ClampedSimd` (f32x4). Each clamps the loaded velocity (and, at order 3,
+  acceleration) to `[-clamp, +clamp]` via `min`/`max` before the Taylor multiply.
+  - **Scope:** the **derivative-clamp-only** case (no `maxDeltaPerSample`). That
+    post-eval delta band is sequential (depends on the prior output) and branchy
+    (`overflowFallback`), so it doesn't vectorize and stays in JS
+    `evaluateTrajectoryInto`; a caller with `maxDeltaPerSample` set keeps using
+    the JS path.
+  - **Equivalence:** f64 scalar AND f64x2 SIMD are **bit-exact** to the JS
+    clamped path for finite derivatives (the JS branch clamp equals `max(-vc,
+    min(vc, v))`, which `f64.min`/`f64.max` reproduce); the f32 scalar path is
+    bit-exact (f64-promoted math matching the JS Float32Array semantics); the
+    f32x4 SIMD path agrees within a few ULP (f32 math, like the unclamped f32
+    SIMD evaluator). Pinned by `tests/Bridge.wasmEquivalence.test.ts` **pin 17**
+    (5 rows × 3 dt, derivatives driven past the clamp so min/max actually fires).
+
+#### Assessed and deferred
+
+- **Hermite SIMD** and **order-3 Taylor SIMD** were evaluated and deferred.
+  Order-3's 24-byte (f64) / 12-byte (f32) sample stride does not pack into v128
+  multiples cleanly — the deinterleave cost dwarfs the per-sample win (the
+  decoder header has noted this since the 0.7.10 SIMD cut). Hermite SIMD is
+  feasible (same interleaved `[p,v]` layout as order-2) but is lower-leverage
+  than closing the no-WASM-clamped-path gap; it remains a candidate for a future
+  patch. Documenting the decision rather than silently skipping.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API on the `webgpu-audio-bridge/worklet`
+subpath; the decoder binary grows ~1.2 KB. No SAB-layout or protocol change.
+
+### Tests
+
+43 Node suites green; `wasmEquivalence` grows to pin 17. `npm run typecheck`
+clean. `npm run bench` push/pull/pullLatest 1.20 µs (unchanged).
+
 ## [0.9.76] — 2026-05-29
 
 ### Added — `TelemetryRing<T>` rolling history (SIMD harvest, Stage 2)

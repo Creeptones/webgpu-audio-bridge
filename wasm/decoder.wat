@@ -1304,4 +1304,238 @@
         local.set $p
         br $loop
       end
+    end)
+
+  ;; ─── Clamped trajectory evaluators (0.9.77) ───────────────────────────
+  ;;
+  ;; Port of `evaluateTrajectoryInto`'s clamped path (src/trajectory.ts, 0.6.7)
+  ;; for the DERIVATIVE-CLAMP-ONLY case: `velocityClamp` (+ `accelerationClamp`
+  ;; at order 3), with `maxDeltaPerSample` UNSET. Each loaded derivative is
+  ;; clamped to `[-clamp, +clamp]` via min/max — the website modal kernel's
+  ;; lane-wise clamp idiom — before the Taylor multiply. The `maxDeltaPerSample`
+  ;; post-eval delta band is sequential (depends on the prior output) and
+  ;; branchy (`overflowFallback`), so it does not vectorize and stays JS-side;
+  ;; a caller with that clamp set keeps using `evaluateTrajectoryInto`.
+  ;;
+  ;; Bit-exactness: the JS clamp is `if (v>vc) vc else if (v<-vc) -vc else v`,
+  ;; which for FINITE derivatives equals `max(-vc, min(vc, v))`. WebAssembly's
+  ;; `f64.min`/`f64.max` produce the identical finite result, so the f64 paths
+  ;; (scalar AND SIMD) are bit-exact to the JS clamped path. The f32 SIMD path
+  ;; does its math in f32 (no per-lane widen), so — like the unclamped f32 SIMD
+  ;; evaluator — it agrees only within a few ULP; the f32 SCALAR path promotes
+  ;; to f64 (matching the JS Float32Array-read→Number semantics) and is
+  ;; bit-exact.
+
+  ;; f64 order-2 scalar clamped: out[i] = p_i + clamp(v_i)·dt.
+  (func $eval_taylor_f64_o2_clamped (export "eval_taylor_f64_o2_clamped")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64) (param $vClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $srcEnd i32) (local $negV f64) (local $v f64)
+    local.get $vClamp f64.neg local.set $negV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 4 i32.shl i32.add local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP local.get $srcEnd i32.ge_u br_if $exit
+        ;; v = max(-vc, min(vc, load v))
+        local.get $srcP i32.const 8 i32.add f64.load align=1
+        local.get $vClamp f64.min
+        local.get $negV f64.max
+        local.set $v
+        local.get $dstP
+        local.get $srcP f64.load align=1
+        local.get $v local.get $dt f64.mul
+        f64.add
+        f64.store align=1
+        local.get $srcP i32.const 16 i32.add local.set $srcP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; f64 order-3 scalar clamped: out[i] = p + clamp(v)·dt + clamp(a)·½dt².
+  (func $eval_taylor_f64_o3_clamped (export "eval_taylor_f64_o3_clamped")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+        (param $vClamp f64) (param $aClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $srcEnd i32)
+    (local $negV f64) (local $negA f64) (local $halfDt2 f64) (local $v f64) (local $a f64)
+    local.get $vClamp f64.neg local.set $negV
+    local.get $aClamp f64.neg local.set $negA
+    local.get $dt local.get $dt f64.mul f64.const 0.5 f64.mul local.set $halfDt2
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 8 i32.mul i32.const 3 i32.mul i32.add local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP local.get $srcEnd i32.ge_u br_if $exit
+        local.get $srcP i32.const 8 i32.add f64.load align=1
+        local.get $vClamp f64.min local.get $negV f64.max local.set $v
+        local.get $srcP i32.const 16 i32.add f64.load align=1
+        local.get $aClamp f64.min local.get $negA f64.max local.set $a
+        local.get $dstP
+        local.get $srcP f64.load align=1
+        local.get $v local.get $dt f64.mul f64.add
+        local.get $a local.get $halfDt2 f64.mul f64.add
+        f64.store align=1
+        local.get $srcP i32.const 24 i32.add local.set $srcP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; f32 order-2 scalar clamped — math promoted to f64 (matches JS), demote on
+  ;; store. Bit-exact to the JS f32 clamped path.
+  (func $eval_taylor_f32_o2_clamped (export "eval_taylor_f32_o2_clamped")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64) (param $vClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $srcEnd i32) (local $negV f64) (local $v f64)
+    local.get $vClamp f64.neg local.set $negV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 3 i32.shl i32.add local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP local.get $srcEnd i32.ge_u br_if $exit
+        local.get $srcP i32.const 4 i32.add f32.load align=1 f64.promote_f32
+        local.get $vClamp f64.min local.get $negV f64.max local.set $v
+        local.get $dstP
+        local.get $srcP f32.load align=1 f64.promote_f32
+        local.get $v local.get $dt f64.mul f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $srcP i32.const 8 i32.add local.set $srcP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; f32 order-3 scalar clamped — f64 math, demote on store.
+  (func $eval_taylor_f32_o3_clamped (export "eval_taylor_f32_o3_clamped")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+        (param $vClamp f64) (param $aClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $srcEnd i32)
+    (local $negV f64) (local $negA f64) (local $halfDt2 f64) (local $v f64) (local $a f64)
+    local.get $vClamp f64.neg local.set $negV
+    local.get $aClamp f64.neg local.set $negA
+    local.get $dt local.get $dt f64.mul f64.const 0.5 f64.mul local.set $halfDt2
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 4 i32.mul i32.const 3 i32.mul i32.add local.set $srcEnd
+    block $exit
+      loop $loop
+        local.get $srcP local.get $srcEnd i32.ge_u br_if $exit
+        local.get $srcP i32.const 4 i32.add f32.load align=1 f64.promote_f32
+        local.get $vClamp f64.min local.get $negV f64.max local.set $v
+        local.get $srcP i32.const 8 i32.add f32.load align=1 f64.promote_f32
+        local.get $aClamp f64.min local.get $negA f64.max local.set $a
+        local.get $dstP
+        local.get $srcP f32.load align=1 f64.promote_f32
+        local.get $v local.get $dt f64.mul f64.add
+        local.get $a local.get $halfDt2 f64.mul f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $srcP i32.const 12 i32.add local.set $srcP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $loop
+      end
+    end)
+
+  ;; f64 order-2 SIMD clamped: 2 samples/iter. Deinterleave [p,v] like the
+  ;; unclamped o2 SIMD, clamp the velocity lane via f64x2.min/max against the
+  ;; broadcast clamp, then positions + velocities·dt. Bit-exact (f64 math).
+  (func $eval_taylor_f64_o2_clamped_simd (export "eval_taylor_f64_o2_clamped_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64) (param $vClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $simdEnd i32) (local $tailEnd i32)
+    (local $negV f64) (local $dtV v128) (local $vcV v128) (local $negVcV v128)
+    (local $v0 v128) (local $v1 v128) (local $positions v128) (local $velocities v128) (local $v f64)
+    local.get $vClamp f64.neg local.set $negV
+    local.get $dt f64x2.splat local.set $dtV
+    local.get $vClamp f64x2.splat local.set $vcV
+    local.get $negV f64x2.splat local.set $negVcV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 4 i32.shl i32.add local.set $tailEnd
+    local.get $srcOff local.get $n i32.const 1 i32.shr_u i32.const 5 i32.shl i32.add local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP local.get $simdEnd i32.ge_u br_if $simdExit
+        local.get $srcP v128.load align=1 local.set $v0
+        local.get $srcP i32.const 16 i32.add v128.load align=1 local.set $v1
+        local.get $v0 local.get $v1 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $positions
+        local.get $v0 local.get $v1 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $velocities
+        ;; clamp velocities lane-wise: max(-vc, min(vc, v))
+        local.get $velocities local.get $vcV f64x2.min local.get $negVcV f64x2.max local.set $velocities
+        local.get $dstP
+        local.get $positions
+        local.get $velocities local.get $dtV f64x2.mul
+        f64x2.add
+        v128.store align=1
+        local.get $srcP i32.const 32 i32.add local.set $srcP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP local.get $tailEnd i32.ge_u br_if $tailExit
+        local.get $srcP i32.const 8 i32.add f64.load align=1
+        local.get $vClamp f64.min local.get $negV f64.max local.set $v
+        local.get $dstP
+        local.get $srcP f64.load align=1
+        local.get $v local.get $dt f64.mul f64.add
+        f64.store align=1
+        local.get $srcP i32.const 16 i32.add local.set $srcP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; f32 order-2 SIMD clamped: 4 samples/iter. f32 math (NOT bit-exact to the
+  ;; f64-promoted scalar — agrees within a few ULP, like the unclamped f32 SIMD).
+  (func $eval_taylor_f32_o2_clamped_simd (export "eval_taylor_f32_o2_clamped_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64) (param $vClamp f64)
+    (local $srcP i32) (local $dstP i32) (local $simdEnd i32) (local $tailEnd i32)
+    (local $dt32 f32) (local $vc32 f32) (local $negVc32 f32)
+    (local $dtV v128) (local $vcV v128) (local $negVcV v128)
+    (local $v0 v128) (local $v1 v128) (local $positions v128) (local $velocities v128) (local $v f32)
+    local.get $dt f32.demote_f64 local.set $dt32
+    local.get $vClamp f32.demote_f64 local.set $vc32
+    local.get $vc32 f32.neg local.set $negVc32
+    local.get $dt32 f32x4.splat local.set $dtV
+    local.get $vc32 f32x4.splat local.set $vcV
+    local.get $negVc32 f32x4.splat local.set $negVcV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    local.get $srcOff local.get $n i32.const 3 i32.shl i32.add local.set $tailEnd
+    local.get $srcOff local.get $n i32.const 2 i32.shr_u i32.const 5 i32.shl i32.add local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP local.get $simdEnd i32.ge_u br_if $simdExit
+        local.get $srcP v128.load align=1 local.set $v0
+        local.get $srcP i32.const 16 i32.add v128.load align=1 local.set $v1
+        local.get $v0 local.get $v1 i8x16.shuffle 0 1 2 3 8 9 10 11 16 17 18 19 24 25 26 27 local.set $positions
+        local.get $v0 local.get $v1 i8x16.shuffle 4 5 6 7 12 13 14 15 20 21 22 23 28 29 30 31 local.set $velocities
+        local.get $velocities local.get $vcV f32x4.min local.get $negVcV f32x4.max local.set $velocities
+        local.get $dstP
+        local.get $positions
+        local.get $velocities local.get $dtV f32x4.mul
+        f32x4.add
+        v128.store align=1
+        local.get $srcP i32.const 32 i32.add local.set $srcP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP local.get $tailEnd i32.ge_u br_if $tailExit
+        local.get $srcP i32.const 4 i32.add f32.load align=1
+        local.get $vc32 f32.min local.get $negVc32 f32.max local.set $v
+        local.get $dstP
+        local.get $srcP f32.load align=1
+        local.get $v local.get $dt32 f32.mul f32.add
+        f32.store align=1
+        local.get $srcP i32.const 8 i32.add local.set $srcP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $tailLoop
+      end
     end))
