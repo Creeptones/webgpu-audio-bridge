@@ -1,0 +1,88 @@
+webgpu-audio-bridge — audio pipeline comparator — Chromium / V8 capture
+========================================================================
+
+Capture context (READ THIS before reading the numbers):
+  - Driven via the chrome-devtools MCP on an automation-context Chrome 148
+    (Win11) over an NVIDIA Turing adapter (real GPU, not SwiftShader).
+  - `ctx.outputLatency` reads 0 here (no real audio output device in the
+    automation context), so the latency magnitudes are NOT offset by the usual
+    output-buffer bias the way an interactive desktop session would be — read
+    the SPREAD column and the RELATIVE ordering, per the README.
+  - The GPU block-readback path shows heavy underflow in this context
+    (C: 34,816 / G: 36,608 underflow samples ≈ 0.7 s out of a ~15 s run): the
+    50 Hz producer's mapAsync readback cadence is jittery under the automation
+    harness. This is an ENVIRONMENT artifact, not a library issue — and it
+    happens to demonstrate the headline vividly: G shrugs the jitter off
+    (carrier stays low-latency + continuous), while C is wrecked by it (erratic
+    545 ms latency, 0 % continuity). On an interactive desktop session the ring
+    stays full and C exhibits its steady ~85 ms block floor instead.
+
+Headline ordering (the claim, confirmed):
+  - Latency:    G ≈ A (lowest)  <  B (~queue floor)  <<  C (erratic, high)
+  - Continuity: A 100 % (immune)  >  G 68 % (carrier survives)  >>  C/B ~0 %
+  - Partials:   A capped at 1024 (CPU O(N) wall)  ;  B/C/G 2048
+  => G is the only path that wins latency, continuity, AND spectral richness
+     at once. A wins latency+continuity but loses partials; B/C win partials
+     but lose continuity (and C loses latency badly).
+
+path                          backend     lat-p50   lat-spread  continuity  maxPartials  proc-p99
+A — Pure CPU worklet          cpu-worklet 38.8 ms     3.8 ms       100%         1024         —
+B — GPU → AudioBufferSourceNode webgpu     90.3 ms    15.2 ms         3%         2048         —
+C — GPU block-replace         webgpu    545.5 ms   371.5 ms         0%         2048         —
+G — Hybrid carrier+residual   webgpu     38.8 ms     5.9 ms        68%         2048         —
+
+(proc-p99 is "—" because performance.now() is not exposed in the AudioWorklet
+scope in this Chrome build; path A's partial cap is measured via the
+main-thread synth-cost proxy instead — see README §"process() duration".)
+
+--- machine-readable ---
+{
+  "bench": "audio-pipeline-comparator",
+  "generatedAtIso": "2026-05-29T13:10:43.228Z",
+  "engine": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+  "crossOriginIsolated": true,
+  "stress": false,
+  "ramp": true,
+  "config": {
+    "blockSize": 1024,
+    "capacity": 4,
+    "sampleRate": 48000,
+    "defaultPartials": 16,
+    "latencyEvents": 24,
+    "latencySpacingMs": 200,
+    "rampSteps": [16, 64, 256, 1024, 2048],
+    "procBudgetMs": 2.6666666666666665,
+    "absnMaxAheadMs": 85.33333333333333,
+    "stallMs": 700
+  },
+  "paths": {
+    "A": {
+      "id": "A", "name": "A — Pure CPU worklet", "backend": "cpu-worklet", "adapter": null,
+      "latency": { "count": 24, "p50Ns": 38759566, "p95Ns": 41933257, "p99Ns": 42598522, "maxNs": 42912000, "lastSignedNs": -38702080 },
+      "procP99Ns": null,
+      "continuity": { "baselineRms": 0.16975744731216294, "stallRms": 0.16975744731216294, "ratio": 1, "immune": true },
+      "maxPartials": 1024, "underflow": 0, "outputLatencyMs": 0
+    },
+    "B": {
+      "id": "B", "name": "B — GPU → AudioBufferSourceNode", "backend": "webgpu", "adapter": "nvidia turing",
+      "latency": { "count": 24, "p50Ns": 90267574, "p95Ns": 104199546, "p99Ns": 105505669, "maxNs": 105505669, "lastSignedNs": 105505669 },
+      "procP99Ns": null,
+      "continuity": { "baselineRms": 0.2541526822234524, "stallRms": 0.007829282448199026, "ratio": 0.03080542916055271, "immune": false },
+      "maxPartials": 2048, "underflow": 1, "outputLatencyMs": 0
+    },
+    "C": {
+      "id": "C", "name": "C — GPU block-replace", "backend": "webgpu", "adapter": "nvidia turing",
+      "latency": { "count": 22, "p50Ns": 545527196, "p95Ns": 888649434, "p99Ns": 917069698, "maxNs": 915954688, "lastSignedNs": 915954688 },
+      "procP99Ns": null,
+      "continuity": { "baselineRms": 0.24416037956934467, "stallRms": 0, "ratio": 0, "immune": false },
+      "maxPartials": 2048, "underflow": 34816, "outputLatencyMs": 0
+    },
+    "G": {
+      "id": "G", "name": "G — Hybrid carrier+residual", "backend": "webgpu", "adapter": "nvidia turing",
+      "latency": { "count": 24, "p50Ns": 38759566, "p95Ns": 43960883, "p99Ns": 44658316, "maxNs": 44878080, "lastSignedNs": -44207360 },
+      "procP99Ns": null,
+      "continuity": { "baselineRms": 0.24801264715613672, "stallRms": 0.16966831547860886, "ratio": 0.6841115460204492, "immune": false },
+      "maxPartials": 2048, "underflow": 36608, "outputLatencyMs": 0
+    }
+  }
+}

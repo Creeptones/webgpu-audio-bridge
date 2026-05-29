@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — audio pipeline comparator</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 980px; outline: 0 solid #0c0d10; }
+      h1 { font-size: 18px; margin: 0 0 8px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; color: #c8cdd5; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      label.opt { font-size: 12px; color: #9aa3ad; margin-right: 16px; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      table.results { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+      table.results th, table.results td { padding: 7px 10px; border-bottom: 1px solid #21252d; text-align: right; }
+      table.results th { color: #9aa3ad; text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; font-weight: 600; }
+      table.results th:first-child, table.results td:first-child { text-align: left; color: #c8cdd5; }
+      table.results td.win { color: #6ee69b; }
+      table.results td.lose { color: #ff7a7a; }
+      .note { background: #15171c; border-left: 3px solid #2a6df4; padding: 12px 16px; margin: 16px 0; }
+      pre.report { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 11px; white-space: pre; overflow-x: auto; max-height: 320px; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — audio pipeline comparator</h1>
+    <p>
+      Renders <strong>one reference signal</strong> (fundamental + N LFO-modulated
+      harmonic partials) through <strong>four</strong> GPU-audio pipelines and scores
+      them side by side:
+      <strong>A</strong> pure-CPU worklet,
+      <strong>B</strong> GPU&nbsp;→&nbsp;<code>AudioBufferSourceNode</code> (no <code>process()</code>),
+      <strong>C</strong> GPU block-replace,
+      <strong>G</strong> hybrid carrier&nbsp;+&nbsp;GPU residual.
+      Each is driven through an identical scripted sequence (settle → freq-change
+      latency sweep → forced GPU-stall continuity → partial-count ramp). The shape
+      to prove: <strong>G wins latency, continuity, and spectral richness at once.</strong>
+    </p>
+    <p>
+      The Web Audio side of A / C / G is the <strong>render quantum</strong> — the spec
+      fixes the default at 128 frames and <code>AudioWorkletProcessor.process()</code> is
+      the per-quantum real-time callback. Path B deliberately is <em>not</em> a
+      <code>process()</code> callback, which is exactly why its latency + continuity story
+      is worse; the bench makes that structural difference quantitative.
+    </p>
+
+    <h2>Run</h2>
+    <button id="run">Run all four</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="copy">Copy report</button>
+    <div style="margin-top: 10px;">
+      <label class="opt"><input type="checkbox" id="ramp" checked /> partial-count ramp</label>
+      <label class="opt"><input type="checkbox" id="stress" /> main-thread stress during sweep</label>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <h2>Scorecard</h2>
+    <div id="results"></div>
+
+    <h2>Report (Copy → results/&lt;engine&gt;.txt)</h2>
+    <pre id="report" class="report"></pre>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Reuses the e2e-latency clock-alignment + histogram, the hybrid-residual stall/RMS
+      sequence, the 0.9.49 input lane for carrier control, and the hybrid worker's WGSL kernel.
+      See <code>bench/audio-pipeline-comparator/README.md</code> for methodology.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

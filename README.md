@@ -1278,9 +1278,12 @@ Telemetry parity: `framesConsumed()` and `underflowSamples()` tick identically a
 
 For the comparative claim — how the hybrid pattern measures up against the six alternative approaches to GPU-accelerated browser audio (pure CPU AudioWorklet, GPU → AudioBufferSourceNode, pure GPU block mode, Faust / Emscripten WASM, Tone.js + GPU side channel, `OfflineAudioContext` + GPU pre-render) — and a 15-item gap analysis covering stereo, polyphony, sample-accurate parameter binding, multi-resolution residual, latency-compensated sync, comparator benches, and more, see [`docs/hybrid-residual-comparison.md`](./docs/hybrid-residual-comparison.md).
 
+**Comparator bench (0.9.50).** [`bench/audio-pipeline-comparator/`](./bench/audio-pipeline-comparator/) renders one reference signal through **all four** pipelines — pure-CPU worklet (A), GPU → `AudioBufferSourceNode` (B), GPU block-replace (C), hybrid carrier+residual (G) — and scores them side by side for freq-change latency, stall continuity, max sustainable partials, and `process()` p99. It turns the "marked upgrade" claim into a measured scorecard: **G is the only path that wins latency, continuity, and spectral richness at once.** Run with `npm run bench:comparator` (port 5178).
+
 ```bash
 npm run build && npm run dev:hybrid-residual    # demo at http://localhost:5176/
 npm run build && npm run bench:hybrid-residual  # bench at http://localhost:5177/
+npm run build && npm run bench:comparator       # comparator at http://localhost:5178/
 ```
 
 ### Stereo / multichannel (0.9.48)

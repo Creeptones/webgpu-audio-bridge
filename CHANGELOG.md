@@ -4,6 +4,80 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.50] — 2026-05-29
+
+### Added — audio-pipeline comparator bench (`bench/audio-pipeline-comparator/`)
+
+Closes **Gap #11** ("Comparator bench harness — apples-to-apples vs A / B / C")
+from `docs/hybrid-residual-comparison.md` — that document's own **Recommendation
+1**, the highest-leverage item for the comparative claim. The doc *asserts* that
+the hybrid residual-on-carrier pattern is a marked upgrade over the four standard
+approaches to GPU-accelerated browser audio; this bench renders the **same**
+reference signal through **all four** pipelines and produces a side-by-side
+scorecard, turning "we think this is better" into "here are the numbers."
+
+#### What shipped (bench + docs only — no `src/`, no wire-format change)
+
+A new `bench/audio-pipeline-comparator/` renders one reference signal
+(fundamental + N LFO-modulated harmonic partials, defined once in a shared
+`reference-signal.js`) four ways:
+
+- **A** — pure-CPU AudioWorklet additive synth (`worklet.cpu.js`); carrier driven
+  sample-accurately by `BridgeInputLane`. CPU-bound: the O(N)-per-sample cost
+  caps the sustainable partial count.
+- **B** — naïve GPU → `AudioBufferSourceNode` (`worker.gpu.js` "absn" mode +
+  main-thread scheduler). The only path with no `process()` callback; latency is
+  the buffer-queue floor, continuity collapses when the queue drains.
+- **C** — GPU block-replace (`worklet.gpu-block-replace.js` over
+  `BridgeBlockConsumer.process()`); a pitch change is only audible once a block
+  *computed at the new freq* crosses the ring, so it inherits the ~85 ms block
+  floor. The producer tags each block with `frame.carrierFreq` so C's latency
+  probe can detect the first new-freq sample.
+- **G** — hybrid carrier + GPU residual (`worklet.hybrid.js`,
+  `processAdd`); the pattern under test.
+
+The GPU producer (`worker.gpu.js`) is shared: one WGSL kernel emits the **full**
+signal (B/C) or the **residual** only (G) via a uniform, and emits over either a
+`Bridge<S>` SAB ring (C/G) or `postMessage` for the ABSN path (B). Metrics:
+freq-change latency (p50/p95/p99/max + spread, shared latency histogram), stall
+continuity (RMS), max sustainable partials, `process()` p99 (feature-detected),
+and underflow / scheduling-gap counts. A "Copy report" button emits a JSON+text
+blob for `results/<engine>.txt`. `npm run bench:comparator` serves it on port
+5178 (COOP/COEP + root fallback).
+
+### Why
+
+The hybrid claim was argued, not measured — `bench/hybrid-residual/` measures
+only one axis (RMS continuity under stall) between only two of the four paths
+(G vs C). This bench measures all the axes across all four paths, producing the
+evidence behind the "marked upgrade" framing: **G is the only path that wins
+latency, continuity, and spectral richness simultaneously** — A wins latency but
+loses partials; B / C win partials but lose latency + continuity.
+
+### Wire compatibility
+
+Zero change. Bench + docs only. `src/` and `dist/` are untouched; the bench
+consumes the already-shipped `Bridge`, `BridgeBlockProducer`,
+`BridgeBlockConsumer.process`/`processAdd`, and `BridgeInputLane` surfaces.
+
+### Tests
+
+Mandatory gates re-run (`npm run typecheck`, `npm test`, `npm run bench`) — all
+green against the unchanged library surface. The comparator itself is a
+manual/browser bench; an optional headless Playwright ordering-assertion spec is
+documented as a follow-up (not shipped). Cross-browser captures land in
+`results/` as gathered (Chromium drivable via the chrome-devtools MCP;
+Firefox/Safari manual), following the `notify-cost-browser/results/` precedent.
+
+### Documentation
+
+`bench/audio-pipeline-comparator/README.md` (methodology + the Web-Audio-quantum
+framing + predicted-vs-measured scorecard) and `results/README.md`.
+`docs/audio-pipeline-comparator-handoff.md` marked shipped; Gap #11 and
+Recommendation 1 in `docs/hybrid-residual-comparison.md` marked
+✅ shipped (0.9.50); README §Hybrid gained a comparator pointer and a
+`bench:comparator` run line.
+
 ## [0.9.49] — 2026-05-29
 
 ### Added — sample-accurate carrier control in the hybrid-residual demo via `BridgeInputLane`

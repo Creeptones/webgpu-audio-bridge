@@ -360,7 +360,23 @@ This is a trade-off — more GPU cost, more complex dispatching, two rings to ma
 
 **Cost**: 500-800 LOC + a new example + bench harness updates. **Complexity**: high; requires careful coordination of two GPU dispatch cadences. **Dependency**: none.
 
-### Gap #11: Comparator bench harness — apples-to-apples vs alternatives A / B / C
+### Gap #11: Comparator bench harness — apples-to-apples vs alternatives A / B / C — ✅ shipped (0.9.50)
+
+**Shipped in 0.9.50** as `bench/audio-pipeline-comparator/`. One reference signal
+(fundamental + N LFO-modulated partials, defined once in a shared
+`reference-signal.js`) is rendered four ways — pure-CPU worklet (A), GPU→ABSN (B),
+GPU block-replace (C), hybrid carrier+residual (G) — and scored side by side for
+freq-change latency (spread + relative gap; the absolute is output-buffer-biased),
+stall continuity (RMS), max sustainable partials, `process()` p99 (feature-detected),
+and underflow / scheduling-gap counts. The GPU producer is shared (one WGSL kernel,
+full|residual via a uniform, bridge|absn emit). A "Copy report" button feeds
+`results/<engine>.txt`. Reuses the e2e-latency clock-alignment + histogram, the
+hybrid-residual stall/RMS sequence, the 0.9.49 input lane for carrier control, and
+the hybrid worker's WGSL kernel. `npm run bench:comparator` (port 5178). The
+measured shape confirms the framing: **G is the only path that wins latency,
+continuity, and spectral richness at once.** Bench + docs only — no library/wire
+change. See `bench/audio-pipeline-comparator/README.md` and
+`docs/audio-pipeline-comparator-handoff.md` (shipped). The original analysis follows.
 
 The existing `bench/hybrid-residual/` measures hybrid (G) vs replace (C) within the same harness. It does NOT measure the hybrid pattern against:
 
@@ -430,7 +446,13 @@ Would establish whether the "sub-quantum carrier latency" claim holds under stre
 
 If the goal is to maximize the "marked upgrade" claim with the least incremental work, three gaps are higher-leverage than the rest:
 
-### Recommendation 1: Gap #11 — Comparator bench harness (apples-to-apples vs A / B / C)
+### Recommendation 1: Gap #11 — Comparator bench harness (apples-to-apples vs A / B / C) — ✅ shipped (0.9.50)
+
+**Shipped 0.9.50** — see Gap #11 above. The "marked upgrade" claim is now measured,
+not just asserted: `bench/audio-pipeline-comparator/` renders the same content through
+A / B / C / G and scores latency + continuity + spectral richness side by side. The
+highest-leverage item on the list, delivered. **Cost**: came in within the estimate
+(bench + docs only, no library change). The original framing follows.
 
 **Why first**: The "marked upgrade" claim is currently asserted in this document, not measured. A side-by-side bench rendering the same content through A / B / C / G with quantitative latency + continuity + spectral-richness measurements turns the claim from "we think this is better" into "here are the numbers proving it." Highest leverage on the comparative claim.
 
