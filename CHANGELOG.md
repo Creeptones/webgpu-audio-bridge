@@ -4,6 +4,47 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.64] — 2026-05-29
+
+### Added — WGSL↔TS bridge design note + Vite virtual-module recipe
+
+Documentation-only close-out of the WGSL↔TS bridge track. New
+`docs/wgsl-schema-bridge-design.md` captures the durable rationale for all four
+pillars (0.9.61–0.9.64): the alignment trap, the load-bearing
+descending-alignment isomorphism between `compileLayout` and WGSL's
+host-shareable struct rules, the three holes patched relative to the original
+proposal (sub-32-bit fail-fast, the invariant protocol hole, zero-decode-vs-
+zero-copy honesty), the trailing-`_wab_pad` subtlety, and the full
+schema → struct → `pushRaw` → SAB pipeline.
+
+Pillar 4 ships as a **documented copy-paste snippet, not a package**: a ~20-line
+Vite plugin that resolves `import struct from "virtual:wab-schema/<Name>"` to
+`emitWgslStruct(schema)` output at build time, so a worker imports the generated
+struct string and drift is impossible. Shipping it as glue-in-docs (rather than a
+`@webgpu-audio-bridge/vite-plugin` sub-package) avoids new release/maintenance
+surface for code that is ~20 lines and framework-portable; the value lives in the
+already-shipped `emitWgslStruct`.
+
+### Why
+
+Closes the DX loop and records the track's rationale in one place for future
+maintainers. The Vite recipe makes "define the schema once, the framework
+generates the shader struct" a build-time guarantee rather than a manual step.
+
+### Wire compatibility
+
+Zero. Docs-only — no `src/` change. Bit-for-bit identical runtime to 0.9.63.
+
+### Tests
+
+No new pins (docs-only). Mandatory gates re-run green: `npm run typecheck`,
+`npm test` (33 suites), `npm run bench` (~1.20 µs baseline).
+
+### Documentation
+
+This entry; new `docs/wgsl-schema-bridge-design.md`; a design-note + Vite-recipe
+reference added to the README `emitWgslStruct` bullet.
+
 ## [0.9.63] — 2026-05-29
 
 ### Added — `BridgeGPUSource` `"raw"` decoder mode
