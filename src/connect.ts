@@ -619,8 +619,65 @@ export function connect<
 
 // ─── mount() ──────────────────────────────────────────────────────────────
 
+/** Deep structural comparison of the re-supplied schema's layout against the
+ *  layout frozen into the handle at allocation time. The `frameByteSize` check
+ *  alone is necessary but NOT sufficient: two schemas can pad to the same frame
+ *  size yet disagree on field names, kinds, byte offsets, array lengths,
+ *  trajectory specs, timestamp roles, or invariant placement — which would
+ *  silently MISDECODE the SAB (the typed-array constructors still succeed
+ *  because alignment is valid, but the bytes mean something different). This
+ *  walks the full `SchemaLayoutDescription` and throws on the FIRST divergence,
+ *  naming the field and what differs, so a schema-version skew between peers
+ *  fails loud at `mount()` instead of corrupting frames at runtime. (0.9.53) */
+function assertLayoutMatches(
+  local: SchemaLayoutDescription,
+  handle: SchemaLayoutDescription,
+  lane: "macro" | "input",
+): void {
+  const fail = (detail: string): never => {
+    throw new Error(
+      `mount(): ${lane} schema layout disagrees with the handle layout — ${detail}. ` +
+        "Same frameByteSize but a different field shape means the peer imported a " +
+        "different schema version; re-supply the same schema the topology was built with.",
+    );
+  };
+  if (local.invariantByteOffset !== handle.invariantByteOffset) {
+    fail(
+      `invariant lane offset ${String(local.invariantByteOffset)} vs handle ` +
+        `${String(handle.invariantByteOffset)} (one schema has .withInvariant(), the other ` +
+        "does not, or they place it differently)",
+    );
+  }
+  if (JSON.stringify(local.timestamps) !== JSON.stringify(handle.timestamps)) {
+    fail("timestamp role configuration differs");
+  }
+  const localNames = Object.keys(local.fields).sort();
+  const handleNames = Object.keys(handle.fields).sort();
+  if (
+    localNames.length !== handleNames.length ||
+    localNames.some((n, i) => n !== handleNames[i])
+  ) {
+    fail(`field set {${localNames.join(", ")}} vs handle {${handleNames.join(", ")}}`);
+  }
+  for (const name of localNames) {
+    // Both lookups are defined: the name sets were just proven identical above.
+    const a = local.fields[name]!;
+    const b = handle.fields[name]!;
+    if (a.kind !== b.kind) fail(`field "${name}": kind ${a.kind} vs handle ${b.kind}`);
+    if (a.byteOffset !== b.byteOffset) {
+      fail(`field "${name}": byteOffset ${a.byteOffset} vs handle ${b.byteOffset}`);
+    }
+    if (a.length !== b.length) {
+      fail(`field "${name}": length ${String(a.length)} vs handle ${String(b.length)}`);
+    }
+    if (JSON.stringify(a.trajectory) !== JSON.stringify(b.trajectory)) {
+      fail(`field "${name}": trajectory spec differs`);
+    }
+  }
+}
+
 /** Reconstruct a single ring's role facade from its handle + the re-supplied
- *  schema. Validates byte-size agreement first. */
+ *  schema. Validates byte-size agreement first, then the full layout shape. */
 function mountRing(
   handle: ConnectRingHandle,
   schema: Schema<FieldsObject, any>,
@@ -639,6 +696,9 @@ function mountRing(
         "schema version. Re-supply the same schema the topology was built with.",
     );
   }
+  // frameByteSize agreement is necessary but not sufficient — two schemas can
+  // pad to the same size with a different field shape. Compare the full layout.
+  assertLayoutMatches(describeSchemaLayout(schema), handle.layout, lane);
   if (handle.mode === "standard") {
     if (handle.port === undefined) {
       throw new Error(`mount(): Standard-mode ${lane} handle is missing its MessagePort.`);

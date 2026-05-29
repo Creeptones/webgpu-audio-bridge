@@ -4,6 +4,53 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.53] — 2026-05-29
+
+### Added — full layout-fingerprint validation in `mount()`
+
+`connect().mount()` previously validated only `frameByteSize` before
+reconstructing a ring from a handle. That check is necessary but **not
+sufficient**: two schemas can pad to the same frame size yet disagree on field
+names, kinds, byte offsets, array lengths, trajectory specs, timestamp roles, or
+invariant placement. A peer that imported a same-size-but-different-shape schema
+would have silently **misdecoded** the SAB — the typed-array constructors still
+succeed (alignment is valid) but the bytes mean something different.
+
+`mountRing()` now runs a deep structural comparison after the `frameByteSize`
+fast-check: it walks the full `SchemaLayoutDescription` already carried on the
+handle and throws on the **first** divergence, naming the field and what
+differs (e.g. `field "seq": kind u64 vs handle f64`). No new utility surface and
+**no wire change** — the handle already ships `describeSchemaLayout()` JSON, so
+the peer simply recomputes its own and compares.
+
+### Why
+
+Addresses the audit finding that the schema-layout validation was only partial
+(category 3). Silent misdecode is the worst failure mode for a transport — it
+produces plausible-but-wrong frames rather than a loud error. Failing at
+`mount()` turns a latent data-corruption bug into an actionable version-skew
+message at topology construction time.
+
+### Wire compatibility
+
+Zero. No `src/` schema change, no SAB byte change, no handle-shape change — the
+comparison reuses the `layout` field already present on `ConnectRingHandle`. A
+correctly-matched mount behaves bit-for-bit as in 0.9.52; only mismatched
+mounts that previously slipped through now throw.
+
+### Tests
+
+New `tests/connect.test.ts` pin **109** (`testMountLayoutMismatchSameByteSize`):
+builds an imposter schema with the **same** `frameByteSize` as the topology's
+macro schema but swapped field kinds, asserts `mount()` throws and that the
+message names the divergent field + kind. Mandatory gates re-run green:
+`npm run typecheck`, `npm test` (30 suites), `npm run bench` (~1.20 µs baseline,
+unmoved).
+
+### Documentation
+
+This entry; README `connect()` / `mount()` note on the full-layout guard.
+
 ## [0.9.52] — 2026-05-29
 
 ### Changed — public-facing metadata sync (docs / packaging only)

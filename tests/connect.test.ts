@@ -31,6 +31,7 @@
  * 106. testMaxSabBytesClamp           — memory guard clamps capacity DOWN
  * 107. testEnumStillWorks             — string hints unchanged (no regression)
  * 108. testAudioFramesPerSlotHelper   — pure block-detector unit test
+ * 109. testMountLayoutMismatchSameByteSize — full-layout guard (same size, wrong shape)
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -268,6 +269,33 @@ function testMountSchemaMismatchThrows(): void {
   ok("102 mount() schema-mismatch (frameByteSize disagreement) throws");
 }
 
+// ── 109. mount() rejects a same-frameByteSize, different-layout schema ───────
+// The dangerous case the frameByteSize check alone misses: two schemas that pad
+// to the SAME frame size but disagree on field kinds/order would silently
+// misdecode the SAB. macroSchema = {seq: u64, x: f64} = 16 bytes; the imposter
+// swaps the kinds → identical 16-byte frame, identical offsets, inverted
+// semantics. The full-layout compare (0.9.53) must catch it and name the field.
+function testMountLayoutMismatchSameByteSize(): void {
+  const topo = connect({ macro: macroSchema, environment: turbo() });
+  const sameSizeWrongKinds = defineSchema({ seq: f64(), x: u64() });
+  assertEq(
+    sameSizeWrongKinds.frameByteSize,
+    macroSchema.frameByteSize,
+    "imposter schema has the SAME frameByteSize (so the byte-size guard alone passes)",
+  );
+  let caught: unknown;
+  try {
+    mount(topo.handle, { role: "consumer", macroSchema: sameSizeWrongKinds });
+  } catch (e) {
+    caught = e;
+  }
+  assert(caught instanceof Error, "mount with a same-size, wrong-layout schema throws");
+  const msg = (caught as Error).message;
+  assert(/layout disagrees/.test(msg), "the error names the layout disagreement");
+  assert(/"seq"/.test(msg) && /kind/.test(msg), "the error names the divergent field + kind");
+  ok("109 mount() same-frameByteSize / different-layout schema throws (full-layout guard)");
+}
+
 // ── 103. latency-budget block-schema sizing (the worked example) ────────────
 
 // 1024-sample f32 block frame (the BridgeBlockConsumer shape): one scalar +
@@ -390,6 +418,7 @@ function main(): void {
   testMaxSabBytesClamp();
   testEnumStillWorks();
   testAudioFramesPerSlotHelper();
+  testMountLayoutMismatchSameByteSize();
   console.log("\nAll connect() topology tests passed.");
 }
 
