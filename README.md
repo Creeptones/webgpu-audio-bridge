@@ -1780,6 +1780,23 @@ const node = new AudioWorkletNode(ctx, "macro-reader", {
 
 **The boundary + CSP are documented, not removed.** Source must cross into the worklet realm; the helpers remove the keystrokes, not the crossing. `toWorkletModuleURL` + `addModule` need `blob:` in `script-src`/`worker-src`; `compileWorkletReader` needs `unsafe-eval`. Apps with strict CSP should use the **build-step path** — write `emitWorkletProcessorModule(...)` output to a `.js` file the bundler serves (CSP-safe, production-correct, and always available).
 
+#### Zero-decode GPU readback — `pushRaw` (0.9.62)
+
+`emitWgslStruct` guarantees the GPU storage buffer is byte-for-byte identical to the SAB frame, which makes per-field readback decoding pointless work. `Bridge<S>.pushRaw(src, srcOffset?)` (also on `BridgeProducer` / `BridgeInputLane`) skips the encode loop entirely: it copies exactly one frame of bytes from `src` (an `ArrayBuffer` or any typed-array / `DataView`) straight into the next free slot with a **single native `Uint8Array.set` memcpy**, then publishes with the *same* release-store + notify protocol as `push`. The consumer cannot tell a `pushRaw` frame from a `push` frame.
+
+```ts
+// A mapped GPU readback range whose layout came from emitWgslStruct(schema):
+const ok = bridge.pushRaw(mappedRange); // one memcpy + publish, no field decode
+```
+
+Honest naming: this is **zero-decode** (one memcpy, no per-field JS dispatch loop), **not** zero-copy — the bytes still move; true zero-copy awaits a shared-memory WebGPU mapping primitive — and it is O(`frameByteSize`) in the copy, O(1) in field dispatch.
+
+- **No-invariant schemas** take the pure fast path: validate length, memcpy, publish.
+- **`.withInvariant(fn)` schemas** stay protocol-safe: after the memcpy, `pushRaw` decodes the slot into a cached scratch frame *solely* to recompute the JS invariant and stamp the hidden lane before the release-store — so the source bytes' invariant lane (which the GPU never wrote) is ignored and the classifier on the consumer still works. The no-invariant path pays none of this.
+- Backpressure policies (`reject` / `drop-newest` / `drop-oldest` / `block`) behave **identically** to `push` (shared cold-path dispatch). A source shorter than `frameByteSize` at `srcOffset` throws `RangeError`.
+
+Pairs with the `BridgeGPUSource` `"raw"` decoder mode (0.9.63), which calls `pushRaw` for you on each completed readback.
+
 ### Real-time-safety role lattice — `Bridge<S, Role>` (0.9.45)
 
 A phantom `Role` type parameter promotes the per-method real-time-safety contract from JSDoc prose into the type system. The methods that are illegal on the audio render thread — `waitForData` / `waitForSpace` (they call `Atomics.wait`, which **throws `TypeError` on the browser main thread** and **stalls the render quantum** inside `process()`) and `subscribeTelemetry` (`setInterval` is absent from `AudioWorkletGlobalScope`) — are made **structurally absent** on the `"worklet"`-branded handle:

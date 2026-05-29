@@ -245,6 +245,7 @@ import {
   type SchemaLayoutDescription,
 } from "./schema.js";
 import { AdaptiveFlowController } from "./AdaptiveFlowController.js";
+import { buildScratchFrame } from "./_heap.js";
 
 export const RING_HEADER_BYTES = 32;
 /** Active SPSC counter lanes: write_index (Int32 lane 0), read_index (Int32
@@ -461,6 +462,19 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   /** Frame size in bytes; matches schema.frameByteSize. */
   public readonly frameByteSize: number;
 
+  /** Whole-SAB byte view, cached once for the zero-decode `pushRaw` memcpy
+   *  so the hot path never re-allocates a destination view. */
+  private readonly _sabU8: Uint8Array;
+  /** Reusable scratch frame for recomputing the invariant on the `pushRaw`
+   *  path (decode slot bytes → run the JS invariant fn). Pre-allocated with a
+   *  heap typed array per array field. Null for no-invariant schemas, where
+   *  `pushRaw` stays a pure memcpy + publish. */
+  private readonly _invariantScratch: Record<string, unknown> | null;
+  /** Out-param scratch for `_applyOverflowPolicy`: the (possibly advanced)
+   *  readIdx to use after a drop-oldest / block decision. Instance field so the
+   *  shared overflow helper allocates nothing on the drop-heavy path. */
+  private _ovfReadIdx = 0;
+
   private readonly indices: Int32Array;
   private readonly mask: number;
 
@@ -621,6 +635,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.schema = schema;
     this.frameByteSize = schema.frameByteSize;
     this.indices = new Int32Array(sab, 0, RING_HEADER_INT32_LANES);
+    this._sabU8 = new Uint8Array(sab);
     this.mask = capacity - 1;
     // PLL offset lanes 4-5 live at bytes 16-23 of the same Int32Array
     // header. As of 0.8.2 the publish path writes them as two Int32 stores
@@ -705,10 +720,15 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       this.invariantView = umbrellas.f64 as Float64Array;
       this.invariantSlotStrideF64 = schema.frameByteSize / 8;
       this.invariantElemOffsetF64 = schema.invariant.byteOffset / 8;
+      // Pre-allocate the pushRaw invariant-recompute scratch: heap typed
+      // arrays per array field, 0/0n scalars (filled by scalarReaders on
+      // decode). Same shape as `Bridge<S>.scratchFrame()`.
+      this._invariantScratch = buildScratchFrame(schema.compiled.fields);
     } else {
       this.invariantView = null;
       this.invariantSlotStrideF64 = 0;
       this.invariantElemOffsetF64 = 0;
+      this._invariantScratch = null;
     }
 
     // Build per-scalar-field writer / reader closures. Each closure captures
@@ -768,6 +788,55 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Shared cold-path backpressure dispatch for `push` and `pushRaw`. Called
+   * ONLY when the ring is full, so it never touches the hot success path —
+   * extracting it keeps the two producers from drifting (the concurrent test
+   * relies on identical semantics) at zero hot-path cost. Allocation-free: the
+   * advanced readIdx is returned via `this._ovfReadIdx`, the decision as a code:
+   *   0 → return false (reject, or block timed-out / still-full)
+   *   1 → return true  (drop-newest: counted, write skipped)
+   *   2 → proceed to write using `this._ovfReadIdx` (drop-oldest / block-ok)
+   *
+   * Note `beginPush` deliberately does NOT use this — its drop-newest returns
+   * null (surfaces the rejection) rather than the silent-success `push` gives.
+   */
+  private _applyOverflowPolicy(writeIdx: number, readIdx: number): 0 | 1 | 2 {
+    // The reject branch (default) is the common case and lands as a single
+    // forward-predicted branch for V8.
+    const p = this.policy;
+    if (p === "reject") {
+      return 0;
+    }
+    if (p === "drop-newest") {
+      this.droppedFrames = (this.droppedFrames + 1) | 0;
+      return 1;
+    }
+    if (p === "drop-oldest") {
+      // Post-_dropOldest the ring has space (either we CAS-advanced or the
+      // consumer raced and drained). Proceed to the normal write path.
+      this._ovfReadIdx = this._dropOldest(readIdx, writeIdx);
+      return 2;
+    }
+    // 'block': park until consumer drains or timeout. On timeout, surface the
+    // same false-return that 'reject' would, so callers can distinguish "could
+    // not be enqueued" from "enqueued".
+    const status = this.waitForSpace(this.blockTimeoutMs);
+    if (status === "timed-out") {
+      return 0;
+    }
+    // Re-load readIdx; the consumer advanced.
+    const r = Atomics.load(this.indices, READ_IDX_LANE);
+    if (((writeIdx - r) | 0) >= this.capacity) {
+      // Pathological: waitForSpace returned ok but the ring is somehow still
+      // full. Cannot happen in SPSC (consumer is the only one that decreases
+      // buffered) but defensive return surfaces it rather than corrupting state.
+      return 0;
+    }
+    this._ovfReadIdx = r;
+    return 2;
+  }
+
+  /**
    * Producer side. Copies `view`'s fields into the next free slot, advances
    * write_index, and notifies any parked consumer. Returns false if the ring
    * is full.
@@ -783,40 +852,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
     let readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     if (((writeIdx - readIdx) | 0) >= this.capacity) {
-      // Full — dispatch on policy (0.6.12). The reject branch (default)
-      // is the common case and lands as a single forward-predicted branch
-      // for V8.
-      const p = this.policy;
-      if (p === "reject") {
-        return false;
-      }
-      if (p === "drop-newest") {
-        this.droppedFrames = (this.droppedFrames + 1) | 0;
-        return true;
-      }
-      if (p === "drop-oldest") {
-        readIdx = this._dropOldest(readIdx, writeIdx);
-        // Post-_dropOldest the ring has space (either we CAS-advanced or
-        // the consumer raced and drained). Fall through to the normal
-        // write path.
-      } else {
-        // 'block': park until consumer drains or timeout. On timeout,
-        // surface the same false-return that 'reject' would, so callers
-        // can distinguish "could not be enqueued" from "enqueued".
-        const status = this.waitForSpace(this.blockTimeoutMs);
-        if (status === "timed-out") {
-          return false;
-        }
-        // Re-load readIdx; the consumer advanced.
-        readIdx = Atomics.load(this.indices, READ_IDX_LANE);
-        if (((writeIdx - readIdx) | 0) >= this.capacity) {
-          // Pathological: waitForSpace returned ok but the ring is somehow
-          // still full. Cannot happen in SPSC (consumer is the only one
-          // that decreases buffered) but defensive return surfaces it
-          // rather than corrupting state.
-          return false;
-        }
-      }
+      const action = this._applyOverflowPolicy(writeIdx, readIdx);
+      if (action === 0) return false; // reject / block-timeout
+      if (action === 1) return true; // drop-newest (counted, no write)
+      readIdx = this._ovfReadIdx; // drop-oldest / block: proceed to write
     }
     // Unsigned-then-mask: the low log2(capacity) bits don't depend on
     // signed-ness, so this is wrap-invariant.
@@ -848,6 +887,98 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.pushedFrames = (this.pushedFrames + 1) | 0;
     this._recordOccupancy((nextWrite - readIdx) | 0);
     return true;
+  }
+
+  /**
+   * Zero-decode push. Copies exactly one frame's bytes (`frameByteSize`) from
+   * `src` straight into the next free slot via a single native `Uint8Array.set`
+   * (memcpy) — no per-field encode loop — then publishes with the same
+   * release-store + notify protocol as `push`. The consumer cannot distinguish
+   * a `pushRaw` frame from a `push` frame: identical slot bytes, identical
+   * invariant lane, identical happens-before ordering.
+   *
+   * Intended for GPU readback (`BridgeGPUSource` "raw" mode), where the mapped
+   * buffer is already laid out byte-for-byte as the SAB frame — guaranteed when
+   * the producing shader's struct came from `emitWgslStruct(schema)`.
+   *
+   * Honesty: this is "zero-decode" (one memcpy, no JS field-dispatch loop), not
+   * "zero-copy" — the bytes still move — and it is O(frameByteSize) in the copy,
+   * O(1) in JS field-dispatch. For no-invariant schemas it is a pure memcpy +
+   * publish. For invariant schemas the bytes are decoded into a cached scratch
+   * frame solely to recompute the JS invariant before publish (the contract of
+   * `.withInvariant(fn)` is preserved); the no-invariant fast path is untouched.
+   *
+   * @param src        one frame of bytes — an `ArrayBuffer` or any typed-array /
+   *                   DataView whose backing buffer holds the frame.
+   * @param srcOffset  byte offset into `src` where the frame begins (default 0).
+   * @returns          true if published; false if the ring was full and the
+   *                   policy declined (reject / block-timeout). drop-newest
+   *                   returns true (counted, not written), drop-oldest evicts.
+   * @throws RangeError if `src` has fewer than `frameByteSize` bytes at offset.
+   */
+  pushRaw(src: ArrayBuffer | ArrayBufferView, srcOffset = 0): boolean {
+    const srcU8 =
+      src instanceof ArrayBuffer
+        ? new Uint8Array(src)
+        : new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    if (
+      srcOffset < 0 ||
+      srcOffset + this.frameByteSize > srcU8.byteLength
+    ) {
+      throw new RangeError(
+        `SpscRing.pushRaw: source too small — need ${this.frameByteSize} bytes ` +
+          `at offset ${srcOffset}, have ${srcU8.byteLength}`,
+      );
+    }
+    const writeIdx = this.indices[WRITE_IDX_LANE]!;
+    let readIdx = Atomics.load(this.indices, READ_IDX_LANE);
+    if (((writeIdx - readIdx) | 0) >= this.capacity) {
+      const action = this._applyOverflowPolicy(writeIdx, readIdx);
+      if (action === 0) return false;
+      if (action === 1) return true;
+      readIdx = this._ovfReadIdx;
+    }
+    const slot = (writeIdx >>> 0) & this.mask;
+    const dest = RING_HEADER_BYTES + slot * this.frameByteSize;
+    // The single native byte copy. subarray is a view (no copy); .set memcpys.
+    this._sabU8.set(
+      srcU8.subarray(srcOffset, srcOffset + this.frameByteSize),
+      dest,
+    );
+    // Compute + store invariant BEFORE the release-store (same ordering as
+    // push). The memcpy above may have written garbage into the slot's
+    // invariant lane; this overwrites it with the authoritative value.
+    if (this.invariantView !== null && this.schema.invariant !== null) {
+      const scratch = this._invariantScratch!;
+      this._decodeSlotInto(slot, scratch);
+      this.invariantView[
+        slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
+      ] = this.schema.invariant.compute(scratch);
+    }
+    const nextWrite = (writeIdx + 1) | 0;
+    Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite); // release
+    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
+    this.pushedFrames = (this.pushedFrames + 1) | 0;
+    this._recordOccupancy((nextWrite - readIdx) | 0);
+    return true;
+  }
+
+  /**
+   * Decode one slot's user fields into `outFrame` (scalars via scalarReaders,
+   * arrays copied from the slot's SAB view into `outFrame`'s pre-allocated typed
+   * arrays). Used only by `pushRaw`'s invariant-recompute path; the hidden
+   * invariant lane is not decoded (the caller recomputes it).
+   */
+  private _decodeSlotInto(slot: number, outFrame: Record<string, unknown>): void {
+    const sr = this.scalarReaders;
+    for (let i = 0; i < sr.length; i++) sr[i]!(slot, outFrame);
+    const al = this.arrayLayout;
+    const av = this.arrayViews;
+    for (let i = 0; i < al.length; i++) {
+      (outFrame[al[i]!.name] as { set: (s: AnyTypedArray) => void }).set(
+        av[i]![slot]!,
+      );
+    }
   }
 
   /**

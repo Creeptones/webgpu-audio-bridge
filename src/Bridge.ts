@@ -618,6 +618,31 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Zero-decode push. Copies exactly one frame of bytes (`frameByteSize`) from
+   * `src` straight into the next free slot via a single native memcpy — no
+   * per-field encode loop — then publishes with the same release-store + notify
+   * protocol as `push`. The consumer cannot distinguish a `pushRaw` frame from
+   * a `push` frame.
+   *
+   * Intended for GPU readback where the mapped buffer is already laid out
+   * byte-for-byte as the SAB frame — guaranteed when the producing shader's
+   * struct came from `emitWgslStruct(schema)`. Pairs with
+   * `BridgeGPUSource(device, bridge, "raw")`.
+   *
+   * "Zero-decode" = one memcpy, no JS field-dispatch loop (not "zero-copy" —
+   * bytes still move). No-invariant schemas take a pure memcpy + publish;
+   * invariant schemas decode into a cached scratch frame solely to recompute
+   * the JS invariant before publish.
+   *
+   * @param src        one frame of bytes (`ArrayBuffer` or any typed-array view).
+   * @param srcOffset  byte offset into `src` where the frame begins (default 0).
+   * @throws RangeError if `src` has fewer than `frameByteSize` bytes at offset.
+   */
+  pushRaw(src: ArrayBuffer | ArrayBufferView, srcOffset = 0): boolean {
+    return this.ring.pushRaw(src, srcOffset);
+  }
+
+  /**
    * Same as `push` but validates `view` per the schema first. Throws TypeError
    * on the first field mismatch. Use in tests / debug builds; the production
    * hot path should call `push` and trust caller-side construction (typically

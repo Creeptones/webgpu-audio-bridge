@@ -4,6 +4,79 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.62] — 2026-05-29
+
+### Added — `pushRaw(src, srcOffset?)`: zero-decode raw-byte push
+
+A new producer method on `Bridge<S>` (and the `BridgeProducer` / `BridgeInputLane`
+facades, all forwarding to the `SpscRing` core) that copies exactly one frame of
+bytes (`frameByteSize`) from `src` straight into the next free slot via a
+**single native `Uint8Array.set` memcpy** — no per-field encode loop — then
+publishes with the *same* release-store + `Atomics.notify` protocol as `push`.
+The consumer cannot distinguish a `pushRaw` frame from a `push` frame: identical
+slot bytes, identical invariant lane, identical happens-before ordering.
+
+`src` may be an `ArrayBuffer` or any `ArrayBufferView` (typed array / `DataView`);
+`srcOffset` (default 0) selects where the frame begins. A source with fewer than
+`frameByteSize` bytes at the offset throws `RangeError`.
+
+Internals:
+
+- **Shared backpressure dispatch.** The cold-path overflow logic in `push` is
+  extracted into a private `_applyOverflowPolicy(writeIdx, readIdx)` helper that
+  `push` and `pushRaw` both call, so the two producers cannot drift on
+  reject / drop-newest / drop-oldest / block semantics. It runs only on overflow
+  (zero hot-path cost) and is allocation-free (decision returned as a small code,
+  advanced readIdx via an instance scratch field). `beginPush` keeps its distinct
+  drop-newest-returns-null semantics and is intentionally left unchanged.
+- **Cached destination view.** A whole-SAB `Uint8Array` is cached once at
+  construction so the memcpy never re-allocates a destination view.
+- **Invariant guard.** No-invariant schemas take a pure memcpy + publish. For
+  `.withInvariant(fn)` schemas, `pushRaw` decodes the just-copied slot into a
+  cached scratch frame (`buildScratchFrame`, the same shape as
+  `Bridge.scratchFrame()`) solely to recompute the JS invariant and stamp the
+  hidden f64 lane *before* the release-store — so the source bytes' invariant
+  lane (which a GPU producer never writes) is ignored and the consumer-side
+  classifier still works. The no-invariant fast path pays none of this.
+
+### Why
+
+`emitWgslStruct` (0.9.61) guarantees the GPU storage buffer is byte-for-byte
+identical to the SAB frame, which makes per-field readback decoding pointless
+CPU work. `pushRaw` collapses GPU→SAB readback to one memcpy. Honest naming:
+**zero-decode** (one memcpy, no per-field JS dispatch loop), *not* "zero-copy"
+(bytes still move; true zero-copy awaits a shared-memory WebGPU mapping
+primitive) and *not* "O(1)" (it is O(`frameByteSize`) in the copy, O(1) in field
+dispatch). Second pillar of the WGSL↔TS bridge track; the `BridgeGPUSource`
+`"raw"` decoder mode (0.9.63) will call `pushRaw` automatically on each
+completed readback.
+
+### Wire compatibility
+
+Zero. `pushRaw` writes the exact same slot bytes + invariant lane as `push` and
+uses the identical release-store/notify protocol — a `pushRaw` producer and any
+existing consumer interoperate over the same SAB transparently. No schema, SAB
+byte, or frame-size change. The `_applyOverflowPolicy` extraction is a pure
+refactor: `push`'s observable behavior is unchanged (bench `push` median
+1.20 µs, unchanged; the 1 M-frame + 250 K drop-oldest concurrent stresses pass).
+
+### Tests
+
+New `tests/Bridge.pushRaw.test.ts` (6 pins, wired into `npm test` / `test:unit`):
+slot bytes byte-identical to `push` + decode round-trip; `ArrayBuffer` /
+typed-array / `DataView` inputs and non-zero `srcOffset`; short-source
+`RangeError`; reject / drop-newest / drop-oldest parity with `push` (return
+values, dropped counts, surviving frames); `block` + 0 ms timeout → false;
+invariant lane recomputed from payload (corrupted source lane ignored) and equal
+to `push`'s stored lane. Mandatory gates green: `npm run typecheck`, `npm test`
+(32 suites), `npm run bench` (~1.20 µs `push`, unchanged).
+
+### Documentation
+
+This entry; a "Zero-decode GPU readback — `pushRaw`" README subsection; method
+JSDoc on `Bridge.pushRaw` and the facades; a self-contained `pushRaw` /
+`_applyOverflowPolicy` / `_decodeSlotInto` doc block in `src/SpscRing.ts`.
+
 ## [0.9.61] — 2026-05-29
 
 ### Added — `emitWgslStruct(schema, opts?)`: schema-derived WGSL struct codegen

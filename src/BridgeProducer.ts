@@ -58,6 +58,14 @@ export class BridgeProducer<S extends Schema<FieldsObject, any>> {
     return this.ring.push(view);
   }
 
+  /** Zero-decode push: memcpy one frame of bytes from `src` straight into the
+   *  next free slot and publish — no per-field encode loop. For GPU readback
+   *  where the bytes already match the SAB layout (see `emitWgslStruct` +
+   *  `BridgeGPUSource` "raw" mode). Mirror of `Bridge<S>.pushRaw`. */
+  pushRaw(src: ArrayBuffer | ArrayBufferView, srcOffset = 0): boolean {
+    return this.ring.pushRaw(src, srcOffset);
+  }
+
   /** Two-step zero-copy push (open). Returns a frame view backed by the
    *  next free SAB slot, or null on full. */
   beginPush(): FrameFor<S> | null {
