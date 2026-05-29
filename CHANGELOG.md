@@ -4,6 +4,78 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.69] — 2026-05-29
+
+### Added — opt-out adaptive flow-scale controller (`flowController: false`)
+
+New `Bridge` / `SpscRing` constructor option `flowController?: boolean`
+(default `true`). When `false`, the consumer skips the per-pull adaptive
+flow-scale PI cycle and the lane-2 `Atomics.store`:
+
+```ts
+const bridge = new Bridge(sab, capacity, schema, { flowController: false });
+```
+
+#### What it removes
+
+Every successful `pull` / `pullLatest` / drain runs `_updateFlowScale`, which
+ticks the `AdaptiveFlowController` PI loop against the pre-pull occupancy and
+publishes the encoded `flow_scale` hint to lane 2 via `Atomics.store`. That is
+useful only when the producer honors `flowScaleHint()` for adaptive pacing —
+and `flow_scale` is documented as a **soft hint, not a hard contract** (the
+hard back-pressure is `push()` returning `false` when full plus the overflow
+`policy`). Apps that never read the hint were paying PI math + an atomic store
+on the consumer's hot path for nothing. `flowController: false` removes both via
+a single frozen early-return branch in `_updateFlowScale`.
+
+#### Behavior when disabled
+
+The `flow_scale` lane is still **seeded** to neutral `1.0` at construction (as
+before), so a producer that does read `flowScaleHint()` sees "go at nominal
+rate" rather than an unseeded `0`. The hard back-pressure contract is
+completely unaffected — `policy`, `push()`-returns-`false`, `'block'` parking,
+torn-frame detection all behave identically. This governs only the soft hint.
+
+### Why
+
+On worklet-critical pull loops the controller is measurable, avoidable work for
+the (common) case where no adaptive pacing is wired up. Making it opt-out keeps
+the adaptive path the default for callers who use it, while letting latency-
+sensitive consumers shed the math + store cleanly. Small, surgical, and
+wire-equivalent.
+
+### Wire compatibility
+
+None affected. The SAB layout is unchanged — lane 2 still exists and is still
+seeded; the option only governs whether the consumer *updates* it per pull. A
+controller-off peer interoperates bit-for-bit with a controller-on peer over the
+same SAB (the off peer simply leaves lane 2 at its seeded value). No schema or
+public-API signature change; `flowController` is a new optional field on
+`SpscRingOptions` (and therefore `BridgeOptions`).
+
+### Tests
+
+35 Node suites green. New `tests/Bridge.observability.test.ts` pin 33b
+(`testFlowControllerDisabled`): with the controller off, 200 saturated
+pull+refill cycles leave `flowScaleHint()` pinned at `1.0` (no PI tick, no
+lane-2 store) and `_updateFlowScale` is a no-op, while FIFO round-trip is
+preserved; a control ring with the default `true` moves the hint below `1.0`
+under the same drive. The existing flow-scale step-response / stability /
+anti-windup pins (default-on) pass unchanged. `npm run typecheck` clean;
+`npm run bench` push/pull/pullLatest median 1.20 μs (unchanged).
+
+### Documentation
+
+- `src/SpscRing.ts` — `flowController` option on `SpscRingOptions`;
+  `flowControllerEnabled` field + constructor read; early-return in
+  `_updateFlowScale`.
+- `src/Bridge.ts` — `BridgeOptions` header note (forwards `flowController`).
+- `README.md` — new "Opting out — `flowController: false`" subsection under
+  Adaptive backpressure.
+- `tests/Bridge.observability.test.ts` — pin 33b + header list entry.
+- `package.json` / `README.md` / `CITATION.cff` — `version` bumped to 0.9.69.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.68] — 2026-05-29
 
 ### Changed — `SpscRing.beginPush()` is now allocation-free (cached per-slot frames)

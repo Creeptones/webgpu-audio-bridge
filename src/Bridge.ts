@@ -324,10 +324,10 @@ export interface SmoothedPullOptions {
 }
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
- *  Forwards `policy` / `blockTimeoutMs` directly to the inner `SpscRing` —
- *  see `SpscRingOptions` for the per-field contract. Forward-compatible
- *  shape; future patches can add fields here without breaking the
- *  constructor signature. */
+ *  Forwards `policy` / `blockTimeoutMs` / `flowController` directly to the
+ *  inner `SpscRing` — see `SpscRingOptions` for the per-field contract.
+ *  Forward-compatible shape; future patches can add fields here without
+ *  breaking the constructor signature. */
 export interface BridgeOptions extends SpscRingOptions {
   /** Publish PLL state to SAB lanes 4-7 on every `observeConsumerTime` /
    *  `resetPll` for cross-process observability (0.6.16). When enabled,

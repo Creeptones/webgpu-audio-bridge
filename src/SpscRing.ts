@@ -385,6 +385,23 @@ export interface SpscRingOptions {
    *  `Atomics.wait`'s default). Ignored for non-`'block'` policies.
    *  Default: `undefined`. */
   readonly blockTimeoutMs?: number;
+  /** Whether the consumer runs the adaptive flow-scale PI controller on each
+   *  successful pull (0.9.69). When `true` (default), every `pull` /
+   *  `pullLatest` / drain runs one PI cycle against the pre-pull occupancy and
+   *  publishes the encoded `flow_scale` hint on lane 2 — a soft, opt-in pacing
+   *  signal the producer may read via `flowScaleHint()`.
+   *
+   *  Set `false` when the app never honors `flowScaleHint()` (the common case:
+   *  `flow_scale` is a soft hint, not a hard contract). This skips the PI math
+   *  + the per-pull `Atomics.store` on the consumer's hot path — a small,
+   *  clean saving on worklet-critical pull loops. `flow_scale` then stays at
+   *  its seeded neutral value (1.0), so any producer that does read
+   *  `flowScaleHint()` sees "go at nominal rate" rather than a stale signal.
+   *
+   *  The hard back-pressure contract (`push` returning `false` when full,
+   *  the overflow `policy`) is unaffected — this only governs the soft hint.
+   *  Default: `true` (preserves pre-0.9.69 behavior bit-exact). */
+  readonly flowController?: boolean;
 }
 
 type AnyTypedArray =
@@ -527,6 +544,13 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  writing the encoded result into lane 2. See AdaptiveFlowController.ts
    *  for the controller contract. */
   private readonly flowController: AdaptiveFlowController = new AdaptiveFlowController();
+
+  /** Whether `_updateFlowScale` runs the PI cycle + publishes lane 2 on each
+   *  successful pull (0.9.69). `false` (via `flowController: false`) skips the
+   *  math + the per-pull `Atomics.store`; `flow_scale` stays at its seeded
+   *  neutral 1.0. Frozen at construction; baked in to a single early-return
+   *  branch in `_updateFlowScale`. Default `true`. */
+  private readonly flowControllerEnabled: boolean;
 
   /** Producer-side overflow disposition (0.6.12). See `BackpressurePolicy`
    *  for the per-policy contract. Frozen at construction; baking it in
@@ -679,6 +703,12 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       );
     }
     this.blockTimeoutMs = t;
+    // 0.9.69 — adaptive flow-scale controller is opt-out. Default true
+    // (pre-0.9.69 behavior bit-exact); false skips the per-pull PI tick +
+    // Atomics.store. The flow_scale lane is still SEEDED below regardless, so
+    // a producer reading flowScaleHint() with the controller off sees a
+    // neutral 1.0 rather than an unseeded 0.
+    this.flowControllerEnabled = opts.flowController ?? true;
     // Seed flow_scale = 1.0 so any producer that reads `flowScaleHint()`
     // before the consumer has issued a single pull sees "no scaling." Both
     // peers construct their own ring over the SAB; this CAS sets the lane
@@ -1663,6 +1693,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * through to this method. Not exported from `index.ts`.
    */
   _updateFlowScale(writeIdx: number, readIdx: number): void {
+    // 0.9.69 — opt-out. When the controller is disabled, skip the PI math + the
+    // per-pull Atomics.store entirely; the seeded neutral flow_scale (1.0) is
+    // left in place on lane 2. Single frozen branch on the consumer hot path.
+    if (!this.flowControllerEnabled) return;
     const buffered = (writeIdx - readIdx) | 0;
     const encoded = this.flowController.tick(buffered, this.capacity);
     Atomics.store(this.indices, FLOW_SCALE_LANE, encoded);

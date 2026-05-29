@@ -8,7 +8,7 @@
 
 ### Status & maturity
 
-- **Version**: 0.9.68 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
+- **Version**: 0.9.69 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
 - **Tests**: 30 Node/TypeScript suites in `npm test`, plus cross-engine Playwright browser CI (schema / Bridge core / smoother / invariant / PLL / trajectory / backpressure / observability / facades / properties / recovery / input-lane / block-consumer / residual-quality-controller / WASM-equivalence / concurrent SPSC stress / roles / connect / typecheck-deprecations / readme-imports / and more). **Cross-engine browser CI**: Playwright runs the minimal-demo smoke + e2e-latency CPU-mode bench against Chromium, Firefox, and WebKit on every push and PR to `main` — `.github/workflows/browser.yml` gates merges (`continue-on-error` is off).
 - **Distribution**: [`webgpu-audio-bridge` on npm](https://www.npmjs.com/package/webgpu-audio-bridge); concept [DOI 10.5281/zenodo.20380886](https://doi.org/10.5281/zenodo.20380886) on Zenodo resolves to the latest release. MIT license. **Zero runtime dependencies.** Engines: Node ≥ 18 for the build / test toolchain; the published library itself is ESM with TypeScript types and runs anywhere `SharedArrayBuffer` + `Atomics` + `AudioWorklet` are available.
 - **Release artifacts**: per-patch history lives in [`CHANGELOG.md`](./CHANGELOG.md) (every patch has its own entry with rationale + wire-compat notes + test deltas). The GitHub Releases tab is intentionally sparse — only the v0.1.x foundation releases are tagged there; subsequent versions ship via npm + Zenodo. Cite the concept DOI or a specific version via the [`CITATION.cff`](./CITATION.cff) at the repo root.
@@ -1626,6 +1626,20 @@ function tick() {
 `flowScaleHint()` returns `1.0` until the consumer issues its first pull, so producer-side code that starts before the consumer is up runs at baseline cadence. The hint is **best-effort** — the bridge does not enforce it. The hard contract is still capacity-based push reject; the soft hint, when honored, keeps the producer/consumer match continuous so the hard reject is reached only under genuine overload.
 
 The controller targets half-full occupancy with `Kp = 0.5, Ki = 0.05` (~10 ms settling time at the canonical 375 Hz consumer cadence). The integrator is bounded to `±20` for anti-windup so a long stall can't trap the controller in permanent over-correction. See the "Adaptive backpressure (CFL-style)" section in `src/Bridge.ts` for the full controller math and the CHANGELOG `[0.5.0]` entry for the design rationale.
+
+#### Opting out — `flowController: false` (0.9.69)
+
+`flow_scale` is a **soft hint, not a hard contract** — the hard back-pressure is `push()` returning `false` when full plus the overflow `policy`. If your app never reads `flowScaleHint()` (i.e. the producer doesn't do adaptive pacing), the controller's per-pull work is pure overhead on the consumer's hot path: one PI cycle plus an `Atomics.store` into lane 2 on every successful `pull` / `pullLatest`.
+
+Turn it off at construction:
+
+```ts
+const bridge = new Bridge(sab, capacity, schema, {
+  flowController: false, // default true
+});
+```
+
+With the controller off, every successful pull skips the PI math and the lane-2 store — a small, clean saving on worklet-critical pull loops. The `flow_scale` lane stays at its seeded neutral `1.0`, so a producer that *does* read `flowScaleHint()` sees "go at nominal rate" rather than a stale value. The hard contract (`push` returns `false` when full, the overflow `policy`) is unaffected. Default stays `true` — existing behavior is unchanged unless you opt out.
 
 ### Observability dashboards (0.6.13)
 

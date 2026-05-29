@@ -14,6 +14,7 @@
  *  31. testFlowScaleIntegrationDirection
  *  32. testFlowScaleStability
  *  33. testFlowScaleAntiWindup
+ *  33b. testFlowControllerDisabled (0.9.69 — flowController:false opt-out)
  *  49. testLatencyP95
  *  69. testTelemetryPushPullSkipCounters
  *  70. testTelemetryWaitDurations
@@ -339,6 +340,58 @@ function testFlowScaleAntiWindup(): void {
     `anti-windup: scale recovered to >1.0 at cycle ${recoveryCycle} (expected < 100)`,
   );
   ok(`flow-scale-anti-windup (recovered at cycle ${recoveryCycle})`);
+}
+
+
+// ── 33b. flowController:false disables the per-pull PI tick (0.9.69) ────────
+// With the controller off, successful pulls must NOT run the PI cycle or write
+// lane 2 — flowScaleHint() stays pinned at the seeded neutral 1.0 no matter the
+// occupancy. The hard pull contract (FIFO round-trip) is unaffected. As a
+// control, an enabled ring under the same drive moves the hint off 1.0.
+function testFlowControllerDisabled(): void {
+  const n = 2;
+  const capacity = 16;
+  const schema = physicsControlFrameSchema(n);
+
+  // Controller OFF.
+  const { sab } = Bridge.allocate(capacity, schema);
+  const ring = new Bridge(sab, capacity, schema, { flowController: false });
+  const out = emptyPhysFrame(n);
+
+  assertEq(ring.flowScaleHint(), 1.0, "off: seeded neutral hint 1.0");
+
+  // Saturated drive that WOULD peg an enabled controller to 0.5: keep the ring
+  // full, pull+refill many times.
+  for (let i = 0; i < capacity; i++) ring.push(makePhysFrame(i, n));
+  for (let i = 0; i < 200; i++) {
+    assertEq(ring.pull(out), true, `off: pull ${i}`);
+    assertEq(out.seq, BigInt(i), `off: FIFO round-trip preserved at ${i}`);
+    assertEq(ring.push(makePhysFrame(capacity + i, n)), true, `off: refill ${i}`);
+  }
+  assertEq(
+    ring.flowScaleHint(),
+    1.0,
+    "off: hint stays 1.0 after 200 saturated pulls (no PI tick, no lane-2 store)",
+  );
+
+  // The direct controller hook is a no-op too.
+  const update = (
+    ring as unknown as { _updateFlowScale(w: number, r: number): void }
+  )._updateFlowScale.bind(ring);
+  update(16, 0);
+  assertEq(ring.flowScaleHint(), 1.0, "off: _updateFlowScale is a no-op");
+
+  // Control: an ENABLED ring (default) under the same drive moves off 1.0.
+  const { sab: sab2 } = Bridge.allocate(capacity, schema);
+  const on = new Bridge(sab2, capacity, schema); // default flowController: true
+  for (let i = 0; i < capacity; i++) on.push(makePhysFrame(i, n));
+  for (let i = 0; i < 50; i++) {
+    on.pull(out);
+    on.push(makePhysFrame(capacity + i, n));
+  }
+  assert(on.flowScaleHint() < 1.0, "control: enabled controller moved hint below 1.0");
+
+  ok("flow-controller-disabled (off pins hint at 1.0; enabled control moves it)");
 }
 
 
@@ -1060,6 +1113,7 @@ async function main(): Promise<void> {
   testFlowScaleIntegrationDirection();
   testFlowScaleStability();
   testFlowScaleAntiWindup();
+  testFlowControllerDisabled();
   testLatencyP95();
   testTelemetryPushPullSkipCounters();
   testTelemetryWaitDurations();
