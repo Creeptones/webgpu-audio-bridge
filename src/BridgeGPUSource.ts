@@ -676,11 +676,37 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       // The readback is ready. Try to acquire a push slot on the bridge.
       const frame = this.bridge.beginPush();
       if (frame !== null) {
-        const range = this.writeTarget.readMapped(i);
-        this.decoder(range, frame);
-        this.bridge.commitPush();
-        this._pushedCount = (this._pushedCount + 1) | 0;
-        count++;
+        // 0.9.54 — readMapped + decoder run USER code against the mapped
+        // range and can throw (malformed range, a decode bug, OOM in a
+        // heavy decoder). If anything throws AFTER beginPush() we must not
+        // leak: abortPush() so write_index never advances on the
+        // half-written frame, tick the drop counter, and surface the error
+        // to the opt-in callback. The unconditional releaseMap + slot reset
+        // below (lines after this if/else) then recycle the staging slot on
+        // every outcome — success, decoder throw, or bridge-full skip. Prior
+        // to this, a single decoder throw stranded the slot in "in-flight"
+        // with its GPU buffer still mapped, eventually starving the pipeline.
+        try {
+          const range = this.writeTarget.readMapped(i);
+          this.decoder(range, frame);
+          this.bridge.commitPush();
+          this._pushedCount = (this._pushedCount + 1) | 0;
+          count++;
+        } catch (err) {
+          this.bridge.abortPush();
+          this._droppedCount = (this._droppedCount + 1) | 0;
+          if (this._onError) {
+            const kind = this._deviceLost ? "fatal" : "transient";
+            try {
+              this._onError(err, kind);
+            } catch {
+              // User callback threw — swallow; the helper's invariant is
+              // "don't crash the producer thread on a decode failure",
+              // which overrides a misbehaving handler (mirrors the
+              // beginMap-reject path above).
+            }
+          }
+        }
       } else {
         // Bridge full — drop the readback. The push policy on the
         // bridge already accounted for whatever policy-driven drop

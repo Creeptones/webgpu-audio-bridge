@@ -4,6 +4,58 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.54] — 2026-05-29
+
+### Fixed — decoder-fault containment in `BridgeGPUSource.pollCompleted()`
+
+The user-supplied `decoder(range, frame)` runs inside `pollCompleted()` and can
+throw (malformed range, a decode bug, OOM in a heavy decoder). Before this patch
+a decoder throw escaped the readback loop **after** `beginPush()` had opened a
+ring slot, so `commitPush()` and the staging-buffer `releaseMap()` + slot reset
+were all skipped. The slot leaked into a permanent `in-flight` "zombie" (its GPU
+buffer still mapped, never re-acquired) — and slot by slot the whole readback
+pipeline starved.
+
+`pollCompleted()` now wraps the `readMapped → decoder → commitPush` region in
+try/catch. On a throw it calls `abortPush()` (so the ring's `write_index` does
+**not** advance on the half-written frame — no torn frame is ever published),
+ticks `droppedCount()`, and surfaces the error through the same
+`onError(err, kind)` channel used for `mapAsync` rejection (classified
+`'transient'` unless `device.lost` has resolved). The unconditional
+`releaseMap()` + slot reset that already followed the push now serve as the
+finally for every outcome — success, decoder throw, or bridge-full skip — so the
+staging slot is always unmapped and recycled. One bad decode costs one dropped
+frame, not the pipeline.
+
+### Why
+
+Addresses the audit's most serious fault-tolerance finding (category 5): the
+decode-failure path could leave a staging slot in a bad state and skip
+`releaseMap()`. Real-time helpers must survive user-decoder exceptions the same
+way they survive device-lost rejections — drop one frame, recycle, keep running.
+
+### Wire compatibility
+
+Zero. No schema, SAB-byte, or public-API change — the fix is internal control
+flow in `pollCompleted()`. A decoder that never throws behaves bit-for-bit as in
+0.9.53; only the throwing path changed (from leak to contained drop).
+
+### Tests
+
+New `tests/BridgeGPUSource.writeTarget.test.ts` pin **11**
+(`testDecoderThrowRecovers`): a resolving mock device drives a slot to the decode
+path with a decoder that throws on the first frame and succeeds on the second.
+Asserts the failed frame pushes nothing (`pushedCount` unchanged), aborts the
+push (no frame readable from the bridge), unmaps the buffer, recycles the slot to
+idle, ticks `droppedCount`, fires `onError('transient')` — and that the recycled
+slot then accepts the next successful readback. Mandatory gates re-run green:
+`npm run typecheck`, `npm test` (30 suites), `npm run bench` (~1.20 µs baseline).
+
+### Documentation
+
+This entry; README "Decoder-fault containment (0.9.54)" subsection under
+§BridgeGPUSource, alongside the existing device-lost handling docs.
+
 ## [0.9.53] — 2026-05-29
 
 ### Added — full layout-fingerprint validation in `mount()`

@@ -49,6 +49,11 @@
  *   10. (0.9.32) A user `onError` handler that itself throws does not
  *       crash the helper — the callback exception is swallowed and
  *       the slot still recycles.
+ *   11. (0.9.54) A decoder that throws AFTER beginPush() does not strand
+ *       the staging slot: pollCompleted aborts the begun push (write_index
+ *       does not advance), unmaps the buffer, recycles the slot to idle,
+ *       ticks droppedCount, and fires onError('transient'). The next
+ *       readback succeeds on the recycled slot (no permanent starvation).
  *
  * No GPU is required; the test uses a tiny mock `GpuDeviceLike`.
  */
@@ -513,6 +518,84 @@ async function testOnErrorUserThrowSwallowed(): Promise<void> {
   ok("10. user onError throwing is swallowed");
 }
 
+// ── 0.9.54 decoder-throw containment ────────────────────────────────────
+//
+// A RESOLVING mock: every staging buffer's `mapAsync` resolves, so the slot
+// reaches the decode path in `pollCompleted`. `getMappedRange` hands back a
+// real ArrayBuffer; `unmap` ticks a counter so the test can assert the buffer
+// is released even when the decoder throws.
+function makeResolvingMockDevice(onUnmap: () => void): GpuDeviceLike {
+  return {
+    createBuffer(desc) {
+      const buf: GpuBufferLike = {
+        size: desc.size,
+        mapAsync: () => Promise.resolve(undefined),
+        getMappedRange: (_offset, size) => new ArrayBuffer(size ?? desc.size),
+        unmap: () => { onUnmap(); },
+        destroy: () => {},
+      };
+      return buf;
+    },
+  };
+}
+
+// ── 11. (0.9.54) A throwing decoder does not strand the staging slot ────────
+// When the decoder throws AFTER beginPush(), pollCompleted must: abort the
+// begun push (write_index does NOT advance), unmap the staging buffer, recycle
+// the slot to idle, tick the drop counter, and surface onError. The next
+// readback then succeeds on the recycled slot — proving the pipeline isn't
+// permanently starved, which is the pre-0.9.54 leak this fix closes.
+async function testDecoderThrowRecovers(): Promise<void> {
+  let unmapCount = 0;
+  const device = makeResolvingMockDevice(() => { unmapCount++; });
+  const bridge = makeBridge();
+  const captured: Array<{ err: unknown; kind: string }> = [];
+
+  let decodeCall = 0;
+  const decoder = (_range: ArrayBuffer, frame: FrameFor<typeof schema>): void => {
+    decodeCall++;
+    if (decodeCall === 1) throw new Error("decoder blew up on the first frame");
+    frame.seq = 42n;
+  };
+
+  const src = new BridgeGPUSource(device, bridge, decoder, {
+    stagingBufferCount: 2,
+    onError: (err, kind) => captured.push({ err, kind }),
+  });
+
+  // Frame 1 — decoder throws.
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed1 = src.pollCompleted();
+
+  assertEq(pushed1, 0, "throwing decoder pushes nothing");
+  assertEq(src.pushedCount(), 0, "pushedCount unchanged after decoder throw");
+  assertEq(src.droppedCount(), 1, "drop counter ticked on decoder throw");
+  assertEq(src.inFlight(), 0, "slot recycled to idle after decoder throw");
+  assertEq(unmapCount, 1, "staging buffer unmapped even though the decoder threw");
+  assertEq(captured.length, 1, "onError fired once on decoder throw");
+  assertEq(captured[0]!.kind, "transient", "decoder throw classified 'transient' (device not lost)");
+  // abortPush() means write_index never advanced — nothing is readable.
+  assert(!bridge.pull(bridge.scratchFrame()), "no frame committed after the aborted push");
+
+  // Frame 2 — same pool recycled, decoder succeeds.
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed2 = src.pollCompleted();
+
+  assertEq(pushed2, 1, "recycled slot accepts the next readback");
+  assertEq(src.pushedCount(), 1, "pushedCount advanced on the successful frame");
+  assertEq(unmapCount, 2, "second readback unmapped its buffer too");
+  const out = bridge.scratchFrame();
+  assert(bridge.pull(out), "the successful frame is now readable");
+  assertEq(out.seq, 42n, "the committed frame carries the decoder's payload");
+
+  src.destroy();
+  ok("11. (0.9.54) decoder throw aborts the push, unmaps, recycles, and recovers");
+}
+
 async function main(): Promise<void> {
   testDefaultResolvesToMapAsync();
   testAutoResolvesToMapAsync();
@@ -524,6 +607,7 @@ async function main(): Promise<void> {
   await testOnErrorFatal();
   await testNoOnErrorSilent();
   await testOnErrorUserThrowSwallowed();
+  await testDecoderThrowRecovers();
   console.log("\nAll BridgeGPUSource.writeTarget.test.ts pins passed.");
 }
 

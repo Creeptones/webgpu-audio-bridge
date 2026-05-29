@@ -961,6 +961,12 @@ The helper itself never throws on a rejection — the slot routes to drop-and-re
 
 Device-lost detection requires the device exposing `lost` as a Promise-like (the real `GPUDevice` always does; minimal `GpuDeviceLike` implementations may not). If `lost` is absent or non-thenable, every rejection classifies as `'transient'` — that's the best-effort fallback. The classification is observed at rejection time, not retroactively: if `device.lost` resolves AFTER a rejection has already fired, the prior callback fires with `'transient'` and the subsequent one with `'fatal'`.
 
+### Decoder-fault containment (0.9.54)
+
+The user-supplied `decoder(range, frame)` runs inside `pollCompleted()` — it's *your* code, and it can throw (a malformed range, a decode bug, OOM in a heavy decoder). Before 0.9.54 a decoder throw escaped the readback loop *after* `beginPush()` had opened a slot, so the slot was never committed and the staging buffer was never unmapped — the slot leaked into a permanent in-flight zombie and, slot by slot, the readback pipeline starved.
+
+`pollCompleted()` now contains decoder faults symmetrically with the device-lost path: a throw triggers `abortPush()` (so the ring's `write_index` does **not** advance on the half-written frame — no torn frame is ever published), ticks `droppedCount()`, unmaps and recycles the staging slot, and surfaces the error through the same `onError(err, 'transient')` channel. The next `scheduleReadback` reuses the recycled slot — one bad decode costs one dropped frame, not the whole pipeline. Pinned by `tests/BridgeGPUSource.writeTarget.test.ts#11`.
+
 ### WebGPU type compatibility
 
 The helper uses structural interfaces (`GpuDeviceLike`, `GpuBufferLike`, `GpuCommandEncoderLike`) that the real WebGPU types satisfy at the surface the helper actually uses (`createBuffer`, `copyBufferToBuffer`, `mapAsync`, `getMappedRange`, `unmap`, `destroy`). No `@webgpu/types` runtime dependency; users on browsers (lib.dom.d.ts) or Node-with-WebGPU (`@webgpu/types` in devDependencies) pass real `GPUDevice` / `GPUBuffer` / `GPUCommandEncoder` directly without coercion.
