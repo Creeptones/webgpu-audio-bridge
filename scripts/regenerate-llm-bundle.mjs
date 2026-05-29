@@ -67,6 +67,11 @@ const INCLUDES = [
   { path: "docs/emit-worklet-reader-design.md", mode: "full", lang: "md" },
   { path: "docs/rt-safety-lattice-design.md", mode: "full", lang: "md" },
   { path: "docs/connect-topology-design.md", mode: "full", lang: "md" },
+  // WGSL↔TS bridge track (0.9.61–0.9.64): the alignment-trap rationale, the
+  // descending-alignment isomorphism argument, the type-support gate, and the
+  // ~20-line copy-paste Vite virtual-module recipe (pillar 4 ships as a
+  // documented snippet, not a package).
+  { path: "docs/wgsl-schema-bridge-design.md", mode: "full", lang: "md" },
   // Formal-correctness artifacts.
   { path: "docs/formal-verification-design.md", mode: "full", lang: "md" },
   { path: "docs/spsc-happens-before-proof.md", mode: "full", lang: "md" },
@@ -88,6 +93,12 @@ const INCLUDES = [
   { path: "src/predictiveExtrapolation.ts", mode: "full", lang: "ts" },
   { path: "src/TimelineRecorder.ts", mode: "full", lang: "ts" },
   { path: "src/emitWorkletReader.ts", mode: "full", lang: "ts" },
+  // The WGSL↔TS bridge emitter (0.9.61): schema-derived WGSL struct codegen
+  // proving the descending-alignment isomorphism arithmetically via
+  // `computeWgslLayout` (no naga/tint). Inlined in full so the emitter body —
+  // not just its exported names — is auditable from the bundle alone. Pairs
+  // with `pushRaw` (SpscRing) + BridgeGPUSource `"raw"` mode.
+  { path: "src/emitWgslStruct.ts", mode: "full", lang: "ts" },
   { path: "src/connect.ts", mode: "full", lang: "ts" },
   { path: "src/_heap.ts", mode: "full", lang: "ts" },
   { path: "src/schemas/physics.ts", mode: "full", lang: "ts" },
@@ -117,7 +128,7 @@ const INCLUDES = [
   { path: "src/AdaptiveFlowController.ts", mode: "full", lang: "ts" },
   { path: "src/BridgeConsumer.ts", mode: "full", lang: "ts" },
   { path: "src/BridgeProducer.ts", mode: "full", lang: "ts" },
-  { path: "src/BridgeWebNNSource.ts", mode: "full", lang: "ts" },
+  { path: "src/experimental/BridgeWebNNSource.ts", mode: "full", lang: "ts" },
 
   // ── Examples — the canonical demos ────────────────────────────────────
   { path: "examples/minimal/README.md", mode: "full", lang: "md" },
@@ -150,8 +161,12 @@ const TEST_FILES_INVENTORY = [
   ["tests/BridgeFacades.test.ts", "Facade-level pins (BridgeConsumer.telemetry symmetry, etc.)."],
   ["tests/BridgeInputLane.test.ts", "BridgeInputLane (fast-lane pattern) pins."],
   ["tests/BridgeBlockConsumer.test.ts", "BridgeBlockConsumer pins — including 0.9.41 processAdd / hybrid pins #14-#21."],
+  ["tests/ResidualQualityController.test.ts", "Graceful-degradation residual-thinning controller pins (0.9.51)."],
   ["tests/BridgeGPUSource.writeTarget.test.ts", "BridgeGPUSource WriteTarget scaffold pins."],
+  ["tests/BridgeGPUSource.raw.test.ts", "BridgeGPUSource \"raw\" decoder-mode pins (0.9.63 zero-decode readback)."],
   ["tests/BridgeWebNNSource.test.ts", "BridgeWebNNSource pins (experimental subpath)."],
+  ["tests/Bridge.wgsl.test.ts", "emitWgslStruct codegen pins — offset/size isomorphism, sub-32-bit fail-fast, vec2<u32> 64-bit transport (0.9.61)."],
+  ["tests/Bridge.pushRaw.test.ts", "pushRaw zero-decode raw-byte push pins — memcpy fidelity + invariant-lane recompute (0.9.62)."],
   ["tests/MessageChannelBridge.test.ts", "0.9.40 Standard mode pins — 9 pins covering MVP1 surface."],
   ["tests/environment.test.ts", "getEnvironmentReport() pins."],
   ["tests/Bridge.phaseLock.test.ts", "FFT-based phase-lock spectrum pin."],
@@ -245,7 +260,7 @@ async function buildBundle() {
 > 3. Recent CHANGELOG entries (0.9.36+; older entries in the full file at the repo).
 > 4. Design notes — Standard mode, hybrid residual, the five frontier-track notes (predictive extrapolation, record/replay, worklet codegen, \`Bridge<S,Role>\` lattice, \`connect()\`), and the formal-correctness notes (TLA+ verification, happens-before proof, interleaving fuzzer) — plus the \`formal/SpscRing.tla\` model itself.
 > 5. Public-API TypeScript source files inlined in full (Bridge + the \`Bridge<S,Role>\` lattice, MessageChannelBridge, BridgeBlockConsumer, schema DSL, environment, trajectory evaluator, the frontier modules \`predictiveExtrapolation\` / \`TimelineRecorder\` / \`emitWorkletReader\` / \`connect\`, canonical schemas) **plus the correctness-critical \`SpscRing\` core inlined in full** (0.9.56) — the SAB/Atomics counter arithmetic, park/wake wait protocol, overflow policies, and notify behavior, so the SPSC semantics are verifiable from the bundle alone alongside \`formal/SpscRing.tla\`.
-> 6. The remaining extracted heap-state machines + composable facades inlined in full (0.9.59) — \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\`. With the \`SpscRing\` core (item 5) this puts the **entire runtime surface** in the bundle — no source file is summarized header-only anymore.
+> 6. The remaining extracted heap-state machines + composable facades inlined in full (0.9.59) — \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\` — plus the WGSL↔TS emitter \`emitWgslStruct\` (0.9.61). With the \`SpscRing\` core (item 5) this puts the **entire runtime surface** in the bundle — including the WGSL emitter body, not just its exported names — so no source file is summarized header-only anymore.
 > 7. Canonical example demos: \`examples/minimal/\` (Worker → Bridge → AudioWorklet) and \`examples/hybrid-residual/\` (the 0.9.41 hybrid pattern).
 > 8. Test-file inventory (full files not inlined; ~5,000 lines combined).
 
@@ -270,6 +285,10 @@ AudioWorklet (f64 synthesis @ 48kHz)
 
 ### Headline shipped features (most-recent-first)
 
+- **0.9.64** — WGSL↔TS bridge track closed out: \`docs/wgsl-schema-bridge-design.md\` design note + a ~20-line copy-paste Vite virtual-module recipe (pillar 4 ships as a documented snippet, not a package).
+- **0.9.63** — \`BridgeGPUSource(..., "raw")\` decoder mode: validates \`stagingBufferSize === frameByteSize\` up front, then calls \`pushRaw\` on each completed readback (zero per-field dispatch).
+- **0.9.62** — \`pushRaw(range)\` zero-decode raw-byte push: one native \`Uint8Array.set\` memcpy into a cached SAB view, same release-store/notify protocol as \`push\`, recomputes the hidden invariant lane before publishing. Zero-decode, not zero-copy.
+- **0.9.61** — \`emitWgslStruct\` / \`computeWgslLayout\` / \`WgslUnsupportedKindError\`: schema-derived WGSL struct codegen byte-isomorphic to the SAB frame (sub-32-bit fail-fast, 64-bit → \`vec2<u32>\`, trailing \`_wab_pad\` stride). Now inlined in full in this bundle.
 - **0.9.59** — Remaining internal machinery + facades inlined in full in this bundle; the entire runtime surface is now present (no header-only summaries left).
 - **0.9.58** — \`BridgeGPUSource\` release-step hardening: \`releaseMap()\` + slot reset moved into a literal \`finally\`, so a throwing \`unmap()\` recycles the slot (the committed frame is kept).
 - **0.9.56** — \`SpscRing\` core inlined in full in this bundle (audit hardening cohort): the correctness-critical SAB/Atomics file is now verifiable from the bundle alone, not just its header.
@@ -353,7 +372,7 @@ The full test files are not inlined here — ~5,000 lines combined. Each pins a 
 |---|---|
 ${inventoryRows}
 
-Test invocation: \`npm test\` (runs all 30 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
+Test invocation: \`npm test\` (runs all 33 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
 `;
 
   return `${headerMd}\n${tocMd}\n${sections.join("")}\n${inventoryMd}\n`;

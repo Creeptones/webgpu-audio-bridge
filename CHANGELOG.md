@@ -4,6 +4,95 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.65] — 2026-05-29
+
+### Added — Audit-response hygiene patch (LLM_BUNDLE coverage + version metadata)
+
+Documentation/tooling-only patch responding to a third-party LLM audit
+(scored 94→95/100) that flagged three concrete defects undermining the
+single-file `LLM_BUNDLE.md` audit artifact. None of the runtime surface
+changes; this is the audit-response sibling to 0.9.36, targeted at the
+same "an evaluator forms an adopt-or-avoid opinion in the first skim"
+failure mode.
+
+#### `src/emitWgslStruct.ts` now inlined in full
+
+The 0.9.61 WGSL emitter was exported, documented, and tested, but the
+bundle generator's `INCLUDES` table never listed its source file — the
+bundle's table of contents jumped straight from `emitWorkletReader.ts`
+to `connect.ts`. An auditor could verify the emitter's API / exports /
+docs / tests but **not its implementation body**, which the audit called
+out as "the biggest remaining audit gap" for the WGSL feature path. The
+emitter is now inlined in full (`computeWgslLayout` isomorphism spine
+included), and the `docs/wgsl-schema-bridge-design.md` design note — the
+home of the alignment-trap rationale, the descending-alignment
+isomorphism argument, and the ~20-line copy-paste Vite virtual-module
+recipe — is now bundled alongside it.
+
+#### `BridgeWebNNSource.ts` no longer "missing at generation time"
+
+The generator pointed at `src/BridgeWebNNSource.ts`, but the file lives
+at `src/experimental/BridgeWebNNSource.ts` (the experimental subpath).
+The mismatch made the generator emit a literal *"(file missing at
+generation time)"* placeholder where the WebNN source should have been —
+so the bundle simultaneously claimed "the entire runtime surface is
+inlined" and visibly omitted one of the files it listed. Path corrected;
+the regenerated bundle has zero "missing at generation time" markers.
+
+#### Version metadata reconciliation
+
+The bundle reported package version `0.9.64` while `README.md` and
+`CITATION.cff` both still read `0.9.52` — a ~12-patch drift that, per the
+audit, "weakens the single-file audit-artifact story." Both are now
+reconciled to the current version, the same fix shape as 0.9.36's
+`CITATION.cff` reconciliation.
+
+#### Bundle inventory + headline accuracy
+
+Folded in while in the generator: the test-file inventory gained the four
+real-but-unlisted suites (`Bridge.wgsl`, `Bridge.pushRaw`,
+`BridgeGPUSource.raw`, `ResidualQualityController`) and the stale "runs
+all 30 suites" line is corrected to 33 (matching `npm test`). The
+headline-features list, which previously stopped at 0.9.59, now covers
+the full WGSL↔TS bridge track (0.9.61–0.9.64), and item 6 of the
+"what this bundle contains" preamble now states the WGSL emitter **body**
+(not just its exported names) is present.
+
+### Why
+
+The 0.9.x soak is the deliberate "polish toward 1.0" phase. `LLM_BUNDLE.md`
+exists specifically so an evaluator can audit the whole project in one
+read — a bundle that contradicts itself (claims full coverage, then shows
+a missing-file placeholder and a stale version) actively undercuts that
+purpose. All three defects are generator-table bugs or stale metadata, not
+runtime issues; fixing them is cheap and restores the artifact's
+credibility.
+
+### Wire compatibility
+
+None affected. Build-tooling (`scripts/regenerate-llm-bundle.mjs`),
+version metadata, and the regenerated `.gitignore`d bundle only. No SAB
+protocol change, no schema DSL change, no public-API change.
+
+### Tests
+
+33 Node suites green. `npm run typecheck` clean. `npm run bench` push /
+pull / pullLatest median sanity-check against the documented ~1.20 μs
+baseline unchanged (push 1.20 μs). No new pins required — this patch adds
+zero runtime surface.
+
+### Documentation
+
+- `scripts/regenerate-llm-bundle.mjs` — added `src/emitWgslStruct.ts` and
+  `docs/wgsl-schema-bridge-design.md` to `INCLUDES`; corrected the
+  `BridgeWebNNSource.ts` path to `src/experimental/`; added four test
+  suites to the inventory; corrected the suite count (30 → 33); extended
+  the headline-features list through 0.9.64.
+- `README.md` — `Version` line bumped to 0.9.65.
+- `CITATION.cff` — `version` bumped to 0.9.65.
+- `package.json` — `version` bumped to 0.9.65.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.64] — 2026-05-29
 
 ### Added — WGSL↔TS bridge design note + Vite virtual-module recipe
