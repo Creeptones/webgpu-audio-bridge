@@ -491,6 +491,20 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   /** Per-scalar-field read closure: copies slot value into outFrame[name]. */
   private readonly scalarReaders: ReadonlyArray<ScalarOp>;
 
+  /** One pre-built `beginPush` frame per ring slot (0.9.68). Each frame's
+   *  array fields alias the slot's stable SAB-backed views (which never change
+   *  for the life of the ring), so `beginPush` hands back the cached object and
+   *  only resets scalars — no object allocation on the hot path. Keeps the
+   *  closure-decoder (non-`"raw"` `BridgeGPUSource`) steady state allocation-
+   *  free, matching the `pushRaw` / `"raw"` story. The array CONTAINER is
+   *  frozen; the per-slot frame objects stay mutable (scalars reset on acquire,
+   *  fields written by the caller). */
+  private readonly slotPushFrames: ReadonlyArray<Record<string, unknown>>;
+  /** Zero value per scalar field, aligned to `scalarLayout` (0.9.68).
+   *  Precomputed so `beginPush`'s scalar reset avoids a per-call `kindTsType`
+   *  branch. `0n` for bigint kinds, `0` otherwise. */
+  private readonly scalarZeros: ReadonlyArray<number | bigint>;
+
   /** Active beginPush/commitPush handle, or null. */
   private pendingPushFrame: Record<string, unknown> | null = null;
   private pendingPushSlot: number = -1;
@@ -710,6 +724,29 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       return views;
     });
     this.arrayViews = arrayViews;
+
+    // 0.9.68 — pre-build one beginPush frame per ring slot + the scalar zero
+    // table. The array fields alias the slot's stable SAB views (built just
+    // above, fixed for the ring's life), so beginPush only resets scalars and
+    // never allocates. Frames are built arrays-then-scalars in the same order
+    // the old inline beginPush used, so every slot frame shares one hidden
+    // class.
+    const scalarZeros: (number | bigint)[] = scalars.map((f) =>
+      kindTsType(f.kind) === "bigint" ? 0n : 0,
+    );
+    this.scalarZeros = Object.freeze(scalarZeros);
+    const slotPushFrames: Record<string, unknown>[] = new Array(capacity);
+    for (let s = 0; s < capacity; s++) {
+      const frame: Record<string, unknown> = {};
+      for (let i = 0; i < arrays.length; i++) {
+        frame[arrays[i]!.name] = arrayViews[i]![s]!;
+      }
+      for (let i = 0; i < scalars.length; i++) {
+        frame[scalars[i]!.name] = scalarZeros[i]!;
+      }
+      slotPushFrames[s] = frame;
+    }
+    this.slotPushFrames = Object.freeze(slotPushFrames);
 
     // Invariant umbrella + stride / offset. Schema's invariant spec guarantees
     // byteOffset is 8-aligned and frameByteSize is a multiple of 8 (compile
@@ -991,6 +1028,17 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * the slot to skip the one .set() copy that `push(view)` would do. Only
    * one begin/commit pair can be in flight at a time per ring instance.
    *
+   * Allocation (0.9.68). The returned frame is the slot's PRE-BUILT cached
+   * object (`slotPushFrames[slot]`), not a fresh allocation — array fields
+   * already alias this slot's SAB views, and only the scalars are reset to
+   * zero on each call. The steady-state path therefore allocates nothing,
+   * keeping the closure-decoder readback (non-`"raw"` `BridgeGPUSource`) GC-
+   * free. Consequence: the frame is only valid between `beginPush` and the
+   * matching `commitPush`/`abortPush`; two `beginPush` calls that land on the
+   * same slot (one ring revolution apart) return the SAME object identity.
+   * Do not retain the frame past `commitPush` — its array views point at a
+   * slot the producer will overwrite, exactly as before.
+   *
    * Policy interaction (0.6.12). `beginPush` honors the same backpressure
    * policy as `push`: under `'drop-newest'` it returns null (the producer
    * can detect and increment its own counters); under `'drop-oldest'` it
@@ -1030,13 +1078,13 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       }
     }
     const slot = (writeIdx >>> 0) & this.mask;
-    const frame: Record<string, unknown> = {};
-    for (let i = 0; i < this.arrayLayout.length; i++) {
-      frame[this.arrayLayout[i]!.name] = this.arrayViews[i]![slot]!;
-    }
-    for (const f of this.scalarLayout) {
-      frame[f.name] = kindTsType(f.kind) === "bigint" ? 0n : 0;
-    }
+    // 0.9.68 — hand back the slot's pre-built frame (array fields already alias
+    // this slot's SAB views) and reset only the scalars to their zero value.
+    // No object/view allocation on the steady-state push path.
+    const frame = this.slotPushFrames[slot]!;
+    const sl = this.scalarLayout;
+    const sz = this.scalarZeros;
+    for (let i = 0; i < sl.length; i++) frame[sl[i]!.name] = sz[i]!;
     this.pendingPushFrame = frame;
     this.pendingPushSlot = slot;
     return frame as FrameFor<S>;

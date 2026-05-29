@@ -19,6 +19,7 @@
  *  8. testAvailableCounter
  *  9. testBeginCommitPush
  *  10. testAbortPush
+ *  10b. testBeginPushCachedFrame (0.9.68 — cached per-slot frame, scalar reset)
  *  11. testPushChecked
  *  12. testFuzzVsOracle
  *  13. testDescribeLayout
@@ -314,6 +315,63 @@ function testAbortPush(): void {
   assert(slot2 !== null, "beginPush after abort succeeds");
   ring.abortPush();
   ok("abort-push");
+}
+
+
+// ── 10b. beginPush hands back a cached per-slot frame (0.9.68) ──────────────
+// beginPush must not allocate a fresh frame object per call: it returns the
+// slot's pre-built frame (array fields aliasing the slot's SAB views) and only
+// resets scalars. Pins the observable consequences — stable object + view
+// identity across a ring revolution, and that scalars are reset (no stale leak)
+// while round-trip stays correct.
+function testBeginPushCachedFrame(): void {
+  const n = 3;
+  const schema = physicsControlFrameSchema(n);
+  const { sab, capacity } = Bridge.allocate(2, schema); // capacity 2 → slot = writeIdx & 1
+  const ring = new Bridge(sab, capacity, schema);
+  const out = emptyPhysFrame(n);
+
+  // Push #0 → slot 0. Fully populate, capturing the frame + a view reference.
+  const f0 = ring.beginPush();
+  assert(f0 !== null, "beginPush #0 returns a slot");
+  const vEff0 = f0!.vEff; // the slot-0 vEff SAB view
+  f0!.seq = 111n; f0!.tMacroNs = 1n; f0!.vMax = 9.0; f0!.jMax = 8.0;
+  for (let k = 0; k < n; k++) { f0!.vEff[k] = k + 1; f0!.jEff[k] = -k; }
+  ring.commitPush();
+  assertEq(ring.pull(out), true, "pull #0");
+  assertEq(out.vMax, 9.0, "push #0 vMax round-trips");
+
+  // Push #1 → slot 1 (different slot, different cached frame).
+  const f1 = ring.beginPush();
+  assert(f1 !== null, "beginPush #1 returns a slot");
+  assert(f1 !== f0, "slot-1 frame is a distinct object from slot-0 frame");
+  f1!.seq = 222n; f1!.tMacroNs = 2n; f1!.vMax = 5.0; f1!.jMax = 4.0;
+  ring.commitPush();
+  assertEq(ring.pull(out), true, "pull #1");
+
+  // Push #2 → slot 0 again (one revolution later). MUST be the same cached
+  // object + same array view as push #0 — proves no per-call allocation.
+  const f2 = ring.beginPush();
+  assert(f2 !== null, "beginPush #2 returns a slot");
+  assert(f2 === f0, "slot-0 frame identity is stable across a ring revolution");
+  assert(f2!.vEff === vEff0, "slot-0 array view identity is stable (no realloc)");
+
+  // Stale-scalar guard: scalars set on push #0 must be reset to 0 on reacquire,
+  // BEFORE the caller writes anything this round.
+  assertEq(f2!.vMax, 0, "vMax reset to 0 on reacquire (no stale 9.0)");
+  assertEq(f2!.jMax, 0, "jMax reset to 0 on reacquire (no stale 8.0)");
+  assertEq(f2!.seq, 0n, "seq reset to 0n on reacquire (bigint zero)");
+
+  // Set only seq this round; leave the rest at their reset zeros. Round-trip
+  // must reflect the reset values, not push #0's stale data.
+  f2!.seq = 333n;
+  ring.commitPush();
+  assertEq(ring.pull(out), true, "pull #2");
+  assertEq(out.seq, 333n, "push #2 seq round-trips");
+  assertEq(out.vMax, 0, "push #2 vMax is the reset 0, not stale 9.0");
+  assertEq(out.jMax, 0, "push #2 jMax is the reset 0, not stale 8.0");
+
+  ok("beginPush cached per-slot frame (0.9.68): stable identity + scalar reset");
 }
 
 
@@ -659,6 +717,7 @@ function main(): void {
   testAvailableCounter();
   testBeginCommitPush();
   testAbortPush();
+  testBeginPushCachedFrame();
   testPushChecked();
   testFuzzVsOracle();
   testDescribeLayout();

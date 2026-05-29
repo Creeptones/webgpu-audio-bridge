@@ -4,6 +4,69 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.68] — 2026-05-29
+
+### Changed — `SpscRing.beginPush()` is now allocation-free (cached per-slot frames)
+
+`beginPush()` previously allocated a fresh frame object (`{}` + per-field
+property writes) on every successful call. The array *views* were already
+cached, but the wrapper object was not — so the two-step push path minted one
+object per call. That undermined the "allocation-free steady state" story for
+the closure-decoder readback path (`BridgeGPUSource` without `"raw"` mode),
+where `beginPush()` runs once per GPU readback on the producer/worker thread.
+
+Now each ring slot owns one **pre-built frame**, constructed once at ring
+construction with its array fields aliasing that slot's stable SAB-backed views
+(which never change for the life of the ring). `beginPush()` hands back the
+slot's cached frame and resets only the scalars to zero (via a precomputed
+`scalarZeros` table, dropping a per-call `kindTsType` branch). The
+steady-state push path now allocates nothing.
+
+#### Behavioral consequence (no contract break)
+
+The returned frame is the slot's stable object, so two `beginPush()` calls that
+land on the same slot (one ring revolution apart) return the SAME object
+identity, and a frame's array views are stable across revolutions. This is not
+a contract change: a `beginPush` frame was only ever valid between `beginPush`
+and its matching `commitPush`/`abortPush` — its array views point at a SAB slot
+the producer overwrites on the next revolution, exactly as before. Retaining a
+frame past `commitPush` was already misuse. Scalars are reset to zero on each
+acquire, so no stale scalar state leaks across reuse of a slot.
+
+### Why
+
+The closure-decoder GPU readback path is a worker-side hot loop; an allocation
+per readback shows up as avoidable GC variance under sustained 60 Hz dispatch.
+Caching the frame removes the only steady-state allocation on that path,
+bringing it in line with the zero-decode `pushRaw` / `"raw"` story. Low-risk:
+the per-slot decode/commit/invariant logic is untouched; only the frame object's
+provenance changed (fresh → cached).
+
+### Wire compatibility
+
+None affected. Internal `SpscRing` heap-state change behind the unchanged
+`beginPush` / `commitPush` / `abortPush` surface. No SAB layout change, no
+schema DSL change, no public-API signature change.
+
+### Tests
+
+35 Node suites green. New `tests/Bridge.core.test.ts` pin 10b
+(`testBeginPushCachedFrame`): stable object + array-view identity across a ring
+revolution (proving no per-call allocation), scalar reset on reacquire (no stale
+leak), and preserved round-trip. The existing begin/commit, abort, fuzz-vs-
+oracle, invariant, backpressure, and GPUSource suites pass unchanged.
+`npm run typecheck` clean; `npm run bench` push median 1.20 μs (unchanged vs the
+documented baseline — no regression on the `push` path).
+
+### Documentation
+
+- `src/SpscRing.ts` — `slotPushFrames` + `scalarZeros` fields; constructor
+  precompute; rewritten `beginPush` hot path; expanded `beginPush` JSDoc
+  (allocation note + frame-validity contract).
+- `tests/Bridge.core.test.ts` — pin 10b + header list entry.
+- `package.json` / `README.md` / `CITATION.cff` — `version` bumped to 0.9.68.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.67] — 2026-05-29
 
 ### Added — `BridgeGPUSource` auto-drain on `mapAsync` resolution
