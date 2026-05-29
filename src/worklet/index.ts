@@ -43,8 +43,15 @@
  */
 
 import { hasWasmConsumerSupport } from "./wasmSimdSupport.js";
+import { kindByteSize, type FieldKind, type SchemaLayoutDescription } from "../schema.js";
 
 export { hasWasmSimd, hasWasmThreads, hasWasmConsumerSupport } from "./wasmSimdSupport.js";
+
+/** Bytes in the SAB ring header preceding slot 0. Mirrors SpscRing's
+ *  `RING_HEADER_BYTES` and `SchemaLayoutDescription.headerBytes` (32 = eight
+ *  Int32 lanes). Re-declared here so the descriptor math doesn't pull in the
+ *  whole SpscRing module on the worklet path. */
+export const RING_HEADER_BYTES = 32;
 
 /**
  * WebAssembly.Memory pages are 64 KiB each. Exported for callers that
@@ -389,6 +396,26 @@ export interface WorkletConsumer {
   evalTaylorF32O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
   evalTaylorF64O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
 
+  /** Descriptor-driven whole-frame decode (0.9.74). Decodes an ENTIRE frame
+   *  in ONE call by looping over a pre-built descriptor table (one
+   *  `memory.copy` per field, slot → scratch). This is the hot-path frame
+   *  decoder; the per-field `read*` methods above each cost a JS↔WASM
+   *  crossing and are for one-off scalar peeks only.
+   *
+   *    - `slotBase` — absolute byte offset of the slot start within the
+   *      WASM memory: `RING_HEADER_BYTES + slot * frameByteSize`. Use
+   *      `slotByteBase(slot, frameByteSize)` to compute it.
+   *    - `descPtr` — absolute byte offset of the descriptor table within
+   *      the WASM memory (4-aligned). Blit a `FrameDescriptorPlan.words`
+   *      Int32Array there ONCE at setup via an Int32Array view over
+   *      `memory.buffer`.
+   *    - `descCount` — `FrameDescriptorPlan.descCount`.
+   *
+   *  Bit-exact to `Bridge.pull`'s decode (pure byte relocation, no
+   *  arithmetic). After it returns the SAB slot may be released
+   *  immediately — pair with `commitPullLatest` / `commitPull`. */
+  decodeFrame(slotBase: number, descPtr: number, descCount: number): void;
+
   /** Raw `WebAssembly.Instance` for introspection (debugging, future
    *  exports). The shim's typed methods are the canonical API; this
    *  is escape-hatch only. */
@@ -459,6 +486,7 @@ export function instantiateConsumer(
     ) => void;
     readonly eval_taylor_f32_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly eval_taylor_f64_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly decode_frame: (slotBase: number, descPtr: number, descCount: number) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -493,6 +521,7 @@ export function instantiateConsumer(
     "eval_hermite_f32",
     "eval_taylor_f32_o2_simd",
     "eval_taylor_f64_o2_simd",
+    "decode_frame",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -551,5 +580,120 @@ export function instantiateConsumer(
       exports.eval_taylor_f32_o2_simd(srcOff, dstOff, n, dt),
     evalTaylorF64O2Simd: (srcOff, dstOff, n, dt) =>
       exports.eval_taylor_f64_o2_simd(srcOff, dstOff, n, dt),
+    decodeFrame: (slotBase, descPtr, descCount) =>
+      exports.decode_frame(slotBase, descPtr, descCount),
   };
+}
+
+/**
+ * Absolute byte offset of ring slot `slot`'s payload start within the SAB /
+ * WASM memory: `RING_HEADER_BYTES + slot * frameByteSize`. The argument the
+ * descriptor-driven `decodeFrame` wants as `slotBase`. Pure arithmetic —
+ * inline it in a tight loop if you prefer.
+ */
+export function slotByteBase(slot: number, frameByteSize: number): number {
+  return RING_HEADER_BYTES + slot * frameByteSize;
+}
+
+/** Per-field destination descriptor inside a `FrameDescriptorPlan`. The JS
+ *  consumer builds typed-array views over `[byteOffset, byteOffset +
+ *  byteCount)` of the scratch region to read the decoded values. */
+export interface FrameFieldDst {
+  readonly kind: FieldKind;
+  /** Flat element count (1 for scalar). */
+  readonly length: number;
+  readonly isArray: boolean;
+  /** Absolute byte offset of this field's decoded bytes within WASM memory. */
+  readonly byteOffset: number;
+  /** `kindByteSize(kind) * length`. */
+  readonly byteCount: number;
+}
+
+/** Output of `buildFrameDescriptors`: the descriptor table to blit into WASM
+ *  memory once, plus the destination map the consumer reads decoded values
+ *  through. */
+export interface FrameDescriptorPlan {
+  /** Tightly-packed `3 * descCount` i32 words — `[srcRel, dstAbs, byteCount]`
+   *  per field — ready to blit into WASM memory at a 4-aligned `descPtr` via
+   *  an `Int32Array(memory.buffer)` view. */
+  readonly words: Int32Array;
+  /** Number of fields (= `words.length / 3`). Pass as `decodeFrame`'s
+   *  `descCount`. */
+  readonly descCount: number;
+  /** Per-field destination, keyed by field name, for building read views. */
+  readonly fields: Readonly<Record<string, FrameFieldDst>>;
+  /** Total bytes the decoded region occupies (the scratch you must reserve
+   *  above `dstBase`). */
+  readonly totalDstBytes: number;
+}
+
+/**
+ * Compile a `describeSchemaLayout()` description into a descriptor table for
+ * the whole-frame `decodeFrame` export (0.9.74).
+ *
+ * Every user field (scalars + arrays + trajectory arrays — the invariant lane
+ * is excluded; it's bridge-managed) gets one descriptor that copies its bytes
+ * from the slot to a freshly-packed destination region starting at `dstBase`.
+ * Destinations are packed in DESCENDING alignment order (8-byte fields first,
+ * then 4, 2, 1) so every field's `byteOffset` is naturally aligned — a
+ * `new Float64Array(memory.buffer, field.byteOffset, n)` view never throws.
+ *
+ * Call this ONCE per (schema, dstBase) at worklet setup; the returned `words`
+ * are blitted into WASM memory once and `decodeFrame` is then called per
+ * quantum with just `(slotBase, descPtr, descCount)`.
+ *
+ * `dstBase` is typically `WorkletMemoryAllocation.scratchByteOffset` (reserve
+ * `totalDstBytes` of scratch). It must be 8-aligned so the highest-alignment
+ * field lands aligned; pass a page-aligned scratch offset and you're safe.
+ */
+export function buildFrameDescriptors(
+  layout: SchemaLayoutDescription,
+  dstBase: number,
+): FrameDescriptorPlan {
+  if (!Number.isInteger(dstBase) || dstBase < 0 || dstBase % 8 !== 0) {
+    throw new Error(
+      `buildFrameDescriptors: dstBase must be a non-negative 8-aligned integer, got ${dstBase}`,
+    );
+  }
+  // Sort fields by descending alignment (= element size), declared order
+  // within a class — the same discipline schema.compileLayout uses for the
+  // SAB frame, so destination offsets stay naturally aligned without padding.
+  const entries = Object.entries(layout.fields).map(([name, f], declOrder) => ({
+    name,
+    field: f,
+    declOrder,
+    elemSize: kindByteSize(f.kind),
+    length: f.length ?? 1,
+    isArray: f.length !== undefined,
+  }));
+  entries.sort((a, b) => {
+    if (a.elemSize !== b.elemSize) return b.elemSize - a.elemSize;
+    return a.declOrder - b.declOrder;
+  });
+
+  const words = new Int32Array(entries.length * 3);
+  const fields: Record<string, FrameFieldDst> = {};
+  let dstCursor = dstBase;
+  let w = 0;
+  for (const e of entries) {
+    const byteCount = e.elemSize * e.length;
+    // dstCursor is aligned: dstBase is 8-aligned and every prior field's
+    // byteCount is a multiple of its (≥ current) elemSize, so the packed
+    // cursor stays a multiple of elemSize for the descending-alignment order.
+    words[w++] = e.field.byteOffset; // srcRel (within frame)
+    words[w++] = dstCursor; // dstAbs (within WASM memory)
+    words[w++] = byteCount;
+    fields[e.name] = {
+      kind: e.field.kind,
+      length: e.length,
+      isArray: e.isArray,
+      byteOffset: dstCursor,
+      byteCount,
+    };
+    dstCursor += byteCount;
+  }
+  // Pad the region end to 8 so a caller stacking multiple plans keeps the
+  // next dstBase 8-aligned.
+  const totalDstBytes = ((dstCursor - dstBase) + 7) & ~7;
+  return { words, descCount: entries.length, fields, totalDstBytes };
 }

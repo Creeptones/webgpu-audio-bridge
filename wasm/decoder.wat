@@ -1225,4 +1225,83 @@
         local.set $dstP
         br $tailLoop
       end
+    end)
+
+  ;; ─── Descriptor-driven whole-frame decode (0.9.74) ────────────────────
+  ;;
+  ;; ONE JS↔WASM crossing decodes an ENTIRE frame. The per-field readers
+  ;; above (`read_f64` / `read_u32` / …) each cost a crossing — fine for a
+  ;; one-off scalar peek, pathological as a hot-path frame decoder (a
+  ;; 6-field frame = 6 crossings/quantum). This export is the antidote and
+  ;; the direct analogue of the website modal kernel's "do a frame's worth
+  ;; of work per call" discipline: it loops over a descriptor table and
+  ;; does one `memory.copy` per field, all inside a single call.
+  ;;
+  ;; The copy gathers each field's bytes from its slot offset into a
+  ;; caller-chosen destination region (the consumer-side scratch the shim
+  ;; allocates above the SAB ring). The JS side then reads the decoded
+  ;; values from that stable scratch snapshot via its own typed-array
+  ;; views — and, crucially, the SAB slot can be released the instant this
+  ;; returns, so the producer is never blocked on the consumer's decode.
+  ;;
+  ;; Descriptor table layout (tightly-packed little-endian i32 words; the
+  ;; shim's `buildFrameDescriptors` emits exactly this and guarantees
+  ;; `descPtr` is 4-aligned):
+  ;;
+  ;;     desc[k].srcRel  = i32 @ descPtr + k*12 + 0   (offset WITHIN the frame)
+  ;;     desc[k].dstAbs  = i32 @ descPtr + k*12 + 4   (absolute WASM-mem offset)
+  ;;     desc[k].byteCnt = i32 @ descPtr + k*12 + 8   (elemSize * length)
+  ;;
+  ;; Per field: memory.copy(dstAbs, slotBase + srcRel, byteCnt). The slot's
+  ;; bytes are little-endian; the copy is byte-exact and endianness-blind,
+  ;; so the JS typed-array views over the scratch interpret them identically
+  ;; to the umbrella views `Bridge.pull` lays over the SAB. Bit-exact to the
+  ;; JS decode by construction (no arithmetic — pure relocation).
+  ;;
+  ;; `slotBase` is the absolute byte offset of the slot start within WASM
+  ;; memory: `RING_HEADER_BYTES(32) + slot * frameByteSize`. The shim
+  ;; computes it from the peeked slot index.
+  (func $decode_frame (export "decode_frame")
+        (param $slotBase i32) (param $descPtr i32) (param $descCount i32)
+    (local $p i32)        ;; running descriptor-word pointer
+    (local $end i32)      ;; one-past-end of the descriptor table
+    local.get $descPtr
+    local.set $p
+    ;; end = descPtr + descCount * 12
+    local.get $descPtr
+    local.get $descCount
+    i32.const 12
+    i32.mul
+    i32.add
+    local.set $end
+    block $exit
+      loop $loop
+        local.get $p
+        local.get $end
+        i32.ge_u
+        br_if $exit
+        ;; memory.copy expects (dst, src, len) on the stack in that order.
+        ;; dst = desc.dstAbs = i32 @ p+4
+        local.get $p
+        i32.const 4
+        i32.add
+        i32.load
+        ;; src = slotBase + desc.srcRel = slotBase + (i32 @ p+0)
+        local.get $slotBase
+        local.get $p
+        i32.load
+        i32.add
+        ;; len = desc.byteCnt = i32 @ p+8
+        local.get $p
+        i32.const 8
+        i32.add
+        i32.load
+        memory.copy
+        ;; advance to next descriptor (3 i32 = 12 bytes)
+        local.get $p
+        i32.const 12
+        i32.add
+        local.set $p
+        br $loop
+      end
     end))

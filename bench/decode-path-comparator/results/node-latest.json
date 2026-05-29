@@ -1,0 +1,47 @@
+{
+  "schema": {
+    "fields": 9,
+    "frameBytes": 1832,
+    "arrayN": 64,
+    "trajN": 64
+  },
+  "iters": 50000,
+  "rows": [
+    {
+      "name": "A1 Bridge.pull",
+      "note": "facade + SPSC atomics (context)",
+      "p50": 500,
+      "p99": 1500,
+      "mean": 671.818
+    },
+    {
+      "name": "A2 JS umbrella decode",
+      "note": "Bridge decode core, no atomics",
+      "p50": 200,
+      "p99": 300,
+      "mean": 270.84
+    },
+    {
+      "name": "B  codegen-JS reader",
+      "note": "emitWorkletReader, no atomics",
+      "p50": 300,
+      "p99": 500,
+      "mean": 471.99
+    },
+    {
+      "name": "C  WASM decodeFrame",
+      "note": "whole-frame, 1 crossing, no atomics",
+      "p50": 100,
+      "p99": 200,
+      "mean": 148.142
+    },
+    {
+      "name": "D  WASM per-field",
+      "note": "N crossings, no atomics",
+      "p50": 1000,
+      "p99": 8600,
+      "mean": 1136.538
+    }
+  ],
+  "winner": "C  WASM decodeFrame"
+}

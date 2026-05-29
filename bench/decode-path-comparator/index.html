@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>decode-path comparator — webgpu-audio-bridge</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; max-width: 760px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { color: #8b949e; margin: 0 0 18px; }
+  button { font: inherit; padding: 8px 14px; border: 1px solid #30363d; background: #161b22; color: #c9d1d9; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+  button:hover { border-color: #58a6ff; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.on { border-color: #f0883e; color: #f0883e; }
+  #status { margin: 16px 0; min-height: 1.4em; }
+  .ok { color: #3fb950; } .err { color: #f85149; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 600; }
+  td:nth-child(n+2), th:nth-child(n+2) { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.win td { color: #3fb950; font-weight: 600; }
+  footer { margin-top: 22px; color: #6e7681; font-size: 12px; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+  <h1>decode-path comparator</h1>
+  <p class="sub">Per-frame decode cost in a real AudioWorklet: JS umbrella (A2) vs codegen-JS reader (B) vs WASM <code>decodeFrame</code> (C). Toggle GC pressure to watch the p99 tail.</p>
+
+  <div>
+    <button id="start">Start</button>
+    <button id="gc">GC pressure: OFF</button>
+    <button id="reset">Reset histograms</button>
+  </div>
+
+  <div id="status">idle — press Start (audio requires a user gesture)</div>
+
+  <table id="results"><tr><th>strategy</th><th>p50</th><th>p99</th><th>max</th><th>n</th></tr></table>
+
+  <footer>
+    Headless companion: <code>npm run bench:decode-path</code> (Node microbench). Findings: <code>docs/decode-path-comparator.md</code>.
+    A faint tone is emitted so decoded values are observably used.
+  </footer>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

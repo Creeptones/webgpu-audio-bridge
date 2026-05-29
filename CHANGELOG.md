@@ -4,6 +4,72 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.74] — 2026-05-29
+
+### Added — whole-frame WASM decode + decode-path comparator (Dimensional/Universe SIMD harvest, Stage 0)
+
+A comparison of this repo's WASM consumer against the website's far more
+extensive Dimensional/Universe modal-DSP WASM engine surfaced that the bridge's
+WASM decoder, while broad in scalar-kind coverage, was **stranded scaffolding**:
+nothing consumed it, its thesis ("WASM decode kills GC glitches") was never
+measured, and its **per-field** primitives (`readF64(off)`, one JS↔WASM crossing
+per field) were the exact antipattern the website kernel avoids ("do a frame's
+worth of work per crossing"). This patch closes the measurement gap and adds the
+fair whole-frame decoder.
+
+#### What shipped
+
+- **`decode_frame` WASM export** (`wasm/decoder.wat`) — descriptor-driven
+  whole-frame decode: one call loops a `(srcRel, dstAbs, byteCount)` descriptor
+  table doing one `memory.copy` per field, slot → scratch. One crossing per
+  frame instead of one per field. Surfaced as `WorkletConsumer.decodeFrame(...)`
+  plus `buildFrameDescriptors(layout, dstBase)` (compiles `describeSchemaLayout`
+  into the descriptor table) and `slotByteBase(slot, frameByteSize)` in
+  `src/worklet/index.ts`. Bit-exact to `Bridge.pull` (pure byte relocation) —
+  pinned by `tests/Bridge.wasmEquivalence.test.ts` **pin 16** (20-row,
+  wrap-covering, mixed scalar+array+trajectory schema + JS cross-check).
+- **`BenchTimer`** (`src/worklet/benchTimer.ts`) — allocation-free per-quantum
+  self-timer (rolling window, `worstUsPerQuantum`, clockless-safe), harvested
+  from the website modal worklet's bench self-timing. `tests/benchTimer.test.ts`
+  (3 pins).
+- **Headless decode-path microbench** (`bench/decode-path.bench.ts`,
+  `npm run bench:decode-path`) — measures decode-only cost for five contenders.
+  **Result (Node 22): WASM `decodeFrame` wins at ~100 ns p50 / 200 ns p99**, 2×
+  the next best; **per-field WASM is the worst at ~900 ns p50 / 8.3 µs p99**,
+  confirming the granularity hypothesis. codegen-JS (`emitWorkletReader`)
+  ~300 ns is the no-WASM fallback. Results persist to
+  `bench/decode-path-comparator/results/node-latest.json`.
+- **Browser comparator harness** (`bench/decode-path-comparator/`,
+  `npm run bench:decode-path-comparator`) — re-confirms the ranking in a real
+  AudioWorklet under a main-thread GC-pressure toggle (the tail condition the
+  Node bench can't create).
+- **Decision note** `docs/decode-path-comparator.md` — full table + the wiring
+  decision: WASM `decodeFrame` canonical, codegen-JS fallback, per-field retired
+  from the hot path (kept for one-off scalar peeks).
+
+### Why
+
+The plan's "bench both, let data decide" fork needed data. It now exists, and it
+selects the canonical consumer for the Stage-1 wiring: whole-frame WASM decode,
+with a graceful `hasWasmConsumerSupport()` → WASM → codegen-JS → `Bridge.pull`
+fallback ladder.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API only (`decodeFrame` /
+`buildFrameDescriptors` / `slotByteBase` on the `webgpu-audio-bridge/worklet`
+subpath; `BenchTimer`). The `decode_frame` export grows the decoder binary by
+~270 bytes; no SAB-layout or protocol change.
+
+### Tests
+
+41 Node suites green (was 40; `benchTimer.test.ts` added). `wasmEquivalence`
+grows to pin 16. `npm run typecheck` clean.
+
+### Documentation
+
+`docs/decode-path-comparator.md`; `bench/decode-path-comparator/README.md`.
+
 ## [0.9.73] — 2026-05-29
 
 ### Added — experimental `renderSizeHint` probe + `renderSizeHint` capability flag

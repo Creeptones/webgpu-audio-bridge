@@ -44,6 +44,8 @@ import { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "../src/tr
 import {
   allocateWorkletMemory,
   instantiateConsumer,
+  buildFrameDescriptors,
+  slotByteBase,
   hasWasmSimd,
   hasWasmThreads,
   hasWasmConsumerSupport,
@@ -1502,8 +1504,125 @@ function main(): void {
     ok(`wasm-invariant-layout-null-for-plain-schema`);
   }
 
+  // ── 16: Whole-frame decode_frame matches Bridge.pull bit-for-bit (0.9.74) ─
+  // The descriptor-driven decode does, in ONE call, what the per-field
+  // readers do in N: gather every field's bytes from the slot into a
+  // scratch region. This pin proves the gathered bytes equal what
+  // Bridge.pull decodes for a mixed scalar+array+trajectory schema across
+  // a multi-row, wrap-covering drive. The fairness premise of the
+  // decode-path comparator bench rests on this equivalence.
+  {
+    const dfSchema = defineSchema({
+      seq: u64(),
+      tNs: u64(),
+      vMax: f64(),
+      flags: u32(),
+      tag: u16(),
+      vEff: f64Array(8),
+      gEff: f32Array(8),
+      traj: f64TrajectoryArray(4, { order: 2 }),
+    });
+    const dfLayout = describeSchemaLayout(dfSchema);
+    const dfCapacity = 8;
+    const dfSabBytes = Bridge.byteLength(dfCapacity, dfSchema);
+    // Reserve scratch sized to the descriptor plan (computed against a
+    // page-aligned dstBase, so build first with a placeholder, then alloc).
+    // Probe the plan size with dstBase=0 to learn totalDstBytes, then alloc.
+    const probe = buildFrameDescriptors(dfLayout, 0);
+    const dfAlloc = allocateWorkletMemory({
+      sabBytes: dfSabBytes,
+      // descriptor table (3*N i32) + decoded region, both above the ring.
+      scratchBytes: probe.descCount * 12 + probe.totalDstBytes + 64,
+    });
+    const dfScratchBase = dfAlloc.scratchByteOffset!;
+    // Lay the descriptor table at the scratch base (4-aligned — page start),
+    // and the decoded region 8-aligned after it.
+    const descPtr = dfScratchBase;
+    const descBytes = probe.descCount * 12;
+    const decodedBase = (dfScratchBase + descBytes + 7) & ~7;
+    const plan = buildFrameDescriptors(dfLayout, decodedBase);
+
+    // Blit the descriptor words into WASM memory once.
+    new Int32Array(dfAlloc.sab, descPtr, plan.words.length).set(plan.words);
+
+    const dfBridge = new Bridge(dfAlloc.sab, dfCapacity, dfSchema);
+    const dfConsumer = instantiateConsumer(wasmBytes, dfAlloc.memory);
+    const mask = dfCapacity - 1;
+    const frameBytes = dfSchema.compiled.frameByteSize;
+
+    // Read views over the decoded scratch region, one per field.
+    const dv = {
+      vMax: new Float64Array(dfAlloc.sab, plan.fields.vMax!.byteOffset, 1),
+      seq: new BigUint64Array(dfAlloc.sab, plan.fields.seq!.byteOffset, 1),
+      tNs: new BigUint64Array(dfAlloc.sab, plan.fields.tNs!.byteOffset, 1),
+      flags: new Uint32Array(dfAlloc.sab, plan.fields.flags!.byteOffset, 1),
+      tag: new Uint16Array(dfAlloc.sab, plan.fields.tag!.byteOffset, 1),
+      vEff: new Float64Array(dfAlloc.sab, plan.fields.vEff!.byteOffset, 8),
+      gEff: new Float32Array(dfAlloc.sab, plan.fields.gEff!.byteOffset, 8),
+      traj: new Float64Array(dfAlloc.sab, plan.fields.traj!.byteOffset, 8),
+    };
+
+    const dfPush = dfBridge.scratchFrame();
+    const dfPull = dfBridge.scratchFrame();
+    while (dfBridge.pull(dfPull)) { /* drain */ }
+
+    const ROWS = 20; // > capacity, covers ring wrap 2×
+    for (let r = 0; r < ROWS; r++) {
+      dfPush.seq = BigInt(900_000 + r);
+      dfPush.tNs = BigInt((900_000 + r) * 1_000);
+      dfPush.vMax = Math.sin(r * 0.31) * 1234.5;
+      dfPush.flags = ((r * 2654435761) >>> 0);
+      dfPush.tag = (r * 7 + 3) & 0xffff;
+      for (let k = 0; k < 8; k++) {
+        dfPush.vEff[k] = Math.cos((r + 1) * (k + 1) * 0.019) * 99;
+        dfPush.gEff[k] = Math.fround(Math.sin(r * 0.2 + k) * 0.5);
+      }
+      for (let k = 0; k < 8; k++) dfPush.traj[k] = (r + 1) * 0.5 + k * 0.125;
+      assert(dfBridge.push(dfPush), `pin16: push row ${r}`);
+
+      // WASM whole-frame decode of the just-pushed slot (FIFO peek).
+      const slot = dfConsumer.peekPull(mask);
+      assert(slot >= 0, `pin16: peekPull row ${r} not empty`);
+      dfConsumer.decodeFrame(slotByteBase(slot, frameBytes), descPtr, plan.descCount);
+
+      // Every decoded field must equal what we pushed (= what Bridge.pull
+      // would decode — verified by the cross-check below).
+      assertEq(dv.seq[0], dfPush.seq, `pin16 seq row ${r}`);
+      assertEq(dv.tNs[0], dfPush.tNs, `pin16 tNs row ${r}`);
+      assertEq(dv.vMax[0], dfPush.vMax, `pin16 vMax row ${r}`);
+      assertEq(dv.flags[0], dfPush.flags, `pin16 flags row ${r}`);
+      assertEq(dv.tag[0], dfPush.tag, `pin16 tag row ${r}`);
+      for (let k = 0; k < 8; k++) {
+        assertEq(dv.vEff[k], dfPush.vEff[k], `pin16 vEff[${k}] row ${r}`);
+        assertEq(dv.gEff[k], dfPush.gEff[k], `pin16 gEff[${k}] row ${r}`);
+        assertEq(dv.traj[k], dfPush.traj[k], `pin16 traj[${k}] row ${r}`);
+      }
+      dfConsumer.commitPull();
+    }
+
+    // Cross-check the WASM decode against JS Bridge.pull on a fresh row.
+    dfPush.seq = 999_999n;
+    dfPush.vMax = -42.25;
+    for (let k = 0; k < 8; k++) { dfPush.vEff[k] = k; dfPush.gEff[k] = Math.fround(k / 3); }
+    for (let k = 0; k < 8; k++) dfPush.traj[k] = 100 + k;
+    assert(dfBridge.push(dfPush), "pin16: push cross-check row");
+    const xSlot = dfConsumer.peekPull(mask);
+    dfConsumer.decodeFrame(slotByteBase(xSlot, frameBytes), descPtr, plan.descCount);
+    dfConsumer.commitPull();
+    // The slot is released; snapshot decoded values now, then JS-pull a
+    // freshly-pushed identical frame and compare.
+    const xVMaxWasm = dv.vMax[0];
+    const xTraj0Wasm = dv.traj[0];
+    assert(dfBridge.push(dfPush), "pin16: re-push for JS cross-check");
+    assert(dfBridge.pull(dfPull), "pin16: JS pull cross-check");
+    assertEq(xVMaxWasm, dfPull.vMax, "pin16: WASM vMax == JS pull vMax");
+    assertEq(xTraj0Wasm, dfPull.traj[0], "pin16: WASM traj[0] == JS pull traj[0]");
+
+    ok(`wasm-decode-frame-equivalence (${ROWS} rows, ${plan.descCount} fields/frame, wrap ${Math.floor(ROWS / dfCapacity)}×)`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode in agreement with JS atomics.",
   );
 }
 
