@@ -150,10 +150,13 @@
  *
  * ─── ──────────────────────────────────────────────────────────────────
  *
- * Heap-only — the PLL never touches the SAB. Lanes 4–7 of the ring header
- * remain reserved; cross-process PLL observability is a follow-up. Bridge
- * exposes `pllLocked` / `pllOffsetNs` / `pllOutliersRejected` in
- * `telemetry()` from heap state via this class's getters.
+ * Heap-only — THIS class never touches the SAB; the PI loop + offset state
+ * live entirely on the JS heap. Bridge exposes `pllLocked` / `pllOffsetNs` /
+ * `pllOutliersRejected` in `telemetry()` from that heap state via this
+ * class's getters. Separately, for CROSS-process observability, Bridge
+ * publishes this PLL's offset/drift/status to ring-header lanes 4–7 (0.6.16,
+ * via SpscRing.publishPllState on every observeConsumerTime / resetPll); a
+ * peer over the same SAB reads them through readPublishedPllState().
  *
  * See Bridge.ts file header "Phase-locked loop" for the caller-side
  * contract and the lineage notes.

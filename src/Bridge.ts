@@ -1424,10 +1424,12 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       capacity: this.capacity,
       writeIndex: this.ring.writeIndexUnsigned(),
       readIndex: this.ring.readIndexUnsigned(),
-      // PLL fields are heap-only on this Bridge instance (gathered from
-      // the composed ConsumerClockRecovery as of 0.6.9). A peer reading
-      // their own Bridge's telemetry sees their own PLL state. Lanes 4-5
-      // are still reserved; cross-process observability lands in a follow-up.
+      // These telemetry PLL fields are read from the heap-side composed
+      // ConsumerClockRecovery (as of 0.6.9), so a peer reading their own
+      // Bridge's telemetry() sees their own PLL state. For CROSS-process
+      // PLL observability, 0.6.16 publishes offset/drift/status to SAB
+      // header lanes 4-7 (observeConsumerTime / resetPll → publishPllState);
+      // a peer over the same SAB reads them via readPublishedPllState().
       pllLocked: this.pll.locked,
       pllOffsetNs: this.pll.offsetNs,
       // 0.6.14 — Mahalanobis outlier gate counter. Cumulative since the
@@ -1449,8 +1451,9 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       // its pulls + wait durations). For cross-process aggregation,
       // postMessage telemetry across at a sampled cadence — the
       // overhead is negligible compared to the 16 ms control-rate
-      // budget, and the heap-only design avoids stealing reserved SAB
-      // lanes for an observability concern.
+      // budget, and the heap-only design avoids spending scarce SAB
+      // header lanes (only 8; lanes 4-7 already carry PLL state) on a
+      // pure observability concern.
       pushedFrames: this.ring.pushedCount(),
       pulledFrames: this.ring.pulledCount(),
       skippedFrames: this.ring.skippedCount(),

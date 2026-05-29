@@ -4,6 +4,56 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.57] — 2026-05-29
+
+### Changed — reconcile stale "reserved" lane comments with the shipped PLL lanes
+
+Since 0.6.16 the consumer's Bridge publishes PLL state (offset / drift / status)
+to SAB header lanes 4–7 on every `observeConsumerTime` / `resetPll`, readable
+cross-process via `readPublishedPllState()`. Several header/inline comments still
+described lanes 4–7 as "reserved" and cross-process PLL observability as "a
+follow-up" — language that predated 0.6.16 and now contradicts the live code.
+
+Comment-only reconciliation, no behavior change:
+
+- **`src/SpscRing.ts`** — file-header "what lives here" bullet, the byte-layout
+  lane table, and the `[byte 16..31]` description now state lanes 4–7 carry
+  published PLL state (offset Int64 ns / drift Q16.16 ppm / status word), point
+  at the canonical lane-index constants as the single source of truth, and note
+  the pre-0.6.16 all-zero default reads as "no published state."
+- **`src/Bridge.ts`** — the `telemetry()` PLL-fields comment no longer claims
+  lanes 4–5 "are still reserved"; it now documents the heap-side read path and
+  the separate 0.6.16 cross-process publish path. The heap-only-counters comment
+  drops the stale "reserved SAB lanes" phrasing.
+- **`src/ConsumerClockRecovery.ts`** — clarifies that *this class* is heap-only
+  while *Bridge* publishes its state to lanes 4–7 (0.6.16), instead of calling
+  the lanes reserved.
+
+The genuinely-reserved bits (lane 7 status word "bits 1-31 reserved") are
+correct and left intact.
+
+### Why
+
+Addresses the audit's documentation finding: "the code path now publishes PLL
+state to SAB lanes but some comments still describe them as reserved." Stale
+protocol comments on a correctness-critical file mislead auditors and future
+maintainers about the wire's actual shape.
+
+### Wire compatibility
+
+Zero. Comments only — no `src/` logic, schema, SAB byte, or public-API change.
+Bit-for-bit identical runtime to 0.9.56.
+
+### Tests
+
+No new pins (comment-only). Mandatory gates re-run green: `npm run typecheck`,
+`npm test` (30 suites), `npm run bench` (~1.20 µs baseline).
+
+### Documentation
+
+This entry; the reconciled comments in `src/SpscRing.ts`, `src/Bridge.ts`, and
+`src/ConsumerClockRecovery.ts`.
+
 ## [0.9.56] — 2026-05-29
 
 ### Changed — inline the full `SpscRing` core in `LLM_BUNDLE.md`

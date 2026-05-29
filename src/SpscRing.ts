@@ -16,8 +16,10 @@
  *   SpscRing  (this file):
  *     - SAB allocation + layout constants (`byteLength`, `allocate`,
  *       `RING_HEADER_BYTES`, lane constants).
- *     - Header lanes 0..3 active (write_index, read_index, flow_scale,
- *       torn_frame_counter); lanes 4..7 reserved.
+ *     - Header lanes 0..3 (write_index, read_index, flow_scale,
+ *       torn_frame_counter) + lanes 4..7 carrying published PLL state
+ *       (offset / drift / status; 0.6.16). All 8 lanes are now active —
+ *       see the canonical lane table at the lane-index constants below.
  *     - `push` / `beginPush` / `commitPush` / `abortPush` / `pull` /
  *       `pullLatest` mechanics with the unconditional `Atomics.notify`
  *       protocol preserved as-is for 0.6.x (the lane-4 wait-flag wake
@@ -63,14 +65,21 @@
  *                                  hard-error invariant failure. Read via
  *                                  bridge.telemetry().tornFrames. See "Schema
  *                                  invariants" in Bridge.ts.
- *                                  Reserved-lane table:
+ *                                  Lane table (canonical copy at the
+ *                                  lane-index constants below):
  *                                    lane 0: write_index            (active, 0.4.0)
  *                                    lane 1: read_index             (active, 0.4.0)
  *                                    lane 2: flow_scale             (active, 0.5.0)
  *                                    lane 3: torn_frame_counter     (active, 0.6.0)
- *                                    lanes 4-7: reserved
- *     [byte 16..31]  reserved (16 bytes — earmarked for the wait-flag wake
- *                              protocol (0.7.0) + soft-error counter etc.)
+ *                                    lanes 4-5: PLL offset (Int64 ns) (active, 0.6.16)
+ *                                    lane 6: PLL drift (Q16.16 ppm)   (active, 0.6.16)
+ *                                    lane 7: PLL status word          (active, 0.6.16)
+ *     [byte 16..31]  PLL state (16 bytes — lanes 4..7). Published by the
+ *                              consumer's Bridge on every observeConsumerTime /
+ *                              resetPll when publishPllToSab is on (default);
+ *                              read cross-process via readPublishedPllState.
+ *                              Were reserved through 0.6.15; the all-zero
+ *                              default reads as "no published state".
  *
  *   Payload region (typed-array umbrella views at SAB byte 32):
  *     For each FieldKind present in the schema, one umbrella view spanning
