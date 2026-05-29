@@ -33,6 +33,15 @@ Once sub-32-bit kinds are excluded (see below), the surviving kinds — `f32/u32
 
 3. **Zero-decode vs zero-copy.** `Uint8Array.set` is a native memcpy (no per-field decode loop), but it is **not** zero-copy until a shared-memory WebGPU mapping primitive ships — the bytes still move. And it is O(`frameByteSize`) in the copy, O(1) in JS field dispatch, not literally "O(1)". The docs/comments use **"zero-decode"** throughout to stay honest.
 
+## Naming: `"raw"`, not `"auto"` (vs the original proposal)
+
+The original proposal named the closure-free `BridgeGPUSource` decoder mode `"auto"`. It shipped (0.9.63) as **`"raw"`** instead, deliberately:
+
+- **`"auto"` is already taken in that constructor.** `BridgeGPUSource`'s `writeTarget` option is `"auto" | "map-async" | "shared"` (`"auto"` = sniff for a zero-copy mapping path, fall back to `mapAsync`). A second `"auto"` on the *decoder* axis — meaning something unrelated ("skip decoding") — would invite "auto-what?" confusion at the call site `new BridgeGPUSource(device, bridge, "auto", { writeTarget: "auto" })`.
+- **`"raw"` names the mechanism, not a heuristic.** The mode does exactly one concrete thing — memcpy the mapped range in as raw bytes via `pushRaw`, no field dispatch. There is nothing automatic or adaptive about it; `"raw"` says what it is. (`decoderMode()` correspondingly reports `"closure" | "raw"`.)
+
+The behaviour is identical to the proposal's `"auto"`: it removes the user's decoder-closure requirement for macro-control frames. Only the spelling differs. No `"auto"` decoder alias is provided — one canonical name keeps the type union and the docs unambiguous.
+
 ## Trailing-padding subtlety (the bug the original example had)
 
 With sub-32-bit excluded, member offsets match the schema exactly; the only divergence is the **trailing struct size**. An all-32-bit schema rounds its WGSL struct size to 4, but the schema pads frames to 8. For three `f32` (natural WGSL size 12) the schema `frameByteSize` is 16, so `array<Struct>` would stride by 12 in WGSL but 16 in the SAB — silent drift.

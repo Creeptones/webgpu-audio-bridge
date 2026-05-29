@@ -166,6 +166,7 @@ const TEST_FILES_INVENTORY = [
   ["tests/BridgeGPUSource.raw.test.ts", "BridgeGPUSource \"raw\" decoder-mode pins (0.9.63 zero-decode readback)."],
   ["tests/BridgeWebNNSource.test.ts", "BridgeWebNNSource pins (experimental subpath)."],
   ["tests/Bridge.wgsl.test.ts", "emitWgslStruct codegen pins — offset/size isomorphism, sub-32-bit fail-fast, vec2<u32> 64-bit transport (0.9.61)."],
+  ["tests/Bridge.viteRecipe.test.ts", "WGSL Vite virtual-module recipe pins (Pillar 4) — resolveId/load glue + build-artifact === emitWgslStruct equality."],
   ["tests/Bridge.pushRaw.test.ts", "pushRaw zero-decode raw-byte push pins — memcpy fidelity + invariant-lane recompute (0.9.62)."],
   ["tests/MessageChannelBridge.test.ts", "0.9.40 Standard mode pins — 9 pins covering MVP1 surface."],
   ["tests/environment.test.ts", "getEnvironmentReport() pins."],
@@ -372,7 +373,7 @@ The full test files are not inlined here — ~5,000 lines combined. Each pins a 
 |---|---|
 ${inventoryRows}
 
-Test invocation: \`npm test\` (runs all 33 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
+Test invocation: \`npm test\` (runs all 34 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
 `;
 
   return `${headerMd}\n${tocMd}\n${sections.join("")}\n${inventoryMd}\n`;

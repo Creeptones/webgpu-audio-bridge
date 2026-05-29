@@ -4,6 +4,72 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.66] — 2026-05-29
+
+### Added — WGSL↔TS bridge: Vite-recipe test + `"raw"`-vs-`"auto"` naming note
+
+Two cheap closeouts surfaced by the WGSL↔TS bridge audit (the track shipped
+across 0.9.61–0.9.64). Both are additive and wire-compatible.
+
+#### Pillar 4 recipe is now pinned by a test
+
+The Vite virtual-module plugin (Pillar 4) ships as a documented copy-paste
+snippet in `docs/wgsl-schema-bridge-design.md`, not a package — the auditor
+accepted that scope but asked that "the copy-paste recipe is tested
+somewhere." New `tests/Bridge.viteRecipe.test.ts` (6 pins) reproduces the
+plugin's `resolveId` / `load` glue exactly as printed in the design note and
+pins it: virtual ids are NUL-marked while foreign/bare imports pass through;
+`load()` emits an `export default <json>;` module; an unregistered schema name
+throws at build time; non-virtual ids return `undefined`. The load-bearing pin
+(#3) decodes the build-baked module and asserts it is **byte-identical** to
+`emitWgslStruct(schema, { structName })` — i.e. the struct compiled into the
+bundle equals the runtime emitter output, so GPU/SAB layout drift is
+impossible through the build path too, not just the direct-call path.
+
+#### `"raw"` vs the proposal's `"auto"` reconciled
+
+The original proposal named the closure-free `BridgeGPUSource` decoder mode
+`"auto"`; it shipped (0.9.63) as `"raw"`. The design note now documents why:
+`"auto"` is already the `writeTarget` default (`"auto" | "map-async" |
+"shared"`), so a second `"auto"` on the decoder axis would be ambiguous at the
+call site, and `"raw"` names the actual mechanism (memcpy the mapped range in
+as raw bytes via `pushRaw`) rather than implying a heuristic. Behaviour is
+identical to the proposal; only the spelling differs. No `"auto"` alias is
+added — one canonical name keeps the type union unambiguous.
+
+### Why
+
+The WGSL↔TS bridge was the one track an LLM audit could not fully sign off:
+the emitter body was inlined in 0.9.65, and this patch closes the last two
+items — an untested recipe and a silent deviation from the proposed API name.
+Both are the kind of first-skim hygiene gap that costs maturity points without
+reflecting real risk.
+
+### Wire compatibility
+
+None affected. New test suite + documentation only. No SAB protocol change, no
+schema DSL change, no public-API change (`"raw"` was already shipped at
+0.9.63; this patch only documents the naming rationale).
+
+### Tests
+
+34 Node suites green (was 33) — `tests/Bridge.viteRecipe.test.ts` added to
+`test` and `test:unit`. `npm run typecheck` clean. `npm run bench` push /
+pull / pullLatest median sanity-check against the documented ~1.20 μs baseline
+unchanged.
+
+### Documentation
+
+- `tests/Bridge.viteRecipe.test.ts` — new (6 pins).
+- `docs/wgsl-schema-bridge-design.md` — new "Naming: `\"raw\"`, not
+  `\"auto\"`" section after the three-holes list.
+- `scripts/regenerate-llm-bundle.mjs` — `Bridge.viteRecipe.test.ts` added to
+  the inventory; suite count corrected (33 → 34).
+- `package.json` — `version` bumped to 0.9.66; new suite wired into `test` /
+  `test:unit`.
+- `README.md` / `CITATION.cff` — `version` bumped to 0.9.66.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.65] — 2026-05-29
 
 ### Added — Audit-response hygiene patch (LLM_BUNDLE coverage + version metadata)
