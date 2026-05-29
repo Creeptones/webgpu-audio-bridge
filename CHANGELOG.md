@@ -4,6 +4,112 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.51] — 2026-05-29
+
+### Added — underflow telemetry + graceful-degradation controller
+
+Closes **Gap #12** ("Subscribe-to-underflow callback") and **Gap #8**
+("Stall-aware quality degradation") from `docs/hybrid-residual-comparison.md`,
+now unblocked by stereo (0.9.48) + the comparator bench (0.9.50). The headline:
+**the residual thins before it glitches.** Under sustained GPU underflow the
+producer voluntarily simplifies the residual (fewer partials) instead of letting
+the ring run dry and the consumer zero-fill.
+
+#### Consumer-side telemetry (`BridgeBlockConsumer<S>`)
+
+Three new windowed, audio-domain getters on top of the existing
+`underflowSamples()` / `framesConsumed()` counters — all **pure polling
+getters**: no timer, no `Atomics.wait`, no audio-thread allocation
+(worklet-safe by construction):
+
+- `underflowRate(windowMs)` — fraction in `[0,1]` of per-channel window samples
+  that took the underflow path over the last `windowMs`. Backed by a
+  fixed-size, preallocated circular history of cumulative
+  `(samplesEmitted, underflowSamples)` marks stamped from inside the
+  `process*()` calls (the cadence is the audio quantum); the mark stride
+  auto-scales to `underflowWindowMs` so the buffer always spans the window
+  regardless of `process()` quantum. `windowMs` is clamped to
+  `underflowWindowMs`.
+- `lastSuccessfulPullTime()` — the audio-domain time (seconds) of the most
+  recent successful ring pull. Monotonic; stalls across an underflow run.
+- `elapsedSeconds()` — the consumer's audio-domain "now"; their difference is
+  the stall age.
+
+All three derive from an exact audio-sample clock (`samplesEmitted /
+sampleRate`), **not** `performance.now()` — which is not reliably exposed in
+`AudioWorkletGlobalScope`. New optional constructor opts: `sampleRate` (the
+AudioWorklet global is in scope; falls back to `globalThis.sampleRate`, else the
+three getters throw a descriptive error) and `underflowWindowMs` (default 1000).
+`reset()` zeroes the new clock + history too.
+
+#### Producer-side controller (`ResidualQualityController`)
+
+A new standalone class (mirrors `AdaptiveFlowController`'s discipline) that maps
+a back-pressure signal into a smoothed, hysteretic `suggestedQualityScale` the
+GPU worker applies to its own knobs (partial count, workgroup count,
+oversampling, …):
+
+- `tick(signal) → { underflowRate, suggestedQualityScale }`. Higher signal =
+  more pressure = degrade.
+- **Option 1 (recommended first ship; zero new wire):** feed
+  `bridge.flowScaleHint()` — a starved consumer drives `flow_scale` toward 2.0
+  ("speed up"), which the producer honors by *simplifying* (cheaper blocks
+  compute faster). Default watermarks (1.6 / 1.15) are tuned for this
+  `[0.5, 2.0]` signal.
+- **Option 2 (more faithful follow-up):** feed the consumer's true measured
+  `underflowRate(windowMs)` over a dedicated back-channel SAB (construct with
+  `[0,1]` watermarks).
+- Hysteresis is mandatory, not polish: a watermark deadband + a bounded
+  `rampPerTick` make quality glide between 1.0 and `minScale` over tens of ticks
+  rather than pumping the timbre per block.
+
+#### Why
+
+Graceful degradation is the next win after the hybrid residual became stereo
+and measurable: rather than the residual glitching/zero-filling under load, it
+*thins* — fewer partials, audible as a duller but continuous timbre — and
+recovers when the GPU catches up. This makes the hybrid pattern robust under
+real GPU jitter, not just nominal conditions.
+
+### Wire compatibility
+
+**Zero.** No new SAB header lane (the ring's 8 Int32 lanes are unchanged). The
+first ship derives the controller's signal from the **existing** `flow_scale`
+lane (Option 1); Option 2's measured-rate back-channel, if a later session adds
+it, is a *separate* SAB, not the Bridge header — also patch-safe. The new
+consumer getters and the new controller class are purely additive API;
+`TelemetrySnapshot` is untouched (new fields are discrete getters, deliberately
+NOT mutated into the frozen 21-field snapshot). A `0.9.51` consumer is
+bit-for-bit interoperable with a `0.9.50` peer.
+
+### Tests
+
+- `tests/BridgeBlockConsumer.test.ts` — 4 new pins (30–33): `underflowRate`
+  (0 / recent-all / mixed-fraction / windowMs clamp / no-sampleRate throw),
+  `lastSuccessfulPullTime`/`elapsedSeconds` (advance-on-pull, stall-across-
+  underflow, stall age), `reset()` zeroes the new state, and an
+  instrument-every-path guard across `process` / `processAdd` /
+  `processAddStereo`.
+- `tests/ResidualQualityController.test.ts` — new file, 9 pins: construction +
+  validation, pressure normalization, sustained-high degrade to `minScale`,
+  sustained-low recover to 1.0, the hysteresis bound (|Δ| ≤ `rampPerTick`
+  across an adversarial alternating signal), floor/ceiling clamps, `reset()`,
+  `tick(NaN)` throws, and Option-2 `[0,1]` watermarks.
+- All prior suites green; `npm run bench` push/pull/pullLatest unchanged at the
+  ~1.20 µs baseline (the `_noteEmitted` tail add is invisible).
+
+### Documentation
+
+- `bench/graceful-degradation.bench.ts` (+ `npm run bench:graceful-degradation`)
+  — a Node-runnable simulation that drives the real `BridgeBlockConsumer` +
+  `ResidualQualityController` against a GPU producer whose block cost scales
+  with partial count, printing the handoff's §8 table and asserting the headline
+  claim: controller-on underflow (≈0%) ≪ controller-off underflow (≈21%), with
+  `effectiveN` dropping under load and recovering.
+- README "Graceful degradation" subsection under the hybrid section.
+- `docs/hybrid-residual-comparison.md` — Gaps #8 + #12 marked ✅ shipped, with
+  the no-new-lane decision recorded.
+
 ## [0.9.50] — 2026-05-29
 
 ### Added — audio-pipeline comparator bench (`bench/audio-pipeline-comparator/`)

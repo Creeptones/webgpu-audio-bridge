@@ -157,6 +157,22 @@ export type {
   BridgeBlockConsumerOptions,
 } from "./BridgeBlockConsumer.js";
 
+// ── Graceful degradation — quality-hint controller (0.9.51) ───────────────
+//
+// `ResidualQualityController` is the producer-side companion to
+// `BridgeBlockConsumer`'s underflow telemetry (`underflowRate`,
+// `lastSuccessfulPullTime`, `elapsedSeconds`). It maps a back-pressure signal
+// — the existing `flow_scale` lane (Option 1, zero new wire) or the consumer's
+// measured `underflowRate` over a back-channel (Option 2) — into a smoothed,
+// hysteretic `suggestedQualityScale` the GPU worker applies to its own knobs
+// (partial count, workgroup count, …) so the residual THINS before it
+// glitches. Closes Gaps #8 + #12. See docs/underflow-quality-degradation-*.
+export { ResidualQualityController } from "./ResidualQualityController.js";
+export type {
+  ResidualQualityHint,
+  ResidualQualityControllerOptions,
+} from "./ResidualQualityController.js";
+
 // ── GPU readback automation (0.6.18) ──────────────────────────────────────
 //
 // The headline helper that closes the loop from "compute pass on the GPU"

@@ -74,6 +74,14 @@
  *  28. Legacy process()/processAdd() throw under channels>1.
  *  29. Telemetry parity — framesConsumed counts ring pulls regardless of
  *      channels; underflowSamples per-channel; reset() zeroes both.
+ *  30. (0.9.51) underflowRate(windowMs) — 0 when no underflow; ≈1 over a
+ *      recent all-underflow window; ≈ the true fraction over a mixed window;
+ *      clamps windowMs to underflowWindowMs; throws without a sampleRate.
+ *  31. (0.9.51) lastSuccessfulPullTime / elapsedSeconds — advance on a pull,
+ *      stall across an underflow run; stall age grows by quantum ÷ sampleRate.
+ *  32. (0.9.51) reset() zeroes the new audio-domain clock + history.
+ *  33. (0.9.51) instrument-every-path — the new telemetry tracks identically
+ *      across process / processAdd / processAddStereo.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -930,6 +938,173 @@ function testInterleavedTelemetry(): void {
   ok("29. interleaved telemetry parity + reset");
 }
 
+// ── 0.9.51 underflow telemetry helpers ─────────────────────────────────────
+function approx(actual: number, expected: number, eps: number, msg: string): void {
+  assert(Math.abs(actual - expected) <= eps,
+    `${msg}\n  expected ≈ ${expected}\n  actual    ${actual}`);
+}
+
+// ── 30. underflowRate(windowMs) (0.9.51) ────────────────────────────────────
+function testUnderflowRate(): void {
+  const SR = 48000;
+  const B = 128; // blockSize === quantum → exactly one pull per process() call.
+  const { bridge } = makeBridge(64, B);
+  const cons = new BridgeBlockConsumer(bridge, {
+    sampleRate: SR,
+    underflowWindowMs: 1000,
+  });
+  assertEq(cons.sampleRate, SR, "sampleRate resolved from opt");
+  assertEq(cons.underflowWindowMs, 1000, "underflowWindowMs resolved from opt");
+
+  const scratch = bridge.scratchFrame();
+  const out = new Float32Array(B);
+
+  // 40 successful quanta → no underflow, rate 0.
+  for (let f = 0; f < 40; f++) pushRampFrame(bridge, scratch, f, B);
+  for (let q = 0; q < 40; q++) cons.process(out);
+  assertEq(cons.underflowSamples(), 0, "no underflow during the fed run");
+  approx(cons.underflowRate(1000), 0, 1e-9, "rate is 0 when nothing underflowed");
+
+  // 40 starved quanta → recent window is all underflow.
+  for (let q = 0; q < 40; q++) cons.process(out);
+  // A ~50 ms window (≈18.75 quanta) lands entirely inside the underflow run.
+  const recent = cons.underflowRate(50);
+  approx(recent, 1.0, 1e-9, "recent all-underflow window → rate 1");
+
+  // Full 1 s window spans 40 fed + 40 starved quanta → ≈ half underflow.
+  const mixed = cons.underflowRate(1000);
+  approx(mixed, 0.5, 0.05, "mixed window → ≈ half underflow");
+
+  // windowMs clamps to underflowWindowMs (1000): a 100 s query equals 1 s.
+  assertEq(cons.underflowRate(100000), cons.underflowRate(1000),
+    "windowMs clamps to underflowWindowMs");
+
+  // No sampleRate → the ms-based getters throw.
+  const { bridge: b2 } = makeBridge(4, B);
+  const noRate = new BridgeBlockConsumer(b2);
+  assertEq(noRate.sampleRate, 0, "no sampleRate resolves to 0");
+  let threw = false;
+  try { noRate.underflowRate(1000); } catch { threw = true; }
+  assert(threw, "underflowRate throws without a sampleRate");
+
+  // Bad windowMs throws.
+  threw = false;
+  try { cons.underflowRate(0); } catch { threw = true; }
+  assert(threw, "windowMs <= 0 throws");
+
+  ok("30. underflowRate(windowMs)");
+}
+
+// ── 31. lastSuccessfulPullTime / elapsedSeconds (0.9.51) ────────────────────
+function testStallClock(): void {
+  const SR = 48000;
+  const B = 128; // one pull per process() call.
+  const { bridge } = makeBridge(16, B);
+  const cons = new BridgeBlockConsumer(bridge, { sampleRate: SR });
+  const scratch = bridge.scratchFrame();
+  const out = new Float32Array(B);
+
+  for (let f = 0; f < 5; f++) pushRampFrame(bridge, scratch, f, B);
+  for (let q = 0; q < 5; q++) cons.process(out);
+
+  // After 5 successful quanta: emitted = 5*128 = 640; the last pull happened
+  // at the start of call #5, when emitted-so-far was 4*128 = 512.
+  approx(cons.elapsedSeconds(), 640 / SR, 1e-12, "elapsedSeconds = emitted/SR");
+  approx(cons.lastSuccessfulPullTime(), 512 / SR, 1e-12,
+    "lastSuccessfulPullTime = emitted-at-pull / SR");
+  approx(cons.elapsedSeconds() - cons.lastSuccessfulPullTime(), 128 / SR, 1e-12,
+    "stall age = one quantum just after a pull");
+
+  // 3 starved quanta: elapsed keeps advancing, last-pull-time stalls.
+  for (let q = 0; q < 3; q++) cons.process(out);
+  approx(cons.elapsedSeconds(), 1024 / SR, 1e-12, "elapsed advances across starve");
+  approx(cons.lastSuccessfulPullTime(), 512 / SR, 1e-12,
+    "lastSuccessfulPullTime stalls across the underflow run");
+  approx(cons.elapsedSeconds() - cons.lastSuccessfulPullTime(), 512 / SR, 1e-12,
+    "stall age grows by quantum ÷ sampleRate per starved call");
+
+  // throws without a rate.
+  const { bridge: b2 } = makeBridge(4, B);
+  const noRate = new BridgeBlockConsumer(b2);
+  let threw = false;
+  try { noRate.lastSuccessfulPullTime(); } catch { threw = true; }
+  assert(threw, "lastSuccessfulPullTime throws without a sampleRate");
+  threw = false;
+  try { noRate.elapsedSeconds(); } catch { threw = true; }
+  assert(threw, "elapsedSeconds throws without a sampleRate");
+
+  ok("31. lastSuccessfulPullTime / elapsedSeconds");
+}
+
+// ── 32. reset() zeroes the new telemetry state (0.9.51) ─────────────────────
+function testResetTelemetry(): void {
+  const SR = 48000;
+  const B = 128;
+  const { bridge } = makeBridge(16, B);
+  const cons = new BridgeBlockConsumer(bridge, { sampleRate: SR });
+  const scratch = bridge.scratchFrame();
+  const out = new Float32Array(B);
+  for (let f = 0; f < 5; f++) pushRampFrame(bridge, scratch, f, B);
+  for (let q = 0; q < 5; q++) cons.process(out);
+  for (let q = 0; q < 3; q++) cons.process(out); // some underflow too
+
+  assert(cons.elapsedSeconds() > 0, "clock advanced before reset");
+  cons.reset();
+  approx(cons.elapsedSeconds(), 0, 1e-12, "reset zeroes elapsedSeconds");
+  approx(cons.lastSuccessfulPullTime(), 0, 1e-12, "reset zeroes last-pull-time");
+  approx(cons.underflowRate(1000), 0, 1e-12, "reset clears underflow history");
+  ok("32. reset() zeroes the new telemetry state");
+}
+
+// ── 33. instrument-every-path (0.9.51) ──────────────────────────────────────
+function testTelemetryEveryPath(): void {
+  const SR = 48000;
+  const B = 128;
+
+  // process()
+  {
+    const { bridge } = makeBridge(8, B);
+    const cons = new BridgeBlockConsumer(bridge, { sampleRate: SR });
+    const scratch = bridge.scratchFrame();
+    pushRampFrame(bridge, scratch, 0, B);
+    const out = new Float32Array(B);
+    cons.process(out);                 // 1 successful
+    cons.process(out);                 // 1 starved
+    approx(cons.elapsedSeconds(), (2 * B) / SR, 1e-12, "process: clock += 2 quanta");
+    approx(cons.lastSuccessfulPullTime(), 0, 1e-12, "process: pull at emitted 0");
+    assert(cons.underflowRate(50) > 0, "process: underflowRate reflects starve");
+  }
+  // processAdd()
+  {
+    const { bridge } = makeBridge(8, B);
+    const cons = new BridgeBlockConsumer(bridge, { sampleRate: SR });
+    const scratch = bridge.scratchFrame();
+    pushRampFrame(bridge, scratch, 0, B);
+    const out = new Float32Array(B);
+    cons.processAdd(out);
+    cons.processAdd(out);
+    approx(cons.elapsedSeconds(), (2 * B) / SR, 1e-12, "processAdd: clock += 2 quanta");
+    approx(cons.lastSuccessfulPullTime(), 0, 1e-12, "processAdd: pull at emitted 0");
+    assert(cons.underflowRate(50) > 0, "processAdd: underflowRate reflects starve");
+  }
+  // processAddStereo()
+  {
+    const C = 2;
+    const { bridge } = makeInterleavedBridge(8, B, C);
+    const cons = new BridgeBlockConsumer(bridge, { channels: 2, sampleRate: SR });
+    const scratch = bridge.scratchFrame();
+    pushInterleavedRampFrame(bridge, scratch, 0, C, B);
+    const L = new Float32Array(B), R = new Float32Array(B);
+    cons.processAddStereo(L, R);       // successful
+    cons.processAddStereo(L, R);       // starved
+    // Per-channel units: each call emits B per-channel samples.
+    approx(cons.elapsedSeconds(), (2 * B) / SR, 1e-12, "stereo: clock += 2 quanta");
+    approx(cons.lastSuccessfulPullTime(), 0, 1e-12, "stereo: pull at emitted 0");
+    assert(cons.underflowRate(50) > 0, "stereo: underflowRate reflects starve");
+  }
+  ok("33. instrument-every-path telemetry");
+}
+
 function main(): void {
   testConstruction();
   testSchemaValidation();
@@ -960,6 +1135,10 @@ function main(): void {
   testInterleavedUnderflow();
   testLegacyGuardedMultichannel();
   testInterleavedTelemetry();
+  testUnderflowRate();
+  testStallClock();
+  testResetTelemetry();
+  testTelemetryEveryPath();
   console.log("all BridgeBlockConsumer pins green");
 }
 

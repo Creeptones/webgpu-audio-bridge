@@ -1286,6 +1286,66 @@ npm run build && npm run bench:hybrid-residual  # bench at http://localhost:5177
 npm run build && npm run bench:comparator       # comparator at http://localhost:5178/
 ```
 
+### Graceful degradation — the residual thins before it glitches (0.9.51)
+
+Hybrid mode already degrades better than `process()` (the carrier survives a
+stall), but it still degrades *passively* — the residual just vanishes for the
+stall duration. 0.9.51 adds the **active** half: under sustained GPU underflow
+the producer voluntarily *simplifies* the residual (fewer harmonic partials,
+fewer workgroups, less oversampling) so a cheaper block computes in time and the
+ring never runs dry. The timbre dulls instead of dropping out, and brightens
+back when the GPU catches up.
+
+Two pieces. **Consumer side** — `BridgeBlockConsumer` gains three windowed,
+worklet-safe (no timer, no allocation) telemetry getters on top of the existing
+counters:
+
+```js
+const consumer = new BridgeBlockConsumer(bridge, { sampleRate, underflowWindowMs: 250 });
+consumer.underflowRate(250);        // fraction in [0,1] of the last 250 ms that underflowed
+consumer.lastSuccessfulPullTime();  // audio-domain seconds of the last successful pull
+consumer.elapsedSeconds() - consumer.lastSuccessfulPullTime();  // the stall age
+```
+
+These read an exact audio-sample clock (`samplesEmitted / sampleRate`), **not**
+`performance.now()` — which is not reliably exposed in the worklet scope. Pass
+`sampleRate` (the AudioWorklet global) at construction; omit it and the three
+ms-based getters throw rather than return `NaN`.
+
+**Producer side** — `ResidualQualityController` maps a back-pressure signal to a
+smoothed, hysteretic quality scale the worker applies to its own knobs:
+
+```js
+import { ResidualQualityController } from "webgpu-audio-bridge";
+const quality = new ResidualQualityController();   // defaults tuned for the flow_scale signal
+
+// In the GPU worker, once per produced block:
+const hint = quality.tick(bridge.flowScaleHint());          // Option 1 — zero new wire
+const effectiveN = Math.max(2, Math.round(N_FULL * hint.suggestedQualityScale));
+// …compute the residual with effectiveN partials instead of N_FULL.
+```
+
+The signal is the **existing** `flow_scale` lane: a starved consumer drives it
+toward 2.0 ("speed up"), which a producer legitimately honors by *simplifying*
+(cheaper blocks compute faster) — so there is **no new wire format**, this stays
+a patch. Hysteresis (a watermark deadband + a bounded `rampPerTick`) is
+mandatory, not polish: a raw per-block reaction pumps the timbre audibly; the
+controller glides between full quality and the `minScale` floor over tens of
+ticks. For a more faithful signal, feed the consumer's measured
+`underflowRate()` over a dedicated back-channel SAB instead (Option 2 — still a
+separate SAB, still a patch).
+
+`bench/graceful-degradation.bench.ts` is the quantitative evidence — it drives
+the real consumer + controller against a GPU producer whose block cost scales
+with partial count. Controller off: ~21% sustained underflow at fixed 16
+partials. Controller on: the partial count drops under load (16 → ~13, transient
+floor ~10) and measured underflow settles to ~0% — the analogue of the 0.9.50
+comparator scorecard for the degradation claim.
+
+```bash
+npm run bench:graceful-degradation   # Node sim; prints the flow_scale → quality → partials table
+```
+
 ### Stereo / multichannel (0.9.48)
 
 `BridgeBlockConsumer` consumes multi-channel audio carried **interleaved** inside the lone `f32Array`. The schema is unchanged in shape — still exactly one `f32Array` field, just sized `channels * blockSize`:

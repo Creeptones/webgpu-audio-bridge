@@ -159,6 +159,34 @@
  * `channels > 1` (no silent wrong-channel audio). `'planar'` layout and
  * `processAddChannels(outs[])` for N>2-in-one-quantum are reserved / deferred.
  *
+ * ─── Underflow telemetry + graceful degradation (0.9.51) ─────────────────
+ *
+ * On top of the cumulative `underflowSamples()` / `framesConsumed()` counters,
+ * three windowed, audio-domain getters surface HOW BADLY and HOW RECENTLY the
+ * ring is starving — the observability half of "the residual thins before it
+ * glitches":
+ *
+ *   - `underflowRate(windowMs)` — fraction in [0,1] of per-channel window
+ *     samples that took the underflow path over the last `windowMs`.
+ *   - `lastSuccessfulPullTime()` / `elapsedSeconds()` — the audio-domain time
+ *     of the last successful pull and "now"; their difference is the stall age.
+ *
+ * All three are **pure polling getters**: no timer, no `Atomics.wait`, no
+ * allocation on the audio thread — worklet-safe by construction (the role
+ * lattice forbids timers on the worklet handle; this helper is role-agnostic,
+ * so it stays getter-only). They derive from an audio-sample clock
+ * (`samplesEmitted / sampleRate`), NOT `performance.now()` — which is not
+ * reliably exposed in `AudioWorkletGlobalScope`. Pass `sampleRate` at
+ * construction (it is in the worklet's global scope) to enable them.
+ *
+ * The producer side acts on these via `ResidualQualityController` (see
+ * `src/ResidualQualityController.ts`): under sustained underflow it lowers a
+ * `suggestedQualityScale` the GPU worker maps to its own knobs (harmonic count,
+ * workgroup count, oversampling) so the residual SIMPLIFIES rather than
+ * glitches. The first ship derives the controller's input from the existing
+ * `flow_scale` backpressure lane (zero new wire); this getter's measured rate
+ * is the more-faithful follow-up signal carried over a dedicated back-channel.
+ *
  * ─── Wire compatibility ──────────────────────────────────────────────────
  *
  * Zero change. BridgeBlockConsumer composes a `Bridge<S>` instance via its
@@ -198,7 +226,31 @@ export interface BridgeBlockConsumerOptions {
   /** Sample layout. Default 'mono' when channels===1, else 'interleaved'
    *  ('planar' throws in 0.9.48). */
   readonly layout?: BlockChannelLayout;
+  /** Sample rate in Hz (0.9.51). Enables the ms-based underflow telemetry
+   *  getters `underflowRate(windowMs)`, `lastSuccessfulPullTime()`, and
+   *  `elapsedSeconds()`. Inside an `AudioWorkletGlobalScope` the global
+   *  `sampleRate` is in scope — pass it here. When omitted, the consumer
+   *  falls back to `globalThis.sampleRate` if present; if neither is
+   *  available the three time-based getters throw a descriptive error.
+   *  `framesConsumed()` / `underflowSamples()` / `remainingInFrame()` do
+   *  NOT require it. */
+  readonly sampleRate?: number;
+  /** Maximum history window, in milliseconds, retained for
+   *  `underflowRate(windowMs)` (0.9.51). `windowMs` queries are clamped to
+   *  this. Default 1000. The history is a fixed-size, preallocated circular
+   *  buffer of cumulative `(samplesEmitted, underflowSamples)` marks — no
+   *  per-call allocation on the audio thread; the mark stride auto-scales so
+   *  the buffer always spans the window regardless of `process()` quantum. */
+  readonly underflowWindowMs?: number;
 }
+
+/** Number of circular-history mark slots for the underflow-rate window
+ *  (0.9.51). Fixed + preallocated; the mark *stride* (in samples) scales to
+ *  `underflowWindowMs` so this slot count always covers the window. */
+const UNDERFLOW_MARK_CAPACITY = 256;
+
+/** Default `underflowWindowMs` when the option is omitted (0.9.51). */
+const DEFAULT_UNDERFLOW_WINDOW_MS = 1000;
 
 export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
   /** The bridge whose pull-side this consumer drives. Exposed so callers can
@@ -227,6 +279,15 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    *  `channels === 1`, `'interleaved'` for `channels > 1`. */
   public readonly layout: BlockChannelLayout;
 
+  /** Sample rate in Hz as resolved at construction (0.9.51), or 0 when no
+   *  rate was supplied (constructor opt nor `globalThis.sampleRate`). The
+   *  ms-based telemetry getters throw when this is 0. */
+  public readonly sampleRate: number;
+
+  /** Max retained underflow-rate history window in ms as resolved at
+   *  construction (0.9.51). `underflowRate(windowMs)` clamps to this. */
+  public readonly underflowWindowMs: number;
+
   // ── Internal state ────────────────────────────────────────────────────
   private readonly frame: FrameFor<S>;
   /** Direct view into `frame[samplesField]`. Bound once at construction;
@@ -253,6 +314,35 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    *  channel hot path stays allocation-free on the audio thread. */
   private readonly _outs: (Float32Array | null)[];
   private readonly _chans: number[];
+
+  // ── Underflow telemetry (0.9.51) ──────────────────────────────────────
+  /** Cumulative per-channel window samples the consumer has been ASKED to
+   *  produce since construction / last reset — i.e. the sum of every
+   *  `count` across `process*()` calls. This is the consumer's monotonic
+   *  audio-domain clock (it advances by exactly the requested quantum every
+   *  call, underflow or not); `elapsedSeconds()` is `_samplesEmitted /
+   *  sampleRate`. Same per-channel unit as `_underflowSamples`. */
+  private _samplesEmitted: number;
+  /** `_samplesEmitted` value at the moment of the most recent SUCCESSFUL
+   *  ring pull. Advances on a pull; stalls across an underflow run.
+   *  `lastSuccessfulPullTime()` is `_lastPullAtSample / sampleRate`. */
+  private _lastPullAtSample: number;
+  /** Circular history of cumulative `samplesEmitted` at each stamped mark
+   *  (paired with `_marksUnderflow`). Preallocated; never reallocated. */
+  private readonly _marksSamples: Float64Array;
+  /** Circular history of cumulative `underflowSamples` at each stamped mark. */
+  private readonly _marksUnderflow: Float64Array;
+  /** Next write slot in the circular mark buffers. */
+  private _markHead: number;
+  /** Number of valid marks currently stored (≤ UNDERFLOW_MARK_CAPACITY). */
+  private _markCount: number;
+  /** `_samplesEmitted` at the last stamped mark — a new mark is stamped once
+   *  `_samplesEmitted` has advanced by ≥ `_markStride` since this. */
+  private _lastMarkSamples: number;
+  /** Minimum sample advance between marks (0 when no sampleRate → windowing
+   *  unavailable). Scaled so UNDERFLOW_MARK_CAPACITY marks span
+   *  `underflowWindowMs`, decoupling buffer size from `process()` cadence. */
+  private readonly _markStride: number;
 
   constructor(bridge: Bridge<S>, opts?: BridgeBlockConsumerOptions) {
     this.bridge = bridge;
@@ -338,6 +428,56 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
     this._framesConsumed = 0;
     this._outs = [null, null];
     this._chans = [0, 0];
+
+    // ── Underflow telemetry (0.9.51) ──────────────────────────────────
+    // Resolve the sample rate: explicit opt wins; else the AudioWorklet
+    // global (`globalThis.sampleRate`) if present; else 0 (the ms-based
+    // getters throw, but the sample-count counters keep working).
+    const optRate = opts?.sampleRate;
+    let resolvedRate = 0;
+    if (optRate !== undefined) {
+      if (!Number.isFinite(optRate) || optRate <= 0) {
+        throw new Error(
+          `BridgeBlockConsumer: sampleRate must be a positive finite number ` +
+          `(got ${optRate}).`,
+        );
+      }
+      resolvedRate = optRate;
+    } else {
+      const globalRate = (globalThis as { sampleRate?: number }).sampleRate;
+      if (typeof globalRate === "number" && Number.isFinite(globalRate) &&
+          globalRate > 0) {
+        resolvedRate = globalRate;
+      }
+    }
+    this.sampleRate = resolvedRate;
+
+    const windowMs = opts?.underflowWindowMs ?? DEFAULT_UNDERFLOW_WINDOW_MS;
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new Error(
+        `BridgeBlockConsumer: underflowWindowMs must be a positive finite ` +
+        `number (got ${windowMs}).`,
+      );
+    }
+    this.underflowWindowMs = windowMs;
+
+    this._samplesEmitted = 0;
+    this._lastPullAtSample = 0;
+    this._marksSamples = new Float64Array(UNDERFLOW_MARK_CAPACITY);
+    this._marksUnderflow = new Float64Array(UNDERFLOW_MARK_CAPACITY);
+    this._markHead = 0;
+    this._markCount = 0;
+    this._lastMarkSamples = 0;
+    // Stride so UNDERFLOW_MARK_CAPACITY marks span `underflowWindowMs`.
+    // 0 disables marking (no sampleRate → underflowRate throws anyway).
+    this._markStride = resolvedRate > 0
+      ? Math.max(
+          1,
+          Math.floor(
+            (windowMs * resolvedRate) / 1000 / (UNDERFLOW_MARK_CAPACITY - 1),
+          ),
+        )
+      : 0;
   }
 
   /**
@@ -376,11 +516,13 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
           const remaining = count - written;
           this._underflowSamples += remaining;
           this._handleUnderflow(out, written, remaining);
+          this._noteEmitted(count);
           return;
         }
         this.cursor = 0;
         this.hasFrame = true;
         this._framesConsumed++;
+        this._lastPullAtSample = this._samplesEmitted + written;
       }
       const take = Math.min(count - written, this.blockSize - this.cursor);
       out.set(this.samples.subarray(this.cursor, this.cursor + take), written);
@@ -388,6 +530,7 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       this.cursor += take;
       written += take;
     }
+    this._noteEmitted(count);
   }
 
   /**
@@ -445,11 +588,13 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
           this._underflowSamples += remaining;
           // Hybrid mode: leave out[] untouched on underflow. Caller's
           // carrier in the unfilled tail survives the GPU stall.
+          this._noteEmitted(count);
           return;
         }
         this.cursor = 0;
         this.hasFrame = true;
         this._framesConsumed++;
+        this._lastPullAtSample = this._samplesEmitted + written;
       }
       const take = Math.min(count - written, this.blockSize - this.cursor);
       const samples = this.samples;
@@ -471,6 +616,7 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       this.cursor += take;
       written += take;
     }
+    this._noteEmitted(count);
   }
 
   /**
@@ -604,11 +750,13 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
         if (!ok) {
           // Carrier survives: leave every out[] tail untouched.
           this._underflowSamples += count - written;
+          this._noteEmitted(count);
           return written;
         }
         this.cursor = 0;
         this.hasFrame = true;
         this._framesConsumed++;
+        this._lastPullAtSample = this._samplesEmitted + written;
       }
       const take = Math.min(count - written, this.blockSize - this.cursor);
       const samples = this.samples;
@@ -638,18 +786,26 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       this.cursor += take;
       written += take;
     }
+    this._noteEmitted(count);
     return written;
   }
 
   /** Discard the in-flight frame and reset the cursor. The next `process()`
    *  call pulls a fresh frame from the ring. Telemetry counters
-   *  (framesConsumed, underflowSamples) are also zeroed. */
+   *  (framesConsumed, underflowSamples) — and the 0.9.51 underflow-rate
+   *  history + audio-domain clock — are also zeroed. */
   reset(): void {
     this.cursor = 0;
     this.hasFrame = false;
     this.holdSample = 0;
     this._underflowSamples = 0;
     this._framesConsumed = 0;
+    // 0.9.51 telemetry state.
+    this._samplesEmitted = 0;
+    this._lastPullAtSample = 0;
+    this._markHead = 0;
+    this._markCount = 0;
+    this._lastMarkSamples = 0;
   }
 
   /** Telemetry: total frames successfully pulled since construction or
@@ -668,6 +824,124 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    *  is in flight. Useful for tests / diagnostics; not a hot-path call. */
   remainingInFrame(): number {
     return this.hasFrame ? this.blockSize - this.cursor : 0;
+  }
+
+  /**
+   * Fraction in `[0, 1]` of per-channel window samples written via the
+   * underflow path over the last `windowMs` (0.9.51). `0` = the consumer is
+   * keeping up; values toward `1` = the ring is starving and the residual is
+   * thinning. Backed by a fixed-size circular history of cumulative
+   * `(samplesEmitted, underflowSamples)` marks stamped from inside the
+   * `process*()` calls — there is **no timer**; the cadence is the audio
+   * quantum (worklet-safe, allocation-free).
+   *
+   * `windowMs` is clamped to the constructor's `underflowWindowMs`. Requires
+   * a resolved `sampleRate` (constructor opt or `globalThis.sampleRate`);
+   * throws otherwise. Returns `0` when no samples have been emitted yet or
+   * the window contains zero emitted samples.
+   *
+   * This is the value the producer-side `ResidualQualityController` consumes
+   * in Option 2 (the consumer's TRUE measured rate, carried back over a
+   * dedicated SAB); Option 1 instead infers it from `flow_scale` saturation
+   * without reading this getter. See `docs/underflow-quality-degradation-*`.
+   */
+  underflowRate(windowMs: number): number {
+    const sr = this._requireSampleRate("underflowRate");
+    if (!Number.isFinite(windowMs) || windowMs <= 0) {
+      throw new Error(
+        `BridgeBlockConsumer.underflowRate: windowMs must be a positive ` +
+        `finite number (got ${windowMs}).`,
+      );
+    }
+    if (this._markCount === 0) return 0;
+    const clampedMs = Math.min(windowMs, this.underflowWindowMs);
+    const windowSamples = (clampedMs * sr) / 1000;
+    const curS = this._samplesEmitted;
+    const curU = this._underflowSamples;
+    const target = curS - windowSamples;
+    // Marks are chronological starting at the oldest valid slot. Walk forward
+    // and keep the latest mark still at/before `target` (so the measured span
+    // is as close to `windowSamples` as the history allows); fall back to the
+    // oldest available mark when the whole history is newer than `target`.
+    const cap = UNDERFLOW_MARK_CAPACITY;
+    const oldest = (this._markHead - this._markCount + cap) % cap;
+    let chosenS = this._marksSamples[oldest] as number;
+    let chosenU = this._marksUnderflow[oldest] as number;
+    for (let k = 1; k < this._markCount; k++) {
+      const idx = (oldest + k) % cap;
+      const s = this._marksSamples[idx] as number;
+      if (s <= target) {
+        chosenS = s;
+        chosenU = this._marksUnderflow[idx] as number;
+      } else {
+        break;
+      }
+    }
+    const dS = curS - chosenS;
+    if (dS <= 0) return 0;
+    let rate = (curU - chosenU) / dS;
+    if (rate < 0) rate = 0;
+    else if (rate > 1) rate = 1;
+    return rate;
+  }
+
+  /**
+   * The consumer's audio-domain time, in SECONDS, of the most recent
+   * SUCCESSFUL ring pull (0.9.51): `samplesEmittedAtThatPull / sampleRate`.
+   * Monotonic from construction / `reset()`; resets to 0 on `reset()`.
+   *
+   * This is **NOT** a wall clock — the AudioWorklet scope has no reliable
+   * `performance.now()` (see the handoff note), so staleness is measured in
+   * the exact, monotonic audio-sample domain. Pair with `elapsedSeconds()`:
+   * `elapsedSeconds() − lastSuccessfulPullTime()` is the stall age (how long,
+   * in audio time, since the ring last delivered a frame). Requires a
+   * resolved `sampleRate`; throws otherwise.
+   */
+  lastSuccessfulPullTime(): number {
+    const sr = this._requireSampleRate("lastSuccessfulPullTime");
+    return this._lastPullAtSample / sr;
+  }
+
+  /**
+   * The consumer's audio-domain "now", in SECONDS (0.9.51): cumulative
+   * per-channel samples emitted ÷ `sampleRate`. Advances by exactly the
+   * `process*()` quantum every call (underflow or not). `elapsedSeconds() −
+   * lastSuccessfulPullTime()` is the stall age — the value a
+   * crossfade-on-stall policy would also key off. Requires a resolved
+   * `sampleRate`; throws otherwise.
+   */
+  elapsedSeconds(): number {
+    const sr = this._requireSampleRate("elapsedSeconds");
+    return this._samplesEmitted / sr;
+  }
+
+  /** Advance the audio-domain clock by one `process*()` call's `count`
+   *  per-channel samples and stamp a history mark if the stride has elapsed.
+   *  Called on EVERY exit of EVERY consumption method (underflow paths too),
+   *  so `_samplesEmitted` is the true emitted-sample count. */
+  private _noteEmitted(count: number): void {
+    this._samplesEmitted += count;
+    if (this._markStride <= 0) return; // no sampleRate → windowing disabled.
+    if (this._markCount === 0 ||
+        this._samplesEmitted - this._lastMarkSamples >= this._markStride) {
+      const slot = this._markHead;
+      this._marksSamples[slot] = this._samplesEmitted;
+      this._marksUnderflow[slot] = this._underflowSamples;
+      this._markHead = (slot + 1) % UNDERFLOW_MARK_CAPACITY;
+      if (this._markCount < UNDERFLOW_MARK_CAPACITY) this._markCount++;
+      this._lastMarkSamples = this._samplesEmitted;
+    }
+  }
+
+  /** Resolve the sample rate or throw a descriptive error naming the getter.
+   *  The ms-based telemetry getters are unusable without a rate. */
+  private _requireSampleRate(method: string): number {
+    if (this.sampleRate > 0) return this.sampleRate;
+    throw new Error(
+      `BridgeBlockConsumer.${method}: requires a sample rate. Construct with ` +
+      `{ sampleRate } (the AudioWorklet global \`sampleRate\` is in scope) to ` +
+      `use the ms-based underflow telemetry getters.`,
+    );
   }
 
   private _handleUnderflow(out: Float32Array, offset: number, count: number): void {

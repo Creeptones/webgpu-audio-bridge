@@ -327,15 +327,37 @@ The library already supports this — `Bridge<S>` is the control-rate bridge —
 
 **Cost**: 300-500 LOC for the demo + minor doc updates. **Complexity**: low (composition of existing primitives). **Dependency**: none.
 
-### Gap #8: Stall-aware quality degradation (reverse `flow_scale` for compute load)
+### Gap #8: Stall-aware quality degradation (reverse `flow_scale` for compute load) — ✅ shipped (0.9.51)
 
-`flow_scale` (0.5.0) lets the consumer signal the producer to slow down when the ring is overfilling. The reverse signal — producer struggling, ring underfilling, audible underflow — is not yet implemented as a back-channel.
+**Shipped 0.9.51** as `ResidualQualityController` + the consumer-side underflow
+telemetry getters on `BridgeBlockConsumer` (`underflowRate`,
+`lastSuccessfulPullTime`, `elapsedSeconds`). The "graceful degradation under
+load" story is now real: the carrier keeps playing, the residual *simplifies*
+(fewer partials) when the GPU can't keep up, and recovers when it catches up —
+"the timbre simplifies" rather than "the sound glitches."
+
+**The wire-format question this gap flagged is resolved: NO new lane.** The
+original cost estimate assumed a new SAB lane (wire-format change → minor bump).
+We avoided it — the controller's first-ship signal is the **existing**
+`flow_scale` lane read in reverse: a starved consumer drives `flow_scale` toward
+2.0 ("speed up"), which the producer legitimately honors by *simplifying*
+(cheaper blocks compute faster). So degradation rides the channel that already
+exists, and 0.9.51 stayed a **patch**. A more faithful signal (the consumer's
+true measured `underflowRate`) is available as a follow-up over a *separate*
+back-channel SAB — still a patch, still not the Bridge header. A 9th Bridge
+header lane was deliberately deferred to a future `0.10.0` wire-format cohort and
+is not needed for this feature. See
+`docs/underflow-quality-degradation-handoff.md` §3 for the full decision and
+`bench/graceful-degradation.bench.ts` for the quantitative evidence (controller
+on ≈0% underflow vs off ≈21%).
+
+The original specification, for the record:
+
+`flow_scale` (0.5.0) lets the consumer signal the producer to slow down when the ring is overfilling. The reverse signal — producer struggling, ring underfilling, audible underflow — was not yet implemented as a back-channel.
 
 When the consumer detects sustained underflow (e.g. `underflowSamples()` rate > 5% of samples over the last second), it could publish a "reduce quality" signal on a new lane (or piggyback on `flow_scale` with the existing direction reversed). The producer voluntarily honors by reducing residual complexity — fewer partials, smaller workgroup count, lower oversampling.
 
-This is the "graceful degradation under load" story. The carrier keeps playing; the residual gets simpler when the GPU can't keep up; the user hears "the timbre simplifies" rather than "the sound glitches."
-
-**Cost**: 200-400 LOC + a new lane (wire-format change → minor bump or careful lane-7 / lane-6 reuse) + producer-side response logic. **Complexity**: medium (wire-format consideration is the main cost). **Dependency**: requires deciding whether to reuse `flow_scale` or open a new lane.
+**Cost (as estimated)**: 200-400 LOC. **Actual**: came in near the low end (controller + telemetry + tests + a Node sim bench), and — by reusing `flow_scale` — with **zero wire-format change**, so it shipped as a patch rather than the feared minor bump.
 
 ### Gap #9: Latency-compensated synchronization mode
 
@@ -394,7 +416,26 @@ The output: a side-by-side latency + continuity scorecard backing the "marked up
 
 **Cost**: 800-1200 LOC of new bench harness + result publication infrastructure. **Complexity**: high; needs four independent audio pipeline implementations + reliable measurement methodology. **Dependency**: depends on Gap #15 (long-tail measurement) for the p99 component.
 
-### Gap #12: Subscribe-to-underflow callback
+### Gap #12: Subscribe-to-underflow callback — ✅ shipped (0.9.51)
+
+**Shipped 0.9.51** as the windowed underflow-rate getter on
+`BridgeBlockConsumer` — `underflowRate(windowMs)`, plus `lastSuccessfulPullTime()`
+/ `elapsedSeconds()` for the stall age. `underflowSamples()` previously returned
+a raw count; computing "GPU is struggling" required polling it and dividing
+manually. `underflowRate(windowMs)` is that rate, computed allocation-free from a
+fixed-size circular history of marks — no per-call work on the audio thread.
+
+The "subscribe" framing was deliberately kept **worker-side**, not a worklet
+timer: the role lattice (0.9.45) structurally forbids `setInterval` on the
+worklet handle, and the consumer telemetry getters are pure polling by design.
+A UI subscription is expressed as the worker polling `consumer.underflowRate()`
+(or diffing `bridge.subscribeTelemetry` snapshots), exactly like the Bridge
+Inspector pattern — so no worklet-side subscribe primitive was added. This both
+serves the three listed use cases and composes directly with Gap #8: the shipped
+`ResidualQualityController` consumes this signal (Option 2) or the `flow_scale`
+proxy (Option 1) to drive degradation automatically.
+
+The original specification, for the record:
 
 `underflowSamples()` returns a raw count. Surfacing "GPU is struggling" to a UI requires polling the counter and computing the rate manually. A subscription primitive — `subscribeUnderflow({ thresholdRatePerSec, callback })` — would let the consumer (or a Bridge Inspector) react to sustained underflow events.
 
@@ -404,7 +445,7 @@ Useful for UIs that want to:
 - Trigger Gap #8's quality degradation automatically.
 - Log telemetry for post-session diagnostics.
 
-**Cost**: 100-200 LOC + test pins. **Complexity**: low. **Dependency**: none. Composes naturally with Gap #8 (degradation) once both ship.
+**Cost**: 100-200 LOC + test pins. **Actual**: shipped as polling getters (no timer; role-lattice-safe), folded into the same 0.9.51 patch as Gap #8.
 
 ### Gap #13: Residual envelope-follows-carrier (auto-ducking)
 
