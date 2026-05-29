@@ -61,6 +61,16 @@ const INCLUDES = [
   // ── Design notes (docs/) ──────────────────────────────────────────────
   { path: "docs/standard-mode-design.md", mode: "full", lang: "md" },
   { path: "docs/hybrid-residual-comparison.md", mode: "full", lang: "md" },
+  // Frontier "King-track" design notes (0.9.44–0.9.46) — all shipped.
+  { path: "docs/predictive-extrapolation-design.md", mode: "full", lang: "md" },
+  { path: "docs/record-replay-design.md", mode: "full", lang: "md" },
+  { path: "docs/emit-worklet-reader-design.md", mode: "full", lang: "md" },
+  { path: "docs/rt-safety-lattice-design.md", mode: "full", lang: "md" },
+  { path: "docs/connect-topology-design.md", mode: "full", lang: "md" },
+  // Formal-correctness artifacts.
+  { path: "docs/formal-verification-design.md", mode: "full", lang: "md" },
+  { path: "docs/spsc-happens-before-proof.md", mode: "full", lang: "md" },
+  { path: "docs/interleaving-fuzzer-design.md", mode: "full", lang: "md" },
 
   // ── Source — public API surface ───────────────────────────────────────
   { path: "src/index.ts", mode: "full", lang: "ts" },
@@ -73,16 +83,36 @@ const INCLUDES = [
   { path: "src/BridgeInputLane.ts", mode: "full", lang: "ts" },
   { path: "src/environment.ts", mode: "full", lang: "ts" },
   { path: "src/trajectory.ts", mode: "full", lang: "ts" },
+  // Frontier modules (0.9.44–0.9.46): predictive extrapolation, record/replay
+  // timeline, schema→worklet codegen, and the one-call topology constructor.
+  { path: "src/predictiveExtrapolation.ts", mode: "full", lang: "ts" },
+  { path: "src/TimelineRecorder.ts", mode: "full", lang: "ts" },
+  { path: "src/emitWorkletReader.ts", mode: "full", lang: "ts" },
+  { path: "src/connect.ts", mode: "full", lang: "ts" },
   { path: "src/_heap.ts", mode: "full", lang: "ts" },
   { path: "src/schemas/physics.ts", mode: "full", lang: "ts" },
+  // The correctness-critical core — SAB/Atomics counter arithmetic, the
+  // park/wake wait protocol, overflow policies, and notify behavior. Inlined in
+  // FULL (0.9.56) so an auditor can verify the SPSC semantics from the bundle
+  // alone, not just the header math. Pairs with formal/SpscRing.tla below.
+  { path: "src/SpscRing.ts", mode: "full", lang: "ts" },
+
+  // ── Formal model (formal/) ────────────────────────────────────────────
+  {
+    path: "formal/SpscRing.tla",
+    mode: "full",
+    lang: "tla",
+    title: "formal/SpscRing.tla (TLA+/PlusCal model)",
+  },
+  { path: "formal/README.md", mode: "full", lang: "md" },
 
   // ── Source — extracted machinery (headers only) ───────────────────────
   // Each of these is a self-contained heap-state-machine the public
   // classes compose. The class internals are mature and well-tested; the
   // file headers carry the protocol math + invariants that an auditor or
   // forker needs to understand the design. Inlining the full files would
-  // ~triple the bundle size for diminishing return.
-  { path: "src/SpscRing.ts", mode: "header", lang: "ts" },
+  // bloat the bundle for diminishing return. (SpscRing.ts is the exception —
+  // it is the correctness-critical core and is inlined in FULL above, 0.9.56.)
   { path: "src/FrameSmoother.ts", mode: "header", lang: "ts" },
   { path: "src/ConsumerClockRecovery.ts", mode: "header", lang: "ts" },
   { path: "src/AdaptiveFlowController.ts", mode: "header", lang: "ts" },
@@ -127,6 +157,12 @@ const TEST_FILES_INVENTORY = [
   ["tests/environment.test.ts", "getEnvironmentReport() pins."],
   ["tests/Bridge.phaseLock.test.ts", "FFT-based phase-lock spectrum pin."],
   ["tests/Bridge.wasmEquivalence.test.ts", "WASM decoder ↔ JS atomics equivalence pins."],
+  ["tests/Bridge.predict.test.ts", "Confidence-bounded predictive extrapolation pins (81-89)."],
+  ["tests/Bridge.timeline.test.ts", "Record/replay deterministic timeline + offline-bounce pins."],
+  ["tests/Bridge.codegen.test.ts", "emitWorkletReader zero-import codegen pins."],
+  ["tests/Bridge.interleaving.test.ts", "Loom-style deterministic SPSC interleaving fuzzer (48k+ states)."],
+  ["tests/Bridge.roles.test.ts", "Bridge<S,Role> RT-safety lattice pins (90-94) + @ts-expect-error type-level pins."],
+  ["tests/connect.test.ts", "connect() one-call topology constructor pins (95-102)."],
   ["tests/Bridge.concurrent.test.ts", "1M-frame cross-thread SPSC stress (concurrent worker)."],
   ["tests/typecheck-deprecations.test.ts", "@ts-expect-error-protected deletion pins (post-0.9.0)."],
   ["tests/readme-imports.test.ts", "Public-API drift gate — every name documented in README must resolve."],
@@ -208,9 +244,9 @@ async function buildBundle() {
 > 1. Project metadata (\`package.json\`, \`CITATION.cff\`).
 > 2. Top-level docs (\`README.md\`, \`ROADMAP.md\`, \`QUICKSTART.md\`, \`MIGRATION.md\`).
 > 3. Recent CHANGELOG entries (0.9.36+; older entries in the full file at the repo).
-> 4. Design notes (\`docs/standard-mode-design.md\`, \`docs/hybrid-residual-comparison.md\`).
-> 5. Public-API TypeScript source files inlined in full (Bridge, MessageChannelBridge, BridgeBlockConsumer, schema DSL, environment, trajectory evaluator, canonical schemas).
-> 6. Extracted-machinery TypeScript files inlined as headers only — \`SpscRing\`, \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\`. The headers carry the protocol math and invariants; full files live in \`src/\`.
+> 4. Design notes — Standard mode, hybrid residual, the five frontier-track notes (predictive extrapolation, record/replay, worklet codegen, \`Bridge<S,Role>\` lattice, \`connect()\`), and the formal-correctness notes (TLA+ verification, happens-before proof, interleaving fuzzer) — plus the \`formal/SpscRing.tla\` model itself.
+> 5. Public-API TypeScript source files inlined in full (Bridge + the \`Bridge<S,Role>\` lattice, MessageChannelBridge, BridgeBlockConsumer, schema DSL, environment, trajectory evaluator, the frontier modules \`predictiveExtrapolation\` / \`TimelineRecorder\` / \`emitWorkletReader\` / \`connect\`, canonical schemas) **plus the correctness-critical \`SpscRing\` core inlined in full** (0.9.56) — the SAB/Atomics counter arithmetic, park/wake wait protocol, overflow policies, and notify behavior, so the SPSC semantics are verifiable from the bundle alone alongside \`formal/SpscRing.tla\`.
+> 6. Remaining extracted-machinery TypeScript files inlined as headers only — \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\`. The headers carry the protocol math and invariants; full files live in \`src/\`.
 > 7. Canonical example demos: \`examples/minimal/\` (Worker → Bridge → AudioWorklet) and \`examples/hybrid-residual/\` (the 0.9.41 hybrid pattern).
 > 8. Test-file inventory (full files not inlined; ~5,000 lines combined).
 
@@ -235,6 +271,14 @@ AudioWorklet (f64 synthesis @ 48kHz)
 
 ### Headline shipped features (most-recent-first)
 
+- **0.9.56** — \`SpscRing\` core inlined in full in this bundle (audit hardening cohort): the correctness-critical SAB/Atomics file is now verifiable from the bundle alone, not just its header.
+- **0.9.55** — \`BridgeBlockConsumer.process()\` is allocation-free on the render path (explicit cached-locals copy replaces \`subarray()\`); byte-identical output.
+- **0.9.54** — Decoder-fault containment in \`BridgeGPUSource.pollCompleted()\`: a throwing decoder aborts the push (no torn frame), unmaps + recycles the slot, and surfaces \`onError\` instead of leaking the staging slot.
+- **0.9.53** — Full layout-fingerprint validation in \`mount()\`: a same-\`frameByteSize\` but different-shape schema is rejected (deep field-by-field compare) instead of silently misdecoding the SAB.
+- **0.9.46** — \`connect()\` one-call topology constructor (final frontier track). Declarative \`latencyHint\` sizing, Turbo/Standard auto-resolution with graceful \`ConnectUnsupportedError\` carrying \`report.fixes\`, postMessage-safe handle/mount split.
+- **0.9.45** — \`Bridge<S, Role>\` real-time-safety role lattice. Phantom role brand makes \`Atomics.wait\` + \`setInterval\` methods a compile error on worklet-branded handles; zero runtime cost.
+- **0.9.44** — Frontier "King-track" cohort: confidence-bounded predictive extrapolation, deterministic record/replay timeline + offline bounce, schema→zero-import worklet codegen (\`emitWorkletReader\`), TLA+/PlusCal SPSC model, written happens-before proof, loom-style interleaving fuzzer.
+- **0.9.43** — \`LLM_BUNDLE.md\` regeneration script (this generator).
 - **0.9.42** — Hybrid residual-on-carrier comparison + 15-item gap analysis (\`docs/hybrid-residual-comparison.md\`).
 - **0.9.41** — \`BridgeBlockConsumer.processAdd()\` for hybrid residual-on-carrier audio. Carrier survives GPU stalls (RMS continuity ~95-100% vs ~0% replace).
 - **0.9.40** — Standard mode shipped (\`MessageChannelBridge<S>\`, MVP1).
@@ -308,7 +352,7 @@ The full test files are not inlined here — ~5,000 lines combined. Each pins a 
 |---|---|
 ${inventoryRows}
 
-Test invocation: \`npm test\` (runs all 23 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
+Test invocation: \`npm test\` (runs all 30 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
 `;
 
   return `${headerMd}\n${tocMd}\n${sections.join("")}\n${inventoryMd}\n`;

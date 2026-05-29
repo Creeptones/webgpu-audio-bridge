@@ -4,6 +4,50 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.56] — 2026-05-29
+
+### Changed — inline the full `SpscRing` core in `LLM_BUNDLE.md`
+
+The bundle generator (`scripts/regenerate-llm-bundle.mjs`) shipped
+`src/SpscRing.ts` as **header-only** — but `SpscRing` is the correctness-critical
+core (SAB/Atomics counter arithmetic, the park/wake wait protocol, overflow
+policies, notify behavior). An auditor reading the bundle alone could verify the
+header math but not the actual implementation that backs it.
+
+`SpscRing.ts` is now inlined in **full** (promoted out of the header-only group),
+sitting alongside `formal/SpscRing.tla` so the modeled invariants and the real
+code are both present in one read. The remaining extracted heap-state machines
+(`FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`,
+`BridgeConsumer`, `BridgeProducer`, `BridgeWebNNSource`) stay header-only. This
+patch also folds in the in-flight generator updates (frontier design notes +
+formal artifacts now inlined, headline list and suite count refreshed to 30).
+
+### Why
+
+Addresses the audit's recurring caveat across categories 1 and 6 — that the core
+SPSC implementation was not inlined in the bundle, so the counter arithmetic,
+wait protocol, overflow policies, and notify behavior could not be verified from
+the artifact alone.
+
+### Wire compatibility
+
+Zero. Tooling/documentation only — no `src/` runtime change, no schema or SAB
+byte change. `LLM_BUNDLE.md` is a `.gitignore`d build artifact; the committed
+change is the generator script + this entry.
+
+### Tests
+
+No new pins (generator/doc change). Mandatory gates re-run green:
+`npm run typecheck`, `npm test` (30 suites), `npm run bench` (~1.20 µs baseline).
+Bundle regenerated and verified to contain deep `SpscRing` symbols
+(`_pullOverrunAware`, `publishPllState`, `drainNoNotify`) in the body, not just
+the header (`npm run llm-bundle` → 21,747 lines / ~1.17 MB).
+
+### Documentation
+
+This entry; `scripts/regenerate-llm-bundle.mjs` inclusion list + rationale comment
++ the bundle's "What this bundle contains" section.
+
 ## [0.9.55] — 2026-05-29
 
 ### Changed — allocation-free copy in `BridgeBlockConsumer.process()`
