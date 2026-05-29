@@ -492,8 +492,9 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    *
    * Hot-path cost: one `bridge.pull` per `blockSize` samples (so for
    * 1024-sample blocks and 128-sample quanta, one pull per 8 calls);
-   * the inter-pull calls are a single `Float32Array.prototype.set` from
-   * an internal subarray view into the caller's buffer.
+   * the inter-pull calls copy `take` samples with an allocation-free
+   * indexed loop over cached locals (0.9.55 — no per-chunk `subarray`
+   * view), matching the additive `processAdd` / `_mixWindow` paths.
    */
   process(out: Float32Array, count: number = out.length): void {
     if (this.channels > 1) {

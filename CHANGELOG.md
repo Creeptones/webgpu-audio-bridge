@@ -4,6 +4,44 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.60] — 2026-05-29
+
+### Changed — fix stale `subarray` description in `BridgeBlockConsumer.process()` doc
+
+`process()`'s JSDoc still described its hot path as "a single
+`Float32Array.prototype.set` from an internal subarray view into the caller's
+buffer" — the pre-0.9.55 behavior. 0.9.55 replaced that with an allocation-free
+indexed loop, so the doc contradicted the code. Updated to describe the
+allocation-free cached-locals loop and cross-reference the additive
+`processAdd` / `_mixWindow` paths.
+
+Comment-only; the two other `subarray` mentions in the file are the 0.9.55
+inline comments that correctly describe what was *replaced*, so they're accurate
+and left as-is.
+
+### Why
+
+Clears the audit's last item: "there is at least one stale comment in
+`BridgeBlockConsumer.process()` saying subarray even though the code no longer
+does that." Stale hot-path docs on a render-loop method mislead readers about
+the allocation profile.
+
+### Wire compatibility
+
+Zero. Doc-comment only — no `src/` logic, schema, SAB byte, or public-API change.
+Bit-for-bit identical runtime to 0.9.59.
+
+### Tests
+
+No new pins (comment-only); the 0.9.55 byte-equivalence pin
+(`tests/BridgeBlockConsumer.test.ts#34`) already pins the behavior the doc now
+describes. Mandatory gates re-run green: `npm run typecheck`, `npm test`
+(30 suites), `npm run bench` (~1.20 µs baseline).
+
+### Documentation
+
+This entry; the corrected `process()` doc-comment.
+
 ## [0.9.59] — 2026-05-29
 
 ### Changed — inline the remaining internal machinery + facades in `LLM_BUNDLE.md`
