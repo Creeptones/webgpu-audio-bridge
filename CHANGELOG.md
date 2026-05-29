@@ -4,6 +4,107 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.71] — 2026-05-29
+
+### Added — first-class "negative latency" mode: `pullPredictedLatest` + readback-median lead source
+
+The confidence-bounded predictive extrapolation that shipped as a standalone
+primitive in 0.9.44 (`predictiveExtrapolateInto`) is now wired into the Bridge
+as a first-class consumer pull. `pullPredictedLatest` renders every trajectory
+field **forward by `leadMs`** so the audio block carries where the macro state
+is *expected to be* once it is heard — not where the last GPU readback left it.
+For a smooth field whose freshest frame is `leadMs` stale, leading by `leadMs`
+cancels the perceived readback latency. This is the "look past the wall" upgrade.
+
+```ts
+bridge.pullPredictedLatest(out, {
+  leadMs: bridge.lastReadbackMedianMs(), // lead by the measured readback wall
+  maxLeadMs: 20,                         // hard horizon ceiling
+  confidenceFloor: 0.25,                 // don't lead a marginally-locked clock
+  consumerNs: currentTime * 1e9,         // warms the PLL (sole per-quantum call)
+});
+```
+
+#### Why this is safe by construction
+
+The forward step IS the shipped confidence→horizon curve, so degradation is
+automatic and bounded:
+
+- A cold / unlocked PLL collapses to a pure order-1 hold — byte-identical to
+  `pullLatest`. Prediction never runs on an untrusted clock.
+- Low clock confidence shrinks the effective horizon AND crossfades the result
+  back toward the hold (`out = w·taylor(w·lead) + (1−w)·hold`).
+- A lead at/beyond `maxLeadMs` fades fully to the hold (no extrapolation past
+  the ceiling).
+- The new opt-in `confidenceFloor` adds a hard cliff: if the confidence weight
+  `w = c_sigma·c_horizon` is below the floor, lead nothing.
+
+So `pullPredictedLatest` is **always at least as safe as `pullLatest`** — the
+worst case is "no prediction," never a wild excursion. Per-sample schema clamps
+(`velocityClamp` / `accelerationClamp` / …) still fire; the horizon clamp is
+orthogonal. **Use only for smooth macro fields** (envelopes, positions, spectra,
+IR-morph values, physical surfaces); never for discontinuous events (note-on,
+transport jumps, mutes, hard resets) — forward-extrapolating a step pre-echoes
+it. Route those through `BridgeInputLane`.
+
+#### What shipped
+
+- **`Bridge.pullPredictedLatest(out, opts?)`** — drains to latest into a cached
+  frame (lifecycle mirrors `pullEvaluatedLatest`, so it keeps predicting off the
+  cache through a brief producer famine), optionally warms the PLL when
+  `opts.consumerNs` + `.withTimestamps(...)` are present, then runs
+  `predictiveExtrapolateInto` per trajectory field at `dt = clamp(leadMs, 0,
+  maxLeadMs)`. Non-trajectory fields pass through from the cached frame verbatim.
+  Returns a `PredictedPullResult` (`skipped` / `predicted` / `confidenceWeight`
+  / `dtEffectiveSeconds` / `leadSecondsRequested` / `valueUncertainty`) for
+  observability. The per-field hold scratch is allocated once and reused — the
+  predictive hot loop allocates nothing.
+- **`Bridge.recordReadbackLatency(ms)` / `Bridge.lastReadbackMedianMs()`** — a
+  fixed-size rolling window (31 samples) + in-place median. Readback latency is
+  a producer-side quantity (the wall-clock gap between a compute pass submitting
+  and its `mapAsync` resolving) and CANNOT be recovered from the consumer PLL —
+  the loop folds the constant delay into its learned offset, so apparent frame
+  staleness is ~0. So the measuring side records it; post across threads if the
+  consumer is elsewhere. Median (not mean) so one stalled readback doesn't yank
+  the lead.
+- **`predictiveExtrapolateInto` gains `config.confidenceFloor`** (default 0,
+  bit-exact with prior releases) — the hard confidence cliff, implemented in the
+  pure module so it's independently testable.
+- Additive public API: `PredictedPullOptions<S>`, `PredictedPullResult`,
+  `DEFAULT_MAX_LEAD_MS` (20) exported from the root.
+
+### Why
+
+Roadmap item: "Turn predictive extrapolation into a first-class negative-latency
+mode." The primitive existed since 0.9.44 but callers had to hand-build the
+`PllUncertainty` snapshot, allocate hold scratch, loop fields, and source a lead
+themselves. This collapses it to one method + a documented lead source, with the
+safety story (cold→hold, floor gate, famine-rides-the-cache) baked in.
+
+### Wire compatibility
+
+**Wire-equivalent.** No SAB header / payload / size change — `pullPredictedLatest`
+is a heap-side consumer computation over the existing frame format (same posture
+as `pullEvaluatedLatest`). Purely additive public API. A predicting consumer
+interoperates with any existing producer.
+
+### Tests
+
+38 Node suites green. New `tests/Bridge.predictLatest.test.ts` (8 pins, 91–98):
+cold-PLL-holds-like-`pullLatest`, warm-PLL-leads-forward (output bit-matches the
+`w·taylor(dtEff)+(1−w)·hold` blend recovered from the returned weight),
+`confidenceFloor` gates at the Bridge level, non-trajectory passthrough, famine
+predicts off the cache, readback-median over explicit samples, readback-window
+circular saturation, and lead-clamp + argument validation.
+`tests/Bridge.predict.test.ts` gains pin 90 (the `confidenceFloor` hard cliff in
+the pure module). `push`/`pull`/`pullLatest` bench medians unchanged at ~1.20 μs.
+
+### Documentation
+
+README §`pullPredictedLatest` (full worked worklet example + the safety/usage
+contract) and two API-reference entries; CHANGELOG (this block); ROADMAP shipped
+row.
+
 ## [0.9.70] — 2026-05-29
 
 ### Added — v2 waiter-flag (conditional) notify protocol: design + proof + guarded experimental implementation

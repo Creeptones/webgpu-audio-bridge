@@ -68,6 +68,11 @@
  *
  *   w = c_sigma · c_horizon                       (∈ [0, 1])
  *
+ * An optional `confidenceFloor` then gates `w` with a hard cliff: if
+ * `w < confidenceFloor` it is forced to 0 (pure hold), so a marginally-
+ * confident clock leads nothing rather than injecting low-confidence wobble.
+ * Default 0 (no gate; bit-exact with every prior release).
+ *
  * The weight is applied TWICE, deliberately conservative:
  *
  *   1. It shrinks the EFFECTIVE horizon:  dtEff = w · dtReqAbs.
@@ -164,6 +169,15 @@ export interface PredictiveExtrapolationConfig {
   /** Conservative sigma (ns) substituted when the real sigma is unknown
    *  (sigma=0 or unlocked). Default = sigmaFloorNs ⇒ c_sigma = 0 ⇒ hold. */
   readonly seedingSigmaNs?: number;
+  /** Hard confidence gate in [0, 1]. After the weight `w = c_sigma·c_horizon`
+   *  is formed, if `w < confidenceFloor` the weight is forced to **0** —
+   *  prediction collapses to the pure order-1 hold (dtEff = 0). This is a
+   *  cliff, not a rescale: below the floor we do not predict at all; at or
+   *  above it `w` is used unchanged. Default `0` (no gate — every prior
+   *  release's behavior is preserved bit-exact). Use it to say "only lead the
+   *  signal when the clock is at least this trustworthy," so a marginally-
+   *  locked PLL doesn't inject low-confidence wobble into a macro field. */
+  readonly confidenceFloor?: number;
 }
 
 /** Diagnostics returned alongside the filled `out` buffer. */
@@ -273,7 +287,13 @@ export function predictiveExtrapolateInto(
     cHorizon = clamp01(cHorizon - driftInflation);
   }
 
-  const w = cSigma * cHorizon;
+  // Confidence floor (a hard cliff, not a rescale): below it we do not
+  // predict at all. Computed from the un-floored product so the gate
+  // compares the TRUE confidence against the threshold; a 0 floor (default)
+  // leaves every prior release's weight bit-exact.
+  const confidenceFloor = config?.confidenceFloor ?? 0;
+  const wRaw = cSigma * cHorizon;
+  const w = wRaw < confidenceFloor ? 0 : wRaw;
   const dtEff = w * dtReqAbs;
 
   // Evaluate the Taylor series at the SHRUNK horizon. spec passes through

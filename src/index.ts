@@ -41,12 +41,18 @@ export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
 // factories over a single `Bridge.allocate(...)`. See
 // docs/rt-safety-lattice-design.md.
 export { forWorklet, forWorker } from "./Bridge.js";
+// Predictive "negative latency" mode (0.9.71) — `pullPredictedLatest` +
+// `lastReadbackMedianMs` live on the Bridge class; the lead ceiling constant
+// and the option / result shapes are exported for callers + tests.
+export { DEFAULT_MAX_LEAD_MS } from "./Bridge.js";
 export type { BridgeRole, DefaultRole } from "./Bridge.js";
 export type {
   BridgeAllocation,
   BridgeOptions,
   SmoothedPullOptions,
   SmootherSkipPolicy,
+  PredictedPullOptions,
+  PredictedPullResult,
   // Observability snapshot + subscription seam (0.7.3)
   TelemetrySnapshot,
   TelemetryListener,

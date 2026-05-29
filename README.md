@@ -310,6 +310,14 @@ Consumer side. Drains to the newest available frame into `out`, discarding older
 
 **This is the typical AudioWorklet read path:** the worklet wants the freshest macro state per quantum, not a queue.
 
+#### `pullPredictedLatest(out, opts?) → PredictedPullResult`
+
+Consumer side, **first-class "negative latency" mode** (0.9.71). Drains to the newest frame and renders every trajectory field **forward by `opts.leadMs`**, confidence-bounded by the PLL, so the block carries where the macro state is *expected to be* once heard. Degrades to a plain latest-frame hold when the clock is cold / below `opts.confidenceFloor` / the lead exceeds `opts.maxLeadMs` — always at least as safe as `pullLatest`. `out` must be a `scratchEvaluatedFrame()`. Use only for **smooth** macro fields (envelopes, positions, spectra, surfaces), never discontinuous events. See [`pullPredictedLatest`](#pullpredictedlatest--first-class-negative-latency-mode-0971).
+
+#### `recordReadbackLatency(ms)` / `lastReadbackMedianMs() → number`
+
+Feed measured GPU-readback round-trip latencies (ms) into a rolling window; read back the median (0 before any sample). Source a sensible `leadMs` for `pullPredictedLatest` straight from `lastReadbackMedianMs()`. Readback latency is producer-side-measured — record it on the handle you predict from (post across threads if needed).
+
 #### `pushChecked(frame) → boolean`
 
 Same as `push` but validates `frame`'s scalar field types and typed-array lengths against the schema first. Use in tests / debug builds; the production hot path should call `push` and trust caller-side construction (typically via `scratchFrame()` reuse).
@@ -782,6 +790,36 @@ Cache semantics on empty pulls: when `pullLatest` returns -1, `pullEvaluatedLate
 `bridge.resetEvalCache()` invalidates the cache (use on `AudioContext` suspend/resume or producer-epoch changes). Independent of `resetSmoother()` and `resetPll()`.
 
 This is the **second cut** of Pillar 3. The `EvalMode` dispatch (`step` / `alpha` / `trajectory` / `catmull`) and per-quantum batch API are still queued as follow-up patches.
+
+#### `pullPredictedLatest` — first-class "negative latency" mode (0.9.71)
+
+`pullEvaluatedLatest` renders each trajectory field *at the frame's stamped state*. `pullPredictedLatest` renders it **forward by `leadMs`** — so the audio block carries where the macro state is *expected to be* once it is heard, not where the last GPU readback left it. For a smooth field whose freshest frame is `leadMs` stale, leading by `leadMs` cancels the perceived readback latency. This is the "look past the wall" upgrade built on the confidence-bounded `predictiveExtrapolateInto` curve.
+
+```ts
+process(_inputs, outputs) {
+  const block = outputs[0][0];
+  const r = this.bridge.pullPredictedLatest(this.evalFrame, {
+    leadMs: this.bridge.lastReadbackMedianMs(), // lead by the measured readback wall
+    maxLeadMs: 20,                              // hard horizon ceiling
+    confidenceFloor: 0.25,                      // don't lead a marginally-locked clock
+    consumerNs: currentTime * 1e9,             // warms the PLL (sole per-quantum call)
+  });
+  // r.predicted / r.confidenceWeight / r.dtEffectiveSeconds are observability.
+  for (let i = 0; i < block.length; i++) block[i] = this.synth.step(this.evalFrame.vEff);
+  return true;
+}
+
+// Producer side (or wherever GPU readback is timed): feed the median.
+source.onReadbackComplete = (ms) => bridge.recordReadbackLatency(ms);
+```
+
+**Safety is the whole point.** The forward step is the same confidence→horizon curve as `predictiveExtrapolateInto`: a cold/unlocked PLL collapses to a pure hold (≡ `pullLatest`), low clock confidence shrinks the horizon and crossfades back toward the hold, and a lead at/beyond `maxLeadMs` fades fully to the hold. So `pullPredictedLatest` is **always at least as safe as `pullLatest`** — the worst case is "no prediction," never a wild excursion. The optional `confidenceFloor` adds a hard cliff: below it, lead nothing. Per-sample schema clamps (`velocityClamp` / `accelerationClamp` / …) still fire — the horizon clamp is orthogonal.
+
+**Use only for smooth macro fields** — envelopes, positions, spectra, IR-morph values, physical surfaces. **Do not** predict discontinuous events (note-on, transport jumps, mutes, hard resets): forward-extrapolating a step pre-echoes it. Route those through `BridgeInputLane`.
+
+Frame lifecycle mirrors `pullEvaluatedLatest`: the newest frame is cached, so during a brief producer famine (ring empty) it keeps predicting off the last known frame — the negative-latency budget that rides over a GPU stall. Non-trajectory fields pass through from the cached frame verbatim.
+
+`lastReadbackMedianMs()` returns the median of recently `recordReadbackLatency(ms)`-recorded samples (0 before any sample). Readback latency is a **producer-side** quantity — the wall-clock gap between a compute pass submitting and its `mapAsync` resolving; it can't be recovered from the consumer PLL, which folds the constant delay into its learned offset. So the measuring side records it; if readback is timed on a different thread than the consumer, post the value across and `recordReadbackLatency` on the consumer's handle. Median (not mean) so one stalled readback doesn't yank the lead.
 
 ## BridgeGPUSource
 

@@ -268,6 +268,10 @@ import {
   evaluateTrajectoryInto,
   evaluateHermiteTrajectoryInto,
 } from "./trajectory.js";
+import {
+  predictiveExtrapolateInto,
+  type PllUncertainty,
+} from "./predictiveExtrapolation.js";
 import { newHeapTypedArray, buildScratchFrame } from "./_heap.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
@@ -321,6 +325,97 @@ export type SmootherSkipPolicy = "stall-smooth" | "catch-up";
  *  default that preserves all pre-0.6.6 behavior bit-exact. */
 export interface SmoothedPullOptions {
   readonly skipPolicy?: SmootherSkipPolicy;
+}
+
+/** Default ceiling (ms) on the forward lead `pullPredictedLatest` will apply
+ *  when `opts.maxLeadMs` is omitted. Matches `predictiveExtrapolation`'s
+ *  20 ms default max horizon. (0.9.71) */
+export const DEFAULT_MAX_LEAD_MS = 20;
+
+/** Number of recent readback-latency samples retained for the
+ *  `lastReadbackMedianMs()` rolling median. Odd so the median is a single
+ *  middle element (no averaging). ~0.5 s of history at a 60 Hz frame
+ *  cadence. Heap-side, per-instance. (0.9.71) */
+const READBACK_SAMPLE_WINDOW = 31;
+
+/**
+ * Options for `pullPredictedLatest` (0.9.71 — first-class "negative latency"
+ * mode). All fields optional; the defaults degrade to a plain `pullLatest`
+ * (zero lead ⇒ the freshest frame's stamped state, no forward extrapolation).
+ *
+ * Use predicted pulls ONLY for smooth macro fields — envelopes, positions,
+ * spectra, IR-morph values, physical surfaces — where a confidence-bounded
+ * forward step beats rendering a stale frame. Do NOT use it for discontinuous
+ * events (note-on, transport jumps, mutes, hard resets): forward-extrapolating
+ * a step injects a pre-echo. Those belong on the `BridgeInputLane` fast lane.
+ */
+export interface PredictedPullOptions<S extends Schema<FieldsObject, any>> {
+  /** Forward lead in **milliseconds** — how far past the freshest frame's
+   *  stamped state to render each trajectory field. Clamped to `[0, maxLeadMs]`.
+   *  Default `0` (≡ `pullLatest`). Source a sensible value from
+   *  `lastReadbackMedianMs()` so the audio side renders where the macro state
+   *  is *expected to be* once the block is heard, not where the last GPU
+   *  readback left it. */
+  readonly leadMs?: number;
+  /** Hard ceiling (ms) on the lead AND on the predictive horizon taper.
+   *  Default `DEFAULT_MAX_LEAD_MS` (20). A lead at/above this fades fully to
+   *  the hold (no extrapolation past the ceiling). */
+  readonly maxLeadMs?: number;
+  /** Confidence floor in `[0, 1]`. If the computed confidence weight
+   *  `w = c_sigma·c_horizon` is below this, prediction collapses to the pure
+   *  hold for that frame (a hard cliff, not a rescale). Default `0` (no gate).
+   *  Raise it to keep a marginally-locked PLL from leading the signal. */
+  readonly confidenceFloor?: number;
+  /** Forward distance (ms) below which prediction is fully trusted
+   *  (`c_horizon = 1`). Maps to `trustedHorizonSeconds`. Default `0` (every
+   *  forward step sits in the taper). */
+  readonly trustedLeadMs?: number;
+  /** sigma (ns) at/above which the clock is considered untrustworthy
+   *  (`c_sigma = 0`). Maps to `sigmaFloorNs`. Default `2_000_000` (2 ms) from
+   *  the predictive module. */
+  readonly sigmaFloorNs?: number;
+  /** Consumer wall-clock (ns) at the moment of this pull. When provided AND
+   *  the schema has `.withTimestamps(...)`, a fresh pull drives the PLL
+   *  (`observeConsumerTime`) — so a worklet can make `pullPredictedLatest` its
+   *  sole per-quantum call and keep the clock warm. Omit it if you warm the
+   *  PLL elsewhere (e.g. a prior `pullEvaluatedLatest`); prediction then uses
+   *  the PLL's current uncertainty snapshot as-is. */
+  readonly consumerNs?: number;
+  /** Sample rate (Hz) for resolving a `samples`-unit timestamp role on the
+   *  warm path. Falls back to `setSampleRate(rate)`. Unused for ns/us/ms/s
+   *  roles or when `consumerNs` is omitted. */
+  readonly sampleRate?: number;
+  /** Timestamp role to observe on the warm path. Defaults to the schema's
+   *  default role. Unused when `consumerNs` is omitted. */
+  readonly timestamp?: TimestampRoleOf<S>;
+}
+
+/** Diagnostics returned by `pullPredictedLatest` (0.9.71). A fresh small
+ *  object per call, matching the `telemetry()` / `SpscPullResult` idiom. */
+export interface PredictedPullResult {
+  /** Frames skipped draining to the newest available frame (0 if a single
+   *  frame was waiting), or `-1` if the ring was empty AND no cached frame
+   *  exists yet (nothing predicted; `out` untouched). When the ring is empty
+   *  but a prior frame is cached, this is `-1`-was-empty but prediction still
+   *  runs off the cache; callers distinguish via `predicted`. */
+  readonly skipped: number;
+  /** True iff a forward step was actually applied (`dtEffectiveSeconds > 0`).
+   *  False when the lead was 0, the PLL was cold/below the floor, or the
+   *  schema has no trajectory fields — in all of which the output equals a
+   *  plain latest-frame hold. */
+  readonly predicted: boolean;
+  /** The confidence weight `w ∈ [0, 1]` applied to every trajectory field
+   *  (identical across fields — it depends only on the clock + horizon, not
+   *  on field values). 0 when cold / gated / no trajectory fields. */
+  readonly confidenceWeight: number;
+  /** The horizon actually evaluated (`= w · leadSeconds`), ≤ the requested
+   *  lead. */
+  readonly dtEffectiveSeconds: number;
+  /** The requested lead in seconds after clamping to `[0, maxLeadMs]`. */
+  readonly leadSecondsRequested: number;
+  /** Largest value-domain uncertainty proxy across the trajectory fields
+   *  (`max_i |v_i| · sigmaDt`). 0 when no order≥2 field was predicted. */
+  readonly valueUncertainty: number;
 }
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
@@ -518,6 +613,24 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   private cachedSampleRate: number = 0;
   /** Optional default sample rate registered via `setSampleRate(rate)`. */
   private defaultSampleRate: number = 0;
+
+  /** Per-trajectory-field hold scratch for `pullPredictedLatest` (0.9.71).
+   *  Lazily allocated on first predicted pull; one buffer per trajectory
+   *  field, sized to its `sampleCount`, matching the field kind (f64/f32).
+   *  Reused across calls — the predictive hot loop allocates nothing. */
+  private _predictHoldScratch: Record<string, Float64Array | Float32Array> | null = null;
+
+  /** Rolling window of recent readback-latency samples (ms) backing
+   *  `lastReadbackMedianMs()` (0.9.71). A fixed-size circular buffer; `_count`
+   *  saturates at the window length and `_head` is the next write slot. Fed by
+   *  `recordReadbackLatency(ms)` and by `pullPredictedLatest`'s warm path
+   *  (observed frame staleness). Heap-side, per-instance. */
+  private readonly _readbackSamples = new Float64Array(READBACK_SAMPLE_WINDOW);
+  private _readbackHead = 0;
+  private _readbackCount = 0;
+  /** Reused scratch for the median computation so `lastReadbackMedianMs()`
+   *  sorts in place without allocating. */
+  private readonly _readbackSortScratch = new Float64Array(READBACK_SAMPLE_WINDOW);
 
   /** Lower floor on the classifier's OK band — `_classifyInvariant` uses
    *  `max(invariantAbsoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`. Set
@@ -1254,6 +1367,253 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    */
   resetEvalCache(): void {
     this.cachedEvalValid = false;
+  }
+
+  /**
+   * Record one GPU-readback round-trip latency sample, in **milliseconds**,
+   * into the rolling window read by `lastReadbackMedianMs()` (0.9.71).
+   *
+   * Readback latency is a producer-side quantity — the wall-clock gap between
+   * a compute pass submitting and its `mapAsync` resolving. (It can NOT be
+   * recovered from the consumer PLL: the loop folds the constant readback
+   * delay into its learned offset, so `phaseLockedTime(now)` maps back onto
+   * the freshest frame's stamp and the apparent staleness is ~0.) So the
+   * measuring side calls this with its own timing; record it on the same
+   * Bridge handle you `pullPredictedLatest` from, or — if readback is timed on
+   * a different thread than the consumer — post the value across and record it
+   * on the consumer's handle.
+   *
+   * Non-finite or negative samples are ignored (defensive — a bad clock read
+   * shouldn't poison the median). Allocation-free; safe from a `process()`
+   * loop.
+   */
+  recordReadbackLatency(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) return;
+    this._readbackSamples[this._readbackHead] = ms;
+    this._readbackHead = (this._readbackHead + 1) % READBACK_SAMPLE_WINDOW;
+    if (this._readbackCount < READBACK_SAMPLE_WINDOW) this._readbackCount++;
+  }
+
+  /**
+   * Median of the recent readback-latency samples, in **milliseconds**
+   * (0.9.71). Returns `0` when no sample has been recorded yet — a safe lead
+   * (predicts nothing). Feed it straight into `pullPredictedLatest`'s
+   * `leadMs` so the forward step tracks the measured readback wall:
+   *
+   *     bridge.pullPredictedLatest(out, {
+   *       leadMs: bridge.lastReadbackMedianMs(),
+   *       maxLeadMs: 20,
+   *       confidenceFloor: 0.25,
+   *       consumerNs: currentTime * 1e9,
+   *     });
+   *
+   * Median (not mean) so a single stalled readback doesn't yank the lead.
+   * Sorts a reused scratch buffer in place — allocation-free.
+   */
+  lastReadbackMedianMs(): number {
+    const n = this._readbackCount;
+    if (n === 0) return 0;
+    const scratch = this._readbackSortScratch;
+    for (let i = 0; i < n; i++) scratch[i] = this._readbackSamples[i]!;
+    // Sort only the populated prefix. Sorting the whole window would drag
+    // unwritten zeros into the low half and bias the median down while the
+    // buffer is still filling.
+    const view = scratch.subarray(0, n);
+    view.sort();
+    const mid = n >> 1;
+    // Odd n → middle element; even n → mean of the two central elements.
+    return (n & 1) === 1 ? view[mid]! : (view[mid - 1]! + view[mid]!) / 2;
+  }
+
+  /**
+   * First-class "negative latency" pull (0.9.71). Drains to the newest
+   * available frame and renders every trajectory field **forward by `leadMs`**
+   * — confidence-bounded by the consumer PLL — so the audio block carries
+   * where the macro state is *expected to be* once it is heard, not where the
+   * last GPU readback left it. For a smooth field whose freshest frame is
+   * `leadMs` stale, leading by `leadMs` cancels the perceived readback latency.
+   *
+   * The forward step is the confidence-bounded `predictiveExtrapolateInto`:
+   * a cold/unlocked PLL collapses to a pure hold (≡ `pullLatest`), low
+   * confidence shrinks the horizon and crossfades back toward the hold, and a
+   * lead at/beyond `maxLeadMs` fades fully to the hold. So this is always at
+   * least as safe as `pullLatest`: the worst case is "no prediction," never a
+   * wild excursion. (Per-sample trajectory clamps on the schema still fire —
+   * the horizon clamp is orthogonal.)
+   *
+   * **Use only for smooth macro fields** — envelopes, positions, spectra,
+   * IR-morph values, physical surfaces. Do NOT predict discontinuous events
+   * (note-on, transport jumps, mutes, hard resets): forward-extrapolating a
+   * step pre-echoes it. Route those through `BridgeInputLane`.
+   *
+   * Frame lifecycle mirrors `pullEvaluatedLatest`: the newest frame is cached,
+   * so during a brief producer famine (ring empty) this keeps predicting off
+   * the last known frame — the negative-latency budget that rides over a GPU
+   * stall. Non-trajectory fields pass through from the cached frame verbatim
+   * (the latest known state — no extrapolation is defined for them).
+   *
+   * `out` must be a `scratchEvaluatedFrame()` (trajectory fields sized to
+   * `sampleCount`). Returns a `PredictedPullResult` with the applied weight +
+   * effective horizon for observability.
+   */
+  pullPredictedLatest(
+    out: FrameFor<S>,
+    opts?: PredictedPullOptions<S>,
+  ): PredictedPullResult {
+    const leadMsRaw = opts?.leadMs ?? 0;
+    const maxLeadMs = opts?.maxLeadMs ?? DEFAULT_MAX_LEAD_MS;
+    if (!Number.isFinite(leadMsRaw) || leadMsRaw < 0) {
+      throw new Error(
+        `pullPredictedLatest: leadMs must be a non-negative finite number, got ${leadMsRaw}`,
+      );
+    }
+    if (!Number.isFinite(maxLeadMs) || maxLeadMs < 0) {
+      throw new Error(
+        `pullPredictedLatest: maxLeadMs must be a non-negative finite number, got ${maxLeadMs}`,
+      );
+    }
+    const leadMs = leadMsRaw > maxLeadMs ? maxLeadMs : leadMsRaw;
+    const leadSeconds = leadMs * 1e-3;
+
+    if (this.cachedRawFrame === null) {
+      this.cachedRawFrame = this.scratchFrame();
+    }
+    const skipped = this.pullLatest(this.cachedRawFrame);
+    if (skipped >= 0) {
+      // Fresh frame — warm the PLL + record staleness when the caller supplied
+      // a consumer clock and the schema carries timestamps. Same observe
+      // gating as pullEvaluatedLatest: only on a fresh pull (repeating a stale
+      // producer stamp at advancing consumer times would poison the residual).
+      const consumerNs = opts?.consumerNs;
+      if (this.schema.timestamps !== null && consumerNs !== undefined) {
+        if (!Number.isFinite(consumerNs)) {
+          throw new Error(
+            `pullPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
+          );
+        }
+        const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
+        const role = this.schema.timestamps.roles[roleName];
+        if (!role) {
+          throw new Error(
+            `pullPredictedLatest: unknown timestamp role '${String(roleName)}'`,
+          );
+        }
+        let sr = opts?.sampleRate ?? this.defaultSampleRate;
+        if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
+          throw new Error(
+            `pullPredictedLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
+          );
+        }
+        const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
+        const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
+        this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
+        this.observeConsumerTime(consumerNs, this.cachedTimestampNs);
+      }
+      this.cachedEvalValid = true;
+    } else if (!this.cachedEvalValid) {
+      // Ring empty and nothing cached — nothing to predict from.
+      return {
+        skipped: -1,
+        predicted: false,
+        confidenceWeight: 0,
+        dtEffectiveSeconds: 0,
+        leadSecondsRequested: leadSeconds,
+        valueUncertainty: 0,
+      };
+    }
+
+    // Build the decoupled PLL uncertainty snapshot once (shared across fields).
+    const pllSnap: PllUncertainty = {
+      sigmaEstimateNs: this.pll.sigmaEstimateNs,
+      driftPpm: this.pll.driftPpm,
+      driftEstimatorEnabled: this.pll.driftEstimatorEnabled,
+      locked: this.pll.locked,
+    };
+    const config = {
+      maxHorizonSeconds: maxLeadMs * 1e-3,
+      trustedHorizonSeconds: (opts?.trustedLeadMs ?? 0) * 1e-3,
+      sigmaFloorNs: opts?.sigmaFloorNs,
+      confidenceFloor: opts?.confidenceFloor,
+    };
+
+    if (this._predictHoldScratch === null) {
+      this._predictHoldScratch = this._buildPredictHoldScratch();
+    }
+    const holdScratch = this._predictHoldScratch;
+    const src = this.cachedRawFrame as unknown as Record<string, unknown>;
+    const dst = out as unknown as Record<string, unknown>;
+    const fields = this.schema.compiled.fields;
+
+    let confidenceWeight = 0;
+    let dtEffectiveSeconds = 0;
+    let valueUncertainty = 0;
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i]!;
+      const name = field.name;
+      if (field.trajectory) {
+        // Confidence-bounded forward extrapolation. The weight + effective
+        // horizon are identical across trajectory fields (they depend only on
+        // the clock + horizon, not on field values), so capturing the last
+        // field's result is representative; valueUncertainty is per-field, so
+        // take the max.
+        const r =
+          field.kind === "f32"
+            ? predictiveExtrapolateInto(
+                src[name] as Float32Array,
+                field.trajectory,
+                leadSeconds,
+                pllSnap,
+                dst[name] as Float32Array,
+                holdScratch[name] as Float32Array,
+                config,
+              )
+            : predictiveExtrapolateInto(
+                src[name] as Float64Array,
+                field.trajectory,
+                leadSeconds,
+                pllSnap,
+                dst[name] as Float64Array,
+                holdScratch[name] as Float64Array,
+                config,
+              );
+        confidenceWeight = r.confidenceWeight;
+        dtEffectiveSeconds = r.dtEffectiveSeconds;
+        if (r.valueUncertainty > valueUncertainty) valueUncertainty = r.valueUncertainty;
+      } else if (field.isArray) {
+        // Non-trajectory array — pass through the latest known state verbatim.
+        (dst[name] as { set(s: ArrayLike<unknown>): void }).set(
+          src[name] as ArrayLike<unknown>,
+        );
+      } else {
+        // Scalar — pass through.
+        dst[name] = src[name];
+      }
+    }
+
+    return {
+      skipped,
+      predicted: dtEffectiveSeconds > 0,
+      confidenceWeight,
+      dtEffectiveSeconds,
+      leadSecondsRequested: leadSeconds,
+      valueUncertainty,
+    };
+  }
+
+  /** Build one hold-scratch buffer per trajectory field, sized to its
+   *  `sampleCount` and matching its kind. Called lazily on the first
+   *  `pullPredictedLatest`. (0.9.71) */
+  private _buildPredictHoldScratch(): Record<string, Float64Array | Float32Array> {
+    const scratch: Record<string, Float64Array | Float32Array> = {};
+    for (const field of this.schema.compiled.fields) {
+      if (field.trajectory) {
+        scratch[field.name] = newHeapTypedArray(
+          field.kind,
+          field.trajectory.sampleCount,
+        ) as Float64Array | Float32Array;
+      }
+    }
+    return scratch;
   }
 
   /**

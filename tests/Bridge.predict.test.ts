@@ -23,6 +23,7 @@
  *  87. testValueUncertaintyFormula
  *  88. testAllocationFreeReuse
  *  89. testF32F64Parity
+ *  90. testConfidenceFloorGate
  */
 
 import {
@@ -311,6 +312,54 @@ function testF32F64Parity(): void {
   ok("89 f32/f64 parity");
 }
 
+// ── 90. confidenceFloor is a hard cliff: below it → pure hold ───────────────
+//
+// A mid-confidence clock (w ≈ 0.5) predicts normally with no floor, but a
+// floor ABOVE the natural weight forces w=0 (hold); a floor AT/BELOW it leaves
+// the weight untouched (bit-exact with the no-floor call).
+function testConfidenceFloorGate(): void {
+  const flat = makeOrder2Flat();
+  const out = new Float64Array(N);
+  const hold = new Float64Array(N);
+  const dt = 0.005;
+  const floor = 2_000_000;
+  const midPll: PllUncertainty = {
+    sigmaEstimateNs: floor / 2, // c_sigma = 0.5
+    driftPpm: 0,
+    driftEstimatorEnabled: false,
+    locked: true,
+  };
+  const base = { trustedHorizonSeconds: 0.01, sigmaFloorNs: floor }; // c_horizon=1 → w=0.5
+  // No floor → predicts at w=0.5. Snapshot the result before it's overwritten.
+  const rNoFloor = predictiveExtrapolateInto(flat, SPEC2, dt, midPll, out, hold, base);
+  assert(approx(rNoFloor.confidenceWeight, 0.5, 1e-12), "no floor → w=0.5");
+  const noFloorSnap = Float64Array.from(out);
+
+  // Floor above the natural weight → collapses to hold.
+  const gatedOut = new Float64Array(N);
+  const rGated = predictiveExtrapolateInto(flat, SPEC2, dt, midPll, gatedOut, hold, {
+    ...base,
+    confidenceFloor: 0.75,
+  });
+  assertEq(rGated.confidenceWeight, 0, "floor above w → w=0");
+  assertEq(rGated.dtEffectiveSeconds, 0, "gated → dtEff=0");
+  for (let i = 0; i < N; i++) {
+    assertEq(gatedOut[i]!, i, `gated out[${i}] is the held position`);
+  }
+
+  // Floor at/below the natural weight → unchanged (bit-exact with no floor).
+  const atFloorOut = new Float64Array(N);
+  const rAtFloor = predictiveExtrapolateInto(flat, SPEC2, dt, midPll, atFloorOut, hold, {
+    ...base,
+    confidenceFloor: 0.5,
+  });
+  assert(approx(rAtFloor.confidenceWeight, 0.5, 1e-12), "floor == w → unchanged");
+  for (let i = 0; i < N; i++) {
+    assertEq(atFloorOut[i]!, noFloorSnap[i]!, `at-floor out[${i}] bit-equals no-floor`);
+  }
+  ok("90 confidenceFloor hard cliff");
+}
+
 function main(): void {
   testColdPllSeedsToHold();
   testConfidentFullStrengthBitEquals();
@@ -321,6 +370,7 @@ function main(): void {
   testValueUncertaintyFormula();
   testAllocationFreeReuse();
   testF32F64Parity();
+  testConfidenceFloorGate();
   console.log("\nAll Bridge predict tests passed.");
 }
 
