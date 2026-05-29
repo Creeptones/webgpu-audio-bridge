@@ -4,6 +4,81 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.61] — 2026-05-29
+
+### Added — `emitWgslStruct(schema, opts?)`: schema-derived WGSL struct codegen
+
+A new string-emitting codegen sibling to `emitWorkletReader`. Given a `Schema`
+(or a postMessage'd `SchemaLayoutDescription`) it emits a WGSL `struct` whose
+memory layout is **byte-isomorphic to the SAB frame** the `Bridge` reads/writes
+for that schema, making the TS `Schema` the single source of truth for the
+GPU-side struct as well as the CPU-side one.
+
+New public surface (exported from `src/index.ts`):
+
+- `emitWgslStruct(input, opts?) → string` — the WGSL `struct` (+ optional
+  trajectory helpers) as a source string.
+- `computeWgslLayout(input, opts?) → WgslLayout` — the testable spine: re-derives
+  member offsets/sizes from WGSL alignment rules so the isomorphism is provable
+  arithmetically (no `naga`/`tint` in the test path).
+- `WgslUnsupportedKindError` — thrown for sub-32-bit kinds.
+- Types: `EmitWgslStructOptions`, `EmitWgslStructInput`, `WgslMember`,
+  `WgslLayout`.
+
+Design decisions baked in:
+
+- **Sub-32-bit kinds fail-fast.** WGSL storage buffers have no native
+  `u8/i8/u16/i16` (absent the unassumable `16bit` extension), so the emitter
+  throws `WgslUnsupportedKindError` rather than emit invalid shader code.
+- **64-bit kinds byte-transport as `vec2<u32>`.** WGSL has no concrete 64-bit
+  scalar; `f64/u64/i64` map to `vec2<u32>` (align/size 8) — lossless byte
+  transport, not native 64-bit GPU arithmetic.
+- **Trailing padding is forced.** An all-32-bit schema would round its WGSL
+  struct size to 4, but the schema pads frames to 8. A trailing
+  `_wab_pad: array<u32, k>` member stretches the struct to the schema's exact
+  `frameByteSize`, keeping `array<Struct>` element stride equal to the SAB slot
+  stride. The same pad covers the hidden invariant lane unless `includeInvariant`
+  exposes it as a named `vec2<u32>` member.
+- **Trajectory helpers.** `f32` trajectory fields get an inline
+  `fn <Struct>_set_<field>(state, idx, p, v[, a])` tuple writer matching the
+  interleaved `[p, v, [a]]` storage order (opt-out via `includeHelpers: false`).
+
+### Why
+
+Eliminates the **alignment trap**: today a developer hand-writes a WGSL struct
+to match their TS schema, and WGSL's strict, silent padding/stride rules mean a
+one-byte drift makes the AudioWorklet decode mathematically-plausible garbage
+without ever crashing — days lost debugging DSP when the bug is memory layout.
+Because `compileLayout` already packs fields by descending alignment class
+(8→4→2→1) with every offset a multiple of its element size, that packing is
+isomorphic to WGSL's host-shareable struct layout once sub-32-bit kinds are
+excluded — so a generated struct is correct *by construction*. This is the first
+pillar of the WGSL↔TS bridge track; it pairs with the zero-decode `pushRaw`
+readback path (0.9.62) and the `BridgeGPUSource` `"raw"` decoder mode (0.9.63).
+
+### Wire compatibility
+
+Zero. Purely additive build-time codegen — no `src/` runtime logic on any hot
+path, no schema/SAB byte change, no public-API break. Bit-for-bit identical
+runtime to 0.9.60.
+
+### Tests
+
+New `tests/Bridge.wgsl.test.ts` (8 pins, wired into `npm test` / `test:unit`):
+sub-32-bit rejection; member offsets equal compiled `byteOffset`s; `structSize`
+equals `frameByteSize` across five schema shapes; all-`f32` trailing-pad; 64-bit
+→ `vec2<u32>`; trajectory flat-array + interleaved helper; invariant fold-vs-
+expose; DO-NOT-EDIT banner + `frameByteSize` fingerprint. Mandatory gates green:
+`npm run typecheck`, `npm test` (31 suites), `npm run bench` (~1.20 µs baseline,
+unchanged — codegen doesn't touch the hot path).
+
+### Documentation
+
+This entry; a new `emitWgslStruct` bullet in the README codegen section; a
+self-contained file header in `src/emitWgslStruct.ts` documenting the
+isomorphism argument, the type-support gate, the 64-bit byte-transport choice,
+and the trailing-pad rule.
+
 ## [0.9.60] — 2026-05-29
 
 ### Changed — fix stale `subarray` description in `BridgeBlockConsumer.process()` doc

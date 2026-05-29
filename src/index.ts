@@ -331,3 +331,24 @@ export type {
   EmitWorkletReaderInput,
   EmitWorkletProcessorOptions,
 } from "./emitWorkletReader.js";
+
+// ── WGSL struct codegen ────────────────────────────────────────────────────
+//
+// `emitWgslStruct` emits, as a SOURCE STRING, a WGSL `struct` whose memory
+// layout is byte-isomorphic to the SAB frame `Bridge` reads/writes for the same
+// `Schema` — making the TS Schema the single source of truth for the GPU-side
+// struct and eliminating the WGSL/TS "alignment trap". Sub-32-bit kinds are
+// rejected (WgslUnsupportedKindError); 64-bit kinds byte-transport as
+// vec2<u32>. Pairs with `BridgeGPUSource(device, bridge, "raw")` for a
+// zero-decode GPU→SAB readback. See src/emitWgslStruct.ts.
+export {
+  emitWgslStruct,
+  computeWgslLayout,
+  WgslUnsupportedKindError,
+} from "./emitWgslStruct.js";
+export type {
+  EmitWgslStructOptions,
+  EmitWgslStructInput,
+  WgslMember,
+  WgslLayout,
+} from "./emitWgslStruct.js";
