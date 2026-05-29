@@ -525,8 +525,18 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
         this._lastPullAtSample = this._samplesEmitted + written;
       }
       const take = Math.min(count - written, this.blockSize - this.cursor);
-      out.set(this.samples.subarray(this.cursor, this.cursor + take), written);
-      this.holdSample = this.samples[this.cursor + take - 1] as number;
+      // 0.9.55 — explicit indexed copy instead of out.set(samples.subarray(...)).
+      // subarray() allocates a typed-array view object per chunk inside the
+      // render loop (≈8 per quantum for a 1024-block / 128-quantum split). The
+      // cached-locals loop below is allocation-free, matches the additive paths
+      // (processAdd / _mixWindow), and is byte-identical in output.
+      const samples = this.samples;
+      const cur = this.cursor;
+      const off = written;
+      for (let i = 0; i < take; i++) {
+        out[off + i] = samples[cur + i] as number;
+      }
+      this.holdSample = samples[cur + take - 1] as number;
       this.cursor += take;
       written += take;
     }

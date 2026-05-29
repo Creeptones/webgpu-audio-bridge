@@ -1202,6 +1202,8 @@ producer.pollCompleted();          // decoded blocks push through the bridge
 
 The bridge schema must declare **exactly one** `f32Array` field (the samples block); the block size derives from the field's declared length. Both helpers validate this at construction. An optional `u64 blockIndex` field is auto-incremented by the producer on every successful push.
 
+`process()` is **allocation-free** on the render path (0.9.55): the per-chunk copy is an explicit cached-locals loop rather than `out.set(samples.subarray(...))`, so it no longer mints a typed-array view object per chunk (≈8 per quantum for a 1024-block / 128-quantum split) — matching the additive `processAdd` / `processAddStereo` paths. Output is byte-for-byte identical to the prior copy (pinned by `tests/BridgeBlockConsumer.test.ts#34`).
+
 ### Latency floor (honest math, hard floor — not a target)
 
 Block mode is inherently higher-latency than control mode. The audio worklet plays back what the producer wrote, and "what the producer wrote" can be up to `ring depth × block size / sample rate` seconds old by the time the worklet pulls it. That's the structural floor — no amount of tuning eliminates it. The honest table:

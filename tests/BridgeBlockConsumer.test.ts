@@ -82,6 +82,10 @@
  *  32. (0.9.51) reset() zeroes the new audio-domain clock + history.
  *  33. (0.9.51) instrument-every-path — the new telemetry tracks identically
  *      across process / processAdd / processAddStereo.
+ *  34. (0.9.55) process() copy equivalence — the explicit cached-locals loop
+ *      that replaced out.set(samples.subarray(...)) is byte-for-byte faithful
+ *      across an irregular straddling chunk schedule, and holdSample read off
+ *      the same copy still tracks the final value (verified via hold-last).
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -1105,6 +1109,57 @@ function testTelemetryEveryPath(): void {
   ok("33. instrument-every-path telemetry");
 }
 
+// ── 34. (0.9.55) process() copy equivalence — explicit loop == subarray ─────
+// The 0.9.55 patch replaced `out.set(samples.subarray(...))` with an explicit
+// cached-locals loop to drop the per-chunk typed-array view allocation. This
+// pin proves the substitution is byte-for-byte faithful across an irregular
+// chunk schedule (exact-multiple, non-divisor, 1-sample, and a > blockSize
+// multi-frame straddle — each lands the cursor at a different phase relative to
+// the 1024 block boundary) AND that the hold-last sample read off the same copy
+// still tracks the final value.
+function testProcessCopyEquivalence(): void {
+  const { bridge } = makeBridge(8);
+  const cons = new BridgeBlockConsumer(bridge, { underflowPolicy: "hold-last" });
+  const scratch = bridge.scratchFrame();
+
+  const F = 3;
+  const total = F * BLOCK_SIZE;
+  // Mirror of every pushed sample — the faithful-copy reference (exactly what
+  // the old `out.set(subarray(...))` would have produced).
+  const ref = new Float32Array(total);
+  for (let f = 0; f < F; f++) {
+    assert(pushRampFrame(bridge, scratch, f), `frame ${f} pushed`);
+    for (let k = 0; k < BLOCK_SIZE; k++) ref[f * BLOCK_SIZE + k] = f * BLOCK_SIZE + k;
+  }
+
+  const chunkPattern = [128, 50, 1, 1000, 333, 7, 1024, 200];
+  let observed = 0;
+  let pi = 0;
+  while (observed < total) {
+    const take = Math.min(chunkPattern[pi % chunkPattern.length]!, total - observed);
+    pi++;
+    const out = new Float32Array(take);
+    cons.process(out, take);
+    for (let i = 0; i < take; i++) {
+      assertEq(out[i], ref[observed + i], `chunk@${observed} (size ${take}) sample ${i} matches faithful copy`);
+    }
+    observed += take;
+  }
+  assertEq(observed, total, "consumed exactly F*blockSize samples");
+  assertEq(cons.underflowSamples(), 0, "no underflow while real samples remained");
+
+  // hold-last underflow after the stream is drained must reflect the final
+  // copied sample — proving holdSample tracked through the explicit-loop copy.
+  const lastCopied = ref[total - 1] as number;
+  const tail = new Float32Array(16);
+  cons.process(tail, 16);
+  for (let i = 0; i < 16; i++) {
+    assertEq(tail[i], lastCopied, `hold-last fill ${i} == final copied sample`);
+  }
+
+  ok("34. (0.9.55) process() explicit-loop copy is byte-identical + holdSample intact");
+}
+
 function main(): void {
   testConstruction();
   testSchemaValidation();
@@ -1139,6 +1194,7 @@ function main(): void {
   testStallClock();
   testResetTelemetry();
   testTelemetryEveryPath();
+  testProcessCopyEquivalence();
   console.log("all BridgeBlockConsumer pins green");
 }
 

@@ -4,6 +4,49 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.55] — 2026-05-29
+
+### Changed — allocation-free copy in `BridgeBlockConsumer.process()`
+
+`process()`'s per-chunk copy was `out.set(this.samples.subarray(cursor, cursor +
+take), written)`. `subarray()` mints a fresh typed-array **view object** per
+chunk inside the AudioWorklet render loop (≈8 per quantum for a 1024-block /
+128-quantum split) — GC pressure on the audio thread, which the additive paths
+(`processAdd` / `_mixWindow`) already avoid with explicit indexed loops.
+
+`process()` now uses the same allocation-free pattern: cache `samples` / `cursor`
+/ `written` into locals and copy with a plain `for` loop. The `holdSample`
+bookkeeping reads off the cached locals. Output is **byte-for-byte identical** to
+the prior copy.
+
+### Why
+
+Addresses the audit's real-time hot-path finding (category 2): `process()` was
+the lone render-loop path still creating a per-chunk view, out of step with the
+additive paths. Removing it makes the whole `BridgeBlockConsumer` render surface
+allocation-free in steady state.
+
+### Wire compatibility
+
+Zero. No schema, SAB-byte, or public-API change — pure internal copy mechanics.
+Bit-for-bit identical output to 0.9.54.
+
+### Tests
+
+New `tests/BridgeBlockConsumer.test.ts` pin **34** (`testProcessCopyEquivalence`):
+asserts the explicit-loop copy is byte-identical to a faithful reference across
+an irregular straddling chunk schedule (exact-multiple, non-divisor, 1-sample,
+and a >blockSize multi-frame straddle), and that `holdSample` read off the same
+copy still tracks the final value (verified via a hold-last underflow). Mandatory
+gates re-run green: `npm run typecheck`, `npm test` (30 suites), `npm run bench`
+(push/pull/pullLatest ~1.20 µs; `process (replace)` cell neutral within the
+100 ns measurement granularity).
+
+### Documentation
+
+This entry; README §Audio-rate mode note that `process()` is allocation-free on
+the render path.
+
 ## [0.9.54] — 2026-05-29
 
 ### Fixed — decoder-fault containment in `BridgeGPUSource.pollCompleted()`
