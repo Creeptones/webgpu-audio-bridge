@@ -164,6 +164,7 @@ const TEST_FILES_INVENTORY = [
   ["tests/ResidualQualityController.test.ts", "Graceful-degradation residual-thinning controller pins (0.9.51)."],
   ["tests/BridgeGPUSource.writeTarget.test.ts", "BridgeGPUSource WriteTarget scaffold pins."],
   ["tests/BridgeGPUSource.raw.test.ts", "BridgeGPUSource \"raw\" decoder-mode pins (0.9.63 zero-decode readback)."],
+  ["tests/BridgeGPUSource.autoPoll.test.ts", "BridgeGPUSource autoPollCompleted:'microtask' auto-drain pins (0.9.67) — drains on mapAsync resolution, destroy-guard, manual-default regression."],
   ["tests/BridgeWebNNSource.test.ts", "BridgeWebNNSource pins (experimental subpath)."],
   ["tests/Bridge.wgsl.test.ts", "emitWgslStruct codegen pins — offset/size isomorphism, sub-32-bit fail-fast, vec2<u32> 64-bit transport (0.9.61)."],
   ["tests/Bridge.viteRecipe.test.ts", "WGSL Vite virtual-module recipe pins (Pillar 4) — resolveId/load glue + build-artifact === emitWgslStruct equality."],
@@ -373,7 +374,7 @@ The full test files are not inlined here — ~5,000 lines combined. Each pins a 
 |---|---|
 ${inventoryRows}
 
-Test invocation: \`npm test\` (runs all 34 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
+Test invocation: \`npm test\` (runs all 35 suites) / \`npm run test:unit\` (skips the 1M-frame concurrent stress) / \`npm run test:concurrent\` (concurrent only) / \`npm run test:browser\` (Playwright across Chromium + Firefox + WebKit on Linux).
 `;
 
   return `${headerMd}\n${tocMd}\n${sections.join("")}\n${inventoryMd}\n`;

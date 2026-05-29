@@ -4,6 +4,94 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.67] — 2026-05-29
+
+### Added — `BridgeGPUSource` auto-drain on `mapAsync` resolution
+
+New opt-in `autoPollCompleted: "microtask"` constructor option. When a staging
+slot's `mapAsync` resolves, a guarded microtask drains *that slot* immediately
+(decode + push + recycle) instead of waiting for the caller's next
+`pollCompleted()`.
+
+#### The cadence tax this removes
+
+`pollCompleted()` is the default drain point. If a caller polls once per ~60 Hz
+producer tick, a readback whose `mapAsync` resolves just after a tick sits idle
+for up to a full frame (0–16.7 ms, ~8 ms average) before it reaches the SAB —
+the helper's own scheduling delay, stacked on top of the unavoidable `mapAsync`
+readback floor. `"microtask"` mode pushes the frame as soon as the bytes are
+CPU-readable and recycles the staging slot sooner (more pipelining headroom).
+
+This is explicitly **not** a `mapAsync` speedup — the GPU readback floor
+(~5–15 ms, driver-bound) is unchanged. It removes only the avoidable cadence
+delay the bridge itself was adding, the way the README's "what's actually
+faster (and what isn't)" framing demands.
+
+#### Shape
+
+- `autoPollCompleted?: "manual" | "microtask"`, default `"manual"` — the
+  pre-0.9.67 behavior is byte-for-byte unchanged for existing callers.
+- New `autoPollMode(): "manual" | "microtask"` getter for telemetry, mirroring
+  `decoderMode()` / `writeTargetKind()`.
+- Works in both `"raw"` and closure decoder modes.
+- Runs on the producer/worker thread (where `BridgeGPUSource` lives), never the
+  AudioWorklet — microtask scheduling here carries no render-thread RT-safety
+  concern.
+
+#### Correctness
+
+The per-slot decode/push/recycle body was extracted from `pollCompleted()` into
+a single self-guarding `_drainSlot(i)` primitive that both the poll loop and the
+microtask call. It bails unless the slot is `in-flight & mapped`, so the two
+callers never double-push — `pollCompleted()` after an auto-drain is a safe
+no-op, and a belt-and-braces poll in the caller's loop is harmless. It is also
+self-recovering (decode/push/unmap faults route to `onError` + the drop counter
+and the slot still recycles — the 0.9.54 + 0.9.58 hardening), so it can never
+throw into a microtask. `destroy()` now flips a `_destroyed` guard before
+tearing down the staging buffers, so a drain microtask that lands after
+`destroy()` bails instead of touching a destroyed buffer.
+
+### Why
+
+The audit closing the WebGPU-readback question concluded the next real latency
+gains come not from making `mapAsync` faster — it can't be — but from removing
+avoidable scheduling delay around it. Auto-drain on resolution is the single
+highest-leverage item on that list: it deletes up to a full producer frame of
+average latency for callers whose poll cadence is coarse, with zero change to
+the readback floor and zero cost to existing manual-mode callers.
+
+### Wire compatibility
+
+None affected. Heap-side helper option on top of the existing `Bridge<S>` push
+surface. No SAB lane change, no schema DSL change. The constructor option is
+purely additive (new optional field, default preserves prior behavior).
+
+### Tests
+
+35 Node suites green (was 34). New `tests/BridgeGPUSource.autoPoll.test.ts`
+(7 pins): auto-drain pushes without any `pollCompleted()` call; manual default
+still waits (regression guard); `pollCompleted()` after auto-drain is a no-op;
+a rejected `beginMap` auto-recycles + ticks `droppedCount` + fires `onError`;
+`destroy()` guards a late microtask; invalid mode throws at construction with no
+buffer leak; auto-drain runs the user decoder in closure mode. The existing
+`BridgeGPUSource.raw` + `BridgeGPUSource.writeTarget` suites pass unchanged
+(the `_drainSlot` extraction is behavior-preserving). `npm run typecheck`
+clean; `npm run bench` push/pull/pullLatest median sanity-check against the
+documented ~1.20 μs baseline unchanged.
+
+### Documentation
+
+- `src/BridgeGPUSource.ts` — new option + `autoPollMode()` getter; class-header
+  lifecycle note; `_drainSlot` / `_autoDrainSlot` doc blocks.
+- `README.md` — new "Auto-drain on `mapAsync` resolution (0.9.67)" subsection
+  under §BridgeGPUSource > Lifecycle; `autoPollMode()` added to Diagnostics.
+- `tests/BridgeGPUSource.autoPoll.test.ts` — new (7 pins).
+- `scripts/regenerate-llm-bundle.mjs` — new suite in the inventory; suite count
+  corrected (34 → 35).
+- `package.json` — `version` 0.9.67; new suite wired into `test` / `test:unit`.
+- `README.md` / `CITATION.cff` — `version` bumped to 0.9.67.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.66] — 2026-05-29
 
 ### Added — WGSL↔TS bridge: Vite-recipe test + `"raw"`-vs-`"auto"` naming note

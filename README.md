@@ -8,7 +8,7 @@
 
 ### Status & maturity
 
-- **Version**: 0.9.66 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
+- **Version**: 0.9.67 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
 - **Tests**: 30 Node/TypeScript suites in `npm test`, plus cross-engine Playwright browser CI (schema / Bridge core / smoother / invariant / PLL / trajectory / backpressure / observability / facades / properties / recovery / input-lane / block-consumer / residual-quality-controller / WASM-equivalence / concurrent SPSC stress / roles / connect / typecheck-deprecations / readme-imports / and more). **Cross-engine browser CI**: Playwright runs the minimal-demo smoke + e2e-latency CPU-mode bench against Chromium, Firefox, and WebKit on every push and PR to `main` — `.github/workflows/browser.yml` gates merges (`continue-on-error` is off).
 - **Distribution**: [`webgpu-audio-bridge` on npm](https://www.npmjs.com/package/webgpu-audio-bridge); concept [DOI 10.5281/zenodo.20380886](https://doi.org/10.5281/zenodo.20380886) on Zenodo resolves to the latest release. MIT license. **Zero runtime dependencies.** Engines: Node ≥ 18 for the build / test toolchain; the published library itself is ESM with TypeScript types and runs anywhere `SharedArrayBuffer` + `Atomics` + `AudioWorklet` are available.
 - **Release artifacts**: per-patch history lives in [`CHANGELOG.md`](./CHANGELOG.md) (every patch has its own entry with rationale + wire-compat notes + test deltas). The GitHub Releases tab is intentionally sparse — only the v0.1.x foundation releases are tagged there; subsequent versions ship via npm + Zenodo. Cite the concept DOI or a specific version via the [`CITATION.cff`](./CITATION.cff) at the repo root.
@@ -936,6 +936,29 @@ Each staging buffer goes through a 4-state cycle: `idle → scheduled → in-fli
 
 The `scheduleReadback` / `flushPending` split exists because `mapAsync` must be called **after** `device.queue.submit()` — starting it before submit risks reading stale GPU state. The user submits between the two calls.
 
+### Auto-drain on `mapAsync` resolution (0.9.67)
+
+By default `pollCompleted()` is where a resolved readback is decoded and pushed — so if you poll once per ~60 Hz producer tick, a readback whose `mapAsync` resolves *just after* a tick waits up to a full frame (0–16.7 ms, ~8 ms average) before it reaches the SAB. That delay is the helper's own **cadence tax**, stacked on top of the unavoidable `mapAsync` readback floor.
+
+Opt out of the tax with `autoPollCompleted: "microtask"`:
+
+```ts
+const source = new BridgeGPUSource(device, bridge, "raw", {
+  stagingBufferCount: 3,
+  autoPollCompleted: "microtask", // default "manual"
+});
+```
+
+In `"microtask"` mode, the moment a slot's `mapAsync` resolves, a guarded microtask drains *that slot* immediately — decode + push + recycle — without waiting for the next `pollCompleted()`. The frame reaches the consumer as soon as the bytes are CPU-readable, and the staging slot returns to `idle` sooner (more pipelining headroom). This does **not** make `mapAsync` faster — the GPU readback floor is unchanged; it removes only the scheduling delay the helper itself was adding.
+
+Notes:
+
+- **Default is `"manual"`** — byte-for-byte the pre-0.9.67 behavior. Existing callers are unaffected.
+- **`pollCompleted()` stays safe to call in either mode.** In `"microtask"` mode it's a redundant no-op for already-drained slots (the per-slot guard skips anything not `in-flight & mapped`), so a belt-and-braces poll in your loop won't double-push.
+- **Producer-thread only.** `BridgeGPUSource` runs on the worker/producer thread driving WebGPU, never the AudioWorklet, so microtask scheduling here carries no render-thread real-time-safety concern.
+- **`destroy()` is safe against in-flight microtasks** — a drain microtask that lands after `destroy()` bails instead of touching a torn-down buffer.
+- Inspect the active mode via `source.autoPollMode()`.
+
 ### Diagnostics
 
 The helper exposes simple counters:
@@ -946,6 +969,7 @@ The helper exposes simple counters:
 - `source.inFlightCount()` (0.7.3) — naming-parity alias for `inFlight()`. Identical semantics; introduced as the canonical name for the in-page Bridge Inspector pattern that pairs with `Bridge.subscribeTelemetry()`.
 - `source.lastReadbackUs()` (0.7.3) — wall-time microseconds for the most recently completed `mapAsync → decode → push` cycle. `0` before the first completion; fractional μs thereafter. Heap-only; consumer-thread. Inspector use: render the GPU readback round-trip characteristic on-page; typical Chrome on Windows lands in 5-15 ms (5000-15000 μs), driver- and adapter-dependent.
 - `source.capacity()` — total staging buffer count
+- `source.autoPollMode()` (0.9.67) — `'microtask'` if readbacks auto-drain on `mapAsync` resolution, else `'manual'` (drained on `pollCompleted()`)
 
 ### Device-lost handling (0.9.32)
 

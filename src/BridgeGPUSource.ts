@@ -60,7 +60,13 @@
  *   `pollCompleted()` — checked once per control-rate tick. For each
  *     buffer whose `mapAsync` has resolved, calls the decoder with the
  *     mapped range, pushes via the bridge, unmaps the buffer, returns it
- *     to IDLE.
+ *     to IDLE. With `autoPollCompleted: 'microtask'` (0.9.67) each slot
+ *     instead drains itself in the `mapAsync`-resolution microtask, so a
+ *     completed readback is pushed immediately rather than waiting up to a
+ *     full tick for the next poll — removing the helper's own cadence tax on
+ *     top of the `mapAsync` floor. The per-slot decode/push/recycle logic is
+ *     shared (`_drainSlot`); the poll loop and the microtask are two callers
+ *     of the same self-guarding primitive.
  *
  * Cost model. Three atomic stores per `commitPush` (the existing ring
  * push) + one `mapAsync` per readback (5–15 ms async) + one decoder
@@ -436,6 +442,35 @@ export interface BridgeGPUSourceOptions {
    *  rejection has already fired, the prior callback fires with
    *  `'transient'` and the subsequent one with `'fatal'`. */
   readonly onError?: (err: unknown, kind: "transient" | "fatal") => void;
+  /** When a readback should be decoded + pushed (0.9.67).
+   *
+   *  - `'manual'` (default) — the resolved `mapAsync` only flips the slot's
+   *    `mapped` flag; the actual decode + push happens on the caller's next
+   *    `pollCompleted()`. Byte-for-byte the pre-0.9.67 behavior.
+   *  - `'microtask'` — when `beginMap` resolves, a guarded microtask drains
+   *    *that* slot immediately (decode + push + recycle), without waiting for
+   *    the next `pollCompleted()`.
+   *
+   *  Why it matters: if `pollCompleted()` runs once per ~60 Hz producer tick,
+   *  a readback whose `mapAsync` resolves just after a tick sits idle for up to
+   *  a full frame (0–16.7 ms, ~8 ms average) before it is pushed — a cadence
+   *  tax stacked on top of the unavoidable `mapAsync` cost. `'microtask'`
+   *  removes that tax: the decode + push runs in the resolving microtask, so
+   *  the frame reaches the SAB as soon as the bytes are CPU-readable, and the
+   *  staging slot recycles to `idle` sooner (more pipelining headroom too).
+   *
+   *  This does NOT make `mapAsync` faster — the GPU readback floor is
+   *  unchanged. It removes the helper's own scheduling delay.
+   *
+   *  `pollCompleted()` stays safe to call in either mode: in `'microtask'`
+   *  mode it is a redundant no-op for already-drained slots (the per-slot
+   *  guard skips anything not `in-flight & mapped`), so a caller can keep a
+   *  belt-and-braces poll in their loop without double-pushing.
+   *
+   *  Runs on the producer/worker thread (where `BridgeGPUSource` lives), never
+   *  the AudioWorklet — microtask scheduling here carries no render-thread
+   *  real-time-safety concern. Default `'manual'`. */
+  readonly autoPollCompleted?: "manual" | "microtask";
 }
 
 /** Decoder callback shape (0.6.18). Receives the mapped staging-buffer
@@ -505,6 +540,16 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  one-way. `false` when `device.lost` is absent or non-thenable. */
   private _deviceLost: boolean = false;
 
+  /** Auto-drain mode (0.9.67). True when constructed with
+   *  `autoPollCompleted: "microtask"` — a resolved `beginMap` drains its slot
+   *  in the resolving microtask instead of waiting for `pollCompleted()`. */
+  private readonly _autoDrain: boolean;
+
+  /** Set by `destroy()`. A microtask scheduled before `destroy()` but firing
+   *  after it must NOT touch the now-destroyed staging buffers; the auto-drain
+   *  guard bails when this is set. */
+  private _destroyed: boolean = false;
+
   constructor(
     device: GpuDeviceLike,
     bridge: Bridge<S> | BridgeProducer<S>,
@@ -538,7 +583,15 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       );
     }
     const kind = opts.writeTarget ?? "auto";
+    const autoPoll = opts.autoPollCompleted ?? "manual";
+    if (autoPoll !== "manual" && autoPoll !== "microtask") {
+      throw new Error(
+        `BridgeGPUSource: autoPollCompleted must be 'manual' or 'microtask' ` +
+          `(got ${String(autoPoll)})`,
+      );
+    }
     this.bridge = bridge;
+    this._autoDrain = autoPoll === "microtask";
     this._rawMode = rawMode;
     this.decoder = rawMode ? null : (decoder as GpuReadbackDecoder<S>);
     const labelPrefix = opts.bufferLabelPrefix ?? "BridgeGPUSource";
@@ -626,6 +679,10 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         p.then(
           () => {
             slot.mapped = true;
+            // 0.9.67 — in 'microtask' mode, drain this slot now instead of
+            // waiting for the caller's next pollCompleted(). Guarded so a
+            // microtask that lands after destroy() bails.
+            if (this._autoDrain) this._autoDrainSlot(i);
           },
           (err: unknown) => {
             // beginMap rejected — capture the error so pollCompleted
@@ -647,6 +704,9 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
                 // and that overrides a misbehaving user handler.
               }
             }
+            // 0.9.67 — auto-drain the error slot too, so it recycles to idle
+            // immediately rather than lingering until the next pollCompleted().
+            if (this._autoDrain) this._autoDrainSlot(i);
           },
         );
       }
@@ -674,26 +734,48 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   pollCompleted(): number {
     let count = 0;
     for (let i = 0; i < this.slots.length; i++) {
-      const slot = this.slots[i]!;
-      if (slot.state !== "in-flight" || !slot.mapped) continue;
-      // 0.9.32 — error path. beginMap rejected; the buffer was never
-      // mapped. Skip readMapped + decoder + releaseMap (which would
-      // either throw on a real GPU or return uninitialized bytes on a
-      // mock) and recycle the slot directly. The drop counter still
-      // ticks so dashboards observe the loss; the onError callback
-      // (if any) already fired at rejection time.
-      if (slot.error !== undefined) {
-        this._droppedCount = (this._droppedCount + 1) | 0;
-        if (slot.mapStartedAtMs > 0) {
-          this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
-        }
-        slot.state = "idle";
-        slot.mapped = false;
-        slot.pending = null;
-        slot.mapStartedAtMs = 0;
-        slot.error = undefined;
-        continue;
+      count += this._drainSlot(i);
+    }
+    return count;
+  }
+
+  /**
+   * Drain a single ready slot: decode + push the mapped frame, recycle the
+   * staging buffer back to `idle`. Returns 1 if a frame was pushed, 0
+   * otherwise (slot not ready, beginMap rejected, or bridge declined the push).
+   *
+   * Self-guarding: bails immediately unless the slot is `in-flight & mapped`,
+   * so it is safe to call from both `pollCompleted()` (per-slot loop) and the
+   * `'microtask'` auto-drain path even if both reach the same slot — whichever
+   * runs first drains it; the other sees `idle` and returns 0. Self-recovering:
+   * decode / push / unmap failures route to `onError` + the drop counter and
+   * the slot still recycles (the 0.9.54 + 0.9.58 hardening), so this never
+   * throws into a microtask. Extracted from the old inline `pollCompleted`
+   * body in 0.9.67; the per-slot semantics are byte-for-byte unchanged.
+   */
+  private _drainSlot(i: number): number {
+    const slot = this.slots[i]!;
+    if (slot.state !== "in-flight" || !slot.mapped) return 0;
+    let pushed = 0;
+    // 0.9.32 — error path. beginMap rejected; the buffer was never
+    // mapped. Skip readMapped + decoder + releaseMap (which would
+    // either throw on a real GPU or return uninitialized bytes on a
+    // mock) and recycle the slot directly. The drop counter still
+    // ticks so dashboards observe the loss; the onError callback
+    // (if any) already fired at rejection time.
+    if (slot.error !== undefined) {
+      this._droppedCount = (this._droppedCount + 1) | 0;
+      if (slot.mapStartedAtMs > 0) {
+        this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
       }
+      slot.state = "idle";
+      slot.mapped = false;
+      slot.pending = null;
+      slot.mapStartedAtMs = 0;
+      slot.error = undefined;
+      return 0;
+    }
+    {
       // The readback is ready.
       if (this._rawMode) {
         // 0.9.63 — zero-decode path. The mapped range is byte-for-byte one SAB
@@ -707,7 +789,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
           const range = this.writeTarget.readMapped(i);
           if (this.bridge.pushRaw(range)) {
             this._pushedCount = (this._pushedCount + 1) | 0;
-            count++;
+            pushed = 1;
           } else {
             // Bridge full / policy declined — observe the loss.
             this._droppedCount = (this._droppedCount + 1) | 0;
@@ -742,7 +824,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
             this.decoder!(range, frame);
             this.bridge.commitPush();
             this._pushedCount = (this._pushedCount + 1) | 0;
-            count++;
+            pushed = 1;
           } catch (err) {
             this.bridge.abortPush();
             this._droppedCount = (this._droppedCount + 1) | 0;
@@ -800,7 +882,33 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         slot.mapStartedAtMs = 0;
       }
     }
-    return count;
+    return pushed;
+  }
+
+  /**
+   * Guarded auto-drain entry point for the `'microtask'` mode (0.9.67). Called
+   * from the `beginMap` resolution handlers. Bails if the source has been
+   * destroyed (a microtask can outlive `destroy()`); otherwise drains the slot.
+   * `_drainSlot` is self-recovering and cannot throw under the documented
+   * contract, but the call is wrapped defensively so a pathological throw
+   * becomes an `onError`/swallow rather than an unhandled promise rejection on
+   * the producer thread.
+   */
+  private _autoDrainSlot(i: number): void {
+    if (this._destroyed) return;
+    try {
+      this._drainSlot(i);
+    } catch (err) {
+      if (this._onError) {
+        const kind = this._deviceLost ? "fatal" : "transient";
+        try {
+          this._onError(err, kind);
+        } catch {
+          // Misbehaving user handler — swallow; never crash the producer
+          // thread from a microtask.
+        }
+      }
+    }
   }
 
   /** Number of staging buffers currently in some non-idle state. */
@@ -863,7 +971,19 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   /** Destroy all staging buffers + release resources. Subsequent
    *  calls become no-ops; do not reuse the instance after destroy. */
   destroy(): void {
+    // 0.9.67 — flip the guard BEFORE tearing down the buffers so any auto-drain
+    // microtask still queued (mapAsync resolved, drain not yet run) bails
+    // instead of touching a destroyed staging buffer.
+    this._destroyed = true;
     this.writeTarget.destroy();
+  }
+
+  /** Auto-drain mode for this instance (0.9.67): `'microtask'` when constructed
+   *  with `autoPollCompleted: "microtask"` (a resolved readback drains itself in
+   *  a microtask), else `'manual'` (drained on the caller's `pollCompleted()`).
+   *  Exposed for telemetry / dashboards, mirroring `decoderMode()`. */
+  autoPollMode(): "manual" | "microtask" {
+    return this._autoDrain ? "microtask" : "manual";
   }
 
   /** The resolved write-target kind for this instance (0.7.15). Always
