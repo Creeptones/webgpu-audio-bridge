@@ -71,7 +71,19 @@
  * inline producer reconstructs typed-array views over the SAB at the right
  * byte offsets and replicates `Bridge.push` write semantics: per-scalar-field
  * write through the matching umbrella view, then `Atomics.store(indices, 0,
- * writeIdx + 1n)` release-store, then unconditional `Atomics.notify`.
+ * writeIdx + 1n)` release-store, then `Atomics.notify`.
+ *
+ * ─── Dual notify-mode run (0.9.70) ────────────────────────────────────────
+ *
+ * The SPSC stress runs TWICE: once under the default `notify: 'always'` and
+ * once under the experimental `notify: 'waiter-flag'`. In waiter-flag mode
+ * the inline producer mirrors `SpscRing._notifyLane` / `waitForSpace` — it
+ * notifies the write_index lane only when the consumer's WAITING_FOR_DATA
+ * tail flag is set, and sets WAITING_FOR_SPACE before parking on read_index.
+ * The consumer (a real `Bridge` with `notify: 'waiter-flag'`) sets/clears
+ * WAITING_FOR_DATA inside `waitForData`. This is the real-machine proof that
+ * a parked peer is woken under conditional notify: a lost wake hangs the run
+ * (STALL_TIMEOUT_MS) or trips the bit-exact / FIFO pins.
  *
  * Critical: the producer's view of "what bytes to write where" comes from
  * `bridge.describeLayout()`, NOT a hardcoded copy of the schema. Adding /
@@ -145,6 +157,8 @@ const PRODUCER_SOURCE = `
     n,
     waitTimeoutMs,
     heartbeatEveryN,
+    notifyMode,
+    tailByteOffset,
   } = workerData;
 
   // Reconstruct umbrella views — one per element-size class used by physics
@@ -160,6 +174,14 @@ const PRODUCER_SOURCE = `
   // ringbuf.js uses; only the lane width and the diff op change vs the pre-0.4
   // BigInt path.
   const indices = new Int32Array(sab, 0, 8);
+
+  // Waiter-flag tail lanes (0.9.70). In 'waiter-flag' mode the producer
+  // mirrors SpscRing's protocol: it (a) only notifies the consumer's
+  // write_index lane when WAITING_FOR_DATA (flags[0]) is set, and (b) sets
+  // WAITING_FOR_SPACE (flags[1]) before parking on read_index, clearing it
+  // after. In 'always' mode the flags are unused (and unallocated).
+  const isWaiterFlag = notifyMode === "waiter-flag";
+  const flags = isWaiterFlag ? new Int32Array(sab, tailByteOffset, 2) : null;
 
   // Per-field stride + elem offset. Stride is frameByteSize / sizeof(elem);
   // since the physics schema's frame byte size is a multiple of 8 and every
@@ -189,10 +211,19 @@ const PRODUCER_SOURCE = `
     // Signed-32 diff: wrap-invisible because capacity ≤ 2^30 keeps the
     // true diff well within [-2^31, 2^31).
     if (((writeIdx - readIdx) | 0) >= capacity) {
-      // Full — park until consumer's pull() notifies.
+      // Full — park until consumer's pull() notifies. In waiter-flag mode set
+      // WAITING_FOR_SPACE before the wait compare (StoreLoad pairing with the
+      // consumer's post-release flag load) and clear it after.
       fullWaits++;
-      const status = Atomics.wait(indices, 1, readIdx, waitTimeoutMs);
-      if (status === "timed-out") fullWaitTimeouts++;
+      if (isWaiterFlag) {
+        Atomics.store(flags, 1, 1);
+        const status = Atomics.wait(indices, 1, readIdx, waitTimeoutMs);
+        Atomics.store(flags, 1, 0);
+        if (status === "timed-out") fullWaitTimeouts++;
+      } else {
+        const status = Atomics.wait(indices, 1, readIdx, waitTimeoutMs);
+        if (status === "timed-out") fullWaitTimeouts++;
+      }
       continue;
     }
     // Slot via unsigned-then-mask — wrap-invariant.
@@ -216,10 +247,14 @@ const PRODUCER_SOURCE = `
       f64View[base + jEffElemOff + k] = -seqNum + k * 0.001;
     }
 
-    // Release-store + unconditional notify. Matches Bridge.push.
+    // Release-store, then notify. Matches Bridge.push / SpscRing._notifyLane:
+    // always mode notifies unconditionally; waiter-flag mode notifies only
+    // when WAITING_FOR_DATA (flags[0]) is set — release-THEN-check ordering.
     Atomics.store(indices, 0, (writeIdx + 1) | 0);
-    notifyCalls++;
-    Atomics.notify(indices, 0, 1);
+    if (!isWaiterFlag || Atomics.load(flags, 0) !== 0) {
+      notifyCalls++;
+      Atomics.notify(indices, 0, 1);
+    }
     nextSeq++;
     pushed++;
     if (heartbeatEveryN > 0 && pushed % heartbeatEveryN === 0) {
@@ -253,10 +288,15 @@ interface ProducerHeartbeatMessage {
 
 type ProducerMessage = ProducerDoneMessage | ProducerHeartbeatMessage;
 
-async function runConcurrentStress(): Promise<void> {
-  const sab = new SharedArrayBuffer(SAB_BYTES);
-  const ring = new Bridge(sab, CAPACITY, SCHEMA);
+async function runConcurrentStress(
+  notify: "always" | "waiter-flag" = "always",
+): Promise<void> {
+  // SAB size depends on the notify mode — 'waiter-flag' appends 8 tail bytes.
+  const sab = new SharedArrayBuffer(Bridge.byteLength(CAPACITY, SCHEMA, { notify }));
+  const ring = new Bridge(sab, CAPACITY, SCHEMA, { notify });
   const layout = ring.describeLayout();
+  // Tail flag-lane offset the inline producer reconstructs in waiter-flag mode.
+  const tailByteOffset = RING_HEADER_BYTES + CAPACITY * SCHEMA.frameByteSize;
 
   const state: {
     producerDone: boolean;
@@ -281,6 +321,8 @@ async function runConcurrentStress(): Promise<void> {
       n: N,
       waitTimeoutMs: PRODUCER_WAIT_TIMEOUT_MS,
       heartbeatEveryN: PRODUCER_HEARTBEAT_EVERY_N,
+      notifyMode: notify,
+      tailByteOffset,
     },
   });
 
@@ -318,6 +360,7 @@ async function runConcurrentStress(): Promise<void> {
   let flowScaleSamples = 0;
   process.stderr.write(
     `[watchdog] t=0.0s starting bridge-concurrent-spsc-stress ` +
+      `notify=${notify} ` +
       `TOTAL_FRAMES=${TOTAL_FRAMES.toLocaleString()} CAPACITY=${CAPACITY} N=${N} ` +
       `PULL_CHUNK=${PULL_CHUNK.toLocaleString()} schema=physicsControlFrameSchema(${N})\n`,
   );
@@ -499,7 +542,7 @@ async function runConcurrentStress(): Promise<void> {
     `tornFrames=0 over ${TOTAL_FRAMES.toLocaleString()} frames on a no-invariant schema (got ${tel.tornFrames})`,
   );
   ok(
-    `bridge-concurrent-spsc-stress (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +
+    `bridge-concurrent-spsc-stress [notify=${notify}] (${TOTAL_FRAMES.toLocaleString()} frames in ${elapsedMs}ms; ` +
       `producer ${fullWaits.toLocaleString()} full-waits / ${producerNotifies.toLocaleString()} push-notifies; ` +
       `consumer ${emptyWaits.toLocaleString()} empty-waits, ${emptyWaitTimeouts}/${TIMEOUT_TOLERANCE} timeouts, ${emptyPolls.toLocaleString()} empty polls; ` +
       `flow-scale envelope [${flowScaleMin.toFixed(3)}, ${flowScaleMax.toFixed(3)}] over ${flowScaleSamples.toLocaleString()} samples)`,
@@ -886,7 +929,13 @@ async function main(): Promise<void> {
   }
   void workerData;
 
-  await runConcurrentStress();
+  // The default always-notify protocol, then the experimental waiter-flag
+  // protocol (0.9.70) over the SAME 1 M-frame cross-thread stress. The
+  // waiter-flag run is the real-machine proof that a parked consumer/producer
+  // is actually woken under conditional notify — a missed wake would either
+  // hang (STALL_TIMEOUT_MS) or drop/torn frames (the bit-exact pins).
+  await runConcurrentStress("always");
+  await runConcurrentStress("waiter-flag");
   await runConcurrentStressDropOldest();
   console.log("\nAll Bridge.concurrent tests passed.");
 }

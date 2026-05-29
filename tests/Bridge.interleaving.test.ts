@@ -56,6 +56,9 @@
  *  8. testPullLatestMultiFrameJump    — pullLatest jumps read_index from R straight to W (line 1104)
  *  9. testDropOldestTwoWriterRace     — producer _dropOldest CAS lands between consumer load & commit-CAS
  * 10. testDropOldestBoundedRetry      — consumer retry count <= capacity+1 under drop-oldest overrun
+ * 11. testWaiterFlagCorrectNoLostWake — v2 waiter-flag notify (correct order): 0 lost wakes across all schedules
+ * 12. testWaiterFlagNaiveLosesWake    — v2 waiter-flag notify (naive order): a lost wake EXISTS (grounds "sharp")
+ * 13. testWaiterFlagSkipsNotifyWhenNoWaiter — v2 elides the notify syscall when no peer is parked (the saving)
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -976,6 +979,205 @@ function testDropOldestBoundedRetry(): void {
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//  v2 WAITER-FLAG NOTIFY PROTOCOL — focused exhaustive micro-model (0.9.70).
+//
+//  The shipped protocol issues Atomics.notify UNCONDITIONALLY after every
+//  release-store (always-notify; pins 6/7 above). A proposed v2 elides the
+//  notify syscall when no peer is parked, gated on a waiter flag the parking
+//  peer sets immediately before Atomics.wait:
+//
+//    WAITING_FOR_DATA  (consumer parks on lane 0 / write_index)
+//    WAITING_FOR_SPACE (producer parks on lane 1 / read_index)
+//
+//  This area is SHARP: it is the dual of the edge-trigger miss the file header
+//  documents. Get the ordering wrong and you reintroduce a lost wakeup. This
+//  micro-model exhaustively enumerates the exact StoreLoad race between the
+//  parking peer's {set-flag, compare-park} and the waking peer's
+//  {release, check-flag-notify}, proving the CORRECT ordering race-free and
+//  the NAIVE ordering broken — see docs/waiter-flag-notify-design.md.
+//
+//  Abstraction: same as the rest of this file — a sequentially-consistent
+//  interleaving checker. JS Atomics are seq-cst, so SC interleaving faithfully
+//  models the StoreLoad ordering the correctness argument relies on.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Minimal shared state for the waiter-flag notify race. `idx` is the lane the
+ *  parking peer waits on (write_index for a data-waiter, read_index for a
+ *  space-waiter); `expected` is the value it captured before deciding to park. */
+interface WfState {
+  idx: number; //       the synchronizing lane value (write_index or read_index)
+  readonly expected: number; // value the waiter compared against at park
+  flag: boolean; //     the waiter flag (WAITING_FOR_DATA / WAITING_FOR_SPACE)
+  parked: boolean; //   waiter is asleep inside Atomics.wait
+  woken: boolean; //    a notify was delivered to the (parked-or-not) waiter
+  advanced: boolean; // waking peer has performed its release-store (lane moved)
+  notifyCount: number; // how many notify syscalls the waking peer actually issued
+}
+
+/** Waiter (parking peer) micro-steps — identical for correct & naive. The
+ *  waiter has already observed the wait condition (ring empty / full) and
+ *  captured `expected`; it now announces intent then compare-parks. */
+type WfWaiterStep = "W_setflag" | "W_park";
+
+/** Waker (peer that clears the condition) micro-steps. Two orderings:
+ *   correct: release THEN check-flag-and-notify (StoreLoad: store idx, load flag)
+ *   naive:   check-flag-and-notify THEN release (the bug — load flag, store idx) */
+type WfWakerStep = "K_release" | "K_checkNotify";
+
+function applyWaiter(s: WfState, op: WfWaiterStep): void {
+  switch (op) {
+    case "W_setflag":
+      // Announce intent to park. Seq-cst store, ordered before the wait below.
+      s.flag = true;
+      break;
+    case "W_park":
+      // Atomics.wait(lane, expected): atomic compare-and-park. Parks ONLY if the
+      // lane still holds `expected`; otherwise returns "not-equal" and the peer
+      // does NOT sleep (it loops and re-checks the condition). This compare is
+      // the StoreLoad-ordered load that pairs with W_setflag's store.
+      if (s.idx === s.expected) {
+        s.parked = true;
+      }
+      // else: lane already moved → no park, peer will see the new data/space.
+      break;
+  }
+}
+
+function applyWaker(s: WfState, op: WfWakerStep): void {
+  switch (op) {
+    case "K_release":
+      // Release-store: advance the lane (publish a frame / free a slot).
+      s.idx = s.expected + 1;
+      s.advanced = true;
+      break;
+    case "K_checkNotify":
+      // v2 conditional notify: only syscall if a waiter flag is set. THIS is the
+      // saving — when no peer is parked the flag is clear and the notify (and its
+      // ~100ns futex_wake syscall) is skipped entirely.
+      if (s.flag) {
+        s.notifyCount++;
+        s.woken = true; // delivered to the waiter (wakes it if/when parked)
+      }
+      break;
+  }
+}
+
+/** Exhaustively enumerate every interleaving of a 2-step waiter program against
+ *  a 2-step waker program. Returns the count of terminal LOST-WAKE states
+ *  (waiter asleep + lane advanced + never woken ⇒ sleeps forever) plus totals. */
+function enumerateWaiterFlag(
+  waiter: readonly WfWaiterStep[],
+  waker: readonly WfWakerStep[],
+): { interleavings: number; lostWakes: number; notifySkips: number } {
+  let interleavings = 0;
+  let lostWakes = 0;
+  let notifySkips = 0;
+
+  function dfs(s: WfState, wi: number, ki: number): void {
+    const wDone = wi >= waiter.length;
+    const kDone = ki >= waker.length;
+    if (wDone && kDone) {
+      interleavings++;
+      // Terminal lost-wake: the waiter committed to sleep, the waker advanced
+      // the lane (so the condition the waiter is blocked on is now satisfiable),
+      // yet no notify was delivered ⇒ the waiter never wakes.
+      if (s.parked && s.advanced && !s.woken) lostWakes++;
+      // Count interleavings where the waker correctly skipped the syscall
+      // (no flag observed) — the perf win, valid only when no wake was owed.
+      if (s.notifyCount === 0) notifySkips++;
+      return;
+    }
+    if (!wDone) {
+      const ns: WfState = { ...s };
+      applyWaiter(ns, waiter[wi]!);
+      dfs(ns, wi + 1, ki);
+    }
+    if (!kDone) {
+      const ns: WfState = { ...s };
+      applyWaker(ns, waker[ki]!);
+      dfs(ns, wi, ki + 1);
+    }
+  }
+
+  const init: WfState = {
+    idx: 0,
+    expected: 0,
+    flag: false,
+    parked: false,
+    woken: false,
+    advanced: false,
+    notifyCount: 0,
+  };
+  dfs(init, 0, 0);
+  return { interleavings, lostWakes, notifySkips };
+}
+
+// ── 11. v2 waiter-flag (correct ordering) — race-free in every schedule. ─────
+function testWaiterFlagCorrectNoLostWake(): void {
+  // Correct waker ordering: RELEASE the lane, THEN check the flag and notify
+  // (store idx → load flag). Waiter: set flag → compare-park (store flag →
+  // load idx via Atomics.wait). The two StoreLoad pairs make a lost wake
+  // impossible: in any interleaving the waiter either (a) sees the lane already
+  // advanced at W_park and does NOT sleep, or (b) parks, in which case its flag
+  // was set before the waker's K_release, so the waker's K_checkNotify observes
+  // the flag and notifies.
+  const res = enumerateWaiterFlag(
+    ["W_setflag", "W_park"],
+    ["K_release", "K_checkNotify"],
+  );
+  assert(res.interleavings === 6, `expected 6 interleavings, got ${res.interleavings}`);
+  assertEq(
+    res.lostWakes,
+    0,
+    `CORRECT waiter-flag protocol must have ZERO lost wakes; found ${res.lostWakes}`,
+  );
+  ok(`testWaiterFlagCorrectNoLostWake (0 lost wakes across ${res.interleavings} interleavings)`);
+}
+
+// ── 12. v2 waiter-flag (naive ordering) — the lost wake the design must avoid. ─
+function testWaiterFlagNaiveLosesWake(): void {
+  // NAIVE waker ordering: check the flag and decide to notify BEFORE the
+  // release-store (load flag → store idx). This is the dual of the edge-trigger
+  // miss. The fuzzer must FIND a lost wake — proving (a) the ordering genuinely
+  // matters and (b) this harness would catch a broken implementation.
+  //
+  // Witness schedule: K_checkNotify (flag still false → skip notify) →
+  // W_setflag → W_park (idx still 0 → parks) → K_release (idx 0→1). Terminal:
+  // parked + advanced + never woken ⇒ the waiter sleeps forever.
+  const res = enumerateWaiterFlag(
+    ["W_setflag", "W_park"],
+    ["K_checkNotify", "K_release"],
+  );
+  assert(res.interleavings === 6, `expected 6 interleavings, got ${res.interleavings}`);
+  assert(
+    res.lostWakes >= 1,
+    `NAIVE waiter-flag protocol MUST exhibit a lost wake (grounding "this area is sharp"); ` +
+      `found ${res.lostWakes}`,
+  );
+  ok(
+    `testWaiterFlagNaiveLosesWake (${res.lostWakes} lost-wake schedule(s) found — ` +
+      `confirms the fuzzer detects the broken ordering)`,
+  );
+}
+
+// ── 13. v2 conditional notify elides the syscall when no peer is parked. ─────
+function testWaiterFlagSkipsNotifyWhenNoWaiter(): void {
+  // The whole point of v2: when no peer is waiting (flag never set), the waking
+  // peer skips the Atomics.notify syscall. Model the waker running alone (no
+  // waiter steps) against a fresh state: K_checkNotify observes flag === false
+  // and issues ZERO notifies. This is the per-op saving the design targets.
+  const res = enumerateWaiterFlag([], ["K_release", "K_checkNotify"]);
+  assertEq(res.interleavings, 1, "no-waiter: single schedule (waker alone)");
+  assertEq(res.lostWakes, 0, "no-waiter: nothing parked ⇒ no lost wake possible");
+  assertEq(
+    res.notifySkips,
+    1,
+    "no-waiter: waker skipped the notify syscall (flag clear) — the v2 saving",
+  );
+  ok("testWaiterFlagSkipsNotifyWhenNoWaiter (notify syscall elided when no peer parked)");
+}
+
 function main(): void {
   testDeterminism();
   testInt32WrapCoercions();
@@ -987,6 +1189,9 @@ function main(): void {
   testPullLatestMultiFrameJump();
   testDropOldestTwoWriterRace();
   testDropOldestBoundedRetry();
+  testWaiterFlagCorrectNoLostWake();
+  testWaiterFlagNaiveLosesWake();
+  testWaiterFlagSkipsNotifyWhenNoWaiter();
   console.log("\nAll Bridge.interleaving tests passed.");
 }
 

@@ -578,20 +578,26 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     this.smoother = new FrameSmoother<S>(schema, () => this.scratchFrame());
   }
 
-  /** Byte size needed for a ring of `(capacity, schema)`. */
+  /** Byte size needed for a ring of `(capacity, schema)`. Pass the same
+   *  `opts` the Bridge will be constructed with so an experimental
+   *  `notify: 'waiter-flag'` ring (0.9.70) is sized for its tail flag lanes;
+   *  omitting `opts` yields the default wire-stable size. */
   static byteLength<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
+    opts?: BridgeOptions,
   ): number {
-    return SpscRing.byteLength(capacity, schema);
+    return SpscRing.byteLength(capacity, schema, opts);
   }
 
-  /** Allocate a SAB sized for the requested ring. */
+  /** Allocate a SAB sized for the requested ring. Pass the same `opts` the
+   *  Bridge will be constructed with (see `byteLength`). */
   static allocate<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
+    opts?: BridgeOptions,
   ): BridgeAllocation<S> {
-    return SpscRing.allocate(capacity, schema);
+    return SpscRing.allocate(capacity, schema, opts);
   }
 
   /**
@@ -1579,6 +1585,12 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     return this.ring.waitForData(timeoutMs);
   }
 
+  /** Active park/wake notify protocol (0.9.70). `'always'` (default) or the
+   *  experimental opt-in `'waiter-flag'`. Delegates to the inner ring. */
+  notifyMode(): "always" | "waiter-flag" {
+    return this.ring.notifyMode();
+  }
+
   /**
    * Returns a JSON-able description of the schema's frame byte layout, for
    * worklets that want to inline the read protocol without importing the
@@ -1723,10 +1735,15 @@ export const Bridge = BridgeImpl as unknown as {
     schema: S,
     opts?: BridgeOptions,
   ): Bridge<S, Role>;
-  byteLength<S extends Schema<FieldsObject, any>>(capacity: number, schema: S): number;
+  byteLength<S extends Schema<FieldsObject, any>>(
+    capacity: number,
+    schema: S,
+    opts?: BridgeOptions,
+  ): number;
   allocate<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
+    opts?: BridgeOptions,
   ): BridgeAllocation<S>;
   readonly INVARIANT_OK_THRESHOLD: number;
   readonly INVARIANT_SOFT_THRESHOLD: number;

@@ -76,6 +76,10 @@ const INCLUDES = [
   { path: "docs/formal-verification-design.md", mode: "full", lang: "md" },
   { path: "docs/spsc-happens-before-proof.md", mode: "full", lang: "md" },
   { path: "docs/interleaving-fuzzer-design.md", mode: "full", lang: "md" },
+  // Proposed v2 conditional-notify protocol (0.9.70): the StoreLoad
+  // correctness argument, the lost-wake hazard, wire impact, and the runnable
+  // fuzzer + TLA verification plan. Design/spec only — not yet implemented.
+  { path: "docs/waiter-flag-notify-design.md", mode: "full", lang: "md" },
 
   // ── Source — public API surface ───────────────────────────────────────
   { path: "src/index.ts", mode: "full", lang: "ts" },

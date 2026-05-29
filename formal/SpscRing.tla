@@ -78,11 +78,13 @@ EXTENDS Integers, Sequences, TLC
 CONSTANTS
     CAPACITY,    \* ring capacity (power of two); FULL when diff >= CAPACITY
     CAP2_32,     \* the modeled counter modulus (small power of two for TLC)
-    MAXFRAMES    \* bound the producer to a finite session for TLC
+    MAXFRAMES,   \* bound the producer to a finite session for TLC
+    NOTIFY_MODE  \* "always" (shipped) | "waiter-flag" (proposed v2)
 
 ASSUME CAPACITY \in Nat /\ CAPACITY >= 1
 ASSUME CAP2_32 \in Nat /\ CAP2_32 > CAPACITY
 ASSUME MAXFRAMES \in Nat
+ASSUME NOTIFY_MODE \in {"always", "waiter-flag"}
 
 \* ToUint32-then-mask slot decode: (idx >>> 0) & (CAPACITY - 1).
 \* Source: `slot = (idx >>> 0) & mask` (src/SpscRing.ts:814, 962).
@@ -128,11 +130,25 @@ variables
     slotOwner = [s \in 0..(CAPACITY - 1) |-> ""],
 
     \* ── Park / wake protocol ghost (src/SpscRing.ts:141-168) ──
-    \* Always-notify: every release-store is unconditionally followed by a
-    \* notify of the peer's lane.  We model a parked peer as a flag and assert
+    \* NOTIFY_MODE = "always" (shipped): every release-store is unconditionally
+    \* followed by a notify of the peer's lane.  NOTIFY_MODE = "waiter-flag"
+    \* (proposed v2, docs/waiter-flag-notify-design.md): the waking peer issues
+    \* the notify only if the parking peer's flag is set.  We model a parked peer
+    \* as a flag (which doubles as the waiter flag: a peer is "parked" exactly
+    \* when its WAITING_FOR_* flag is set and it is blocked) and assert
     \* WakeLiveness: a peer parked on a stale value is eventually released.
-    producerParked = FALSE,   \* producer in waitForSpace (src/SpscRing.ts:1832)
-    consumerParked = FALSE,   \* consumer in waitForData  (src/SpscRing.ts:1855)
+    \*
+    \* In the faithful FUSED model the correct v2 ordering — advance the index,
+    \* THEN check the flag, in the same release window (PubW / CommitR) — makes a
+    \* conditional clear OBSERVATIONALLY EQUIVALENT to an unconditional one: the
+    \* wake matters only when the peer is parked, and then its flag is set, so the
+    \* conditional notify fires.  Hence WakeLiveness holds in BOTH modes.  The
+    \* NAIVE reordering (check the flag BEFORE the release) breaks this and loses
+    \* a wake; that hazard is explored exhaustively in the runnable interleaving
+    \* fuzzer (tests/Bridge.interleaving.test.ts pins 11-13), which splits the
+    \* release and the flag-check into distinct interleaving points.
+    producerParked = FALSE,   \* producer in waitForSpace (src/SpscRing.ts:1832); doubles as WAITING_FOR_SPACE
+    consumerParked = FALSE,   \* consumer in waitForData  (src/SpscRing.ts:1855); doubles as WAITING_FOR_DATA
 
     \* ── Bookkeeping for safety invariants ──
     nextSeq   = 1,            \* next logical payload id the producer will emit
@@ -217,9 +233,16 @@ ProducerLoop:
                     writeIdx := Incr(writeIdx);
                     nextSeq  := nextSeq + 1;
                     produced := produced + 1;
-                    \* Step 5: unconditional notify wakes a parked consumer.
-                    \* (src/SpscRing.ts:838)
-                    consumerParked := FALSE;
+                    \* Step 5: wake a parked consumer. "always" = unconditional
+                    \* notify (src/SpscRing.ts:838). "waiter-flag" = notify only
+                    \* if the consumer flag is set; since the index was advanced
+                    \* just above (correct ordering) and a parked consumer's flag
+                    \* is set, the conditional clear matches the unconditional one
+                    \* (clearing a non-parked peer is a no-op either way).
+                    consumerParked := IF NOTIFY_MODE = "always"
+                                      THEN FALSE
+                                      ELSE IF consumerParked THEN FALSE
+                                           ELSE consumerParked;
             end if;
     end while;
 end process;
@@ -259,9 +282,15 @@ ConsumerLoop:
                     lastConsumedSeq := slots[Slot(readIdx)];
                     readIdx  := Incr(readIdx);
                     consumed := consumed + 1;
-                    \* Step 5: unconditional notify wakes a parked producer.
-                    \* (src/SpscRing.ts:981)
-                    producerParked := FALSE;
+                    \* Step 5: wake a parked producer. "always" = unconditional
+                    \* notify (src/SpscRing.ts:981). "waiter-flag" = notify only
+                    \* if the producer flag is set; the read_index was advanced
+                    \* just above (correct ordering), so the conditional clear
+                    \* matches the unconditional one (mirror of PubW).
+                    producerParked := IF NOTIFY_MODE = "always"
+                                      THEN FALSE
+                                      ELSE IF producerParked THEN FALSE
+                                           ELSE producerParked;
             end if;
     end while;
 end process;
@@ -270,8 +299,12 @@ end algorithm;*)
 
 \* ───────────────────────── LIVENESS PROPERTY ─────────────────────────
 \* WakeLiveness: a peer parked because the ring was full/empty is eventually
-\* released once the other peer makes progress.  This is the correctness
-\* claim of the always-notify protocol (src/SpscRing.ts:141-161): "a parked
+\* released once the other peer makes progress.  Checked under BOTH
+\* NOTIFY_MODE = "always" (the shipped protocol) and "waiter-flag" (the
+\* proposed v2): the conditional-notify clear is observationally equivalent in
+\* the fused model (see the park/wake ghost comment), so this property must hold
+\* for both.  This is the correctness claim of the always-notify protocol
+\* (src/SpscRing.ts:141-161): "a parked
 \* peer is guaranteed to be woken on the next state change", and
 \* Atomics.wait's atomic compare-and-park closes the load-then-park race
 \* (src/SpscRing.ts:156-161).  Under weak fairness on both processes:

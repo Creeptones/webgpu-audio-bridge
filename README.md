@@ -8,7 +8,7 @@
 
 ### Status & maturity
 
-- **Version**: 0.9.69 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
+- **Version**: 0.9.70 (May 2026). Active 0.9.x soak cohort heading toward 1.0; see [`ROADMAP.md`](./ROADMAP.md#the-10-trigger). Pre-1.0 is **deliberate policy**, not abandonment — 1.0 means a settled-API stability commitment, not a feature checkpoint, and the [`CLAUDE.md`](./CLAUDE.md) versioning policy treats each 0.9.x patch as a maturity checkpoint rather than a race-to-1.0 stepping stone.
 - **Tests**: 30 Node/TypeScript suites in `npm test`, plus cross-engine Playwright browser CI (schema / Bridge core / smoother / invariant / PLL / trajectory / backpressure / observability / facades / properties / recovery / input-lane / block-consumer / residual-quality-controller / WASM-equivalence / concurrent SPSC stress / roles / connect / typecheck-deprecations / readme-imports / and more). **Cross-engine browser CI**: Playwright runs the minimal-demo smoke + e2e-latency CPU-mode bench against Chromium, Firefox, and WebKit on every push and PR to `main` — `.github/workflows/browser.yml` gates merges (`continue-on-error` is off).
 - **Distribution**: [`webgpu-audio-bridge` on npm](https://www.npmjs.com/package/webgpu-audio-bridge); concept [DOI 10.5281/zenodo.20380886](https://doi.org/10.5281/zenodo.20380886) on Zenodo resolves to the latest release. MIT license. **Zero runtime dependencies.** Engines: Node ≥ 18 for the build / test toolchain; the published library itself is ESM with TypeScript types and runs anywhere `SharedArrayBuffer` + `Atomics` + `AudioWorklet` are available.
 - **Release artifacts**: per-patch history lives in [`CHANGELOG.md`](./CHANGELOG.md) (every patch has its own entry with rationale + wire-compat notes + test deltas). The GitHub Releases tab is intentionally sparse — only the v0.1.x foundation releases are tagged there; subsequent versions ship via npm + Zenodo. Cite the concept DOI or a specific version via the [`CITATION.cff`](./CITATION.cff) at the repo root.
@@ -1575,6 +1575,25 @@ while (!ring.push(vEff, jEff, header)) {
 **Do NOT call `waitForData()` from `AudioWorklet.process()`** — that method is hard-real-time and must never block. AudioWorklets should keep polling via `pullLatest()` and rely on the consumer-side smoothing they already have. `waitForSpace` / `waitForData` are for Workers, the main thread, Node tests, and any non-realtime downstream reader that can afford to block.
 
 Both methods use `Atomics.wait` with the spec's atomic compare-and-park semantic, so the load-then-park race is closed: if the peer advances its index between your load and your wait, the wait returns `"not-equal"` immediately rather than parking forever. The matching `Atomics.notify` is **unconditional** on every `push` / `pull` / `pullLatest` — a parked peer is guaranteed to be woken on the next state change. This is deliberately not edge-triggered; an earlier iteration tried "notify only on empty→non-empty / full→non-full" and lost wake-ups under genuine 2-thread contention. See the "Park / wake protocol" section in `src/SpscRing.ts` for the full story.
+
+#### Experimental — `notify: 'waiter-flag'` (0.9.70)
+
+> **Experimental, opt-in.** `notify: 'waiter-flag'` may break across PATCH releases (same posture as `BridgeWebNNSource`). The default `notify: 'always'` is byte-identical to every prior version and unaffected.
+
+The unconditional notify above is a fixed per-op cost: an `Atomics.notify` with zero waiters still issues a `futex_wake` syscall (~100 ns). In the dominant deployment — an AudioWorklet consumer that polls `pullLatest` and **never parks**, with a non-`block` producer that **also never parks** — *every* notify wakes nobody. The opt-in `notify: 'waiter-flag'` mode elides that syscall: the parking peer (`waitForData` / `waitForSpace`) sets a flag immediately before `Atomics.wait`, and the waking peer issues `Atomics.notify` **only if** that flag is set.
+
+```ts
+// Both peers MUST agree on the mode — the SAB size differs.
+const alloc = Bridge.allocate(capacity, schema, { notify: 'waiter-flag' });
+const producer = new Bridge(alloc.sab, alloc.capacity, alloc.schema, { notify: 'waiter-flag' });
+// …and the consumer constructs over the same SAB with { notify: 'waiter-flag' } too.
+```
+
+- The two flag lanes (`WAITING_FOR_DATA`, `WAITING_FOR_SPACE`) live at the **SAB tail**, after the payload — the header and payload byte layout are unchanged, so `notify: 'always'` stays wire-stable. `waiter-flag` mode adds **8 bytes** to the SAB; pass the same `opts` to `Bridge.allocate` / `Bridge.byteLength` so the SAB is sized for them.
+- This is the *dual* of the edge-trigger miss: get the store/load ordering wrong and you reintroduce a lost wakeup. The implementation releases the index **then** checks the flag (never the reverse) — the StoreLoad pairing that makes it race-free. The full correctness argument is in [`docs/waiter-flag-notify-design.md`](./docs/waiter-flag-notify-design.md); the runnable proof is `tests/Bridge.interleaving.test.ts` pins 11–13, and `tests/Bridge.concurrent.test.ts` runs the 1 M-frame cross-thread stress in this mode (it cut push-notifies ~97% with every frame still bit-exact).
+- `notifyMode()` (on `Bridge` / `SpscRing`) reports the active mode.
+
+The recommendation is to soak this opt-in mode, then promote conditional-notify to the wire-versioned **default** at a deliberate `0.10.0`.
 
 ### Overflow policies (0.6.12)
 

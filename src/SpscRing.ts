@@ -176,6 +176,19 @@
  * realtime consumers (concurrent stress tests, bench harnesses, non-audio
  * downstream readers).
  *
+ * Waiter-flag mode (0.9.70, experimental opt-in `notify: 'waiter-flag'`).
+ * A v2 conditional-notify protocol that elides the always-notify syscall
+ * when no peer is parked. The parking peer sets a tail flag immediately
+ * before Atomics.wait; the waking peer issues Atomics.notify only if that
+ * flag is set. All notify sites route through the single `_notifyLane`
+ * helper, where the mode dispatch AND the mandatory release-then-check-flag
+ * ordering live. The flags occupy two Int32 lanes appended at the SAB TAIL
+ * (see the layout block below), so the header + payload byte layout — and
+ * therefore RING_HEADER_BYTES and every payload-offset computation — stay
+ * byte-identical to the default. Default mode is unchanged. The full
+ * race-freedom (StoreLoad) argument is in docs/waiter-flag-notify-design.md;
+ * the runnable proof is tests/Bridge.interleaving.test.ts pins 11-13.
+ *
  * ─── Adaptive backpressure (CFL-style, 0.5.0) ─────────────────────────────
  *
  * The ring exposes a soft rate-control signal on lane 2 (`flow_scale`,
@@ -285,6 +298,36 @@ const PLL_DRIFT_Q16_16 = 65536;
 // positive signed-32 → Atomics.load on Int32Array returns the stored
 // value bit-for-bit (no sign weirdness).
 const FLOW_SCALE_Q = AdaptiveFlowController.Q;
+
+// ─── Waiter-flag notify (experimental, opt-in 0.9.70) ─────────────────────
+//
+// The `notify: 'waiter-flag'` mode appends two Int32 "is-a-peer-parked?"
+// lanes at the SAB TAIL — after the payload region — so the header + payload
+// byte layout (and therefore `RING_HEADER_BYTES` and every payload-offset
+// computation in src + tests) stay byte-identical to the default. The waker
+// elides the `Atomics.notify` syscall when the relevant flag reads 0
+// (no peer parked). See `docs/waiter-flag-notify-design.md` for the full
+// race-freedom (StoreLoad) argument and `tests/Bridge.interleaving.test.ts`
+// pins 11-13 for the runnable proof.
+//
+//   tail = RING_HEADER_BYTES + capacity * frameByteSize   (Int32-aligned)
+//   [ tail + 0 )  WAITING_FOR_DATA  — consumer parked on write_index lane
+//   [ tail + 4 )  WAITING_FOR_SPACE — producer parked on read_index lane
+//
+// Only allocated when `notify === 'waiter-flag'`; the default `'always'`
+// mode leaves the SAB size and behavior bit-identical to pre-0.9.70.
+const WAITER_FLAG_LANES = 2;
+const WAITER_FLAG_TAIL_BYTES = WAITER_FLAG_LANES * 4; // 8
+// Indices into the 2-lane tail Int32Array view (`this.waiterFlags`).
+const WAITING_FOR_DATA_FLAG = 0; // consumer parked via waitForData
+const WAITING_FOR_SPACE_FLAG = 1; // producer parked via waitForSpace
+
+/** Module-global one-shot guard for the experimental waiter-flag runtime
+ *  warning. Warn at most once per process load so an app that constructs
+ *  many rings doesn't drown stderr; the `@experimental` JSDoc provides the
+ *  IDE-time signal and this warn is the runtime backstop. Mirrors
+ *  `BridgeWebNNSource`'s warn pattern (0.9.70). */
+let _waiterFlagExperimentalWarned = false;
 
 export interface BridgeAllocation<S extends Schema<FieldsObject, any>> {
   sab: SharedArrayBuffer;
@@ -402,6 +445,31 @@ export interface SpscRingOptions {
    *  the overflow `policy`) is unaffected — this only governs the soft hint.
    *  Default: `true` (preserves pre-0.9.69 behavior bit-exact). */
   readonly flowController?: boolean;
+  /** Park/wake notify protocol (0.9.70, **experimental, opt-in**).
+   *
+   *  - `'always'` (default): every `push` / `pull` issues `Atomics.notify`
+   *    unconditionally after its release-store. Correct by construction,
+   *    wire-identical to all prior versions. This is the only mode existing
+   *    peers and the canonical AudioWorklet deployment use.
+   *
+   *  - `'waiter-flag'`: a v2 conditional-notify protocol. The parking peer
+   *    sets a flag immediately before `Atomics.wait`; the waking peer issues
+   *    `Atomics.notify` **only if** that flag is set, eliding the
+   *    `futex_wake` syscall (~100 ns) when no peer is parked — the dominant
+   *    case for a polling AudioWorklet consumer + non-`block` producer. The
+   *    flags live in two Int32 lanes appended at the SAB **tail** (the
+   *    header + payload byte layout are unchanged), so this mode adds 8
+   *    bytes to the SAB and is selectable per-ring without disturbing the
+   *    default wire format.
+   *
+   *    @experimental — may break across PATCH releases (same posture as
+   *    `BridgeWebNNSource`). **Both peers must construct with the same
+   *    `notify` value** — the SAB size differs, and a `'waiter-flag'` peer
+   *    relies on its counterpart honoring the flag protocol. See
+   *    `docs/waiter-flag-notify-design.md`.
+   *
+   *  Default: `'always'`. */
+  readonly notify?: "always" | "waiter-flag";
 }
 
 type AnyTypedArray =
@@ -552,6 +620,18 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    *  branch in `_updateFlowScale`. Default `true`. */
   private readonly flowControllerEnabled: boolean;
 
+  /** Park/wake notify protocol (0.9.70). `'always'` (default) notifies
+   *  unconditionally; `'waiter-flag'` (experimental) only notifies when the
+   *  peer announced it parked via the tail flag lanes. Frozen at construction.
+   *  See `SpscRingOptions.notify` + `docs/waiter-flag-notify-design.md`. */
+  private readonly _notify: "always" | "waiter-flag";
+
+  /** Two-lane Int32 view over the SAB tail flag lanes (WAITING_FOR_DATA at
+   *  index 0, WAITING_FOR_SPACE at index 1). Non-null **only** in
+   *  `'waiter-flag'` mode; null in the default `'always'` mode where the
+   *  lanes are not allocated. See the "Waiter-flag notify" header block. */
+  private readonly waiterFlags: Int32Array | null;
+
   /** Producer-side overflow disposition (0.6.12). See `BackpressurePolicy`
    *  for the per-policy contract. Frozen at construction; baking it in
    *  once avoids a per-push policy dispatch on the fast path (the
@@ -662,7 +742,30 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         `SpscRing: capacity must be ≤ 2^30 (signed-32 diff headroom), got ${capacity}`,
       );
     }
-    const expectedBytes = SpscRing.byteLength(capacity, schema);
+    // Notify mode from opts (0.9.70). Validated here, before the byteLength
+    // check, because the SAB size depends on it ('waiter-flag' appends two
+    // tail lanes). Default 'always' — wire-identical to all prior versions.
+    const notify = opts.notify ?? "always";
+    if (notify !== "always" && notify !== "waiter-flag") {
+      throw new Error(
+        `SpscRing: unknown notify mode '${String(notify)}'; ` +
+          `expected 'always' | 'waiter-flag'`,
+      );
+    }
+    this._notify = notify;
+    if (notify === "waiter-flag" && !_waiterFlagExperimentalWarned) {
+      _waiterFlagExperimentalWarned = true;
+      console.warn(
+        "[webgpu-audio-bridge] notify: 'waiter-flag' is experimental and " +
+          "outside the 1.0 stability contract. The conditional-notify " +
+          "protocol may break across PATCH releases until it is promoted to " +
+          "the wire-versioned default (a deliberate 0.10.0 decision). Both " +
+          "peers MUST construct with the same `notify` value — the SAB size " +
+          "differs. See docs/waiter-flag-notify-design.md.",
+      );
+    }
+
+    const expectedBytes = SpscRing.byteLength(capacity, schema, opts);
     if (sab.byteLength < expectedBytes) {
       throw new Error(
         `SpscRing: SAB too small (${sab.byteLength} bytes, need ${expectedBytes} for capacity=${capacity}, schema.frameByteSize=${schema.frameByteSize})`,
@@ -679,6 +782,20 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     // header. As of 0.8.2 the publish path writes them as two Int32 stores
     // (BigInt-free); the legacy aliased BigInt64 view was retired then.
     // SAB byte layout unchanged.
+
+    // Waiter-flag tail lanes (0.9.70). Only allocated in 'waiter-flag' mode;
+    // the default 'always' mode leaves `waiterFlags` null and the SAB tail
+    // byte-identical to v1. The two flags default to 0 via the SAB's
+    // zero-initialization. Deliberately NOT stored here: unlike the
+    // flow_scale non-zero seed, the waiter-flag default IS 0, so a fresh SAB
+    // is already correct — and a late-constructing third peer must NOT reset
+    // a flag a live peer just set to 1 (which a plain store would clobber).
+    if (notify === "waiter-flag") {
+      const tailByteOffset = RING_HEADER_BYTES + capacity * schema.frameByteSize;
+      this.waiterFlags = new Int32Array(sab, tailByteOffset, WAITER_FLAG_LANES);
+    } else {
+      this.waiterFlags = null;
+    }
 
     // Policy + block-timeout from opts. Validated here so invalid configs
     // surface at construction rather than as a confusing branch-miss later.
@@ -834,23 +951,32 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     this.scalarReaders = Object.freeze(readers);
   }
 
-  /** Byte size needed for a ring of `(capacity, schema)`. */
+  /** Byte size needed for a ring of `(capacity, schema)`.
+   *
+   *  `opts.notify === 'waiter-flag'` (0.9.70) appends `WAITER_FLAG_TAIL_BYTES`
+   *  (8) for the two tail flag lanes. Any other `opts` (or omitted) yields the
+   *  byte-identical pre-0.9.70 size — the default wire format is unchanged. */
   static byteLength<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
+    opts?: SpscRingOptions,
   ): number {
     if (!isPowerOfTwo(capacity)) {
       throw new Error(`SpscRing.byteLength: capacity must be power of two`);
     }
-    return RING_HEADER_BYTES + capacity * schema.frameByteSize;
+    const base = RING_HEADER_BYTES + capacity * schema.frameByteSize;
+    return opts?.notify === "waiter-flag" ? base + WAITER_FLAG_TAIL_BYTES : base;
   }
 
-  /** Allocate a SAB sized for the requested ring. */
+  /** Allocate a SAB sized for the requested ring. Pass the same `opts` the
+   *  ring will be constructed with so `'waiter-flag'` rings get the extra
+   *  tail bytes; omitting `opts` allocates the default (wire-stable) size. */
   static allocate<S extends Schema<FieldsObject, any>>(
     capacity: number,
     schema: S,
+    opts?: SpscRingOptions,
   ): BridgeAllocation<S> {
-    const sab = new SharedArrayBuffer(SpscRing.byteLength(capacity, schema));
+    const sab = new SharedArrayBuffer(SpscRing.byteLength(capacity, schema, opts));
     return { sab, capacity, schema };
   }
 
@@ -904,6 +1030,46 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
   }
 
   /**
+   * Single dispatch point for every park/wake notify (0.9.70). All six notify
+   * sites (`push`, `pushRaw`, `commitPush`, `pull`, `pullLatest`, the two
+   * overrun-aware pulls, and `_notifyReadAdvance`) route through here so the
+   * mode decision — and the load-bearing ORDERING RULE — live in exactly one
+   * place.
+   *
+   * **Ordering (mandatory):** callers MUST have already issued the
+   * release-store (`Atomics.store` of the index lane) BEFORE calling this. In
+   * `'waiter-flag'` mode the flag load below pairs with the parked peer's
+   * `store(FLAG, 1)` → `Atomics.wait` compare-and-park via a Dekker-style
+   * StoreLoad: release-then-check-flag is race-free; the reverse
+   * (check-flag-then-release) loses a wake. See
+   * `docs/waiter-flag-notify-design.md` §"Why it is race-free" and
+   * `tests/Bridge.interleaving.test.ts` pins 11-12.
+   *
+   *   lane = WRITE_IDX_LANE → consumer parks via `waitForData` (sets
+   *                           WAITING_FOR_DATA); push-side wakes it.
+   *   lane = READ_IDX_LANE  → producer parks via `waitForSpace` (sets
+   *                           WAITING_FOR_SPACE); pull-side wakes it.
+   *
+   * `'always'` mode is unchanged: an unconditional `Atomics.notify`. V8
+   * constant-folds the `this._notify` check per-instance.
+   */
+  private _notifyLane(lane: number): void {
+    if (this._notify === "always") {
+      Atomics.notify(this.indices, lane, 1);
+      return;
+    }
+    // 'waiter-flag': only issue the futex_wake syscall if the peer that parks
+    // on this lane announced it is (about to be) parked. `waiterFlags` is
+    // non-null whenever `_notify === 'waiter-flag'`.
+    const flags = this.waiterFlags!;
+    const flagIdx =
+      lane === WRITE_IDX_LANE ? WAITING_FOR_DATA_FLAG : WAITING_FOR_SPACE_FLAG;
+    if (Atomics.load(flags, flagIdx) !== 0) {
+      Atomics.notify(this.indices, lane, 1);
+    }
+  }
+
+  /**
    * Producer side. Copies `view`'s fields into the next free slot, advances
    * write_index, and notifies any parked consumer. Returns false if the ring
    * is full.
@@ -949,8 +1115,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     }
     const nextWrite = (writeIdx + 1) | 0;
     Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite); // release
-    // Unconditional notify — see file header on the always-notify protocol.
-    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
+    // Notify after the release-store (always mode: unconditional; waiter-flag
+    // mode: only if a consumer parked). See `_notifyLane` for the ordering
+    // rule and the file header on the always-notify protocol.
+    this._notifyLane(WRITE_IDX_LANE);
     this.pushedFrames = (this.pushedFrames + 1) | 0;
     this._recordOccupancy((nextWrite - readIdx) | 0);
     return true;
@@ -1024,7 +1192,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     }
     const nextWrite = (writeIdx + 1) | 0;
     Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite); // release
-    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
+    this._notifyLane(WRITE_IDX_LANE);
     this.pushedFrames = (this.pushedFrames + 1) | 0;
     this._recordOccupancy((nextWrite - readIdx) | 0);
     return true;
@@ -1139,7 +1307,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
     const nextWrite = (writeIdx + 1) | 0;
     Atomics.store(this.indices, WRITE_IDX_LANE, nextWrite);
-    Atomics.notify(this.indices, WRITE_IDX_LANE, 1);
+    this._notifyLane(WRITE_IDX_LANE);
     this.pendingPushFrame = null;
     this.pendingPushSlot = -1;
     this.pushedFrames = (this.pushedFrames + 1) | 0;
@@ -1196,7 +1364,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         ]!
       : 0;
     Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
-    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    this._notifyLane(READ_IDX_LANE);
     this._updateFlowScale(writeIdx, readIdx);
     this._recordOccupancy((writeIdx - readIdx) | 0);
     this.pulledFrames = (this.pulledFrames + 1) | 0;
@@ -1320,7 +1488,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         ]!
       : 0;
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
-    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    this._notifyLane(READ_IDX_LANE);
     this._updateFlowScale(writeIdx, readIdx);
     this._recordOccupancy((writeIdx - readIdx) | 0);
     this.pulledFrames = (this.pulledFrames + 1) | 0;
@@ -1413,7 +1581,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         (readIdx + 1) | 0,
       );
       if (prev !== readIdx) continue; // producer overran — retry whole pull
-      Atomics.notify(this.indices, READ_IDX_LANE, 1);
+      this._notifyLane(READ_IDX_LANE);
       this._updateFlowScale(writeIdx, readIdx);
       this._recordOccupancy((writeIdx - readIdx) | 0);
       this.pulledFrames = (this.pulledFrames + 1) | 0;
@@ -1482,7 +1650,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         writeIdx | 0,
       );
       if (prev !== readIdx) continue;
-      Atomics.notify(this.indices, READ_IDX_LANE, 1);
+      this._notifyLane(READ_IDX_LANE);
       this._updateFlowScale(writeIdx, readIdx);
       this._recordOccupancy((writeIdx - readIdx) | 0);
       this.pulledFrames = (this.pulledFrames + 1) | 0;
@@ -1583,7 +1751,11 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * The underscore prefix marks this as internal-only. Not re-exported.
    */
   _notifyReadAdvance(): void {
-    Atomics.notify(this.indices, READ_IDX_LANE, 1);
+    // Routes through `_notifyLane` so the trailing-notify primitive honors
+    // the waiter-flag mode (elides the syscall when no producer parked) and
+    // the same release-then-check ordering rule — the caller has already
+    // issued the per-frame release-stores on READ_IDX_LANE before this.
+    this._notifyLane(READ_IDX_LANE);
   }
 
   /**
@@ -2055,6 +2227,32 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const writeIdx = this.indices[WRITE_IDX_LANE]!;
     const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
     if (((writeIdx - readIdx) | 0) < this.capacity) return "not-equal";
+    // 0.9.70 — in 'waiter-flag' mode announce intent BEFORE the wait's
+    // compare-and-park (the StoreLoad that pairs with the consumer's
+    // post-release flag load in `_notifyLane`). Cleared in `finally` so a
+    // throw/timeout never leaves the flag stuck set (a stuck flag only costs
+    // a spurious notify, not correctness, but keep it clean). The set must
+    // precede the `Atomics.wait` compare in program order — seq-cst gives
+    // the StoreLoad. See docs/waiter-flag-notify-design.md.
+    if (this._notify === "waiter-flag") {
+      const flags = this.waiterFlags!;
+      Atomics.store(flags, WAITING_FOR_SPACE_FLAG, 1);
+      try {
+        return this._waitForSpaceCore(readIdx, timeoutMs);
+      } finally {
+        Atomics.store(flags, WAITING_FOR_SPACE_FLAG, 0);
+      }
+    }
+    return this._waitForSpaceCore(readIdx, timeoutMs);
+  }
+
+  /** Shared park + timing body for `waitForSpace`, factored so the
+   *  waiter-flag set/clear wraps exactly the `Atomics.wait` (0.9.70).
+   *  `readIdx` is the value compared against READ_IDX_LANE. */
+  private _waitForSpaceCore(
+    readIdx: number,
+    timeoutMs?: number,
+  ): "ok" | "not-equal" | "timed-out" {
     // 0.6.13 — record the wait duration into `lastFullWaitNs` for
     // telemetry. `performance.now()` returns milliseconds with sub-ms
     // precision in both Node and browsers; multiply to get ns. We time
@@ -2078,12 +2276,39 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx !== readIdx) return "not-equal";
+    // 0.9.70 — mirror of `waitForSpace`: in waiter-flag mode set
+    // WAITING_FOR_DATA before the wait compare and clear it in `finally`.
+    if (this._notify === "waiter-flag") {
+      const flags = this.waiterFlags!;
+      Atomics.store(flags, WAITING_FOR_DATA_FLAG, 1);
+      try {
+        return this._waitForDataCore(writeIdx, timeoutMs);
+      } finally {
+        Atomics.store(flags, WAITING_FOR_DATA_FLAG, 0);
+      }
+    }
+    return this._waitForDataCore(writeIdx, timeoutMs);
+  }
+
+  /** Shared park + timing body for `waitForData` (0.9.70). `writeIdx` is the
+   *  value compared against WRITE_IDX_LANE. */
+  private _waitForDataCore(
+    writeIdx: number,
+    timeoutMs?: number,
+  ): "ok" | "not-equal" | "timed-out" {
     // 0.6.13 — mirror of `waitForSpace` timing. Records the actual parked
     // duration into `lastEmptyWaitNs` for telemetry.
     const t0 = performance.now();
     const status = Atomics.wait(this.indices, WRITE_IDX_LANE, writeIdx, timeoutMs);
     this.lastEmptyWaitNs = Math.round((performance.now() - t0) * 1e6);
     return status;
+  }
+
+  /** Active park/wake notify protocol (0.9.70). `'always'` (default) or
+   *  `'waiter-flag'` (experimental). Mirrors `decoderMode()` /
+   *  `autoPollMode()` for telemetry / dashboards. */
+  notifyMode(): "always" | "waiter-flag" {
+    return this._notify;
   }
 
   /**

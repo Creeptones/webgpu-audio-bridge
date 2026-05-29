@@ -487,6 +487,68 @@ function runNotifyOnPullBench(): {
 }
 
 /**
+ * 0.9.70 cell. Waiter-flag conditional-notify saving on the push hot path.
+ *
+ * Goal: quantify what `notify: 'waiter-flag'` saves on `push` when no peer is
+ * parked — the dominant deployment (an AudioWorklet consumer polls
+ * `pullLatest` and never calls `waitForData`, so WAITING_FOR_DATA stays 0 and
+ * every push elides the `Atomics.notify` syscall). This is the production
+ * payoff the design predicts (~100 ns/push); the older
+ * `runNotifyOnPullBench` cell sized the same syscall from the pull side via
+ * the `_pullNoNotify` shim — this cell measures the actual shipped path.
+ *
+ * Approach: two `SpscRing<S>` instances over the same physics-control schema,
+ * one `'always'` and one `'waiter-flag'`. Each iteration times the `push`
+ * then drains with a `pull` so both stay at the one-buffered steady state and
+ * the per-push memcpy + scalar/array-loop costs match. The waiter-flag ring's
+ * WAITING_FOR_DATA flag is never set (no parked consumer), so its push takes
+ * the elided-notify branch. The reported delta is `alwaysMed - waiterMed`.
+ *
+ * Not gated — informational, like the other notify cells.
+ */
+function runWaiterFlagPushBench(): {
+  alwaysSamples: number[];
+  waiterSamples: number[];
+} {
+  const schema = physicsControlFrameSchema(N);
+  const frame = makeFrame();
+  const out = makeOutFrame();
+
+  const aAlloc = SpscRing.allocate(CAPACITY, schema);
+  const aRing = new SpscRing(aAlloc.sab, CAPACITY, schema);
+  const wAlloc = SpscRing.allocate(CAPACITY, schema, { notify: "waiter-flag" });
+  const wRing = new SpscRing(wAlloc.sab, CAPACITY, schema, { notify: "waiter-flag" });
+
+  // Warm both at the one-buffered steady state.
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    aRing.push(frame);
+    aRing.pull(out);
+    wRing.push(frame);
+    wRing.pull(out);
+  }
+
+  const alwaysSamples = new Array<number>(MEASURE_ITERS);
+  const waiterSamples = new Array<number>(MEASURE_ITERS);
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.seq = BigInt(i);
+    const t0 = hrtime.bigint();
+    aRing.push(frame);
+    const t1 = hrtime.bigint();
+    alwaysSamples[i] = Number(t1 - t0);
+    aRing.pull(out); // drain so the next push has a free slot
+
+    frame.seq = BigInt(i);
+    const t2 = hrtime.bigint();
+    wRing.push(frame);
+    const t3 = hrtime.bigint();
+    waiterSamples[i] = Number(t3 - t2);
+    wRing.pull(out);
+  }
+  return { alwaysSamples, waiterSamples };
+}
+
+/**
  * 0.8.2 cell. `BridgeInputLane.pullAll` notify-cost amortization.
  *
  * Goal: demonstrate that the 0.8.2 single-trailing-notify rewrite of
@@ -821,6 +883,20 @@ function main(): void {
   console.log(
     `  notify-on-pull delta (pull - noNotify) = ${fmt(notifyDelta)}  ` +
       `(sizes the 0.7.0 wait-flag payoff)`,
+  );
+  console.log();
+
+  // 0.9.70 cell — waiter-flag conditional-notify saving on push (no waiter
+  // parked). `always - waiter-flag` is the per-push Atomics.notify syscall
+  // the experimental mode elides in the dominant polling-consumer
+  // deployment. Not gated; informational.
+  const wf = runWaiterFlagPushBench();
+  const wfAlwaysMed = summarize("push (always)", wf.alwaysSamples);
+  const wfWaiterMed = summarize("push (waiter-flag, no waiter)", wf.waiterSamples);
+  const wfDelta = wfAlwaysMed - wfWaiterMed;
+  console.log(
+    `  waiter-flag push saving (always - waiter-flag) = ${fmt(wfDelta)}  ` +
+      `(elided notify syscall; experimental notify:'waiter-flag')`,
   );
   console.log();
 

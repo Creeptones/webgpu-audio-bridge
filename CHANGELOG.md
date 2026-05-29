@@ -4,6 +4,144 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.70] — 2026-05-29
+
+### Added — v2 waiter-flag (conditional) notify protocol: design + proof + guarded experimental implementation
+
+A v2 park/wake protocol that elides the `Atomics.notify` syscall when no peer
+is parked, landing as **(1)** the spec + correctness proof and **(2)** a
+guarded, opt-in experimental implementation (`notify: 'waiter-flag'`). The
+**default mode is byte-identical to every prior version** — the experimental
+mode is additive and selected per-ring, so this stays a patch.
+
+#### The idea
+
+The shipped protocol notifies unconditionally after every release-store
+(`push` → lane 0, `pull` → lane 1). Correct, but every notify with zero waiters
+is a wasted `futex_wake` (~100 ns; the header calls the baseline
+"`Atomics.notify`-dominated"). The dominant case — an AudioWorklet consumer that
+polls and never parks, with a non-`block` producer that also never parks — wakes
+nobody on *every* notify. The v2 protocol has the parking peer set a flag
+(`WAITING_FOR_DATA` / `WAITING_FOR_SPACE`) immediately before `Atomics.wait`, and
+the waking peer notifies only if that flag is set.
+
+#### Why this is sharp, and how it's proven
+
+This is the **dual of the edge-trigger miss** the file header documents: wrong
+store/load ordering reintroduces a lost wakeup. The correctness hinges on a
+StoreLoad pairing — the waiting peer's `Atomics.wait` compare-and-park is the
+load that pairs with its flag store, and the waking peer must **release the
+index, then check the flag** (never the reverse).
+
+- **`docs/waiter-flag-notify-design.md`** — the protocol, the full StoreLoad /
+  Dekker correctness argument, the naive ordering that breaks, the wire impact
+  (two new header lanes ⇒ a `0.10.0` decision), the perf rationale, and the
+  rollout recommendation (guarded experimental mode first, then wire-versioned
+  default).
+- **`tests/Bridge.interleaving.test.ts` pins 11–13** (runnable, exhaustive):
+  pin 11 — the correct ordering has **0 lost wakes** across all 6 interleavings
+  of {set-flag, compare-park} × {release, check-notify}; pin 12 — the naive
+  ordering **does** lose a wake (the harness finds the witness schedule,
+  grounding "this area is sharp" and proving the fuzzer would catch a broken
+  impl); pin 13 — the notify syscall is **elided** when no peer is parked (the
+  saving). These run in CI as the load-bearing proof.
+- **`formal/SpscRing.tla`** — new `NOTIFY_MODE` constant
+  (`"always"` | `"waiter-flag"`); the wake is gated conditionally. In the fused
+  model the correct ordering makes the conditional clear observationally
+  equivalent to the unconditional one, so `WakeLiveness` holds for both modes
+  (offline TLC cross-check; safety invariants are notify-mode-independent).
+
+#### Added — Implementation (experimental, opt-in)
+
+The guarded implementation the design recommended now ships behind
+`notify: 'waiter-flag'` (default `'always'`). The design note's wire-impact
+analysis assumed two **new header lanes** would shift the payload ⇒ a `0.10.0`
+wire change. The shipped implementation **avoids that** by putting the two
+flag lanes at the **SAB tail**, after the payload region:
+
+```
+[ 0 .. 31 ]                     header lanes 0–7        (UNCHANGED)
+[ 32 .. 32 + cap*frameBytes )   payload region          (UNCHANGED)
+[ tail .. tail + 8 )            WAITING_FOR_DATA (i32), WAITING_FOR_SPACE (i32)
+                                only allocated in 'waiter-flag' mode
+```
+
+- `RING_HEADER_BYTES` (32) and every `RING_HEADER_BYTES + slot*frameByteSize`
+  payload-offset computation in src + tests are **untouched**. The default
+  `notify: 'always'` SAB byte layout — header, payload, size — is identical to
+  pre-0.9.70, so existing peers and all current tests are unaffected.
+- `notify: 'waiter-flag'` allocates **8 extra tail bytes** for the two flags.
+  The parking peer (`waitForData` / `waitForSpace`) sets its flag immediately
+  before `Atomics.wait` and clears it in a `finally`; the waking peer routes
+  every notify through one private `_notifyLane(lane)` helper that, in
+  waiter-flag mode, issues `Atomics.notify` **only if** the relevant flag is
+  set — after the release-store (the mandatory release-then-check ordering the
+  proof relies on lives in that one helper).
+- Additive public API: `SpscRingOptions.notify` / `BridgeOptions.notify`
+  (`'always' | 'waiter-flag'`), `Bridge.byteLength(cap, schema, opts)` /
+  `Bridge.allocate(cap, schema, opts)` gained an optional `opts` so a
+  waiter-flag SAB is sized for its tail lanes, and a `notifyMode()` getter on
+  `SpscRing` / `Bridge` (mirrors `decoderMode()` / `autoPollMode()`).
+- `@experimental` — "may break across PATCH releases," same posture as
+  `BridgeWebNNSource`, with a one-shot `console.warn` on first construction.
+  **Both peers must construct with the same `notify` value** (the SAB size
+  differs); the default mode interops with any existing peer.
+
+The recommended rollout is unchanged: soak the opt-in mode + accumulate bench
+evidence, then promote conditional-notify to the wire-versioned default at a
+deliberate `0.10.0`.
+
+### Why
+
+This was the audit's "consider a v2" item, flagged "do not patch casually —
+backed by the fuzzer/TLA model." The responsible answer to "should we?" is the
+proof that it's correct, a runnable interleaving check that both proves the fix
+and demonstrates the hazard, the formal-model cross-check, and the measured-
+upside rationale — so the wire bump is an evidence-based decision, not a leap.
+
+### Wire compatibility
+
+**Default (`notify: 'always'`) is byte-identical to every prior version** — no
+header change, no payload-offset change, no SAB size change. Existing peers and
+all current tests are unaffected. The opt-in `notify: 'waiter-flag'` mode adds
+8 bytes at the SAB tail for its two flag lanes; both peers must construct with
+the same `notify` value (the SAB size differs). The flags are a liveness
+optimization only — the safety protocol (release/acquire counters, no-torn-read,
+FIFO) is mode-independent. (The eventual promotion of conditional-notify to the
+*default* at `0.10.0` will be the wire change; this patch keeps it opt-in.)
+
+### Tests
+
+36 Node suites green (new `tests/Bridge.waiterFlag.test.ts`, 5 pins W1–W5:
+default-mode wire-identity, `notifyMode()` getter + construction validation,
+skip-notify-when-no-waiter via an `Atomics.notify` spy, and the
+`waitForData` / `waitForSpace` flag lifecycle — set-before-park, clear-in-finally
+— via an `Atomics.wait` spy). `tests/Bridge.concurrent.test.ts` now runs its
+1 M-frame cross-thread SPSC stress in **both** notify modes; the waiter-flag run
+is the real-machine proof a parked peer is woken (it cut push-notifies from
+1,000,000 to ~28k — ~97% fewer `futex_wake` syscalls — with every frame still
+bit-exact). `tests/Bridge.interleaving.test.ts` pins 11–13 (the abstract proof)
+unchanged. `npm run typecheck` clean; `npm run bench` push/pull/pullLatest
+median ~1.2 μs (unchanged — the always-mode `_notifyLane` branch is constant-
+folded) + a new `push (always)` vs `push (waiter-flag, no waiter)` cell.
+
+### Documentation
+
+- `docs/waiter-flag-notify-design.md` — design note + a **Shipped postscript**
+  documenting the tail-append refinement that kept the guarded impl a patch.
+- `tests/Bridge.interleaving.test.ts` — pins 11–13 + the waiter-flag
+  micro-enumerator; header pin list updated.
+- `formal/SpscRing.tla` — `NOTIFY_MODE` constant + conditional wake; park/wake
+  ghost + WakeLiveness comments updated.
+- `README.md` — `notify: 'waiter-flag'` documented under the experimental /
+  back-pressure surface.
+- `formal/SpscRing.cfg` — `NOTIFY_MODE = "always"` default.
+- `formal/README.md` — new `NOTIFY_MODE` section cross-linking the design note +
+  fuzzer pins.
+- `scripts/regenerate-llm-bundle.mjs` — design note added to the bundle.
+- `package.json` / `README.md` / `CITATION.cff` — `version` bumped to 0.9.70.
+- `CHANGELOG.md` — this entry.
+
 ## [0.9.69] — 2026-05-29
 
 ### Added — opt-out adaptive flow-scale controller (`flowController: false`)

@@ -83,6 +83,33 @@ parked peer is guaranteed to be woken on the next state change", and
 `Atomics.wait`'s atomic compare-and-park closes the load-then-park race
 (`SpscRing.ts:156-161`).
 
+### `NOTIFY_MODE` — always-notify vs the proposed waiter-flag v2
+
+`NOTIFY_MODE` (`SpscRing.cfg`, default `"always"`) selects the wake protocol:
+
+- `"always"` — the **shipped** unconditional notify (`SpscRing.ts:838`/`:981`).
+- `"waiter-flag"` — the **proposed v2** conditional notify
+  ([`../docs/waiter-flag-notify-design.md`](../docs/waiter-flag-notify-design.md)):
+  the waking peer issues the notify only if the parking peer's
+  `WAITING_FOR_DATA` / `WAITING_FOR_SPACE` flag is set.
+
+`WakeLiveness` must hold for **both** — re-run TLC with each value. In the fused
+model the correct v2 ordering (advance the index, *then* check the flag, in the
+same release window) makes the conditional clear observationally equivalent to
+the unconditional one, so liveness is preserved. The **safety** invariants
+(`NoOverwrite` / `NoTornRead` / `FifoMonotone` / `Conservation`) are
+notify-mode-independent — the wake mechanism touches only liveness.
+
+The TLA model deliberately does **not** model the *naive* (broken) v2 ordering
+— that requires splitting the release-store and the flag-check into distinct
+interleaving points, which is done in the runnable interleaving fuzzer
+([`../tests/Bridge.interleaving.test.ts`](../tests/Bridge.interleaving.test.ts)
+pins 11–13): pin 11 proves the correct ordering race-free across all schedules,
+pin 12 confirms the naive ordering loses a wake (so the harness would catch a
+broken implementation), pin 13 shows the notify syscall is elided when no peer
+is parked. The fuzzer is the load-bearing, CI-runnable proof; this TLA mode is
+the offline cross-check that the *liveness* property survives the change.
+
 These leads-to properties require weak fairness on both processes
 (`WF_vars(Producer)` and `WF_vars(Consumer)`). The processes are declared
 `fair process` so the PlusCal translator emits those `WF_vars` conjuncts into
