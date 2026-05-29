@@ -4,6 +4,47 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.59] — 2026-05-29
+
+### Changed — inline the remaining internal machinery + facades in `LLM_BUNDLE.md`
+
+0.9.56 inlined the `SpscRing` core but left six files header-only:
+`FrameSmoother`, `ConsumerClockRecovery`, `AdaptiveFlowController`,
+`BridgeConsumer`, `BridgeProducer`, `BridgeWebNNSource`. An auditor reading the
+bundle could see their header math but not the smoother blend, the PLL PI loop,
+the flow-controller integrator, or the facade delegation.
+
+All six are now inlined in **full**. With the `SpscRing` core that puts the
+**entire runtime source surface** in the bundle — no `src/` file is summarized
+header-only anymore (verified: zero "no leading JSDoc header" placeholders, all
+six class bodies present). Bundle grows to ~23,150 lines / ~1.23 MB.
+
+### Why
+
+Clears the audit's remaining bundle caveat: "some deep machinery is still
+header-only — FrameSmoother, ConsumerClockRecovery, AdaptiveFlowController,
+BridgeConsumer, BridgeProducer, and BridgeWebNNSource remain summarized rather
+than fully inlined." A self-contained audit artifact should contain the code it
+asks the reader to trust.
+
+### Wire compatibility
+
+Zero. Tooling/documentation only — no `src/` runtime change, no schema or SAB
+byte change. `LLM_BUNDLE.md` is a `.gitignore`d build artifact; the committed
+change is the generator script + this entry.
+
+### Tests
+
+No new pins (generator/doc change). Mandatory gates re-run green:
+`npm run typecheck`, `npm test` (30 suites), `npm run bench` (~1.20 µs baseline).
+Bundle regenerated and verified: all six class bodies present, zero header-only
+placeholders remaining.
+
+### Documentation
+
+This entry; `scripts/regenerate-llm-bundle.mjs` inclusion list + rationale comment
++ the bundle's "What this bundle contains" section (item 6 now "inlined in full").
+
 ## [0.9.58] — 2026-05-29
 
 ### Fixed — `releaseMap()` slot reset moved into a literal `finally`

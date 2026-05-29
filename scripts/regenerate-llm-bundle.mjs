@@ -106,19 +106,18 @@ const INCLUDES = [
   },
   { path: "formal/README.md", mode: "full", lang: "md" },
 
-  // ── Source — extracted machinery (headers only) ───────────────────────
-  // Each of these is a self-contained heap-state-machine the public
-  // classes compose. The class internals are mature and well-tested; the
-  // file headers carry the protocol math + invariants that an auditor or
-  // forker needs to understand the design. Inlining the full files would
-  // bloat the bundle for diminishing return. (SpscRing.ts is the exception —
-  // it is the correctness-critical core and is inlined in FULL above, 0.9.56.)
-  { path: "src/FrameSmoother.ts", mode: "header", lang: "ts" },
-  { path: "src/ConsumerClockRecovery.ts", mode: "header", lang: "ts" },
-  { path: "src/AdaptiveFlowController.ts", mode: "header", lang: "ts" },
-  { path: "src/BridgeConsumer.ts", mode: "header", lang: "ts" },
-  { path: "src/BridgeProducer.ts", mode: "header", lang: "ts" },
-  { path: "src/BridgeWebNNSource.ts", mode: "header", lang: "ts" },
+  // ── Source — extracted machinery + facades (inlined in full) ──────────
+  // The self-contained heap-state machines the public classes compose, plus
+  // the composable-facade entrypoints. Inlined in FULL (0.9.59) so an auditor
+  // can verify the smoother / PLL / flow-controller math and the facade
+  // delegation from the bundle alone — completing the SpscRing full-inline
+  // (0.9.56) so the entire runtime surface is present, not just summarized.
+  { path: "src/FrameSmoother.ts", mode: "full", lang: "ts" },
+  { path: "src/ConsumerClockRecovery.ts", mode: "full", lang: "ts" },
+  { path: "src/AdaptiveFlowController.ts", mode: "full", lang: "ts" },
+  { path: "src/BridgeConsumer.ts", mode: "full", lang: "ts" },
+  { path: "src/BridgeProducer.ts", mode: "full", lang: "ts" },
+  { path: "src/BridgeWebNNSource.ts", mode: "full", lang: "ts" },
 
   // ── Examples — the canonical demos ────────────────────────────────────
   { path: "examples/minimal/README.md", mode: "full", lang: "md" },
@@ -246,7 +245,7 @@ async function buildBundle() {
 > 3. Recent CHANGELOG entries (0.9.36+; older entries in the full file at the repo).
 > 4. Design notes — Standard mode, hybrid residual, the five frontier-track notes (predictive extrapolation, record/replay, worklet codegen, \`Bridge<S,Role>\` lattice, \`connect()\`), and the formal-correctness notes (TLA+ verification, happens-before proof, interleaving fuzzer) — plus the \`formal/SpscRing.tla\` model itself.
 > 5. Public-API TypeScript source files inlined in full (Bridge + the \`Bridge<S,Role>\` lattice, MessageChannelBridge, BridgeBlockConsumer, schema DSL, environment, trajectory evaluator, the frontier modules \`predictiveExtrapolation\` / \`TimelineRecorder\` / \`emitWorkletReader\` / \`connect\`, canonical schemas) **plus the correctness-critical \`SpscRing\` core inlined in full** (0.9.56) — the SAB/Atomics counter arithmetic, park/wake wait protocol, overflow policies, and notify behavior, so the SPSC semantics are verifiable from the bundle alone alongside \`formal/SpscRing.tla\`.
-> 6. Remaining extracted-machinery TypeScript files inlined as headers only — \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\`. The headers carry the protocol math and invariants; full files live in \`src/\`.
+> 6. The remaining extracted heap-state machines + composable facades inlined in full (0.9.59) — \`FrameSmoother\`, \`ConsumerClockRecovery\`, \`AdaptiveFlowController\`, \`BridgeConsumer\`, \`BridgeProducer\`, \`BridgeWebNNSource\`. With the \`SpscRing\` core (item 5) this puts the **entire runtime surface** in the bundle — no source file is summarized header-only anymore.
 > 7. Canonical example demos: \`examples/minimal/\` (Worker → Bridge → AudioWorklet) and \`examples/hybrid-residual/\` (the 0.9.41 hybrid pattern).
 > 8. Test-file inventory (full files not inlined; ~5,000 lines combined).
 
@@ -271,6 +270,8 @@ AudioWorklet (f64 synthesis @ 48kHz)
 
 ### Headline shipped features (most-recent-first)
 
+- **0.9.59** — Remaining internal machinery + facades inlined in full in this bundle; the entire runtime surface is now present (no header-only summaries left).
+- **0.9.58** — \`BridgeGPUSource\` release-step hardening: \`releaseMap()\` + slot reset moved into a literal \`finally\`, so a throwing \`unmap()\` recycles the slot (the committed frame is kept).
 - **0.9.56** — \`SpscRing\` core inlined in full in this bundle (audit hardening cohort): the correctness-critical SAB/Atomics file is now verifiable from the bundle alone, not just its header.
 - **0.9.55** — \`BridgeBlockConsumer.process()\` is allocation-free on the render path (explicit cached-locals copy replaces \`subarray()\`); byte-identical output.
 - **0.9.54** — Decoder-fault containment in \`BridgeGPUSource.pollCompleted()\`: a throwing decoder aborts the push (no torn frame), unmaps + recycles the slot, and surfaces \`onError\` instead of leaking the staging slot.
