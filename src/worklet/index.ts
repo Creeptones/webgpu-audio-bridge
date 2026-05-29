@@ -46,6 +46,15 @@ import { hasWasmConsumerSupport } from "./wasmSimdSupport.js";
 import { kindByteSize, type FieldKind, type SchemaLayoutDescription } from "../schema.js";
 
 export { hasWasmSimd, hasWasmThreads, hasWasmConsumerSupport } from "./wasmSimdSupport.js";
+export { BenchTimer, type BenchReport, type BenchTimerOptions } from "./benchTimer.js";
+export {
+  flattenFrame,
+  compareCaptures,
+  withinTolerance,
+  TOLERANCE_EXACT,
+  TOLERANCE_F32_SIMD,
+  type CaptureComparison,
+} from "./captureProbe.js";
 
 /** Bytes in the SAB ring header preceding slot 0. Mirrors SpscRing's
  *  `RING_HEADER_BYTES` and `SchemaLayoutDescription.headerBytes` (32 = eight

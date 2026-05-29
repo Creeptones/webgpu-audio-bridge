@@ -4,6 +4,62 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.75] — 2026-05-29
+
+### Added — WASM consumer wired into a real worklet + capture-probe equivalence harness (SIMD harvest, Stage 1)
+
+Stage 0 proved WASM `decodeFrame` is the fastest decode path but it was still
+*stranded* — no example, no worklet actually consumed it. This stage closes that
+headline gap: the WASM decoder now runs in a real `process()` loop, with a
+graceful fallback ladder and a numerical-equivalence harness.
+
+#### What shipped
+
+- **`examples/wasm-decode-worklet/`** (`npm run dev:wasm-decode`, port 5181) —
+  an AudioWorklet that drains a Bridge SAB **through the WASM decoder
+  end-to-end**: `peek_pull_latest` → `decode_frame` (whole-frame, one crossing)
+  → `commit_pull_latest`, then synthesizes an 8-partial additive tone from the
+  decoded macro frame. A CPU producer worker feeds it at 60 Hz; a slider
+  retunes the fundamental. **Fallback ladder** decided on the main thread:
+  `hasWasmConsumerSupport()` → `"wasm"` mode, else `"js"` mode (inline umbrella
+  `pullLatest`, import-free on the audio thread). A "force JS fallback" checkbox
+  exercises the no-WASM path on a WASM-capable browser; the HUD reports live
+  decode-µs the worklet self-times.
+- **`captureProbe`** (`src/worklet/captureProbe.ts`, re-exported from the
+  `webgpu-audio-bridge/worklet` subpath) — a numerical-equivalence harness
+  harvested from the website's `simdCaptureProbe`/`simdAbFlag` pattern:
+  `flattenFrame` (decoded frame → flat f64 buffer), `compareCaptures`
+  (`{rms, max, firstDiffIndex, sameLength}`, NaN-aware), `withinTolerance`, and
+  the `TOLERANCE_EXACT` / `TOLERANCE_F32_SIMD` bands (the latter for f32-SIMD-
+  vs-scalar-f64 paths, mirroring the website's exit criteria). Also re-exports
+  `BenchTimer` from the subpath.
+- **Tests** — `tests/captureProbe.test.ts` (5 pins incl. an end-to-end
+  `Bridge.pull` vs `emitWorkletReader` bit-exact leg, headless) and
+  `tests/browser/decode-equivalence.spec.ts` (Playwright; runs all three paths
+  in a real cross-origin-isolated browser against the `Bridge.pull` oracle,
+  asserting bit-exact for both `emitWorkletReader` and WASM `decodeFrame`).
+
+### Why
+
+Gap #1 from the Dimensional/Universe comparison was that the WASM consumer was
+never wired into anything runnable and its thesis never demonstrated. It is now
+a one-`npm run` demo with a measured decode-µs HUD and a proven-equivalent
+fallback ladder.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive only: new example, new `captureProbe` exports on
+the `/worklet` subpath, new tests. No SAB-layout or protocol change.
+
+### Tests
+
+42 Node suites green (`captureProbe.test.ts` added). New browser spec under
+`test:browser`. `npm run typecheck` clean.
+
+### Documentation
+
+`examples/wasm-decode-worklet/README.md`.
+
 ## [0.9.74] — 2026-05-29
 
 ### Added — whole-frame WASM decode + decode-path comparator (Dimensional/Universe SIMD harvest, Stage 0)
