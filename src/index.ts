@@ -153,6 +153,7 @@ export { BridgeInputLane } from "./BridgeInputLane.js";
 export { BridgeBlockConsumer } from "./BridgeBlockConsumer.js";
 export type {
   BlockUnderflowPolicy,
+  BlockChannelLayout,
   BridgeBlockConsumerOptions,
 } from "./BridgeBlockConsumer.js";
 

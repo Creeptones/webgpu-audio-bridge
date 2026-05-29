@@ -4,6 +4,113 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.48] — 2026-05-28
+
+### Added — stereo / multi-channel `BridgeBlockConsumer` (interleaved `processAddStereo` / `processAddChannel`)
+
+Lands the `docs/stereo-residual-handoff.md` spec: the highest-leverage real-audio
+feature on the hybrid-residual track. The hybrid pattern (0.9.41) was mono;
+stereo is the wall every adopter hits in the first 30 seconds. This closes Gap #1
+from `docs/hybrid-residual-comparison.md` with the lowest-risk shape the gap
+analysis identified — **interleaved samples in the lone `f32Array`**, decoded
+per-channel on the consumer side.
+
+#### What it does
+
+`BridgeBlockConsumer<S>` gained two construction options and two methods:
+
+- **`channels?: 1 | 2 | 4 | 6 | 8`** (default 1) and **`layout?: BlockChannelLayout`**
+  (`"mono" | "interleaved" | "planar"`). For `channels > 1` the lone `f32Array`
+  is interpreted as interleaved `L,R,L,R…` of `channels * blockSize` flat samples;
+  `blockSize` becomes **per-channel** (`arrayLength / channels`). The sample for
+  channel `c` at per-channel index `j` lives at flat index `j*channels + c`, and
+  the cursor walks per-channel-sample units exactly as in mono (`channels === 1`
+  is bit-for-bit the legacy path).
+- **`processAddChannel(out, channelIndex, gain?, count?)`** — additive per-channel
+  mix that ADVANCES THE CURSOR. The primitive for a one-channel-per-consumer
+  topology or sequential consumption.
+- **`processAddStereo(left, right, gain?, count?)`** — mixes channel 0 → `left`
+  and channel 1 → `right` from the SAME window, advancing the cursor ONCE. The
+  atomic "render one stereo quantum" op. Returns per-channel samples mixed.
+
+The cursor-advance contract is load-bearing: `processAddStereo` is deliberately
+NOT `processAddChannel(left,0)` + `processAddChannel(right,1)` — the latter
+advances the cursor twice and reads two consecutive windows, desyncing L from R.
+Both methods are thin wrappers over a private allocation-free `_mixWindow`
+window-walker.
+
+Carrier survives **per channel**: one interleaved frame is one ring pull, so all
+channels underflow together; on ring-empty both methods leave the unfilled tail
+of every output buffer untouched. `framesConsumed()` counts ring pulls regardless
+of channel count; `underflowSamples()` counts per-channel window samples (cursor
+units) — a stereo underflow of K window samples adds K, not 2K.
+
+Legacy `process()` / `processAdd()` take no channel index and now THROW under
+`channels > 1` (a guiding error, no silent wrong-channel audio). Public readonly
+`channels` and `layout` were added for introspection.
+
+#### Resolved design decisions (from the handoff's open questions)
+
+- **A (>2ch):** stereo ships fully via `processAddStereo`; `channels: 4|6|8` is
+  accepted by the type/validation but a `processAddChannels(outs[])` atomic for
+  N>2-in-one-quantum is deferred (no concrete consumer yet). `processAddChannel`
+  is the per-channel primitive available now.
+- **B:** legacy `process`/`processAdd` throw under `channels > 1`.
+- **C:** no new replacing stereo method; the example's "replace" mode zeroes L/R
+  then `processAddStereo`s.
+- **D:** `underflowSamples()` in per-channel window-sample (cursor) units.
+
+`'planar'` layout throws at construction in 0.9.48 (reserved in the type for a
+future non-breaking multi-field shape).
+
+#### New exports (package root)
+
+`BlockChannelLayout` (type).
+
+### Why
+
+The gap analysis flags stereo as the wall every hybrid-residual adopter hits
+immediately, and stereo is what turns the demo from a proof into an instrument.
+Yet interleaved keeps it low-risk: one `f32Array`, one ring, one producer
+timeline, no wire change, mono bit-identical — almost all the work is
+consumer-side cursor arithmetic. The psychoacoustic carrier/residual split
+applies in stereo exactly as in mono; the only genuinely new design surface is
+the cursor-advance contract for multi-channel-per-quantum rendering, which
+`processAddStereo` resolves cleanly.
+
+### Wire compatibility
+
+Zero change. An interleaved schema still declares exactly one `f32Array`, so the
+construction contract, the SAB layout, and `BridgeBlockProducer` are all
+unchanged (the producer copies the lone array's full `channels * blockSize`
+length). A `channels`-omitted / `channels: 1` consumer is byte-identical to
+≤0.9.47. Additive + wire-equivalent → **patch** bump (`0.9.47 → 0.9.48`).
+`blockSize`'s meaning changes only for `channels > 1`, which is brand-new, so it
+is not a break.
+
+### Tests
+
+`tests/BridgeBlockConsumer.test.ts` pins 22–29: mono backward-compat (byte-
+identical), interleaved construction + introspection, construction validation
+(non-divisible length / channels>1+mono / planar / channels:3 all throw),
+`processAddStereo` cursor advancement across frame boundaries + non-divisor
+quantum (headline), `processAddChannel` advance-on-every-call contract,
+interleaved underflow preserving the carrier per channel (full + mid-window),
+legacy methods guarded under multichannel, and telemetry parity + `reset()`.
+All 29 pins green; full suite + 1M-frame concurrent stress pass; `npm run bench`
+within budget (new `processAddStereo` cell ≈ 0.7 µs/quantum, ~0.4 µs over the
+mono `processAdd`).
+
+### Documentation
+
+`src/BridgeBlockConsumer.ts` file header gained a "Stereo / multi-channel"
+section; method JSDoc documents the cursor-advance contract. README gained a
+"Stereo / multichannel" subsection. New `examples/hybrid-residual-stereo/`
+(six files + `npm run dev:hybrid-residual-stereo`) mirrors the mono demo with a
+stereo-width slider and an L/R meter. `docs/stereo-residual-handoff.md` flipped
+to shipped with a postscript; Gap #1 in `docs/hybrid-residual-comparison.md`
+flipped to "shipped (0.9.48)".
+
 ## [0.9.47] — 2026-05-28
 
 ### Added — closing the last rung on two frontier tracks (codegen seamlessness + connect() latency-budget sizing)

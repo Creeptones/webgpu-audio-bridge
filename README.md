@@ -1281,6 +1281,48 @@ npm run build && npm run dev:hybrid-residual    # demo at http://localhost:5176/
 npm run build && npm run bench:hybrid-residual  # bench at http://localhost:5177/
 ```
 
+### Stereo / multichannel (0.9.48)
+
+`BridgeBlockConsumer` consumes multi-channel audio carried **interleaved** inside the lone `f32Array`. The schema is unchanged in shape — still exactly one `f32Array` field, just sized `channels * blockSize`:
+
+```ts
+const stereoSchema = defineSchema({
+  blockIndex: u64(),
+  samples:    f32Array(2 * 1024),   // L,R,L,R… one ring, one producer timeline
+});
+
+const consumer = new BridgeBlockConsumer(bridge, {
+  channels: 2,
+  layout:   "interleaved",
+});
+consumer.blockSize;   // 1024 (PER-CHANNEL)
+consumer.channels;    // 2
+
+// in process(_, outputs):
+const [L, R] = outputs[0];                          // two Float32Array(128)
+// …write the CPU carrier into L and R…
+consumer.processAddStereo(L, R, residualGain);      // fold the GPU residual on top
+```
+
+The interleave convention is: for `channels = C` and per-channel `blockSize = B`, the lone array is `[ch0[0], ch1[0], …, ch{C-1}[0], ch0[1], …]` — the sample for channel `c` at per-channel index `j` is at flat index `j*C + c`. The cursor walks **per-channel-sample units** in `[0, blockSize]`, exactly as in mono (`channels === 1` is bit-for-bit the legacy path; omit `channels` to get it).
+
+Two additive methods consume channels:
+
+- **`processAddStereo(left, right, gain?, count?)`** — mixes channel 0 → `left` **and** channel 1 → `right` from the **same** cursor window, advancing the cursor **once**. The atomic "render one stereo quantum" op. Requires `channels >= 2`.
+- **`processAddChannel(out, channelIndex, gain?, count?)`** — mixes **one** channel and **advances the cursor**. The primitive for a one-channel-per-consumer topology or sequential consumption.
+
+> **The cursor-advance contract (read twice).** `processAddStereo` is **not** `processAddChannel(left, 0)` + `processAddChannel(right, 1)` — the latter advances the cursor twice and reads two consecutive windows, desyncing L from R. To render multiple channels of one time window you must read them from one window and advance once; `processAddStereo` is that atomic op.
+
+Underflow keeps the **carrier alive per channel**: one interleaved frame is one ring pull, so all channels underflow together, and on ring-empty both methods leave the unfilled tail of **every** output buffer untouched (left AND right keep their carrier). `framesConsumed()` counts ring pulls regardless of channel count; `underflowSamples()` counts per-channel window samples (cursor units), so a stereo underflow of K window samples adds K, not 2K.
+
+Because the wire format is unchanged, `BridgeBlockProducer` works as-is (it copies the lone array's full `C*B` length — the producer just fills it interleaved). The mono-only `process()` / `processAdd()` take no channel index and **throw** under `channels > 1` (use `processAddChannel` / `processAddStereo`). `'planar'` layout and a `processAddChannels(outs[])` atomic for >2 channels in one quantum are reserved / deferred.
+
+[`examples/hybrid-residual-stereo/`](./examples/hybrid-residual-stereo/) ships the runnable stereo demo (CPU sawtooth carrier into both channels + GPU-computed interleaved stereo-wide residual, stereo-width slider, L/R meter, the same mode-toggle + programmable GPU stall as the mono demo).
+
+```bash
+npm run build && npm run dev:hybrid-residual-stereo    # demo at http://localhost:5178/
+```
+
 ### Worked example
 
 [`examples/audio-rate/`](./examples/audio-rate/) ships the canonical end-to-end demo: a worker runs a WGSL additive-sine-bank compute shader that emits 1024 samples per tick; `BridgeBlockProducer` pipes them into the ring; an AudioWorklet drives them out through `BridgeBlockConsumer.process(outputs[0][0])`. CPU fallback when WebGPU isn't available; on-page status panel shows production rate, dropped readbacks, last-readback μs, frames consumed, and underflow samples.

@@ -597,18 +597,23 @@ function runPullAllAmortizationBench(): {
  *   - `process` — baseline. `out.set(samples.subarray(...))` per quantum.
  *   - `processAdd g=1` — fast path. `out[i] += samples[i]` per quantum.
  *   - `processAdd g≠1` — general path. `out[i] += gain * samples[i]`.
+ *   - `processAddStereo` (0.9.48) — interleaved 2ch fold, one cursor advance
+ *     per quantum, two output buffers (L+R). Cost ≈ two channel folds plus the
+ *     interleave-indexed read `samples[(cur+i)*2 + c]`; the delta over the mono
+ *     `processAdd g=1` sizes the per-channel + interleave-stride tax.
  *
  * The deltas are the hybrid-mode tax over replace mode. At 48 kHz the
  * worklet has ~2.67 ms of wall-clock budget per quantum on top of
  * whatever the carrier loop costs; the cells confirm the addition
  * stays orders of magnitude below that floor.
  *
- * Not gated. Documented in CHANGELOG[0.9.41].
+ * Not gated. Documented in CHANGELOG[0.9.41] (mono) / [0.9.48] (stereo).
  */
 function runBlockConsumerBench(): {
   processSamples: number[];
   processAddSamples: number[];
   processAddGainSamples: number[];
+  processAddStereoSamples: number[];
 } {
   const BLOCK_SIZE = 1024;
   const QUANTUM = 128;
@@ -617,6 +622,11 @@ function runBlockConsumerBench(): {
   const blockSchema = defineSchema({
     blockIndex: u64(),
     samples: f32Array(BLOCK_SIZE),
+  });
+  // Interleaved stereo twin of the mono block: one f32Array(2 * BLOCK_SIZE).
+  const stereoSchema = defineSchema({
+    blockIndex: u64(),
+    samples: f32Array(2 * BLOCK_SIZE),
   });
 
   function setup() {
@@ -666,7 +676,41 @@ function runBlockConsumerBench(): {
   const processAddSamples = timeCell((cons, out) => cons.processAdd(out, 1.0));
   const processAddGainSamples = timeCell((cons, out) => cons.processAdd(out, 0.5));
 
-  return { processSamples, processAddSamples, processAddGainSamples };
+  // ── Stereo cell (0.9.48): interleaved 2ch processAddStereo. ───────────
+  function timeStereoCell(): number[] {
+    const { sab } = Bridge.allocate(CAP, stereoSchema);
+    const bridge = new Bridge(sab, CAP, stereoSchema);
+    const cons = new BridgeBlockConsumer(bridge, { channels: 2, layout: "interleaved" });
+    const scratch = bridge.scratchFrame();
+    for (let k = 0; k < 2 * BLOCK_SIZE; k++) scratch.samples[k] = Math.sin(k * 0.01);
+    scratch.blockIndex = 0n;
+    const L = new Float32Array(QUANTUM);
+    const R = new Float32Array(QUANTUM);
+    L.fill(0.1); R.fill(0.1);
+
+    for (let i = 0; i < WARMUP_ITERS; i++) {
+      if (i % QUANTA_PER_BLOCK === 0) {
+        scratch.blockIndex = BigInt(i);
+        bridge.push(scratch);
+      }
+      cons.processAddStereo(L, R, 1.0);
+    }
+    const samples = new Array<number>(MEASURE_ITERS);
+    for (let i = 0; i < MEASURE_ITERS; i++) {
+      if (i % QUANTA_PER_BLOCK === 0) {
+        scratch.blockIndex = BigInt(WARMUP_ITERS + i);
+        bridge.push(scratch);
+      }
+      const t0 = hrtime.bigint();
+      cons.processAddStereo(L, R, 1.0);
+      const t1 = hrtime.bigint();
+      samples[i] = Number(t1 - t0);
+    }
+    return samples;
+  }
+  const processAddStereoSamples = timeStereoCell();
+
+  return { processSamples, processAddSamples, processAddGainSamples, processAddStereoSamples };
 }
 
 function runPullLatestBench(): { samples: number[]; misses: number } {
@@ -800,8 +844,10 @@ function main(): void {
   const processMed = summarize("process (replace)", block.processSamples);
   const processAddMed = summarize("processAdd g=1", block.processAddSamples);
   const processAddGainMed = summarize("processAdd g≠1", block.processAddGainSamples);
+  const processAddStereoMed = summarize("processAddStereo g=1", block.processAddStereoSamples);
   const addDelta = processAddMed - processMed;
   const addGainDelta = processAddGainMed - processMed;
+  const stereoDelta = processAddStereoMed - processAddMed;
   console.log(
     `  processAdd hybrid tax g=1.0  = ${fmt(addDelta).padStart(8)}  ` +
       `(vs process replace, 128-sample quantum)`,
@@ -809,6 +855,10 @@ function main(): void {
   console.log(
     `  processAdd hybrid tax g≠1.0 = ${fmt(addGainDelta).padStart(8)}  ` +
       `(general-gain path, same quantum)`,
+  );
+  console.log(
+    `  processAddStereo tax vs mono = ${fmt(stereoDelta).padStart(8)}  ` +
+      `(2ch interleaved fold, one cursor advance, 128-sample quantum)`,
   );
   console.log();
 

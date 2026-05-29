@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — stereo hybrid residual-on-carrier demo</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 860px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      button.warn { background: #b45f0a; }
+      button.warn:hover:not(:disabled) { background: #e07a14; }
+      label { display: block; margin: 8px 0 6px; color: #9aa3ad; font-size: 12px; }
+      input[type=range] { width: 100%; }
+      .row { display: flex; align-items: center; gap: 12px; }
+      .row input[type=range] { flex: 1; }
+      .row .lbl { min-width: 80px; text-align: right; color: #d4d7dc; }
+      .modes { display: flex; gap: 16px; margin-top: 8px; }
+      .modes label { color: #d4d7dc; font-size: 13px; margin: 0; cursor: pointer; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k { color: #9aa3ad; }
+      .status .v { color: #d4d7dc; }
+      .status .err { color: #ff7a7a; }
+      .status .ok { color: #6ee69b; }
+      .meters { display: grid; grid-template-columns: 24px 1fr; gap: 6px 10px; align-items: center; margin-top: 8px; }
+      .meters .ch { color: #9aa3ad; font-size: 12px; }
+      .meter-track { background: #15171c; border: 1px solid #21252d; border-radius: 4px; height: 14px; overflow: hidden; }
+      .meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2a6df4, #6ee69b); transition: width 60ms linear; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      .callout { background: #15171c; border-left: 3px solid #2a6df4; padding: 12px 16px; margin: 16px 0; font-size: 13px; color: #c8cdd5; }
+      .callout strong { color: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — stereo hybrid residual-on-carrier demo</h1>
+
+    <p>
+      The stereo sibling of the <code>examples/hybrid-residual/</code> demo.
+      Demonstrates <code>BridgeBlockConsumer.processAddStereo(L, R, gain)</code> —
+      one atomic op that mixes channel 0 → left and channel 1 → right from an
+      <strong>interleaved</strong> GPU residual (one ring, one
+      <code>f32Array(2 × blockSize)</code>), advancing the sample cursor once
+      so L and R stay sample-locked. The <code>AudioWorklet</code> generates a
+      cheap CPU sawtooth (zero-latency pitch) into both channels, then folds the
+      GPU harmonic-partial residual on top.
+    </p>
+
+    <div class="callout">
+      <strong>What you're listening for.</strong> Move the freq slider — pitch follows
+      <em>instantly</em> (fundamental on the CPU). Raise <em>Stereo width</em> — the
+      upper-harmonic layer widens across L/R while the fundamental stays centered.
+      Press <em>"Simulate GPU stall"</em> — in <strong>Hybrid</strong> mode the
+      harmonics fade on BOTH channels for ~250 ms while the (centered) fundamental
+      keeps playing; <code>processAddStereo</code> leaves L and R untouched on
+      ring-empty, so the carrier survives per channel — no click.
+    </div>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="stall" class="warn" disabled>Simulate GPU stall (250 ms)</button>
+
+    <h2>Mode</h2>
+    <div class="modes">
+      <label><input type="radio" name="mode" value="hybrid" checked /> Hybrid (carrier + processAddStereo)</label>
+      <label><input type="radio" name="mode" value="replace" /> Replace (zero L/R then add)</label>
+      <label><input type="radio" name="mode" value="carrier-only" /> Carrier only (no GPU)</label>
+    </div>
+
+    <h2>Carrier frequency</h2>
+    <div class="row">
+      <input id="freq" type="range" min="55" max="500" step="1" value="220" />
+      <span id="freq-label" class="lbl">220 Hz</span>
+    </div>
+
+    <h2>Residual gain</h2>
+    <div class="row">
+      <input id="rgain" type="range" min="0" max="1.2" step="0.01" value="0.5" />
+      <span id="rgain-label" class="lbl">0.50</span>
+    </div>
+
+    <h2>Stereo width</h2>
+    <div class="row">
+      <input id="width" type="range" min="0" max="1" step="0.01" value="0.5" />
+      <span id="width-label" class="lbl">0.50</span>
+    </div>
+
+    <h2>L / R output</h2>
+    <div class="meters">
+      <span class="ch">L</span>
+      <div class="meter-track"><div id="meter-l" class="meter-fill"></div></div>
+      <span class="ch">R</span>
+      <div class="meter-track"><div id="meter-r" class="meter-fill"></div></div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <h2>What this is showing</h2>
+    <p style="font-size: 13px; color: #c8cdd5;">
+      Stereo is the first feature every hybrid-residual adopter hits in the first
+      30 seconds. The lowest-risk shape keeps the wire format unchanged: the lone
+      <code>f32Array</code> carries <strong>interleaved</strong> L,R,L,R… samples,
+      and the consumer de-interleaves on its side via <code>channels: 2</code>.
+      The only genuinely new surface is the cursor-advance contract —
+      <code>processAddStereo</code> reads both channels from one window and
+      advances once, so it is <em>not</em> two <code>processAddChannel</code>
+      calls (which would desync L from R). See README §"Stereo / multichannel".
+    </p>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      See <code>examples/hybrid-residual/</code> for the mono original.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

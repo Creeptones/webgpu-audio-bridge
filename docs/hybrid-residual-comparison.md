@@ -247,7 +247,9 @@ Fifteen specific extensions that build on the hybrid pattern. Each has a one-lin
 
 The numbering is for reference, not priority. The recommendation section at the bottom of this document highlights the three highest-leverage gaps to consider closing first.
 
-### Gap #1: Stereo / multi-channel support
+### Gap #1: Stereo / multi-channel support — ✅ shipped (0.9.48)
+
+**Shipped in 0.9.48** via the **interleaved schema** shape (option 2 below). `BridgeBlockConsumer` gained `channels?: 1|2|4|6|8` + `layout?` options; the lone `f32Array` carries interleaved `L,R,L,R…` and is de-interleaved consumer-side. New `processAddStereo(left, right, gain?, count?)` (atomic stereo-quantum render, one cursor advance) and `processAddChannel(out, channelIndex, gain?, count?)` (per-channel primitive). Wire format unchanged, mono bit-identical, `BridgeBlockProducer` works as-is. See README §"Stereo / multichannel", `docs/stereo-residual-handoff.md` (shipped), and `examples/hybrid-residual-stereo/`. The "two consumers" and "planar" shapes remain deferred (planar is reserved in the type; `processAddChannels(outs[])` for >2ch-in-one-quantum is a future patch). The original analysis follows.
 
 The current pattern is mono — `BridgeBlockConsumer` requires exactly one `f32Array` field in the schema, and the worklet processes `outputs[0][0]` (the first channel of the first output). Real audio is stereo at minimum and often more.
 

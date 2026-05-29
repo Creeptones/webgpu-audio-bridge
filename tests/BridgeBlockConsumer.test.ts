@@ -59,6 +59,21 @@
  *      finite gain throws.
  *  21. process / processAdd cursor interop — interleaved calls on the same
  *      consumer share the cursor; sample stream is monotonic.
+ *  22. Stereo (0.9.48) mono backward-compat — channels:1 / omitted construct
+ *      identically; output byte-identical to the legacy path.
+ *  23. Interleaved construction — channels:2 → blockSize === arrayLength/2;
+ *      channels / layout introspection.
+ *  24. Construction validation — non-divisible length, channels>1 + 'mono',
+ *      'planar', and channels:3 all throw.
+ *  25. processAddStereo cursor advancement (headline) — L gets channel-0's
+ *      de-interleaved ramp, R channel-1's, one cursor advance per call,
+ *      across frame boundaries; non-divisor quantum variant.
+ *  26. processAddChannel single-channel + advance-on-every-call contract.
+ *  27. Interleaved underflow preserves the carrier per channel — full + mid-
+ *      window; underflowSamples in per-channel units.
+ *  28. Legacy process()/processAdd() throw under channels>1.
+ *  29. Telemetry parity — framesConsumed counts ring pulls regardless of
+ *      channels; underflowSamples per-channel; reset() zeroes both.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -112,6 +127,54 @@ function pushRampFrame(
   const base = frameIdx * blockSize;
   for (let k = 0; k < blockSize; k++) scratch.samples[k] = base + k;
   return bridge.push(scratch);
+}
+
+// ── Interleaved (multi-channel) helpers (0.9.48) ──────────────────────────
+//
+// An interleaved schema is still ONE f32Array — `f32Array(channels*blockSize)`.
+// Flat layout: [ch0[0], ch1[0], …, ch0[1], …]. Channel `c` at per-channel
+// index `j` lives at flat index `j*C + c`.
+function makeInterleavedSchema(blockSize: number, channels: number) {
+  return defineSchema({
+    blockIndex: u64(),
+    samples:    f32Array(channels * blockSize),
+  });
+}
+
+function makeInterleavedBridge(
+  capacity: number,
+  blockSize: number,
+  channels: number,
+) {
+  const schema = makeInterleavedSchema(blockSize, channels);
+  const { sab } = Bridge.allocate(capacity, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+  return { bridge, schema, sab };
+}
+
+/** Push an interleaved ramp frame: the lone array is the contiguous flat ramp
+ *  [frameIdx*C*B, +1, …]. By interleave arithmetic this makes channel `c`'s
+ *  de-interleaved per-channel stream the value `gj*C + c` at per-channel
+ *  global index `gj` — so channel 0 is the even ramp, channel 1 the odd ramp
+ *  (distinguishable, integer-valued → bit-exact in f32). */
+function pushInterleavedRampFrame(
+  bridge: any,
+  scratch: any,
+  frameIdx: number,
+  channels: number,
+  blockSize: number,
+): boolean {
+  scratch.blockIndex = BigInt(frameIdx);
+  const flat = channels * blockSize;
+  const base = frameIdx * flat;
+  for (let k = 0; k < flat; k++) scratch.samples[k] = base + k;
+  return bridge.push(scratch);
+}
+
+/** Expected de-interleaved value for channel `c` at per-channel global index
+ *  `gj` under the `pushInterleavedRampFrame` convention. */
+function expectedChannelValue(gj: number, c: number, channels: number): number {
+  return gj * channels + c;
 }
 
 // ── 1. Construction surface ────────────────────────────────────────────────
@@ -606,6 +669,267 @@ function testProcessAddCursorInterop(): void {
   ok("21. process / processAdd cursor interop");
 }
 
+// ── 22. Stereo: mono backward-compat ──────────────────────────────────────
+function testStereoMonoBackcompat(): void {
+  // channels omitted and channels:1 must construct identically and produce
+  // byte-identical output to the legacy path (the pin-3 ramp).
+  for (const opts of [undefined, { channels: 1 as const }]) {
+    const { bridge } = makeBridge(8);
+    const cons = new BridgeBlockConsumer(bridge, opts);
+    assertEq(cons.blockSize, BLOCK_SIZE, "mono blockSize === arrayLength");
+    assertEq(cons.channels, 1, "channels === 1");
+    assertEq(cons.layout, "mono", "layout === 'mono'");
+    const scratch = bridge.scratchFrame();
+    const F = 3;
+    for (let f = 0; f < F; f++) pushRampFrame(bridge, scratch, f);
+    const out = new Float32Array(QUANTUM);
+    let observed = 0;
+    for (let q = 0; q < (F * BLOCK_SIZE) / QUANTUM; q++) {
+      cons.process(out);
+      for (let i = 0; i < QUANTUM; i++) {
+        assertEq(out[i], observed, `mono backcompat sample ${observed}`);
+        observed++;
+      }
+    }
+  }
+  // layout:'interleaved' with channels:1 normalizes to mono (harmless).
+  {
+    const { bridge } = makeBridge(4);
+    const cons = new BridgeBlockConsumer(bridge, { channels: 1, layout: "interleaved" });
+    assertEq(cons.layout, "mono", "channels:1 + interleaved normalizes to mono");
+  }
+  ok("22. stereo mono backward-compat");
+}
+
+// ── 23. Interleaved construction ───────────────────────────────────────────
+function testInterleavedConstruction(): void {
+  const { bridge } = makeInterleavedBridge(8, 1024, 2);
+  const cons = new BridgeBlockConsumer(bridge, { channels: 2, layout: "interleaved" });
+  assertEq(cons.blockSize, 1024, "blockSize === arrayLength / channels");
+  assertEq(cons.channels, 2, "channels === 2");
+  assertEq(cons.layout, "interleaved", "layout === 'interleaved'");
+  assertEq(cons.samplesField, "samples", "samplesField surfaced");
+  // layout omitted defaults to interleaved for channels>1.
+  const cons2 = new BridgeBlockConsumer(bridge, { channels: 2 });
+  assertEq(cons2.layout, "interleaved", "channels>1 defaults layout to interleaved");
+  ok("23. interleaved construction");
+}
+
+// ── 24. Construction validation ────────────────────────────────────────────
+function testInterleavedValidation(): void {
+  // arrayLength not divisible by channels (1025 % 2 !== 0).
+  {
+    const schema = defineSchema({ blockIndex: u64(), samples: f32Array(1025) });
+    const { sab } = Bridge.allocate(4, schema);
+    const bridge = new Bridge(sab, 4, schema);
+    let threw = false;
+    try { new BridgeBlockConsumer(bridge, { channels: 2 }); } catch { threw = true; }
+    assert(threw, "non-divisible arrayLength throws");
+  }
+  // channels>1 with layout:'mono' throws.
+  {
+    const { bridge } = makeInterleavedBridge(4, 512, 2);
+    let threw = false;
+    try { new BridgeBlockConsumer(bridge, { channels: 2, layout: "mono" }); } catch { threw = true; }
+    assert(threw, "channels>1 + layout:'mono' throws");
+    // layout:'planar' throws (not-yet-implemented).
+    threw = false;
+    try { new BridgeBlockConsumer(bridge, { channels: 2, layout: "planar" }); } catch { threw = true; }
+    assert(threw, "layout:'planar' throws");
+  }
+  // channels:3 (not in the allowed set) throws.
+  {
+    const { bridge } = makeInterleavedBridge(4, 512, 1);
+    let threw = false;
+    try { new BridgeBlockConsumer(bridge, { channels: 3 as any }); } catch { threw = true; }
+    assert(threw, "channels:3 (not allowed) throws");
+  }
+  ok("24. interleaved construction validation");
+}
+
+// ── 25. processAddStereo cursor advancement (headline) ─────────────────────
+function testProcessAddStereo(): void {
+  const C = 2, B = 1024;
+  const { bridge } = makeInterleavedBridge(8, B, C);
+  const cons = new BridgeBlockConsumer(bridge, { channels: 2, layout: "interleaved" });
+  const scratch = bridge.scratchFrame();
+  const F = 3;
+  for (let f = 0; f < F; f++) {
+    assert(pushInterleavedRampFrame(bridge, scratch, f, C, B), `frame ${f} pushed`);
+  }
+
+  const L = new Float32Array(QUANTUM);
+  const R = new Float32Array(QUANTUM);
+  let gj = 0; // per-channel global index
+  const quanta = (F * B) / QUANTUM;
+  for (let q = 0; q < quanta; q++) {
+    L.fill(0); R.fill(0);
+    const mixed = cons.processAddStereo(L, R);
+    assertEq(mixed, QUANTUM, `q=${q} full window mixed`);
+    for (let i = 0; i < QUANTUM; i++) {
+      assertEq(L[i], expectedChannelValue(gj, 0, C), `q=${q} L sample (gj=${gj})`);
+      assertEq(R[i], expectedChannelValue(gj, 1, C), `q=${q} R sample (gj=${gj})`);
+      gj++;
+    }
+  }
+  // One cursor advance per call → one frame pulled per B per-channel samples,
+  // NOT per B*C. F frames cover F*B per-channel samples.
+  assertEq(cons.framesConsumed(), F, "framesConsumed === F (one pull per per-channel block)");
+  assertEq(cons.underflowSamples(), 0, "no underflow");
+
+  // Non-divisor quantum variant: 50-sample quanta straddle frame boundaries.
+  {
+    const { bridge: b2 } = makeInterleavedBridge(4, B, C);
+    const c2 = new BridgeBlockConsumer(b2, { channels: 2 });
+    const s2 = b2.scratchFrame();
+    for (let f = 0; f < 2; f++) pushInterleavedRampFrame(b2, s2, f, C, B);
+    const Q = 50;
+    const l2 = new Float32Array(Q), r2 = new Float32Array(Q);
+    let g = 0;
+    const total = 2 * B;
+    const nQ = Math.floor(total / Q);
+    for (let q = 0; q < nQ; q++) {
+      l2.fill(0); r2.fill(0);
+      c2.processAddStereo(l2, r2);
+      for (let i = 0; i < Q; i++) {
+        assertEq(l2[i], expectedChannelValue(g, 0, C), `nd L g=${g}`);
+        assertEq(r2[i], expectedChannelValue(g, 1, C), `nd R g=${g}`);
+        g++;
+      }
+    }
+  }
+  ok("25. processAddStereo cursor advancement");
+}
+
+// ── 26. processAddChannel single-channel + advance-on-every-call ──────────
+function testProcessAddChannel(): void {
+  const C = 2, B = 1024;
+  const { bridge } = makeInterleavedBridge(8, B, C);
+  const cons = new BridgeBlockConsumer(bridge, { channels: 2 });
+  const scratch = bridge.scratchFrame();
+  for (let f = 0; f < 2; f++) pushInterleavedRampFrame(bridge, scratch, f, C, B);
+
+  const out = new Float32Array(QUANTUM);
+  // First call: channel 1, window [0, QUANTUM).
+  out.fill(0);
+  const m1 = cons.processAddChannel(out, 1);
+  assertEq(m1, QUANTUM, "first call mixes full window");
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], expectedChannelValue(i, 1, C), `ch1 first window sample ${i}`);
+  }
+  // Second call advances to the NEXT window — proves advance-on-every-call.
+  out.fill(0);
+  cons.processAddChannel(out, 1);
+  for (let i = 0; i < QUANTUM; i++) {
+    assertEq(out[i], expectedChannelValue(QUANTUM + i, 1, C), `ch1 second window sample ${i}`);
+  }
+  // channelIndex out of range throws.
+  let threw = false;
+  try { cons.processAddChannel(out, 2); } catch { threw = true; }
+  assert(threw, "channelIndex >= channels throws");
+  threw = false;
+  try { cons.processAddChannel(out, -1); } catch { threw = true; }
+  assert(threw, "negative channelIndex throws");
+  ok("26. processAddChannel single-channel + advance contract");
+}
+
+// ── 27. Interleaved underflow preserves the carrier per channel ────────────
+function testInterleavedUnderflow(): void {
+  const C = 2, B = 1024;
+  // Full-window underflow: ring empty from the start.
+  {
+    const { bridge } = makeInterleavedBridge(4, B, C);
+    const cons = new BridgeBlockConsumer(bridge, { channels: 2 });
+    const L = new Float32Array(QUANTUM), R = new Float32Array(QUANTUM);
+    L.fill(111); R.fill(222);
+    const mixed = cons.processAddStereo(L, R);
+    assertEq(mixed, 0, "nothing mixed under full underflow");
+    for (let i = 0; i < QUANTUM; i++) {
+      assertEq(L[i], 111, `L carrier preserved ${i}`);
+      assertEq(R[i], 222, `R carrier preserved ${i}`);
+    }
+    // Per-channel units: K window samples → +K (NOT 2K).
+    assertEq(cons.underflowSamples(), QUANTUM, "underflowSamples per-channel units");
+    assertEq(cons.framesConsumed(), 0, "no frame consumed");
+  }
+  // Mid-window underflow with a small block: head gets real adds, both tails
+  // keep their carrier.
+  {
+    const smallB = 80;
+    const { bridge } = makeInterleavedBridge(4, smallB, C);
+    const cons = new BridgeBlockConsumer(bridge, { channels: 2 });
+    const scratch = bridge.scratchFrame();
+    pushInterleavedRampFrame(bridge, scratch, 0, C, smallB); // one frame only
+    const L = new Float32Array(QUANTUM), R = new Float32Array(QUANTUM);
+    L.fill(111); R.fill(222);
+    const mixed = cons.processAddStereo(L, R, 1.0, QUANTUM);
+    assertEq(mixed, smallB, "mid-window mixes one block worth");
+    for (let i = 0; i < smallB; i++) {
+      assertEq(L[i], 111 + expectedChannelValue(i, 0, C), `L head add ${i}`);
+      assertEq(R[i], 222 + expectedChannelValue(i, 1, C), `R head add ${i}`);
+    }
+    for (let i = smallB; i < QUANTUM; i++) {
+      assertEq(L[i], 111, `L tail carrier ${i}`);
+      assertEq(R[i], 222, `R tail carrier ${i}`);
+    }
+    assertEq(cons.underflowSamples(), QUANTUM - smallB, "mid-window per-channel tally");
+  }
+  ok("27. interleaved underflow preserves carrier per channel");
+}
+
+// ── 28. Legacy methods guarded under multichannel ──────────────────────────
+function testLegacyGuardedMultichannel(): void {
+  const { bridge } = makeInterleavedBridge(4, 512, 2);
+  const cons = new BridgeBlockConsumer(bridge, { channels: 2 });
+  const out = new Float32Array(QUANTUM);
+  let threw = false;
+  try { cons.process(out); } catch { threw = true; }
+  assert(threw, "process() throws under channels>1");
+  threw = false;
+  try { cons.processAdd(out); } catch { threw = true; }
+  assert(threw, "processAdd() throws under channels>1");
+  // processAddStereo requires channels>=2 — fine here; a mono consumer throws.
+  {
+    const { bridge: bm } = makeBridge(4);
+    const cm = new BridgeBlockConsumer(bm);
+    const l = new Float32Array(QUANTUM), r = new Float32Array(QUANTUM);
+    threw = false;
+    try { cm.processAddStereo(l, r); } catch { threw = true; }
+    assert(threw, "processAddStereo throws when channels < 2");
+  }
+  ok("28. legacy methods guarded under multichannel");
+}
+
+// ── 29. Telemetry parity + reset() ─────────────────────────────────────────
+function testInterleavedTelemetry(): void {
+  const C = 2, B = 256;
+  const { bridge } = makeInterleavedBridge(4, B, C);
+  const cons = new BridgeBlockConsumer(bridge, { channels: 2 });
+  const scratch = bridge.scratchFrame();
+  pushInterleavedRampFrame(bridge, scratch, 0, C, B);
+  pushInterleavedRampFrame(bridge, scratch, 1, C, B);
+
+  const L = new Float32Array(QUANTUM), R = new Float32Array(QUANTUM);
+  // Drain both frames fully (2*B per-channel samples / QUANTUM quanta).
+  for (let q = 0; q < (2 * B) / QUANTUM; q++) {
+    L.fill(0); R.fill(0);
+    cons.processAddStereo(L, R);
+  }
+  assertEq(cons.framesConsumed(), 2, "framesConsumed counts ring pulls (2)");
+  assertEq(cons.underflowSamples(), 0, "no underflow during the run");
+
+  // One more quantum → full underflow, per-channel units.
+  cons.processAddStereo(L, R);
+  assertEq(cons.underflowSamples(), QUANTUM, "underflow per-channel units");
+
+  // reset() zeroes both and discards the in-flight interleaved frame.
+  cons.reset();
+  assertEq(cons.framesConsumed(), 0, "reset zeroes framesConsumed");
+  assertEq(cons.underflowSamples(), 0, "reset zeroes underflowSamples");
+  assertEq(cons.remainingInFrame(), 0, "reset discards in-flight frame");
+  ok("29. interleaved telemetry parity + reset");
+}
+
 function main(): void {
   testConstruction();
   testSchemaValidation();
@@ -628,6 +952,14 @@ function main(): void {
   testProcessAddGainZero();
   testProcessAddBounds();
   testProcessAddCursorInterop();
+  testStereoMonoBackcompat();
+  testInterleavedConstruction();
+  testInterleavedValidation();
+  testProcessAddStereo();
+  testProcessAddChannel();
+  testInterleavedUnderflow();
+  testLegacyGuardedMultichannel();
+  testInterleavedTelemetry();
   console.log("all BridgeBlockConsumer pins green");
 }
 

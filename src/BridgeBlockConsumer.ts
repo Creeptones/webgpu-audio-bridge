@@ -24,10 +24,10 @@
  * samples block. Additional scalar fields (block index, timing, etc.) are
  * fine and ignored by the consumer. The block size is taken from the array
  * field's declared length. Schemas with zero or multiple `f32Array` fields
- * throw on construction with a descriptive message — the helper is mono-
- * channel by design (multi-channel can layer on later via either repeated
- * fields with explicit channel naming or a single interleaved array; both
- * options are deferred until a real consumer asks for them).
+ * throw on construction with a descriptive message. Multi-channel audio
+ * rides INSIDE that lone array as interleaved samples — see the "Stereo /
+ * multi-channel (0.9.48)" section below; the one-f32Array contract is
+ * unchanged.
  *
  *   const blockSchema = defineSchema({
  *     blockIndex: u64(),
@@ -117,6 +117,48 @@
  * identically to `process()`. The semantic difference is what happens to
  * `out` on underflow, not what gets counted.
  *
+ * ─── Stereo / multi-channel (0.9.48) ──────────────────────────────────────
+ *
+ * Multi-channel audio is carried INTERLEAVED inside the lone `f32Array`:
+ * for `channels = C` and per-channel `blockSize = B`, the frame is
+ * `[ch0[0], ch1[0], …, ch{C-1}[0], ch0[1], …]` — i.e. `f32Array(C * B)`.
+ * The sample for channel `c` at per-channel index `j` is at flat index
+ * `j*C + c`. **The cursor walks per-channel-sample units in `[0, blockSize]`,
+ * exactly as in mono** (mono is `C = 1`, where `j*1+0 = j`). `this.blockSize`
+ * is therefore PER-CHANNEL.
+ *
+ * Because an interleaved schema still declares exactly one `f32Array`, the
+ * construction contract, the wire format, and `BridgeBlockProducer` are all
+ * unchanged — the producer copies the lone array's full `C*B` length and the
+ * feature is entirely consumer-side cursor arithmetic. A `channels`-omitted /
+ * `channels: 1` consumer is bit-for-bit the legacy mono path.
+ *
+ * Two additive methods consume channels:
+ *
+ *   - `processAddChannel(out, channelIndex, gain?, count?)` — mixes ONE
+ *     channel and ADVANCES THE CURSOR. The right primitive for a one-channel-
+ *     per-consumer topology or sequential consumption.
+ *   - `processAddStereo(left, right, gain?, count?)` — mixes channel 0 → left
+ *     AND channel 1 → right from the SAME window and advances the cursor ONCE.
+ *     The atomic "render one stereo quantum" op.
+ *
+ * The cursor-advance contract is load-bearing: `processAddStereo` is NOT
+ * `processAddChannel(left,0)` + `processAddChannel(right,1)` — the latter
+ * advances the cursor twice and reads two consecutive windows, desyncing L
+ * from R. To render multiple channels of one time window you MUST read them
+ * from one window and advance once.
+ *
+ * Carrier survives PER CHANNEL: one interleaved frame is one ring pull, so
+ * all channels underflow together. On ring-empty, both methods leave the
+ * unfilled tail of EVERY output buffer untouched. `framesConsumed()` counts
+ * ring pulls regardless of channel count; `underflowSamples()` counts
+ * per-channel window samples (cursor units), so a stereo underflow of K
+ * window samples adds K (not 2K).
+ *
+ * Legacy `process()` / `processAdd()` take no channel index and THROW under
+ * `channels > 1` (no silent wrong-channel audio). `'planar'` layout and
+ * `processAddChannels(outs[])` for N>2-in-one-quantum are reserved / deferred.
+ *
  * ─── Wire compatibility ──────────────────────────────────────────────────
  *
  * Zero change. BridgeBlockConsumer composes a `Bridge<S>` instance via its
@@ -139,9 +181,23 @@ import type {
  *  operational tradeoffs of each. */
 export type BlockUnderflowPolicy = "zero-fill" | "hold-last";
 
+/** Channel memory layout within the lone `f32Array` samples field (0.9.48).
+ *    'mono'        — channels === 1; the legacy path, byte-identical to ≤0.9.47.
+ *    'interleaved' — channels ≥ 2 packed L,R,L,R… in ONE f32Array(channels*blockSize).
+ *    'planar'      — DEFERRED (throws at construction in 0.9.48). Reserved in the
+ *                    type for the future multi-field / multi-ring shape so adding
+ *                    it later is non-breaking. */
+export type BlockChannelLayout = "mono" | "interleaved" | "planar";
+
 export interface BridgeBlockConsumerOptions {
   /** How `process()` handles a ring-empty event. Default `'zero-fill'`. */
   readonly underflowPolicy?: BlockUnderflowPolicy;
+  /** Channel count. Default 1 (mono, legacy). Restricted to standard audio
+   *  layouts. */
+  readonly channels?: 1 | 2 | 4 | 6 | 8;
+  /** Sample layout. Default 'mono' when channels===1, else 'interleaved'
+   *  ('planar' throws in 0.9.48). */
+  readonly layout?: BlockChannelLayout;
 }
 
 export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
@@ -150,8 +206,9 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    *  without holding a second reference. */
   public readonly bridge: Bridge<S>;
 
-  /** Samples per block — derived from the schema's lone `f32Array` field.
-   *  The cursor walks `[0, blockSize]`. */
+  /** PER-CHANNEL samples per block — `arrayLength / channels`. The cursor
+   *  walks `[0, blockSize]` in per-channel-sample units (mono is `channels===1`,
+   *  where per-channel and flat indices coincide). */
   public readonly blockSize: number;
 
   /** Name of the schema's `f32Array` samples field. Mostly a diagnostic
@@ -160,6 +217,15 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
 
   /** Underflow policy as resolved at construction. */
   public readonly underflowPolicy: BlockUnderflowPolicy;
+
+  /** Channel count as resolved at construction. Default 1 (mono). For
+   *  `channels > 1` the lone `f32Array` is interpreted as interleaved
+   *  L,R,… of `channels * blockSize` flat samples. */
+  public readonly channels: number;
+
+  /** Channel memory layout as resolved at construction. `'mono'` for
+   *  `channels === 1`, `'interleaved'` for `channels > 1`. */
+  public readonly layout: BlockChannelLayout;
 
   // ── Internal state ────────────────────────────────────────────────────
   private readonly frame: FrameFor<S>;
@@ -182,6 +248,11 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
   /** Telemetry: total frames successfully pulled since construction (or
    *  last reset). */
   private _framesConsumed: number;
+  /** Reusable scratch for `_mixWindow`'s (channel → buffer) pairs. Sized for
+   *  the max simultaneous outputs (stereo = 2); preallocated so the multi-
+   *  channel hot path stays allocation-free on the audio thread. */
+  private readonly _outs: (Float32Array | null)[];
+  private readonly _chans: number[];
 
   constructor(bridge: Bridge<S>, opts?: BridgeBlockConsumerOptions) {
     this.bridge = bridge;
@@ -215,7 +286,47 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
     // samplesField is non-null by construction here (count === 1).
     const resolved = samplesField as { name: string; length: number };
     this.samplesField = resolved.name;
-    this.blockSize = resolved.length;
+    const arrayLength = resolved.length;
+
+    // ── Channel / layout resolution + validation (0.9.48) ─────────────
+    const channels = opts?.channels ?? 1;
+    if (channels !== 1 && channels !== 2 && channels !== 4 &&
+        channels !== 6 && channels !== 8) {
+      throw new Error(
+        `BridgeBlockConsumer: channels must be one of 1 | 2 | 4 | 6 | 8 ` +
+        `(got ${channels}).`,
+      );
+    }
+    const requestedLayout = opts?.layout;
+    if (requestedLayout === "planar") {
+      throw new Error(
+        "BridgeBlockConsumer: planar layout is not implemented in 0.9.48; " +
+        "use 'interleaved'.",
+      );
+    }
+    let layout: BlockChannelLayout;
+    if (channels === 1) {
+      // 'interleaved' with channels:1 is harmless and equals mono — normalize.
+      layout = "mono";
+    } else {
+      if (requestedLayout === "mono") {
+        throw new Error(
+          `BridgeBlockConsumer: channels>1 requires layout:'interleaved' ` +
+          `(got 'mono' with channels ${channels}).`,
+        );
+      }
+      // undefined defaults to 'interleaved'; 'interleaved' passes through.
+      layout = "interleaved";
+      if (arrayLength % channels !== 0) {
+        throw new Error(
+          `BridgeBlockConsumer: f32Array length ${arrayLength} is not ` +
+          `divisible by channels ${channels}.`,
+        );
+      }
+    }
+    this.channels = channels;
+    this.layout = layout;
+    this.blockSize = arrayLength / channels;
 
     this.frame = bridge.scratchFrame();
     this.samples = (this.frame as unknown as Record<string, unknown>)[resolved.name] as Float32Array;
@@ -225,6 +336,8 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
     this.holdSample = 0;
     this._underflowSamples = 0;
     this._framesConsumed = 0;
+    this._outs = [null, null];
+    this._chans = [0, 0];
   }
 
   /**
@@ -243,6 +356,13 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
    * an internal subarray view into the caller's buffer.
    */
   process(out: Float32Array, count: number = out.length): void {
+    if (this.channels > 1) {
+      throw new Error(
+        `BridgeBlockConsumer.process: ambiguous for channels>1 (channels ` +
+        `${this.channels}); use processAddChannel / processAddStereo for ` +
+        `multichannel consumers.`,
+      );
+    }
     if (!Number.isFinite(count) || count < 0 || count > out.length) {
       throw new Error(
         `BridgeBlockConsumer.process: count ${count} out of range [0, ${out.length}]`,
@@ -299,6 +419,13 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
     gain: number = 1.0,
     count: number = out.length,
   ): void {
+    if (this.channels > 1) {
+      throw new Error(
+        `BridgeBlockConsumer.processAdd: ambiguous for channels>1 (channels ` +
+        `${this.channels}); use processAddChannel / processAddStereo for ` +
+        `multichannel consumers.`,
+      );
+    }
     if (!Number.isFinite(count) || count < 0 || count > out.length) {
       throw new Error(
         `BridgeBlockConsumer.processAdd: count ${count} out of range [0, ${out.length}]`,
@@ -344,6 +471,174 @@ export class BridgeBlockConsumer<S extends Schema<FieldsObject, any>> {
       this.cursor += take;
       written += take;
     }
+  }
+
+  /**
+   * Additive per-channel mix (0.9.48). SUMS `gain * residual[channelIndex]`
+   * into `out[i]` for `count` per-channel samples AT THE CURRENT CURSOR, then
+   * advances the cursor by `count` per-channel samples. Returns the number of
+   * per-channel samples actually mixed before any underflow (`== count` on a
+   * full window).
+   *
+   * The interleaved frame is `[L0,R0,L1,R1,…]`; the sample for channel `c` at
+   * per-channel index `j` lives at flat index `j*channels + c`. The cursor
+   * walks per-channel-sample units exactly as in mono.
+   *
+   * **This advances the cursor on EVERY call.** It is the right primitive for
+   * a one-channel-per-consumer topology or sequential consumption — NOT for
+   * rendering multiple channels of the same time window. To render L and R of
+   * one quantum together (advancing once, from one window) use
+   * `processAddStereo` — it is NOT the same as two `processAddChannel` calls,
+   * which would advance the cursor twice and desync L from R.
+   *
+   * Underflow leaves `out`'s unfilled tail UNTOUCHED (hybrid carrier-survives
+   * semantics, same as `processAdd`). `underflowSamples()` increments by the
+   * unfilled per-channel count.
+   *
+   * @param out          Caller buffer carrying the carrier; mixed in place.
+   * @param channelIndex Integer channel in `[0, channels)`.
+   * @param gain         Multiplier on the residual. Default 1. `gain = 0`
+   *                     still pulls + advances + counts (drain-without-mix).
+   * @param count        Per-channel samples to mix. Default `out.length`.
+   */
+  processAddChannel(
+    out: Float32Array,
+    channelIndex: number,
+    gain: number = 1.0,
+    count: number = out.length,
+  ): number {
+    if (!Number.isInteger(channelIndex) || channelIndex < 0 ||
+        channelIndex >= this.channels) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddChannel: channelIndex ${channelIndex} ` +
+        `out of range [0, ${this.channels})`,
+      );
+    }
+    if (!Number.isFinite(count) || count < 0 || count > out.length) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddChannel: count ${count} out of range ` +
+        `[0, ${out.length}]`,
+      );
+    }
+    if (!Number.isFinite(gain)) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddChannel: gain must be finite (got ${gain})`,
+      );
+    }
+    this._outs[0] = out;
+    this._chans[0] = channelIndex;
+    return this._mixWindow(1, gain, count);
+  }
+
+  /**
+   * Convenience for the common stereo case (0.9.48): mix channel 0 → `left`
+   * and channel 1 → `right` from the SAME cursor window, advancing the cursor
+   * ONCE by `count`. Requires `channels >= 2`. Returns per-channel samples
+   * actually mixed before underflow.
+   *
+   * This is the atomic "render one stereo quantum" op — reading both channels
+   * from a single window keeps L and R sample-locked. It is deliberately NOT
+   * expressible as `processAddChannel(left, 0)` + `processAddChannel(right, 1)`,
+   * which would advance the cursor twice and read two consecutive windows.
+   *
+   * Underflow leaves the unfilled tails of BOTH `left` and `right` UNTOUCHED
+   * (carrier survives per channel — one interleaved frame is one ring pull, so
+   * all channels underflow together). `underflowSamples()` increments by the
+   * unfilled per-channel count (NOT doubled).
+   *
+   * @param left   Channel-0 carrier buffer; mixed in place.
+   * @param right  Channel-1 carrier buffer; mixed in place.
+   * @param gain   Multiplier on the residual. Default 1. `gain = 0` drains.
+   * @param count  Per-channel samples to mix. Default
+   *               `Math.min(left.length, right.length)`.
+   */
+  processAddStereo(
+    left: Float32Array,
+    right: Float32Array,
+    gain: number = 1.0,
+    count: number = Math.min(left.length, right.length),
+  ): number {
+    if (this.channels < 2) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddStereo: requires channels >= 2 ` +
+        `(channels ${this.channels})`,
+      );
+    }
+    if (!Number.isFinite(count) || count < 0 ||
+        count > left.length || count > right.length) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddStereo: count ${count} out of range ` +
+        `[0, ${Math.min(left.length, right.length)}]`,
+      );
+    }
+    if (!Number.isFinite(gain)) {
+      throw new Error(
+        `BridgeBlockConsumer.processAddStereo: gain must be finite (got ${gain})`,
+      );
+    }
+    this._outs[0] = left;
+    this._chans[0] = 0;
+    this._outs[1] = right;
+    this._chans[1] = 1;
+    return this._mixWindow(2, gain, count);
+  }
+
+  /**
+   * Private cursor-advancing window-walker shared by `processAddChannel` and
+   * `processAddStereo`. Mixes `nOuts` (channel → buffer) pairs from `this._outs`
+   * / `this._chans` from the SAME cursor window, advancing the cursor ONCE by
+   * `count` per-channel samples. Returns per-channel samples mixed before any
+   * underflow.
+   *
+   * Crosses frame boundaries transparently. On ring-empty mid-call the
+   * unfilled tail of every output buffer is left untouched (carrier survives
+   * per channel) and `_underflowSamples` increments by the remaining
+   * per-channel count.
+   */
+  private _mixWindow(nOuts: number, gain: number, count: number): number {
+    const C = this.channels;
+    let written = 0;
+    while (written < count) {
+      if (!this.hasFrame || this.cursor >= this.blockSize) {
+        const ok = this.bridge.pull(this.frame);
+        if (!ok) {
+          // Carrier survives: leave every out[] tail untouched.
+          this._underflowSamples += count - written;
+          return written;
+        }
+        this.cursor = 0;
+        this.hasFrame = true;
+        this._framesConsumed++;
+      }
+      const take = Math.min(count - written, this.blockSize - this.cursor);
+      const samples = this.samples;
+      const cur = this.cursor;
+      const off = written;
+      if (gain !== 0.0) {
+        for (let n = 0; n < nOuts; n++) {
+          const out = this._outs[n] as Float32Array;
+          const c = this._chans[n] as number;
+          if (gain === 1.0) {
+            for (let i = 0; i < take; i++) {
+              out[off + i] = (out[off + i] as number) +
+                (samples[(cur + i) * C + c] as number);
+            }
+          } else {
+            for (let i = 0; i < take; i++) {
+              out[off + i] = (out[off + i] as number) +
+                gain * (samples[(cur + i) * C + c] as number);
+            }
+          }
+        }
+      }
+      // gain === 0: cursor still advances, telemetry still updates, outs
+      // untouched (drain-without-mix), matching processAdd's contract.
+      this.holdSample =
+        samples[(cur + take - 1) * C + (this._chans[0] as number)] as number;
+      this.cursor += take;
+      written += take;
+    }
+    return written;
   }
 
   /** Discard the in-flight frame and reset the cursor. The next `process()`
