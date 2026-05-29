@@ -3,12 +3,23 @@
 // Mirrors examples/audio-rate/main.js but threads two extra controls — a
 // mode toggle and a residual-gain slider — through to the worklet, plus
 // a "Simulate GPU stall" button that pings the worker.
+//
+// Carrier control is SAMPLE-ACCURATE (0.9.49). The freq + residual-gain
+// sliders no longer postMessage the worklet; they write straight into a
+// dedicated input SAB via BridgeInputLane (~1 µs synchronous SAB write, no
+// event-loop hop). The worklet drains the lane per quantum and applies each
+// change at its sample offset — so the carrier's pitch tracks the slider
+// within one quantum, while the GPU residual still rides the block-mode floor.
 
-import { Bridge } from "../../dist/index.js";
+import { Bridge, BridgeInputLane, SpscRing } from "../../dist/index.js";
 import {
   BLOCK_SIZE,
   CAPACITY,
+  EVT_FREQ,
+  EVT_GAIN,
+  INPUT_CAPACITY,
   N_PARTIALS,
+  makeInputSchema,
   makeSchema,
 } from "./schema.js";
 
@@ -28,7 +39,30 @@ const state = {
   worker: null,
   running: false,
   lastReport: {},
+  inputRing: null,    // SpscRing<HybridInputSchema>
+  inputLane: null,    // BridgeInputLane over inputRing (producer side)
+  inputFrame: null,   // reusable scratch frame
+  seqInput: 0n,       // monotonic event sequence counter
 };
+
+// The fast-lane write path: stamp seq + timestamp, fill the event fields,
+// lane.push(). No postMessage, no event-loop hop, no allocation. `sampleOffset`
+// is left 0 — a slider drag can't correlate its clock to the audio quantum, so
+// the worklet applies the change at the start of the receiving quantum (still a
+// one-quantum response). Returns false if the lane is full (it won't be at
+// human slider rates).
+function fireInputEvent(eventType, value0) {
+  if (!state.inputLane || !state.inputFrame) return false;
+  const ev = state.inputFrame;
+  state.seqInput++;
+  ev.seq          = state.seqInput;
+  ev.tInputNs     = BigInt(Math.floor(performance.now() * 1e6));
+  ev.eventType    = eventType;
+  ev.sampleOffset = 0;
+  ev.value0       = value0;
+  ev.value1       = 0;
+  return state.inputLane.push(ev);
+}
 
 function setStatus(parts) {
   STATUS.innerHTML = parts
@@ -66,6 +100,13 @@ async function start() {
   const schema = makeSchema(BLOCK_SIZE);
   const { sab } = Bridge.allocate(CAPACITY, schema);
 
+  // Allocate the carrier-control input lane and hold its producer side.
+  const inputSchema = makeInputSchema();
+  const { sab: inputSab } = SpscRing.allocate(INPUT_CAPACITY, inputSchema);
+  state.inputRing = new SpscRing(inputSab, INPUT_CAPACITY, inputSchema);
+  state.inputLane = new BridgeInputLane(state.inputRing);
+  state.inputFrame = state.inputLane.scratchFrame();
+
   state.worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
   state.worker.onmessage = onWorkerMessage;
   state.worker.onerror = (e) => {
@@ -86,18 +127,23 @@ async function start() {
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [1],
-    processorOptions: { sab, capacity: CAPACITY, blockSize: BLOCK_SIZE },
+    processorOptions: {
+      sab,
+      capacity: CAPACITY,
+      blockSize: BLOCK_SIZE,
+      inputSab,
+      inputCapacity: INPUT_CAPACITY,
+      // Initial carrier state — subsequent changes ride the input lane.
+      carrierFreq: Number(FREQ.value),
+      residualGain: Number(RGAIN.value),
+    },
   });
   state.node.port.onmessage = onWorkletMessage;
   state.node.connect(state.ctx.destination);
 
-  // Push initial config into the worklet.
-  state.node.port.postMessage({
-    type: "config",
-    carrierFreq: Number(FREQ.value),
-    residualGain: Number(RGAIN.value),
-    mode: currentMode(),
-  });
+  // Only the control-plane mode toggle goes through postMessage now; freq +
+  // residual gain are sample-accurate on the input lane.
+  state.node.port.postMessage({ type: "config", mode: currentMode() });
 
   state.running = true;
   STOP.disabled = false;
@@ -118,6 +164,9 @@ function stop() {
   state.node = null;
   state.ctx = null;
   state.worker = null;
+  state.inputRing = null;
+  state.inputLane = null;
+  state.inputFrame = null;
   state.lastReport = {};
   setStatus([["status", "stopped."]]);
 }
@@ -158,6 +207,8 @@ function render() {
     ["frames consumed", String(r.framesConsumed ?? 0)],
     ["underflow samples", String(r.underflowSamples ?? 0)],
     ["stall samples", String(r.stallSamplesTotal ?? 0)],
+    ["carrier events", String(state.seqInput)],
+    ["events applied", String(r.inputDrained ?? 0)],
   ]);
 }
 
@@ -166,20 +217,27 @@ function render() {
 FREQ.addEventListener("input", () => {
   const v = Number(FREQ.value);
   FREQ_LABEL.textContent = `${v.toFixed(0)} Hz`;
-  // Push to both worker (drives WGSL uniform) and worklet (drives CPU
-  // sawtooth phase). The two are nominally locked because they read the
-  // same slider value; minor drift across the ~85 ms transit window is
-  // invisible because the residual's pitch only matters relative to the
-  // carrier's, and the WGSL kernel recomputes the partials freshly per
-  // block.
+  // Two destinations, two transports:
+  //   - Carrier (worklet): SAMPLE-ACCURATE via the input lane. ~1 µs SAB
+  //     write; the worklet retunes the sawtooth within one quantum (~2.7 ms).
+  //   - GPU residual (worker): the slow path — postMessage drives the WGSL
+  //     uniform, and the residual lands ~85 ms later. That lag is fine: the
+  //     residual's pitch only matters relative to the carrier's, and the
+  //     WGSL kernel recomputes the partials freshly per block. The two are
+  //     nominally locked because they read the same slider value; the
+  //     ASYMMETRY (carrier instant, residual lagged) is exactly the point.
+  fireInputEvent(EVT_FREQ, v);
   state.worker?.postMessage({ type: "freq", value: v });
-  state.node?.port.postMessage({ type: "config", carrierFreq: v });
 });
 
 RGAIN.addEventListener("input", () => {
   const v = Number(RGAIN.value);
   RGAIN_LABEL.textContent = v.toFixed(2);
-  state.node?.port.postMessage({ type: "config", residualGain: v });
+  // Residual gain also rides the input lane (consistency with the carrier
+  // path). It's quantum-granular in effect — the residual is a block layer, so
+  // processAdd applies one scalar per quantum — but it still skips the
+  // postMessage hop.
+  fireInputEvent(EVT_GAIN, v);
 });
 
 for (const r of MODE_RADIOS) {

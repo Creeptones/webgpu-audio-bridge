@@ -4,6 +4,79 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.49] — 2026-05-29
+
+### Added — sample-accurate carrier control in the hybrid-residual demo via `BridgeInputLane`
+
+Closes **Gap #3** from `docs/hybrid-residual-comparison.md` (Recommendation 3, the
+smallest-cost gap on the list). The 0.9.41 hybrid demo controlled the carrier
+fundamental through `port.postMessage({ type: "config", carrierFreq })` — a
+control path that is quantum-granular at best and subject to MessagePort delivery
+jitter. That undersold the architecture: the whole hybrid claim is *"the carrier
+is low-latency,"* yet the carrier was being driven through the slowest transport
+in the system. This rewires it onto the project's existing fast-lane primitive.
+
+#### What changed (examples-only — no library / wire-format change)
+
+`examples/hybrid-residual/` gained a second schema and a second SAB:
+
+- **`makeInputSchema()`** (`schema.js`) — one frame per discrete carrier-control
+  event: `seq: u64`, `tInputNs: u64`, `eventType: u32` (`0 = freq`, `1 = noteOn`,
+  `2 = noteOff`, `3 = gain`), `sampleOffset: u32`, `value0: f32`, `value1: f32`.
+  Plus `INPUT_CAPACITY = 64`, `EVENT_DRAIN_PER_QUANTUM = 32`, and `EVT_*` constants.
+- **`main.js`** — allocates the input SAB (`SpscRing.allocate`), holds the
+  `BridgeInputLane` producer side, and routes the freq + residual-gain sliders
+  through `fireInputEvent()` (a ~1 µs synchronous SAB write) instead of
+  `port.postMessage`. The GPU residual still gets the freq via `postMessage` to
+  the worker (it rides the slow lane by design). Only the mode toggle stays on
+  `postMessage` (control-plane, not sample-timed).
+- **`worklet.js`** — holds the `BridgeInputLane` consumer side, drains every
+  unread event per quantum (`drainEvents()` → `inputLane.pullAll`), clamps +
+  sorts the batch by `sampleOffset`, then applies each frequency change **at its
+  sample offset** inside the per-sample carrier loop. The carrier retunes within
+  one quantum (~2.7 ms), bounded only by the audio output buffer.
+
+`sampleOffset` is producer-supplied: a source that can correlate its clock to the
+audio quantum (a sequencer, a timestamped MIDI stream) sets it for true
+intra-quantum placement; a slider drag can't, so it leaves it `0` ("apply at
+quantum start") — still a one-quantum response. The worklet honors whatever the
+producer sends, clamped to `[0, N-1]`.
+
+### Why
+
+The perceptual win the hybrid pattern promises — *GPU residual may lag; carrier
+control does not* — is only real if the carrier's control path is actually fast.
+Routing carrier frequency through `postMessage` made the demo's headline a
+fiction: pitch changes inherited the event-loop's latency, the exact thing the
+architecture exists to avoid. Wiring it through `BridgeInputLane` makes the claim
+true and demonstrates that the hybrid-residual pattern composes with the
+project's fast-lane primitive (the same `BridgeInputLane` the `examples/fast-lane/`
+demo uses for note events).
+
+### Wire compatibility
+
+Zero change to the library. This is an examples-only patch — it consumes the
+already-shipped `BridgeInputLane` (0.6.19) and `BridgeBlockConsumer.processAdd`
+(0.9.41) surfaces unchanged. `src/` is untouched; `dist/` is unchanged.
+
+### Tests
+
+`npm run typecheck` / `npm test` / `npm run bench` re-run green (no `src/` change,
+so the existing suites cover the unchanged library surface). The new input-lane
+round-trip was validated out-of-band: a producer pushing freq/gain events through
+`BridgeInputLane` over the new schema and a separate consumer view draining them
+via `pullAll` round-trips all six fields bit-exactly (`u64` seq/timestamp, `u32`
+eventType/sampleOffset, `f32` value0/value1) in FIFO order.
+
+### Documentation
+
+- README §"Hybrid residual-on-carrier mode" gained a "Sample-accurate carrier
+  control (0.9.49)" paragraph.
+- `examples/hybrid-residual/index.html` copy updated to describe the input-lane
+  control path and the carrier/residual latency asymmetry.
+- `docs/hybrid-residual-comparison.md` Gap #3 and Recommendation 3 marked
+  ✅ shipped (0.9.49).
+
 ## [0.9.48] — 2026-05-28
 
 ### Added — stereo / multi-channel `BridgeBlockConsumer` (interleaved `processAddStereo` / `processAddChannel`)

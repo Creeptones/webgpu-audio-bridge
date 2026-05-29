@@ -273,7 +273,9 @@ Three viable shapes:
 
 **Cost**: 400-800 LOC + a polyphonic example + test pins. **Complexity**: medium (especially shape 3, which needs WGSL voice-list logic). **Dependency**: none.
 
-### Gap #3: Sample-accurate carrier parameter changes via `BridgeInputLane`
+### Gap #3: Sample-accurate carrier parameter changes via `BridgeInputLane` — ✅ shipped (0.9.49)
+
+**Shipped in 0.9.49.** `examples/hybrid-residual/` now carries a second schema (`makeInputSchema`: `seq, tInputNs, eventType, sampleOffset, value0, value1`) on a dedicated input SAB. The main thread holds the `BridgeInputLane` producer side and writes each freq / residual-gain slider tick straight into the SAB (~1 µs, no `postMessage`); the worklet holds the consumer side, drains every unread event per quantum via `inputLane.pullAll`, and applies each frequency change **at its `sampleOffset`** inside the per-sample carrier loop. The carrier retunes within one quantum (~2.7 ms); the GPU residual still rides the ~85 ms block-mode floor — proving the asymmetry *"GPU residual may lag; carrier control does not."* `sampleOffset` is producer-supplied: a sequencer / timestamped-MIDI source sets it for intra-quantum placement, a slider drag leaves it `0` (apply at quantum start). Examples-only change — no library/wire-format change; it composes the existing `BridgeInputLane` (0.6.19) and `processAdd` (0.9.41) primitives. See README §"Hybrid residual-on-carrier mode". The original analysis follows.
 
 The 0.9.41 example wires `carrierFreq` through `port.postMessage`. The worklet polls a heap field updated on each message. Quantum-granularity at best, often coarser (depending on browser MessagePort delivery cadence).
 
@@ -440,11 +442,11 @@ If the goal is to maximize the "marked upgrade" claim with the least incremental
 
 **Cost**: 200-400 LOC. Lowest-cost high-leverage gap on the list.
 
-### Recommendation 3: Gap #3 — Sample-accurate carrier params via `BridgeInputLane`
+### Recommendation 3: Gap #3 — Sample-accurate carrier params via `BridgeInputLane` — ✅ shipped (0.9.49)
 
-**Why third**: The "carrier responds at sub-quantum latency" claim is currently bottlenecked at the `port.postMessage` cadence (often coarser than the carrier's own latency budget). Wiring `BridgeInputLane` into the hybrid example proves the pattern composes with the project's existing fast-lane primitive and demonstrates pro-audio-grade carrier responsiveness.
+**Why third**: The "carrier responds at sub-quantum latency" claim was bottlenecked at the `port.postMessage` cadence (often coarser than the carrier's own latency budget). Wiring `BridgeInputLane` into the hybrid example proves the pattern composes with the project's existing fast-lane primitive and demonstrates pro-audio-grade carrier responsiveness.
 
-**Cost**: 100-200 LOC. Smallest-cost gap on the list; composes cleanly with what's already shipped.
+**Shipped 0.9.49** — see Gap #3 above. **Cost**: came in at the low end (~150 LOC, examples-only). Smallest-cost gap on the list; composed cleanly with what was already shipped (`BridgeInputLane` 0.6.19 + `processAdd` 0.9.41).
 
 The other twelve gaps are real and worth tracking, but most are either niche-use-case improvements (Gap #6 predictive carrier, Gap #9 latency compensation, Gap #10 multi-resolution residual) or measurement / observability extensions (Gap #14 cross-browser, Gap #15 long-tail) that should follow the comparator bench (Gap #11) rather than precede it.
 

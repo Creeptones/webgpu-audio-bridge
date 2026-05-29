@@ -44,13 +44,24 @@
       <strong>GPU-computed harmonic-partial residual</strong> on top.
     </p>
 
+    <p>
+      The freq + gain sliders are wired through <code>BridgeInputLane</code> for
+      <strong>sample-accurate carrier control</strong> — each slider tick is a
+      ~1&nbsp;µs synchronous SAB write, not a <code>postMessage</code> hop. The
+      worklet drains the lane every quantum and retunes the carrier at the
+      event's sample offset, so pitch tracks the slider within one quantum
+      (~2.7&nbsp;ms) regardless of main-thread jank.
+    </p>
+
     <div class="callout">
       <strong>What you're listening for.</strong> Move the freq slider — pitch follows
-      <em>instantly</em> because the fundamental lives on the CPU. Press
+      <em>instantly</em> because the fundamental lives on the CPU and its control
+      events arrive sample-accurately over the input lane. Press
       <em>"Simulate GPU stall"</em> — in <strong>Hybrid</strong> mode the upper harmonics fade out
       for ~250 ms while the fundamental keeps playing (audible thinning, no click).
       In <strong>Replace</strong> mode the same stall produces audible silence /
-      click because the worklet has nothing to write.
+      click because the worklet has nothing to write. The asymmetry is the whole
+      point: <em>GPU residual may lag; carrier control does not.</em>
     </div>
 
     <h2>Run</h2>
