@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — renderSizeHint bench</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        background: #0e1116; color: #d7dde5; margin: 0; padding: 2rem;
+        max-width: 980px; margin-inline: auto;
+      }
+      h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+      .sub { color: #8b96a5; margin: 0 0 1.5rem; }
+      .panel {
+        background: #161b22; border: 1px solid #283040; border-radius: 8px;
+        padding: 1rem 1.25rem; margin-bottom: 1.25rem;
+      }
+      .panel h2 { font-size: .95rem; margin: 0 0 .75rem; color: #9fb0c3; text-transform: uppercase; letter-spacing: .04em; }
+      .kv { display: flex; justify-content: space-between; gap: 1rem; padding: .1rem 0; }
+      .k { color: #8b96a5; }
+      .v { color: #d7dde5; text-align: right; word-break: break-all; }
+      .ok { color: #4ade80; }
+      .warn { color: #fbbf24; }
+      .err { color: #f87171; }
+      button {
+        font: inherit; background: #2563eb; color: white; border: 0;
+        border-radius: 6px; padding: .55rem 1.1rem; cursor: pointer;
+      }
+      button:disabled { background: #334155; cursor: default; }
+      .status { margin-top: .75rem; color: #8b96a5; min-height: 1.4em; }
+      table { width: 100%; border-collapse: collapse; margin-top: .25rem; }
+      th, td { text-align: right; padding: .35rem .5rem; border-bottom: 1px solid #222b38; }
+      th:first-child, td:first-child { text-align: left; }
+      th { color: #9fb0c3; font-weight: 600; font-size: .8rem; }
+      td.err { color: #f87171; text-align: left; font-size: .8rem; }
+      .baseline { margin-top: .9rem; padding-top: .8rem; border-top: 1px dashed #2b3545; color: #cbd5e1; }
+      code { background: #222b38; padding: .1rem .35rem; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>renderSizeHint bench</h1>
+    <p class="sub">
+      Measures the actual render quantum a browser grants for each
+      <code>renderSizeHint</code>, and what that does to the input→audible
+      latency floor. Experimental — the hint is not a guarantee.
+    </p>
+
+    <div class="panel">
+      <h2>Environment</h2>
+      <div id="env"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Sweep</h2>
+      <button id="run">Run sweep (needs a click — AudioContext gesture)</button>
+      <div id="status" class="status"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>requested</th>
+            <th>renderQuantumSize</th>
+            <th>honored</th>
+            <th>avg quantum (ms)</th>
+            <th>baseLatency (ms)</th>
+            <th>outputLatency (ms)</th>
+            <th>est in→audible (ms)</th>
+            <th>error</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="baseline" class="baseline"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Worklet ground-truth</h2>
+      <p class="sub" style="margin:.25rem 0 .75rem">
+        Confirms the main-thread <code>renderQuantumSize</code> attribute
+        against the actual block length <code>process()</code> receives on the
+        audio thread.
+      </p>
+      <div id="worklet"></div>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

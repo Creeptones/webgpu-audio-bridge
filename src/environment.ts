@@ -166,6 +166,30 @@ export interface EnvironmentReport {
    * `MLTensor` yet; this flag captures that split.
    */
   readonly mlTensor: boolean;
+  /**
+   * `'renderQuantumSize' in BaseAudioContext.prototype` (0.9.73).
+   *
+   * Interface-presence sniff for the Web Audio `renderSizeHint`
+   * construction option + its `renderQuantumSize` readback attribute.
+   * Smaller render quanta (e.g. 64 vs the historical fixed 128) halve
+   * the AudioWorklet scheduling granularity — ~1.33 ms vs ~2.67 ms at
+   * 48 kHz — which is the single largest reducible term in the Turbo
+   * input-latency floor.
+   *
+   * **Experimental, NOT a guarantee.** The capability label is stable;
+   * the predicate sniffs the readback attribute's presence on
+   * `BaseAudioContext.prototype` (which `AudioContext.prototype`
+   * inherits). A browser exposing the attribute does NOT promise it
+   * will *honor* a numeric hint — only `measureRenderQuantum()` (under
+   * the `webgpu-audio-bridge/experimental` subpath) tells you what you
+   * actually got, since that requires constructing a context and a user
+   * gesture (both forbidden in this pure-reflection report). Sniffs by
+   * interface presence, NOT UA version. Returns `false` on browsers that
+   * never shipped the attribute.
+   *
+   * @experimental
+   */
+  readonly renderSizeHint: boolean;
   /** `navigator?.userActivation` present. Predicts whether AudioContext.resume will succeed. */
   readonly userActivation: boolean;
   /** `globalThis.isSecureContext === true`. */
@@ -273,6 +297,28 @@ function hasMLTensor(g: typeof globalThis): boolean {
   return typeof (g as { MLTensor?: unknown }).MLTensor === "function";
 }
 
+/**
+ * Interface-presence sniff for the Web Audio `renderQuantumSize` readback
+ * attribute (0.9.73) — the observable companion to the `renderSizeHint`
+ * construction option. Lives on `BaseAudioContext.prototype`, which
+ * `AudioContext.prototype` inherits, so we probe whichever base is present.
+ * Does NOT construct an AudioContext. Returns `false` on browsers that never
+ * shipped the attribute.
+ */
+function hasRenderSizeHint(g: typeof globalThis): boolean {
+  const Base = (g as { BaseAudioContext?: { prototype?: object } }).BaseAudioContext;
+  const baseProto = Base?.prototype;
+  if (baseProto && typeof baseProto === "object" && "renderQuantumSize" in baseProto) {
+    return true;
+  }
+  const AC = (g as { AudioContext?: { prototype?: object } }).AudioContext;
+  const acProto = AC?.prototype;
+  if (acProto && typeof acProto === "object" && "renderQuantumSize" in acProto) {
+    return true;
+  }
+  return false;
+}
+
 function hasWebMidi(nav: NavigatorLike | undefined): boolean {
   return !!nav && typeof nav.requestMIDIAccess === "function";
 }
@@ -300,6 +346,7 @@ interface FeatureFlags {
   readonly webgpuZeroCopy: boolean;
   readonly webnn: boolean;
   readonly mlTensor: boolean;
+  readonly renderSizeHint: boolean;
   // Stable, non-feature host flags.
   readonly userActivation: boolean;
   readonly secureContext: boolean;
@@ -521,6 +568,7 @@ export function getEnvironmentReport(): EnvironmentReport {
     webgpuZeroCopy: hasWebGpuZeroCopy(g),
     webnn: hasWebNN(nav),
     mlTensor: hasMLTensor(g),
+    renderSizeHint: hasRenderSizeHint(g),
     userActivation: hasUserActivation(nav),
     secureContext: hasSecureContext(g),
   };
@@ -540,6 +588,7 @@ export function getEnvironmentReport(): EnvironmentReport {
     webgpuZeroCopy: flags.webgpuZeroCopy,
     webnn: flags.webnn,
     mlTensor: flags.mlTensor,
+    renderSizeHint: flags.renderSizeHint,
     userActivation: flags.userActivation,
     secureContext: flags.secureContext,
     suggestedMode,

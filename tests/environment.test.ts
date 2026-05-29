@@ -53,6 +53,10 @@
  *  15.  (0.7.17) mlTensor is false on current Node, flips to true
  *       when `globalThis.MLTensor` is a function. Interface-presence
  *       sniff; pairs with `BridgeWebNNSource.isAvailable()`.
+ *  16.  (0.9.73) renderSizeHint is false on current Node, flips to true
+ *       when `BaseAudioContext.prototype` (or `AudioContext.prototype`)
+ *       exposes `renderQuantumSize`. Interface-presence sniff; pairs with
+ *       `measureRenderQuantum()` under the experimental subpath.
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -82,6 +86,9 @@ const KEYS = [
   // 0.7.17 — added for the mlTensor pin so test bodies can install /
   // delete MLTensor to drive the WebNN tensor-class sniff.
   "MLTensor",
+  // 0.9.73 — added for the renderSizeHint pin so test bodies can install /
+  // delete BaseAudioContext to drive the renderQuantumSize attribute sniff.
+  "BaseAudioContext",
 ] as const;
 
 type GlobalKey = (typeof KEYS)[number];
@@ -184,6 +191,9 @@ const BARE_SHAPE: MockShape = {
   // 0.7.17 — ensure pins start from a no-MLTensor baseline so
   // `mlTensor` reads as false regardless of host defaults.
   MLTensor: SENTINEL_DELETE,
+  // 0.9.73 — ensure pins start from a no-BaseAudioContext baseline so
+  // `renderSizeHint` reads as false regardless of host defaults.
+  BaseAudioContext: SENTINEL_DELETE,
 };
 
 // ── 1. Vanilla / no-browser shape → 'unsupported' ────────────────────────
@@ -202,6 +212,7 @@ function testBareEnvironment(): void {
   assertEq(report.webMidi, false, "bare: webMidi false");
   assertEq(report.webnn, false, "bare: webnn false");
   assertEq(report.mlTensor, false, "bare: mlTensor false");
+  assertEq(report.renderSizeHint, false, "bare: renderSizeHint false");
   assertEq(report.userActivation, false, "bare: userActivation false");
   assertEq(report.suggestedMode, "unsupported", "bare → unsupported");
   assertEq(report.userAgent, "", "bare: userAgent ''");
@@ -612,6 +623,46 @@ function testWebNNAndMLTensorSniff(): void {
   ok("14. WebNN + MLTensor interface-presence sniffs");
 }
 
+// ── 15. renderSizeHint sniff (0.9.73) ────────────────────────────────────
+function testRenderSizeHintSniff(): void {
+  // (a) Bare — flag false.
+  const bare = withMockedGlobal(BARE_SHAPE, () => getEnvironmentReport());
+  assertEq(bare.renderSizeHint, false, "bare: renderSizeHint false");
+
+  // (b) BaseAudioContext.prototype WITHOUT renderQuantumSize → still false.
+  const BaseNoAttr = function (this: object): void { /* never new'd */ };
+  (BaseNoAttr as unknown as { prototype: object }).prototype = {};
+  withMockedGlobal({ ...BARE_SHAPE, BaseAudioContext: BaseNoAttr }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.renderSizeHint, false, "BaseAudioContext without renderQuantumSize: false");
+  });
+
+  // (c) BaseAudioContext.prototype WITH renderQuantumSize → true. Pure
+  // presence sniff — the value is irrelevant, the key's existence is what
+  // counts (the spec attribute is a readonly getter on the prototype).
+  const BaseWithAttr = function (this: object): void { /* never new'd */ };
+  (BaseWithAttr as unknown as { prototype: object }).prototype = { renderQuantumSize: 128 };
+  withMockedGlobal({ ...BARE_SHAPE, BaseAudioContext: BaseWithAttr }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.renderSizeHint, true, "BaseAudioContext with renderQuantumSize: true");
+  });
+
+  // (d) Inheritance path: no BaseAudioContext, but AudioContext.prototype
+  // carries the attribute directly → true (covers hosts that expose it on
+  // the concrete class).
+  const ACWithAttr = function (this: object): void { /* never new'd */ };
+  (ACWithAttr as unknown as { prototype: object }).prototype = {
+    audioWorklet: {},
+    renderQuantumSize: 64,
+  };
+  withMockedGlobal({ ...BARE_SHAPE, AudioContext: ACWithAttr }, () => {
+    const r = getEnvironmentReport();
+    assertEq(r.renderSizeHint, true, "AudioContext.prototype with renderQuantumSize: true");
+  });
+
+  ok("15. renderSizeHint interface-presence sniff");
+}
+
 function main(): void {
   testBareEnvironment();
   testIndividualFlags();
@@ -627,6 +678,7 @@ function main(): void {
   testCoopCoepSeverityDowngrade();
   testWebGpuZeroCopySniff();
   testWebNNAndMLTensorSniff();
+  testRenderSizeHintSniff();
   console.log("\nAll environment.test.ts pins passed.");
 }
 

@@ -1578,6 +1578,37 @@ Both are interface-presence sniffs; neither calls anything. Both return `false` 
 
 **Spec tracking.** [W3C WebNN Candidate Recommendation](https://www.w3.org/TR/webnn/), [WebNN explainer](https://webmachinelearning.github.io/webnn-intro/), [Chrome implementation status](https://chromestatus.com/feature/5466739056508928). Issues + design feedback welcome on the project's GitHub.
 
+### Experimental: `renderSizeHint` probe (0.9.73)
+
+> **Experimental, opt-in, not a product guarantee.** The shapes under `webgpu-audio-bridge/experimental` may break across MINOR (and, for spec-tracking entries like this one, PATCH) releases. The stable surface is the `getEnvironmentReport().renderSizeHint` capability flag.
+
+The AudioWorklet render quantum has been fixed at **128 frames** since the API shipped, and that quantum is the single largest *reducible* term in the Turbo input-latency floor: a control frame the worker pushes waits, on average, **half a quantum** for the worklet's next `process()`. The Web Audio spec gained `AudioContextOptions.renderSizeHint` (`"default"` | `"hardware"` | a numeric frame count) plus a `BaseAudioContext.renderQuantumSize` readback, and Blink has been experimenting with honoring it. A 64-frame quantum would halve the average scheduling wait — ~0.67 ms vs ~1.33 ms at 48 kHz:
+
+| quantum | worst case @48 kHz | average @48 kHz |
+|--------:|-------------------:|----------------:|
+| 64      | 1.333 ms           | 0.667 ms        |
+| 128     | 2.667 ms           | 1.333 ms        |
+| 256     | 5.333 ms           | 2.667 ms        |
+
+It is **a hint, not a guarantee** — a browser may clamp, round, expose the readback while still rendering 128, or reject a numeric value. So the library ships a *measurement* layer, not a sizing assumption:
+
+```ts
+import { getEnvironmentReport } from "webgpu-audio-bridge";
+import { measureRenderQuantum } from "webgpu-audio-bridge/experimental";
+
+if (getEnvironmentReport().renderSizeHint) {           // stable pre-construction sniff
+  // inside a click handler (AudioContext needs a user gesture):
+  const r = await measureRenderQuantum({ hint: 64 });
+  console.log(r.renderQuantumSize, r.honored, r.estimatedInputToAudibleMs);
+}
+```
+
+`measureRenderQuantum(options)` constructs a context with the requested hint, reads back `renderQuantumSize` / `baseLatency` / `outputLatency`, and returns a **frozen, JSON-serializable** report; `honored` is `true` when a numeric request equals the readback, and `estimatedInputToAudibleMs = avg-quantum + (outputLatency ?? baseLatency)`. It never throws for the common failure modes (no constructor, construction error, blocked resume) — those land in `report.error`. Companions: `sweepRenderQuantum(hints)`, the pure `quantumLatencyMs(quantum, sampleRate)`, and `isRenderSizeHintSupported()`.
+
+**Deliberately NOT auto-wired.** Ring capacity sizing in `connect()` / `Bridge.allocate()` still floors on the caller-supplied `outputBufferFrames` (default 128). A consumer that has *measured* an honored smaller quantum can pass it explicitly; the library does not assume the hint was granted.
+
+**Browser harness.** `npm run bench:render-size-hint` (port 5179) sweeps `["default", 64, 128, 256, 512, "hardware"]` via the library API, then confirms the smallest honored numeric quantum against **worklet ground truth** — a probe processor reports the actual `process()` block length and `currentFrame` delta from the audio thread — and prints the measured latency gain (or states plainly that no hint was honored on your platform). See [`docs/render-size-hint-experiment.md`](./docs/render-size-hint-experiment.md).
+
 ## Use cases
 
 The pattern this library implements unblocks browser projects that previously had no clean answer:

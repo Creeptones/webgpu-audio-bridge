@@ -4,6 +4,84 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.73] — 2026-05-29
+
+### Added — experimental `renderSizeHint` probe + `renderSizeHint` capability flag
+
+The Web Audio spec gained an `AudioContextOptions.renderSizeHint`
+(`"default"` | `"hardware"` | a numeric frame count) plus a
+`BaseAudioContext.renderQuantumSize` readback; Blink has been experimenting
+with it. The historical render quantum has been fixed at **128 frames**, and
+that quantum is the single largest *reducible* term in the Turbo input-latency
+floor — a control frame the worker pushes waits, on average, half a quantum for
+the AudioWorklet's next `process()`. A 64-frame quantum would halve that
+(~0.67 ms vs ~1.33 ms at 48 kHz). It is a **hint, not a guarantee**, so this
+ship is a *measurement* layer, not an assumption baked into sizing.
+
+#### What shipped
+
+- **Stable surface** — `getEnvironmentReport().renderSizeHint: boolean`, an
+  interface-presence sniff for `renderQuantumSize` on
+  `BaseAudioContext.prototype` (which `AudioContext.prototype` inherits).
+  Pure feature detection, consistent with the rest of the report — it does NOT
+  construct a context. Joins the existing experimental capability flags
+  (`webgpuZeroCopy` / `webnn` / `mlTensor`).
+- **Experimental surface** (`webgpu-audio-bridge/experimental`):
+  - `measureRenderQuantum(options)` — constructs an `AudioContext` with the
+    requested hint, optionally `resume()`s it (needs a gesture for a realistic
+    `outputLatency`), reads back `renderQuantumSize` / `baseLatency` /
+    `outputLatency` / `sampleRate`, and returns a **frozen, JSON-serializable**
+    `RenderQuantumReport`. `honored` is `true` when a numeric request equals the
+    readback; `estimatedInputToAudibleMs = avg-quantum + (outputLatency ??
+    baseLatency)`. Never throws for the common failure modes (no constructor,
+    construction error, blocked resume) — those surface in `report.error` so a
+    sweep keeps going. Constructor is injectable for tests; closes the context
+    unless `keepOpen`.
+  - `sweepRenderQuantum(hints, options)` — sequential sweep, one report per hint.
+  - `quantumLatencyMs(quantum, sampleRate)` — pure `{ worstCaseMs, averageMs }`.
+  - `isRenderSizeHintSupported()` — the report sniff, re-exported on the subpath.
+- **Browser harness** — `bench/render-size-hint/` (`npm run bench:render-size-hint`,
+  port 5179) sweeps `["default", 64, 128, 256, 512, "hardware"]` via the library
+  API, then confirms the smallest honored numeric quantum against **worklet
+  ground truth**: a probe processor reports the actual `process()` block length
+  and `currentFrame` delta from the audio thread, and the page prints the measured
+  latency gain (or states plainly that no hint was honored).
+
+### Why
+
+Roadmap frontier item #8. The quantum-boundary wait is the one input-latency term
+the SAB transport can't shrink on its own, and the spec just exposed a knob for
+it. But the knob is unsettled and unevenly honored, so the right ship is a probe
+that tells you the truth on *your* hardware — not a sizing assumption. The library
+deliberately does NOT wire a measured quantum into `connect()` / `Bridge.allocate()`
+capacity sizing; a consumer that has measured an honored smaller quantum can pass
+it explicitly via the existing `outputBufferFrames`.
+
+### Wire compatibility
+
+**Wire-equivalent.** Additive only: one new boolean field on the
+`getEnvironmentReport()` result (existing fields unchanged), a new module under
+the already-unstable `/experimental` subpath, a new bench harness, and a new npm
+script. No SAB header / payload / size change, no change to any Bridge wire path.
+
+### Tests
+
+41 Node suites green (was 40). New `tests/renderQuantum.test.ts` (12 pins) pins
+the quantum-latency math, the support sniff, and every `measureRenderQuantum`
+branch (honored / ignored / unsupported / "default"-mirrors-supported / close-vs-
+keepOpen / rejected-resume non-fatal / frozen + JSON round-trip / baseLatency
+fallback / sweep order) against an injected mock `AudioContext`.
+`tests/environment.test.ts` gains pin 15 (`renderSizeHint` interface-presence
+sniff incl. the `AudioContext.prototype` inheritance path). `push`/`pull`/
+`pullLatest` bench medians unchanged at ~1.30 μs.
+
+### Documentation
+
+New `docs/render-size-hint-experiment.md` (opportunity, why-experimental,
+shipped surface, how-to-read-a-result, scope decisions); README §experimental
+gains a `renderSizeHint` subsection; ROADMAP frontier #8 marked shipped;
+CHANGELOG (this block).
+
 ## [0.9.72] — 2026-05-29
 
 ### Added — the four-tier hybrid stack composed in one demo (`examples/hybrid-four-tier/`)
