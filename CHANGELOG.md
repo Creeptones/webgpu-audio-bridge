@@ -4,6 +4,60 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.85] — 2026-05-29
+
+### Added — FFT spectral pin: each Hermite order measurably tightens the rolloff (Phase I consolidation, Stage 2)
+
+Phase I's Stage-1/2 trajectory pins prove the higher-order Hermite seams are
+finite-difference *continuous* (cubic C¹, quintic C², septic C³). But the
+mission's headline claim — "each order removes one more derivative step at the
+frame seam, eliminating the FM/zipper click" — is fundamentally **spectral**.
+This stage turns the continuity proof into a measurement.
+
+#### What shipped
+
+- **`tests/Bridge.phaseLock.test.ts` — third pin `runHermiteOrderRolloffSpectrum`**
+  (alongside the existing Taylor and cubic-Hermite spectrum pins). A 60 Hz
+  producer stamps a full order-4 analytic trajectory (`p, v, a, jerk` = the
+  sine's exact derivatives) for a 14.65 Hz signal; the frames round-trip
+  through a real `Bridge` SAB ring; the consumer then reconstructs every audio
+  sample three ways — cubic / quintic / septic — and FFTs each (reusing the
+  file's inline radix-2 FFT + Hann machinery).
+
+#### Correctness
+
+- The pin reconstructs strictly in the **interpolation** regime (`t ∈ [0, 1]`
+  between the two producer frames that *bracket* each audio sample), matching
+  `pullHermiteLatest`'s clamp. This is deliberate: in the extrapolation regime
+  (`t > 1`) a degree-7 polynomial diverges *faster* than a degree-3 one, which
+  would invert the ordering — the C²/C³ continuity claim only lives on the
+  segment interior.
+- Asserts the >30 Hz producer-image band energy drops **monotonically** with
+  order: quintic ≥6 dB below cubic, septic ≥6 dB below quintic — the
+  `f^-3 → f^-4 → f^-5` Fourier-envelope step (a C^k-continuous reconstruction
+  rolls off ~`f^{-(k+2)}`) made testable.
+
+#### Measured
+
+Image-band energy relative to the signal bin: **cubic −44.0 dB → quintic
+−78.0 dB → septic −111.7 dB** — each higher order is ≈34 dB quieter, ~5.5× the
+6 dB regression threshold, so the pin never flakes on FFT bin-edge placement.
+
+### Wire compatibility
+
+Test-only — no source change, no wire/SAB/protocol/API change.
+
+### Tests
+
+One new pin in the existing `Bridge.phaseLock.test.ts` (already in both `test`
+and `test:unit`); 45 Node suites green, `npm run typecheck` clean, `npm run
+bench` unchanged (push/pull/pullLatest 1.30 μs).
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.85 row; README phase-lock-spectrum note extended to
+cover the order-rolloff pin.
+
 ## [0.9.84] — 2026-05-29
 
 ### Added — `pullHermiteLatest`: one-call two-frame Hermite reconstruction (Phase I consolidation, Stage 1)

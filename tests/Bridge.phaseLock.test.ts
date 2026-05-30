@@ -59,6 +59,12 @@
 import { assert, ok } from "./_assert.js";
 import { Bridge } from "../src/Bridge.js";
 import { defineSchema, f64TrajectoryArray, u64 } from "../src/schema.js";
+import type { TrajectorySpec } from "../src/schema.js";
+import {
+  evaluateHermiteTrajectoryInto,
+  evaluateQuinticHermiteTrajectoryInto,
+  evaluateSepticHermiteTrajectoryInto,
+} from "../src/trajectory.js";
 
 // ─── FFT ───────────────────────────────────────────────────────────────────
 
@@ -495,9 +501,217 @@ function runHermiteVsTaylorSpectrum(): void {
   );
 }
 
+// ─── Pin (0.9.85) — Hermite order rolloff (cubic vs quintic vs septic) ──────
+//
+// Apollo Phase I shipped quintic (C², 0.9.80) and septic (C³, 0.9.81) Hermite
+// reconstruction on top of the cubic (C¹, 0.7.3) path. The mission's headline
+// claim — each higher order removes one more derivative step at the frame
+// seam — is fundamentally SPECTRAL: a reconstruction that is C^k continuous
+// (but not C^{k+1}) carries a Fourier envelope that decays ~ f^{-(k+2)} at
+// high frequency. So summed producer-image energy above the signal should be
+// strictly ordered cubic (C¹, ~f^-3) > quintic (C², ~f^-4) > septic (C³,
+// ~f^-5). The Stage-1/2 finite-difference pins prove seam continuity; THIS
+// pin turns that into a measurement.
+//
+// ─── Why interpolation, not the consumer-cadence dance ──────────────────────
+//
+// The two pins above run a fast consumer (375 Hz) against a slow producer
+// (60 Hz), so they spend most samples at/after the newest frame — Taylor and
+// cubic-Hermite there EXTRAPOLATE (t > 1). Extrapolation is the wrong regime
+// for an order comparison: a degree-7 polynomial diverges FASTER than a
+// degree-3 one past the segment, which would invert the very ordering we want
+// to measure. The C²/C³ continuity claim lives strictly in INTERPOLATION
+// (t ∈ [0, 1] between two known frames) — exactly the regime `pullHermiteLatest`
+// clamps to. So this pin reconstructs each audio sample from the producer
+// segment that BRACKETS it (one-frame interpolation latency), keeping all
+// three evaluators on the t ∈ [0, 1] interior where the seam-continuity order
+// is the only variable.
+//
+// The producer stamps a full order-4 analytic trajectory (p, v, a, jerk = the
+// sine's exact derivatives) and the frames round-trip through a real `Bridge`
+// SAB ring; all three reconstructions then read the identical pulled stream.
+// Signal sits at FFT bin 5 (14.65 Hz, ≈ half the 60 Hz producer Nyquist) so
+// each 16.67 ms segment spans a meaningful arc — the higher-derivative terms
+// carry real energy and the order separation is large and unambiguous.
+
+/** A producer trajectory frame drained from the ring: nanosecond timestamp +
+ *  the flat order-4 (p, v, a, jerk) payload. */
+interface RolloffFrame {
+  tNs: bigint;
+  sig: Float64Array;
+}
+
+// The signal sits at a higher bin than the bin-1 used above: more per-segment
+// curvature makes the cubic/quintic/septic separation large. Still bin-aligned
+// (leakage-free peak) and comfortably below the 30 Hz producer Nyquist.
+const ROLLOFF_SIGNAL_BIN = 5;
+
+// Measured (signal 14.65 Hz, 60 Hz producer, FFT 16 384, interpolation regime):
+// the >30 Hz image-band energy (rel signal bin) reads cubic −44.0 dB →
+// quintic −78.0 dB → septic −111.7 dB, i.e. each higher order drops the band
+// by ≈34 dB — the f^-3 → f^-4 → f^-5 envelope step made measurable. The
+// thresholds below are loose regression guards (each order must be at least
+// this many dB quieter than the previous); the measured gaps are ~5.5× larger,
+// so −6 dB never flakes on FFT bin-edge placement.
+const QUINTIC_VS_CUBIC_DB = -6;
+const SEPTIC_VS_QUINTIC_DB = -6;
+
+function runHermiteOrderRolloffSpectrum(): void {
+  const signalHz = (SAMPLE_RATE / FFT_SIZE) * ROLLOFF_SIGNAL_BIN; // 14.6484 Hz
+  const schema = defineSchema({
+    seq: u64(),
+    tMacroNs: u64(),
+    signal: f64TrajectoryArray(1, { order: 4, interpolationMode: "septic-hermite" }),
+  });
+  // Push the whole ~0.34 s of producer frames up front, then drain them all,
+  // so the ring must hold every frame at once — size it past the frame count.
+  const audioEndS = (SIM_SAMPLE_COUNT - 1) / SAMPLE_RATE;
+  const periodS = Number(PRODUCER_PERIOD_NS) * 1e-9;
+  // One frame past the last bracketing segment so every audio sample has a
+  // right endpoint to interpolate toward.
+  const frameCount = Math.ceil(audioEndS / periodS) + 2;
+  const { sab, capacity } = Bridge.allocate(
+    1 << Math.ceil(Math.log2(frameCount + 1)),
+    schema,
+  );
+  const ring = new Bridge(sab, capacity, schema);
+  const trajSpec: TrajectorySpec = { order: 4, sampleCount: 1 };
+
+  const omega = 2 * Math.PI * signalHz;
+  const amplitude = 1.0;
+
+  // Producer: stamp the analytic sine and its first three derivatives at exact
+  // 60 Hz multiples, then push. (p, v, a, j) = (A·sin, A·ω·cos, −A·ω²·sin,
+  // −A·ω³·cos) — the exact trajectory a GPU physics producer would emit.
+  const pushFrame = ring.scratchFrame();
+  for (let k = 0; k < frameCount; k++) {
+    const tNs = PRODUCER_PERIOD_NS * BigInt(k);
+    const t_s = Number(tNs) * 1e-9;
+    pushFrame.seq = BigInt(k);
+    pushFrame.tMacroNs = tNs;
+    pushFrame.signal[0] = amplitude * Math.sin(omega * t_s);
+    pushFrame.signal[1] = amplitude * omega * Math.cos(omega * t_s);
+    pushFrame.signal[2] = -amplitude * omega * omega * Math.sin(omega * t_s);
+    pushFrame.signal[3] = -amplitude * omega * omega * omega * Math.cos(omega * t_s);
+    assert(ring.push(pushFrame), `order-rolloff pin: producer push at k=${k}`);
+  }
+
+  // Consumer: drain every frame back off the SAB ring (real wire round-trip),
+  // then reconstruct by bracketing — clean t ∈ [0, 1] interpolation only.
+  const frames: RolloffFrame[] = [];
+  const tempFrame = ring.scratchFrame();
+  while (ring.pull(tempFrame)) {
+    frames.push({ tNs: tempFrame.tMacroNs, sig: Float64Array.from(tempFrame.signal) });
+  }
+  assert(frames.length === frameCount, `drained ${frames.length} of ${frameCount} frames`);
+
+  const audioCubic = new Float64Array(SIM_SAMPLE_COUNT);
+  const audioQuintic = new Float64Array(SIM_SAMPLE_COUNT);
+  const audioSeptic = new Float64Array(SIM_SAMPLE_COUNT);
+  const cubicOut = new Float64Array(1);
+  const quinticOut = new Float64Array(1);
+  const septicOut = new Float64Array(1);
+
+  let seg = 0;
+  for (let n = 0; n < SIM_SAMPLE_COUNT; n++) {
+    const time_s = n / SAMPLE_RATE;
+    // Advance to the segment [frames[seg], frames[seg+1]) that contains this
+    // audio time. Frames are monotonic at the fixed producer period.
+    while (seg + 1 < frames.length && Number(frames[seg + 1]!.tNs) * 1e-9 <= time_s) {
+      seg++;
+    }
+    const prev = frames[seg]!;
+    const curr = frames[seg + 1]!;
+    const prevStampS = Number(prev.tNs) * 1e-9;
+    const currStampS = Number(curr.tNs) * 1e-9;
+    const segmentSeconds = currStampS - prevStampS;
+    const t = (time_s - prevStampS) / segmentSeconds; // ∈ [0, 1] by construction
+
+    evaluateHermiteTrajectoryInto(prev.sig, curr.sig, trajSpec, t, segmentSeconds, cubicOut);
+    evaluateQuinticHermiteTrajectoryInto(prev.sig, curr.sig, trajSpec, t, segmentSeconds, quinticOut);
+    evaluateSepticHermiteTrajectoryInto(prev.sig, curr.sig, trajSpec, t, segmentSeconds, septicOut);
+    audioCubic[n] = cubicOut[0]!;
+    audioQuintic[n] = quinticOut[0]!;
+    audioSeptic[n] = septicOut[0]!;
+  }
+
+  const cubicSpec = spectrumOf(audioCubic);
+  const quinticSpec = spectrumOf(audioQuintic);
+  const septicSpec = spectrumOf(audioSeptic);
+
+  const sigCubic = mag(cubicSpec.re, cubicSpec.im, ROLLOFF_SIGNAL_BIN);
+  const sigQuintic = mag(quinticSpec.re, quinticSpec.im, ROLLOFF_SIGNAL_BIN);
+  const sigSeptic = mag(septicSpec.re, septicSpec.im, ROLLOFF_SIGNAL_BIN);
+  assert(sigCubic > 0 && sigQuintic > 0 && sigSeptic > 0, "order-rolloff: signal bins have energy");
+
+  // Sanity: all three preserve the underlying signal at its bin. Higher orders
+  // interpolate the sine more accurately, so their in-band magnitudes differ
+  // only slightly; ±3 dB is loose, the strong claim is the image rolloff below.
+  const sigSpread = Math.max(
+    Math.abs(dB(sigQuintic, sigCubic)),
+    Math.abs(dB(sigSeptic, sigCubic)),
+  );
+  assert(
+    sigSpread < 3,
+    `order-rolloff: signal-bin magnitudes diverge by ${sigSpread.toFixed(2)} dB (>3 dB); a reconstruction broke the signal`,
+  );
+
+  // Image-band energy: everything above 30 Hz (the producer Nyquist — well
+  // clear of the 14.65 Hz signal and its leakage) up to the FFT Nyquist. This
+  // is the producer-rate seam-image energy the continuity order suppresses.
+  const binHz = SAMPLE_RATE / FFT_SIZE;
+  const kLow = Math.ceil(30 / binHz);
+  const kHigh = FFT_SIZE / 2 - 1;
+  const bandRms = (s: { re: Float64Array; im: Float64Array }): number => {
+    let sumSq = 0;
+    for (let k = kLow; k <= kHigh; k++) {
+      const m = mag(s.re, s.im, k);
+      sumSq += m * m;
+    }
+    return Math.sqrt(sumSq);
+  };
+  const cubicBand = bandRms(cubicSpec);
+  const quinticBand = bandRms(quinticSpec);
+  const septicBand = bandRms(septicSpec);
+
+  // Express each band energy relative to its own signal bin (so the three are
+  // compared on a common in-band reference) and as a step-down from the
+  // previous order.
+  const cubicBandDb = dB(cubicBand, sigCubic);
+  const quinticBandDb = dB(quinticBand, sigQuintic);
+  const septicBandDb = dB(septicBand, sigSeptic);
+  const quinticVsCubic = dB(quinticBand / sigQuintic, cubicBand / sigCubic);
+  const septicVsQuintic = dB(septicBand / sigSeptic, quinticBand / sigQuintic);
+
+  // (a) Quintic's image band must sit at least 6 dB below cubic's — the C¹→C²
+  //     step that the acceleration-matching seam buys.
+  assert(
+    quinticVsCubic <= QUINTIC_VS_CUBIC_DB,
+    `quintic image band must be ≥${-QUINTIC_VS_CUBIC_DB} dB below cubic. ` +
+    `cubic=${cubicBandDb.toFixed(1)} dB, quintic=${quinticBandDb.toFixed(1)} dB, ` +
+    `Δ=${quinticVsCubic.toFixed(1)} dB (rel cubic)`,
+  );
+  // (b) Septic's image band must sit at least 6 dB below quintic's — the
+  //     C²→C³ step that the jerk-matching seam buys.
+  assert(
+    septicVsQuintic <= SEPTIC_VS_QUINTIC_DB,
+    `septic image band must be ≥${-SEPTIC_VS_QUINTIC_DB} dB below quintic. ` +
+    `quintic=${quinticBandDb.toFixed(1)} dB, septic=${septicBandDb.toFixed(1)} dB, ` +
+    `Δ=${septicVsQuintic.toFixed(1)} dB (rel quintic)`,
+  );
+
+  ok(
+    `hermite-order-rolloff-fft (signal=${signalHz.toFixed(2)}Hz bin${ROLLOFF_SIGNAL_BIN}; ` +
+    `image band >30Hz rel signal: cubic=${cubicBandDb.toFixed(1)}dB → ` +
+    `quintic=${quinticBandDb.toFixed(1)}dB (Δ${quinticVsCubic.toFixed(1)}) → ` +
+    `septic=${septicBandDb.toFixed(1)}dB (Δ${septicVsQuintic.toFixed(1)}))`,
+  );
+}
+
 function main(): void {
   runPhaseLockSpectrum();
   runHermiteVsTaylorSpectrum();
+  runHermiteOrderRolloffSpectrum();
   console.log("\nAll Bridge.phaseLock tests passed.");
 }
 
