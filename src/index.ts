@@ -45,6 +45,11 @@ export { forWorklet, forWorker } from "./Bridge.js";
 // `lastReadbackMedianMs` live on the Bridge class; the lead ceiling constant
 // and the option / result shapes are exported for callers + tests.
 export { DEFAULT_MAX_LEAD_MS } from "./Bridge.js";
+export {
+  DEFAULT_KALMAN_PROCESS_NOISE,
+  DEFAULT_KALMAN_MEAS_POS_NOISE,
+  DEFAULT_KALMAN_INITIAL_VARIANCE,
+} from "./Bridge.js";
 export type { BridgeRole, DefaultRole } from "./Bridge.js";
 export type {
   BridgeAllocation,
@@ -53,6 +58,8 @@ export type {
   SmootherSkipPolicy,
   PredictedPullOptions,
   PredictedPullResult,
+  KalmanPredictedPullOptions,
+  KalmanPredictedPullResult,
   // Observability snapshot + subscription seam (0.7.3)
   TelemetrySnapshot,
   TelemetryListener,

@@ -274,6 +274,7 @@ import {
   predictiveExtrapolateInto,
   type PllUncertainty,
 } from "./predictiveExtrapolation.js";
+import { StatePredictor, type StatePredictorModel } from "./StatePredictor.js";
 import { newHeapTypedArray, buildScratchFrame } from "./_heap.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
@@ -418,6 +419,101 @@ export interface PredictedPullResult {
   /** Largest value-domain uncertainty proxy across the trajectory fields
    *  (`max_i |v_i| · sigmaDt`). 0 when no order≥2 field was predicted. */
   readonly valueUncertainty: number;
+}
+
+/** Default process-noise spectral density (`q`) for the per-field `StatePredictor`s
+ *  built by `pullKalmanPredictedLatest` (0.9.902). A middling value tuned for the
+ *  slow macro fields the predictor targets; raise it for faster-moving controls,
+ *  lower it to smooth noisy stamps harder. */
+export const DEFAULT_KALMAN_PROCESS_NOISE = 1e3;
+/** Default position measurement-noise variance (`r_p`, value-units²). */
+export const DEFAULT_KALMAN_MEAS_POS_NOISE = 1e-4;
+/** Default initial covariance seed (`P0`); also the default `varianceFloor` (a
+ *  freshly-seeded filter reports variance ≥ P0 ⇒ confidence 0 ⇒ hold, the
+ *  cold-safety property). */
+export const DEFAULT_KALMAN_INITIAL_VARIANCE = 1e6;
+
+/**
+ * Options for `pullKalmanPredictedLatest` (0.9.902 — history-aware classical
+ * prediction, Apollo Frontier 2). The horizon/confidence knobs mirror
+ * `PredictedPullOptions`; the `*Noise` / `initialVariance` knobs tune the
+ * per-field `StatePredictor` filters and are read **once**, when the filters are
+ * lazily constructed on the first call (later changes are ignored — construct a
+ * fresh `Bridge` to retune). Requires `.withTimestamps(...)` (the predictor is
+ * fundamentally time-based — it needs a producer timestamp per frame to compute
+ * the inter-frame `dt`).
+ *
+ * Same audience as `pullPredictedLatest`: smooth macro fields only.
+ */
+export interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>> {
+  /** Forward lead in **milliseconds** past the freshest frame's stamped time.
+   *  Clamped to `[0, maxLeadMs]`. Default `0` (≡ a latest-frame hold). */
+  readonly leadMs?: number;
+  /** Hard ceiling (ms) on the lead AND the horizon taper. Default
+   *  `DEFAULT_MAX_LEAD_MS` (20). A lead at/above this fades fully to the hold. */
+  readonly maxLeadMs?: number;
+  /** Forward distance (ms) below which the horizon is fully trusted
+   *  (`c_horizon = 1`). Default `0` (every step sits in the taper). */
+  readonly trustedLeadMs?: number;
+  /** Confidence floor in `[0, 1]`. If the field weight `w = c_horizon·c_variance`
+   *  is below this, prediction collapses to the pure hold for that frame (a hard
+   *  cliff). Default `0` (no gate). */
+  readonly confidenceFloor?: number;
+  /** Value-domain variance (units²) at/above which the predicted confidence is 0
+   *  (`c_variance = clamp01(1 − maxVar/varianceFloor)`). Default = the resolved
+   *  `initialVariance`, so a cold/under-observed filter (variance ≥ seed) holds
+   *  and prediction fades in as the filter's variance drops below its seed. */
+  readonly varianceFloor?: number;
+  /** Process-noise spectral density (`q`). Default `DEFAULT_KALMAN_PROCESS_NOISE`.
+   *  Read once at filter construction. */
+  readonly processNoise?: number;
+  /** Position measurement-noise variance (`r_p`). Default
+   *  `DEFAULT_KALMAN_MEAS_POS_NOISE`. Read once at filter construction. */
+  readonly measPosNoise?: number;
+  /** Stamped-velocity measurement-noise variance (`r_v`). Read once. */
+  readonly measVelNoise?: number;
+  /** Stamped-acceleration measurement-noise variance (`r_a`, CA only). Read once. */
+  readonly measAccNoise?: number;
+  /** Initial covariance seed (`P0`). Default `DEFAULT_KALMAN_INITIAL_VARIANCE`.
+   *  Read once at filter construction; also the default `varianceFloor`. */
+  readonly initialVariance?: number;
+  /** Consumer wall-clock (ns) at this pull. When provided AND the schema has
+   *  timestamps, a fresh pull warms the PLL (`observeConsumerTime`) so telemetry
+   *  stays live — the Kalman prediction itself does not depend on the PLL. */
+  readonly consumerNs?: number;
+  /** Sample rate (Hz) for a `samples`-unit timestamp role. Falls back to
+   *  `setSampleRate(rate)`. */
+  readonly sampleRate?: number;
+  /** Timestamp role to read the producer time from. Defaults to the schema's
+   *  default role. */
+  readonly timestamp?: TimestampRoleOf<S>;
+}
+
+/** Diagnostics returned by `pullKalmanPredictedLatest` (0.9.902). A fresh small
+ *  object per call, matching the `PredictedPullResult` idiom. */
+export interface KalmanPredictedPullResult {
+  /** Frames skipped draining to the newest frame (0 if one was waiting), or `-1`
+   *  if the ring was empty AND nothing is cached (nothing predicted; `out`
+   *  untouched). Empty-but-cached still predicts off the cache (distinguish via
+   *  `predicted`). */
+  readonly skipped: number;
+  /** True iff a forward step was actually applied (`dtEffectiveSeconds > 0`).
+   *  False on a cold/under-observed filter, a gated/zero weight, a zero lead, or
+   *  a schema with no trajectory fields — all of which output a latest-frame hold. */
+  readonly predicted: boolean;
+  /** Conservative field confidence weight `w ∈ [0, 1]` (`c_horizon · clamp01(1 −
+   *  maxVariance/varianceFloor)`), the same weight blended per lane this call. */
+  readonly confidenceWeight: number;
+  /** Horizon actually evaluated (`= w · leadSeconds`), ≤ the requested lead. */
+  readonly dtEffectiveSeconds: number;
+  /** Requested lead in seconds after clamping to `[0, maxLeadMs]`. */
+  readonly leadSecondsRequested: number;
+  /** Largest predicted value-domain 1σ uncertainty across trajectory lanes
+   *  (`√maxVariance`), in value-units. 0 when no trajectory field was predicted. */
+  readonly valueUncertainty: number;
+  /** Largest predicted position variance across trajectory lanes (value-units²).
+   *  The first-principles confidence signal driving the fade. */
+  readonly maxVariance: number;
 }
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
@@ -621,6 +717,24 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *  field, sized to its `sampleCount`, matching the field kind (f64/f32).
    *  Reused across calls — the predictive hot loop allocates nothing. */
   private _predictHoldScratch: Record<string, Float64Array | Float32Array> | null = null;
+
+  /** Per-trajectory-field `StatePredictor` filters for `pullKalmanPredictedLatest`
+   *  (0.9.902). Lazily built on the first call; one filter per trajectory field,
+   *  model `"ca"` for order ≥3 (stamped accel) else `"cv"`, laneCount =
+   *  `sampleCount`. The tuning (`processNoise` / `meas*Noise` / `initialVariance`)
+   *  is captured at construction from the first call's opts. Heap-only. */
+  private _kalmanPredictors: Map<string, StatePredictor> | null = null;
+  /** The resolved `initialVariance` used to build the filters above — also the
+   *  default `varianceFloor` for the confidence curve. */
+  private _kalmanInitialVariance: number = DEFAULT_KALMAN_INITIAL_VARIANCE;
+  /** Per-trajectory-field f64 scratch for `pullKalmanPredictedLatest`: deinterleaved
+   *  position/velocity/acceleration measurement lanes + the predicted-value and
+   *  predicted-variance output lanes, each sized to the field's `sampleCount`.
+   *  Reused across calls — the predicted hot loop allocates nothing. */
+  private _kalmanScratch: Record<
+    string,
+    { pos: Float64Array; vel: Float64Array; acc: Float64Array; pred: Float64Array; varr: Float64Array }
+  > | null = null;
 
   /** Two-frame ping-pong cache for `pullHermiteLatest` (0.9.84). Hermite
    *  reconstruction needs the PREVIOUS + CURRENT frame pair; the single
@@ -1722,6 +1836,247 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       leadSecondsRequested: leadSeconds,
       valueUncertainty,
     };
+  }
+
+  /**
+   * History-aware predictive pull (0.9.902 — Apollo Frontier 2, classical
+   * estimation). The companion to `pullPredictedLatest`: instead of
+   * extrapolating off the **single newest frame's** stamped derivatives (Taylor),
+   * this fuses the last several frames through a per-field `StatePredictor` (a
+   * linear Kalman) and renders each trajectory field **forward by `leadMs`** from
+   * the filter's smoothed state, **confidence-bounded by the filter's covariance**.
+   *
+   * Where it beats `pullPredictedLatest` (see `StatePredictor`'s header + the
+   * 0.9.901 probe): position-only (order-1) fields get a real forward step from an
+   * estimated velocity (Taylor holds), noisy stamped derivatives are smoothed
+   * rather than propagated verbatim, and the covariance gives a first-principles
+   * confidence rather than a heuristic floor. The model is chosen per field from
+   * its trajectory order — `"ca"` (`[p,v,a]`) for order ≥3, `"cv"` (`[p,v]`) for
+   * order 1–2 — because estimating acceleration from position-only history
+   * amplifies noise (the probe's decisive finding).
+   *
+   * **Never worse than `pullLatest`.** The per-field weight is
+   * `w = c_horizon · clamp01(1 − maxVariance/varianceFloor)`, with the optional
+   * `confidenceFloor` cliff. A cold/under-observed filter reports variance ≥ its
+   * seed (`initialVariance`, the default `varianceFloor`) ⇒ `w = 0` ⇒ the output
+   * is the latest-frame hold (the position lane). A lead at/beyond `maxLeadMs`
+   * fades fully to the hold. The blend is `out[i] = w·predicted[i] + (1−w)·hold[i]`.
+   *
+   * Requires `.withTimestamps(...)` — the predictor needs a producer timestamp per
+   * frame to compute the inter-frame `dt`; throws otherwise. Frame lifecycle
+   * mirrors `pullPredictedLatest`: the newest frame is cached and the filters are
+   * fed only on a **fresh** pull (a stale producer stamp re-fed at advancing
+   * times would corrupt the `dt`), so a brief producer famine rides off the last
+   * known state. Non-trajectory fields pass through from the cached frame verbatim.
+   *
+   * `out` must be a `scratchEvaluatedFrame()`. Returns a `KalmanPredictedPullResult`.
+   * Use only for **smooth** macro fields, never discontinuous events.
+   */
+  pullKalmanPredictedLatest(
+    out: FrameFor<S>,
+    opts?: KalmanPredictedPullOptions<S>,
+  ): KalmanPredictedPullResult {
+    if (this.schema.timestamps === null) {
+      throw new Error(
+        "pullKalmanPredictedLatest: schema must declare .withTimestamps(...) — the predictor needs a producer timestamp per frame to compute the inter-frame dt",
+      );
+    }
+    const leadMsRaw = opts?.leadMs ?? 0;
+    const maxLeadMs = opts?.maxLeadMs ?? DEFAULT_MAX_LEAD_MS;
+    if (!Number.isFinite(leadMsRaw) || leadMsRaw < 0) {
+      throw new Error(
+        `pullKalmanPredictedLatest: leadMs must be a non-negative finite number, got ${leadMsRaw}`,
+      );
+    }
+    if (!Number.isFinite(maxLeadMs) || maxLeadMs < 0) {
+      throw new Error(
+        `pullKalmanPredictedLatest: maxLeadMs must be a non-negative finite number, got ${maxLeadMs}`,
+      );
+    }
+    const leadMs = leadMsRaw > maxLeadMs ? maxLeadMs : leadMsRaw;
+    const leadSeconds = leadMs * 1e-3;
+    const trustedLeadMs = opts?.trustedLeadMs ?? 0;
+    const confidenceFloor = opts?.confidenceFloor ?? 0;
+
+    // Lazily build the per-field filters + scratch (tuning captured here, once).
+    if (this._kalmanPredictors === null) this._buildKalmanPredictors(opts);
+    const predictors = this._kalmanPredictors!;
+    const scratch = this._kalmanScratch!;
+    const varianceFloor = opts?.varianceFloor ?? this._kalmanInitialVariance;
+
+    if (this.cachedRawFrame === null) {
+      this.cachedRawFrame = this.scratchFrame();
+    }
+    const skipped = this.pullLatest(this.cachedRawFrame);
+    let fresh = false;
+    if (skipped >= 0) {
+      // Fresh frame — extract the producer timestamp (always; timestamps are
+      // required here) and optionally warm the PLL for telemetry.
+      const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
+      const role = this.schema.timestamps.roles[roleName];
+      if (!role) {
+        throw new Error(
+          `pullKalmanPredictedLatest: unknown timestamp role '${String(roleName)}'`,
+        );
+      }
+      let sr = opts?.sampleRate ?? this.defaultSampleRate;
+      if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
+        throw new Error(
+          `pullKalmanPredictedLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
+        );
+      }
+      const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
+      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
+      this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
+      const consumerNs = opts?.consumerNs;
+      if (consumerNs !== undefined) {
+        if (!Number.isFinite(consumerNs)) {
+          throw new Error(
+            `pullKalmanPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
+          );
+        }
+        this.observeConsumerTime(consumerNs, this.cachedTimestampNs);
+      }
+      this.cachedEvalValid = true;
+      fresh = true;
+    } else if (!this.cachedEvalValid) {
+      // Ring empty and nothing cached — nothing to predict from.
+      return {
+        skipped: -1,
+        predicted: false,
+        confidenceWeight: 0,
+        dtEffectiveSeconds: 0,
+        leadSecondsRequested: leadSeconds,
+        valueUncertainty: 0,
+        maxVariance: 0,
+      };
+    }
+
+    // Horizon confidence taper (clock-independent; matches the Taylor curve).
+    let cHorizon: number;
+    if (leadMs <= trustedLeadMs) cHorizon = 1;
+    else if (leadMs >= maxLeadMs) cHorizon = 0;
+    else {
+      const span = maxLeadMs - trustedLeadMs;
+      cHorizon = span > 0 ? 1 - (leadMs - trustedLeadMs) / span : 0;
+    }
+    if (cHorizon < 0) cHorizon = 0;
+    else if (cHorizon > 1) cHorizon = 1;
+
+    const targetNs = this.cachedTimestampNs + leadSeconds * 1e9;
+    const src = this.cachedRawFrame as unknown as Record<string, unknown>;
+    const dst = out as unknown as Record<string, unknown>;
+    const fields = this.schema.compiled.fields;
+
+    let resultMaxVar = 0;
+    let headlineWeight = 0;
+    let predictedAny = false;
+    let sawTrajectory = false;
+    for (let fi = 0; fi < fields.length; fi++) {
+      const field = fields[fi]!;
+      const name = field.name;
+      if (field.trajectory) {
+        sawTrajectory = true;
+        const order = field.trajectory.order;
+        const sc = field.trajectory.sampleCount;
+        const predictor = predictors.get(name)!;
+        const sb = scratch[name]!;
+        const flat = src[name] as Float64Array | Float32Array;
+        // Deinterleave the stamped (p[,v[,a]]) lanes from the flat trajectory.
+        for (let i = 0; i < sc; i++) {
+          const j = i * order;
+          sb.pos[i] = flat[j]!;
+          if (order >= 2) sb.vel[i] = flat[j + 1]!;
+          if (order >= 3) sb.acc[i] = flat[j + 2]!;
+        }
+        // Fuse only on a fresh pull (re-feeding a stale stamp would corrupt dt).
+        if (fresh) {
+          const v = order >= 2 ? sb.vel : undefined;
+          const a = order >= 3 ? sb.acc : undefined;
+          predictor.ingest(this.cachedTimestampNs, sb.pos, v, a);
+        }
+        predictor.predictInto(targetNs, sb.pred, sb.varr);
+        // Field variance = the worst lane (conservative).
+        let maxVar = 0;
+        for (let i = 0; i < sc; i++) if (sb.varr[i]! > maxVar) maxVar = sb.varr[i]!;
+        let cVar = varianceFloor > 0 ? 1 - maxVar / varianceFloor : 0;
+        if (cVar < 0) cVar = 0;
+        else if (cVar > 1) cVar = 1;
+        let w = cHorizon * cVar;
+        if (w < confidenceFloor) w = 0;
+        // Blend predicted → hold (position lane). w=0 ⇒ exact latest-frame hold.
+        const dstField = dst[name] as Float64Array | Float32Array;
+        const oneMinusW = 1 - w;
+        for (let i = 0; i < sc; i++) {
+          dstField[i] = w * sb.pred[i]! + oneMinusW * sb.pos[i]!;
+        }
+        if (w > 0) predictedAny = true;
+        // The headline reflects the MOST uncertain field (most conservative).
+        if (maxVar >= resultMaxVar) {
+          resultMaxVar = maxVar;
+          headlineWeight = w;
+        }
+      } else if (field.isArray) {
+        (dst[name] as { set(s: ArrayLike<unknown>): void }).set(
+          src[name] as ArrayLike<unknown>,
+        );
+      } else {
+        dst[name] = src[name];
+      }
+    }
+
+    const dtEffectiveSeconds = headlineWeight * leadSeconds;
+    return {
+      skipped,
+      predicted: predictedAny && dtEffectiveSeconds > 0,
+      confidenceWeight: sawTrajectory ? headlineWeight : 0,
+      dtEffectiveSeconds,
+      leadSecondsRequested: leadSeconds,
+      valueUncertainty: resultMaxVar > 0 ? Math.sqrt(resultMaxVar) : 0,
+      maxVariance: resultMaxVar,
+    };
+  }
+
+  /** Build one `StatePredictor` + deinterleave/output scratch per trajectory
+   *  field. Called lazily on the first `pullKalmanPredictedLatest`; the tuning
+   *  is captured from that first call's opts. (0.9.902) */
+  private _buildKalmanPredictors(opts?: KalmanPredictedPullOptions<S>): void {
+    const q = opts?.processNoise ?? DEFAULT_KALMAN_PROCESS_NOISE;
+    const rp = opts?.measPosNoise ?? DEFAULT_KALMAN_MEAS_POS_NOISE;
+    const p0 = opts?.initialVariance ?? DEFAULT_KALMAN_INITIAL_VARIANCE;
+    this._kalmanInitialVariance = p0;
+    const preds = new Map<string, StatePredictor>();
+    const scratch: Record<
+      string,
+      { pos: Float64Array; vel: Float64Array; acc: Float64Array; pred: Float64Array; varr: Float64Array }
+    > = {};
+    for (const field of this.schema.compiled.fields) {
+      if (!field.trajectory) continue;
+      const order = field.trajectory.order;
+      const sc = field.trajectory.sampleCount;
+      const model: StatePredictorModel = order >= 3 ? "ca" : "cv";
+      preds.set(
+        field.name,
+        new StatePredictor({
+          laneCount: sc,
+          model,
+          processNoise: q,
+          measPosNoise: rp,
+          measVelNoise: opts?.measVelNoise,
+          measAccNoise: opts?.measAccNoise,
+          initialVariance: p0,
+        }),
+      );
+      scratch[field.name] = {
+        pos: new Float64Array(sc),
+        vel: new Float64Array(sc),
+        acc: new Float64Array(sc),
+        pred: new Float64Array(sc),
+        varr: new Float64Array(sc),
+      };
+    }
+    this._kalmanPredictors = preds;
+    this._kalmanScratch = scratch;
   }
 
   /** Build one hold-scratch buffer per trajectory field, sized to its

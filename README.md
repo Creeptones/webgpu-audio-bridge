@@ -902,6 +902,8 @@ Frame lifecycle mirrors `pullEvaluatedLatest`: the newest frame is cached, so du
 
 `pullPredictedLatest` extrapolates off the **single newest frame's** stamped derivatives (Taylor: `p + v·dt + ½a·dt²`). `StatePredictor` is the **history-aware** companion: it fuses the last few frames under a linear motion model + measurement-noise model (a per-lane Kalman) and carries a **principled covariance** for confidence. Non-neural, fully inspectable — the de-neuralized form of Apollo Frontier 2. It **complements** `pullPredictedLatest`; both coexist.
 
+At the Bridge level it is exposed as **`pullKalmanPredictedLatest(out, opts?)`** — a first-class predicted pull beside `pullPredictedLatest` (the Taylor path is untouched). It drains to the newest frame, feeds the per-field filters on each fresh pull, renders every trajectory field forward by `opts.leadMs`, and confidence-bounds the result to a latest-frame hold via the filter covariance — so it is **always at least as safe as `pullLatest`**. (`StatePredictor` is also a standalone composable primitive for callers who want to drive it directly.)
+
 It fixes the three places single-frame Taylor is weak (each confirmed by a throwaway probe before any code shipped):
 
 1. **Position-only (order-1) fields** — Taylor off one position is just a hold; the predictor *estimates* velocity from the position sequence and takes a real forward step.
@@ -927,7 +929,7 @@ predictor.predictInto(consumerNsMappedToProducer + leadNs, value, variance);
 // Large `variance` ⇒ low confidence ⇒ hold (the never-worse-than-`pullLatest` guarantee).
 ```
 
-**Why the model order is chosen by field order** (the probe's key finding): a constant-acceleration filter fed only positions estimates acceleration from the *second difference* of noisy positions, which amplifies noise and ends up **worse than a hold** — so position-only fields use `"cv"`, where the first-difference velocity is robust. When stamped derivatives exist, `"ca"` captures curvature and wins the noisy and stalled regimes. A cold or under-observed filter reports an enormous variance, so the Bridge layer (the upcoming `pullKalmanPredictedLatest`, 0.9.902) folds it straight into the same confidence→horizon crossfade `pullPredictedLatest` already uses. Allocation-free after construction; heap-only (never touches the SAB). Same Apollo discipline as the Hermite work: closed-form, left-to-right f64 accumulation, bit-exact-reasoned for the WASM scalar (0.9.903) + SIMD (0.9.904) ports.
+**Why the model order is chosen by field order** (the probe's key finding): a constant-acceleration filter fed only positions estimates acceleration from the *second difference* of noisy positions, which amplifies noise and ends up **worse than a hold** — so position-only fields use `"cv"`, where the first-difference velocity is robust. When stamped derivatives exist, `"ca"` captures curvature and wins the noisy and stalled regimes. A cold or under-observed filter reports an enormous variance, so `pullKalmanPredictedLatest` folds it straight into the same confidence→horizon crossfade `pullPredictedLatest` already uses (`w = c_horizon · clamp01(1 − maxVariance/varianceFloor)`, with an optional `confidenceFloor` cliff). Allocation-free after construction; heap-only (never touches the SAB). Same Apollo discipline as the Hermite work: closed-form, left-to-right f64 accumulation, bit-exact-reasoned for the WASM scalar (0.9.903) + SIMD (0.9.904) ports.
 
 ## BridgeGPUSource
 

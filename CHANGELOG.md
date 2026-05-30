@@ -4,6 +4,77 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.902] — 2026-05-30
+
+### Added — `Bridge.pullKalmanPredictedLatest`: the predictor wired to the ring (Apollo Frontier 2 — Stage 2 of 4)
+
+Wires the 0.9.901 `StatePredictor` into the Bridge as a **first-class predicted
+pull beside `pullPredictedLatest`** — the Taylor path is untouched and stays
+bit-exact (mirroring how `pullHermiteLatest` sat beside the Taylor pulls). The
+consumer can now choose **history-aware Kalman** prediction or **single-frame
+Taylor** per pull.
+
+#### What shipped
+
+- **`Bridge.pullKalmanPredictedLatest(out, opts?) → KalmanPredictedPullResult`**
+  — drains to the newest frame and renders every trajectory field **forward by
+  `leadMs`** off a per-field `StatePredictor`, confidence-bounded by the filter's
+  covariance. One filter per trajectory field, lazily built on first call, model
+  chosen by the field's order (`"ca"` for order ≥3, `"cv"` for order 1–2),
+  laneCount = `sampleCount`. Allocation-free after that first call (preallocated
+  deinterleave + output scratch per field).
+- **Confidence → hold.** The per-field weight is `w = c_horizon · clamp01(1 −
+  maxVariance/varianceFloor)`, with an optional `confidenceFloor` hard cliff. A
+  cold/under-observed filter reports variance ≥ its seed (`initialVariance`, the
+  default `varianceFloor`) ⇒ `w = 0` ⇒ the output is the **latest-frame hold**
+  (the position lane), and a lead ≥ `maxLeadMs` fades fully to the hold. The
+  blend is `out[i] = w·predicted[i] + (1−w)·hold[i]` — **never worse than
+  `pullLatest`**, the same guarantee the Taylor path carries.
+- **Lifecycle parity with `pullPredictedLatest`.** The newest frame is cached and
+  the filters are fed only on a **fresh** pull (re-feeding a stale stamp at
+  advancing times would corrupt the inter-frame `dt`), so a brief producer famine
+  rides off the last known state; non-trajectory fields pass through verbatim.
+  Requires `.withTimestamps(...)` (the predictor is fundamentally time-based) —
+  throws otherwise.
+- **New exports:** `KalmanPredictedPullOptions` / `KalmanPredictedPullResult`
+  types + `DEFAULT_KALMAN_PROCESS_NOISE` / `DEFAULT_KALMAN_MEAS_POS_NOISE` /
+  `DEFAULT_KALMAN_INITIAL_VARIANCE` constants. The result carries
+  `confidenceWeight`, `dtEffectiveSeconds`, `valueUncertainty` (√maxVariance, the
+  value-domain 1σ), and `maxVariance` for observability.
+
+### Tests
+
+- New **`tests/Bridge.kalmanPredict.test.ts`** (11 pins; registered in both
+  `test` and `test:unit`): requires-timestamps guard; cold/single-frame → exact
+  latest-frame hold (weight 0, variance ≥ seed); warmed **CV** (order-2) leads a
+  constant-velocity truth near-exactly (predErr < 2% of the hold's error, weight
+  ≈ 1); position-only (**order-1**) estimates velocity and beats a hold; warmed
+  **CA** (order-3) leads a curved truth; `leadMs ≥ maxLeadMs` → full hold;
+  `confidenceFloor` cliff → hold; non-trajectory passthrough; producer famine
+  rides the frozen cache; empty-never-pulled leaves `out` untouched; validation.
+- Full suite green (incl. the 1 M-frame concurrent stress, no flake).
+
+### Performance
+
+- New bench cell `pullKalmanPredict` (gated): a full predicted pull on a
+  **16-lane** order-3 CA macro field (a generous macro width — the predictor
+  targets small smooth controls, not 1000-lane spectra) is **~3.2 µs median**,
+  within the 10 µs hard budget; ~200 ns/lane in JS — the baseline the WASM scalar
+  (0.9.903) + SIMD (0.9.904) ports will beat. Core push/pull/pullLatest unchanged
+  at ~1.3 µs.
+
+### Wire compatibility
+
+None affected. New public method + option/result types + tuning constants on the
+existing `Bridge<S>`. No SAB layout, wire-format, protocol, or break to any prior
+method — the Taylor `pullPredictedLatest` path is bit-exact unchanged.
+
+### Documentation
+
+- README `StatePredictor` subsection updated: the `pullKalmanPredictedLatest`
+  entry point now exists (the 0.9.901 text said it was upcoming).
+- ROADMAP row above 0.9.901.
+
 ## [0.9.901] — 2026-05-30
 
 ### Added — `StatePredictor`: history-aware classical state predictor (Apollo Frontier 2, de-neuralized — Stage 1 of 4)

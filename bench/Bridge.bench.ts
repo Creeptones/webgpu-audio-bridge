@@ -79,6 +79,7 @@ import {
   f32,
   f32Array,
   f64,
+  f64TrajectoryArray,
   i32,
   u32,
   u64,
@@ -802,6 +803,56 @@ function runPullLatestBench(): { samples: number[]; misses: number } {
   return { samples, misses };
 }
 
+/** Lane count for the Kalman-predict cell. The predictor targets SMALL smooth
+ *  macro fields (filter cutoff, spatial azimuth, IR-morph scalars) — a handful of
+ *  lanes, not the N=1000 spectra the core pulls bench. 16 is a generous macro
+ *  width. The per-lane cost is reported so the WASM scalar (0.9.903) + SIMD
+ *  (0.9.904) ports have a JS baseline to beat. */
+const KALMAN_LANES = 16;
+
+/** 0.9.902 — `pullKalmanPredictedLatest` hot-path cell. A CA (order-3) trajectory
+ *  of KALMAN_LANES with a ns timestamp: each iteration pushes a fresh frame and
+ *  runs a full predicted pull (deinterleave → per-lane Kalman ingest+predict →
+ *  confidence blend). Gated against the 10 µs hard ceiling at the macro width. */
+function runKalmanPredictBench(): { samples: number[]; misses: number; lanes: number } {
+  const lanes = KALMAN_LANES;
+  const schema = defineSchema({
+    seq: u64(),
+    t: u64(),
+    vEff: f64TrajectoryArray(lanes, { order: 3 }),
+  }).withTimestamps({ tNs: { field: "t", unit: "ns", default: true } });
+  const { sab } = Bridge.allocate(CAPACITY, schema);
+  const ring = new Bridge(sab, CAPACITY, schema);
+  const frame = ring.scratchFrame();
+  const out = ring.scratchEvaluatedFrame();
+  let tNs = 1_000_000;
+  const period = 16_666_667;
+  for (let i = 0; i < lanes * 3; i++) frame.vEff[i] = Math.sin(i * 0.01);
+
+  for (let i = 0; i < WARMUP_ITERS; i++) {
+    frame.seq = BigInt(i);
+    frame.t = BigInt(tNs);
+    ring.push(frame);
+    ring.pullKalmanPredictedLatest(out, { leadMs: 8, trustedLeadMs: 8 });
+    tNs += period;
+  }
+
+  const samples = new Array<number>(MEASURE_ITERS);
+  let misses = 0;
+  for (let i = 0; i < MEASURE_ITERS; i++) {
+    frame.seq = BigInt(i);
+    frame.t = BigInt(tNs);
+    ring.push(frame);
+    tNs += period;
+    const t0 = hrtime.bigint();
+    const r = ring.pullKalmanPredictedLatest(out, { leadMs: 8, trustedLeadMs: 8 });
+    const t1 = hrtime.bigint();
+    samples[i] = Number(t1 - t0);
+    if (r.skipped < 0) misses++;
+  }
+  return { samples, misses, lanes };
+}
+
 function summarize(label: string, samples: number[]): number {
   const sorted = [...samples].sort((a, b) => a - b);
   const med = percentile(sorted, 0.5);
@@ -857,6 +908,27 @@ function main(): void {
   console.log(
     `  trajEval (clamp) median  ${fmt(trajClampedMed)} (documented, not gated)`,
   );
+  console.log();
+
+  // 0.9.902 cell — `pullKalmanPredictedLatest` (history-aware classical
+  // prediction). Full predicted pull on an order-3 CA trajectory of N lanes;
+  // gated against the 10 µs hard budget like the core pulls.
+  const kalman = runKalmanPredictBench();
+  const kalmanMed = summarize("pullKalmanPredict", kalman.samples);
+  const perLane = kalmanMed / kalman.lanes;
+  console.log(
+    `  pullKalmanPredict per-lane ≈ ${fmt(perLane)} (${kalman.lanes} lanes, order-3 CA — JS baseline for the WASM/SIMD ports)`,
+  );
+  if (kalmanMed < HARD_BUDGET_NS) {
+    console.log(
+      `  within hard budget  pullKalmanPredict median ${fmt(kalmanMed)} < ${fmt(HARD_BUDGET_NS)} (${kalman.lanes}-lane macro field, order-3 CA)`,
+    );
+  } else {
+    console.error(
+      `  FAIL                pullKalmanPredict median ${fmt(kalmanMed)} ≥ hard budget ${fmt(HARD_BUDGET_NS)}`,
+    );
+    process.exitCode = 1;
+  }
   console.log();
 
   // 0.6.11 cell — per-frame property-access cost on a 4-scalar schema.
