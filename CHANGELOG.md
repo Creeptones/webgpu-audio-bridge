@@ -4,6 +4,65 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.86] — 2026-05-29
+
+### Added — `examples/hermite-orders`: audible cubic/quintic/septic A/B demo (Phase I consolidation, Stage 3)
+
+The spectral pin (0.9.85) proves the rolloff in a test; this stage makes it
+something you can **hear and toggle live** in a browser. A synthetic producer
+drives an aggressive FM control trajectory through a `Bridge<S>`; the worklet
+reconstructs it cubic / quintic / septic and you switch orders in real time.
+
+#### What shipped
+
+- **`examples/hermite-orders/`** (`schema.js` / `worker.js` / `worklet.js` /
+  `main.js` / `index.html` / `serve.mjs`) + **`npm run dev:hermite-orders`**
+  (port 5182). A plain `Worker` (no GPU) stamps an order-4 analytic trajectory
+  — an FM carrier's instantaneous frequency plus its velocity, acceleration,
+  and **jerk** — into the ring at a user-adjustable control rate. A single
+  `AudioWorklet` reconstructs that frequency between control frames, integrates
+  it into a tone, and exposes a live **cubic / quintic / septic** toggle plus an
+  `AnalyserNode` spectrum so the seam-image spray is visible as well as audible.
+  Sliders: control rate (18–120 Hz), carrier, LFO rate, FM depth.
+
+#### The interesting design finding
+
+- The demo reconstructs the **completed segment behind the newest frame**
+  (≈1.35 control periods of deliberate interpolation latency, bracketing the
+  PLL-mapped render time) and calls the three evaluator functions directly —
+  **not** `pullHermiteLatest`. Reason, verified empirically: `pullHermiteLatest`
+  is a *minimum-latency freshest-interpolation* primitive — it interpolates the
+  two newest frames with `t` clamped to [0, 1], and for a fast consumer the PLL
+  locks `t` to the segment **boundary**, where cubic / quintic / septic all
+  return the same endpoint value. A constant interpolation lag doesn't help (the
+  PLL absorbs it within its lock time). The C²/C³ benefit lives only on the
+  segment **interior**, so the audible A/B needs the one-frame-latency
+  bracketing path — the same regime the 0.9.85 pin measures. The PLL still does
+  its real job: aligning the producer's wall clock to the audio-render clock.
+
+#### Verified
+
+Smoke-tested in-browser (Chrome): `crossOriginIsolated` + SAB true, producer at
+the set control rate, **interior-interpolation fraction ~89%**, live order
+toggle + spectrum render confirmed. Offline probe across regimes: the cubic↔
+septic instantaneous-frequency divergence scales from ~0.16 Hz at a 60 Hz
+control rate to ~33 Hz at 24 Hz — the "drop the control rate, hear the cubic
+buzz, toggle to septic to clean it" interaction.
+
+### Wire compatibility
+
+Example + one `dev:*` script only — no source / wire / SAB / protocol / API change.
+
+### Tests
+
+No test change (the spectral claim is pinned by 0.9.85's `Bridge.phaseLock`
+pin). `npm run typecheck` clean; `npm test` 45 suites green; `npm run bench`
+unchanged.
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.86 row; README examples-table row for the new demo.
+
 ## [0.9.85] — 2026-05-29
 
 ### Added — FFT spectral pin: each Hermite order measurably tightens the rolloff (Phase I consolidation, Stage 2)

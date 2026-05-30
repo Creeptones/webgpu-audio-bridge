@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — Hermite-order A/B (cubic vs quintic vs septic)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 820px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      .orders button { background: #1b1f27; border: 1px solid #2b313c; color: #aeb6c0; min-width: 132px; }
+      .orders button.on { background: #14342a; border-color: #5bd1a0; color: #5bd1a0; }
+      .orders button:hover:not(.on) { background: #232834; }
+      label { display: block; margin: 12px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; }
+      canvas { width: 100%; height: 200px; background: #101218; border: 1px solid #21252d; border-radius: 6px; display: block; margin-top: 8px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+      .status { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k { color: #9aa3ad; }
+      .status .v { color: #d4d7dc; }
+      .status .err { color: #ff7a7a; }
+      .status .ok { color: #6ee69b; }
+      .status .hot { color: #5bd1a0; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; }
+      code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+      strong { color: #e7eaee; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — Hermite-order A/B</h1>
+    <p>
+      A synthetic <code>Worker</code> producer stamps an <strong>order-4 control trajectory</strong>
+      (an FM carrier's instantaneous frequency + its velocity, acceleration, and <em>jerk</em>) into a
+      <code>Bridge&lt;S&gt;</code> at a deliberately low control rate. The <code>AudioWorklet</code>
+      reconstructs that frequency <strong>between</strong> control frames and integrates it into a tone —
+      and you choose how many derivatives the reconstruction matches at the seam:
+    </p>
+    <ul style="font-size:13px">
+      <li><strong>cubic · C¹</strong> — matches position + velocity (the 0.7.3 path).</li>
+      <li><strong>quintic · C²</strong> — also matches acceleration (0.9.80). No curvature step.</li>
+      <li><strong>septic · C³</strong> — also matches jerk (0.9.81). No third-derivative step.</li>
+    </ul>
+    <p>
+      <strong>Drop the control rate toward 24–30 Hz</strong> and toggle the orders: the cubic seam
+      buzzes (its second/third-derivative steps spray energy into the high sidebands); septic stays
+      clean. Watch the spectrum's high skirt thin out as you climb orders — that's the
+      <code>f⁻³ → f⁻⁴ → f⁻⁵</code> rolloff the 0.9.85 FFT pin measures.
+    </p>
+    <p style="color:#7e8893">
+      Note: this demo reconstructs the <em>completed</em> segment behind the newest frame (≈1.35
+      control periods of deliberate interpolation latency) rather than calling
+      <code>pullHermiteLatest</code> — the convenience path is a freshest-interpolation primitive that
+      pins <code>t</code> to the segment boundary, where all orders agree. See <code>worklet.js</code>.
+    </p>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+
+    <h2>Reconstruction order (live A/B)</h2>
+    <div class="orders">
+      <button id="order-cubic">cubic · C¹</button>
+      <button id="order-quintic">quintic · C²</button>
+      <button id="order-septic">septic · C³</button>
+    </div>
+
+    <h2>Spectrum</h2>
+    <canvas id="spectrum" width="800" height="200"></canvas>
+
+    <h2>Producer controls</h2>
+    <div class="grid">
+      <div>
+        <label for="controlHz">control rate <span class="val" id="controlHz-val"></span> Hz</label>
+        <input id="controlHz" type="range" min="18" max="120" step="1" value="30" />
+      </div>
+      <div>
+        <label for="carrier">carrier <span class="val" id="carrier-val"></span> Hz</label>
+        <input id="carrier" type="range" min="110" max="660" step="1" value="330" />
+      </div>
+      <div>
+        <label for="lfoHz">LFO rate <span class="val" id="lfoHz-val"></span> Hz</label>
+        <input id="lfoHz" type="range" min="1" max="24" step="0.5" value="8" />
+      </div>
+      <div>
+        <label for="depth">FM depth <span class="val" id="depth-val"></span> Hz</label>
+        <input id="depth" type="range" min="0" max="360" step="1" value="220" />
+      </div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
