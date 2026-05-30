@@ -21,7 +21,11 @@
  *  82. testTrajectoryQuinticBitExact            (0.9.80 — quintic Hermite closed-form)
  *  83. testTrajectoryQuinticEndpoints           (0.9.80 — C² continuity at the seam)
  *  84. testTrajectoryQuinticFloat32Truncation   (0.9.80 — f32 within-ULP grid sweep)
- *  85. testHermiteInterpolationModeDispatch      (0.9.80 — evaluateHermiteInto mode routing)
+ *  85. testHermiteInterpolationModeDispatch      (0.9.80/0.9.81 — evaluateHermiteInto mode routing)
+ *  86. testTrajectorySepticBitExact              (0.9.81 — septic Hermite closed-form)
+ *  87. testTrajectorySepticEndpoints             (0.9.81 — C³ continuity at the seam)
+ *  88. testTrajectorySepticFloat32Truncation     (0.9.81 — f32 within-ULP grid sweep)
+ *  89. testTrajectoryOrder4Roundtrip             (0.9.81 — jerk lane survives push/pull)
  */
 
 import {
@@ -46,6 +50,7 @@ import {
 import { physicsControlFrameSchema } from "../src/schemas/physics.js";
 import {
   evaluateQuinticHermiteTrajectoryInto,
+  evaluateSepticHermiteTrajectoryInto,
   evaluateTrajectoryInto,
 } from "../src/trajectory.js";
 
@@ -868,7 +873,7 @@ function testHermiteInterpolationModeDispatch(): void {
   for (let i = 0; i < N; i++) if (outFrame.cEff[i] !== outFrame.qEff[i]) anyDiff = true;
   assert(anyDiff, "cubic and quintic produce different output on identical (p,v,a) data");
 
-  // 'septic-hermite' (order=4) throws the staged error.
+  // 'septic-hermite' (order=4) routes through the septic evaluator (0.9.81).
   const septicSchema = defineSchema({
     seq: u64(),
     sEff: f64TrajectoryArray(N, { order: 4, interpolationMode: "septic-hermite" }),
@@ -878,12 +883,198 @@ function testHermiteInterpolationModeDispatch(): void {
   const p2 = b2.scratchFrame(); const c2 = b2.scratchFrame();
   p2.seq = 1n; c2.seq = 2n;
   p2.sEff = new Float64Array(N * 4); c2.sEff = new Float64Array(N * 4);
+  for (let k = 0; k < N * 4; k++) {
+    p2.sEff[k] = (rng() - 0.5) * 30; c2.sEff[k] = (rng() - 0.5) * 30;
+  }
   const of2 = b2.scratchEvaluatedFrame();
-  let threw = false;
-  try { b2.evaluateHermiteInto(p2, c2, t, segSec, of2); } catch { threw = true; }
-  assert(threw, "evaluateHermiteInto 'septic-hermite' throws (lands in 0.9.81)");
+  b2.evaluateHermiteInto(p2, c2, t, segSec, of2);
+  const refS = new Float64Array(N);
+  evaluateSepticHermiteTrajectoryInto(
+    p2.sEff, c2.sEff, { order: 4, sampleCount: N }, t, segSec, refS,
+  );
+  for (let i = 0; i < N; i++) {
+    assertEq(of2.sEff[i], refS[i]!, `evaluateHermiteInto septic dispatch sample ${i}`);
+  }
 
   ok("hermite-interpolation-mode-dispatch");
+}
+
+// ── Septic basis reference (mirrors src/trajectory.ts accumulation order
+// exactly so f64 comparisons are bit-exact). ────────────────────────────────
+function septicRef(
+  p0: number, v0: number, a0: number, j0: number,
+  p1: number, v1: number, a1: number, j1: number,
+  t: number, T: number,
+): number {
+  const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t, t6 = t5 * t, t7 = t6 * t;
+  const h0 = 1 - 35 * t4 + 84 * t5 - 70 * t6 + 20 * t7;
+  const h1 = t - 20 * t4 + 45 * t5 - 36 * t6 + 10 * t7;
+  const h2 = 0.5 * t2 - 5 * t4 + 10 * t5 - 7.5 * t6 + 2 * t7;
+  const h3 = (1 / 6) * t3 - (2 / 3) * t4 + t5 - (2 / 3) * t6 + (1 / 6) * t7;
+  const h4 = 35 * t4 - 84 * t5 + 70 * t6 - 20 * t7;
+  const h5 = -15 * t4 + 39 * t5 - 34 * t6 + 10 * t7;
+  const h6 = 2.5 * t4 - 7 * t5 + 6.5 * t6 - 2 * t7;
+  const h7 = -(1 / 6) * t4 + 0.5 * t5 - 0.5 * t6 + (1 / 6) * t7;
+  const T2 = T * T, T3 = T2 * T;
+  return (
+    h0 * p0 + (h1 * T) * v0 + (h2 * T2) * a0 + (h3 * T3) * j0 +
+    h4 * p1 + (h5 * T) * v1 + (h6 * T2) * a1 + (h7 * T3) * j1
+  );
+}
+
+// ── 86. septic Hermite closed-form bit-exact (0.9.81) ────────────────────
+function testTrajectorySepticBitExact(): void {
+  const rng = mulberry32(0x5E97);
+  const N = 100;
+  const t = 0.63712;
+  const T = 0.8;
+  const prev = new Float64Array(N * 4);
+  const curr = new Float64Array(N * 4);
+  for (let k = 0; k < prev.length; k++) prev[k] = (rng() - 0.5) * 200;
+  for (let k = 0; k < curr.length; k++) curr[k] = (rng() - 0.5) * 200;
+  const spec: TrajectorySpec = { order: 4, sampleCount: N };
+  const out = new Float64Array(N);
+  evaluateSepticHermiteTrajectoryInto(prev, curr, spec, t, T, out);
+  for (let i = 0; i < N; i++) {
+    const j = i * 4;
+    const want = septicRef(
+      prev[j]!, prev[j + 1]!, prev[j + 2]!, prev[j + 3]!,
+      curr[j]!, curr[j + 1]!, curr[j + 2]!, curr[j + 3]!,
+      t, T,
+    );
+    assertEq(out[i], want, `septic sample ${i} bit-exact`);
+  }
+
+  // order != 4 rejected (3 and any other).
+  for (const badOrder of [3, 2, 1] as const) {
+    let threw = false;
+    try {
+      evaluateSepticHermiteTrajectoryInto(
+        new Float64Array(N * badOrder), new Float64Array(N * badOrder),
+        { order: badOrder, sampleCount: N }, t, T, out,
+      );
+    } catch {
+      threw = true;
+    }
+    assert(threw, `septic rejects order=${badOrder}`);
+  }
+
+  ok("trajectory-septic-bit-exact");
+}
+
+// ── 87. septic C³ continuity at the seam (0.9.81) ────────────────────────
+//
+// Endpoint value reproduction is exact; the reconstructed first/second/THIRD
+// derivatives at each seam match the stamped endpoint velocity/acceleration/
+// jerk (finite-diff, scaled out of local-t by T / T² / T³) → C³.
+function testTrajectorySepticEndpoints(): void {
+  const T = 1.25;
+  const p0 = 0.4, v0 = 1.1, a0 = -0.7, j0 = 2.0;
+  const p1 = -0.3, v1 = 0.5, a1 = 1.2, j1 = -1.5;
+  const prev = new Float64Array([p0, v0, a0, j0]);
+  const curr = new Float64Array([p1, v1, a1, j1]);
+  const spec: TrajectorySpec = { order: 4, sampleCount: 1 };
+  const out = new Float64Array(1);
+
+  // t=0: exact (all basis but H0 carry a factor of t → 0; H0(0)=1).
+  evaluateSepticHermiteTrajectoryInto(prev, curr, spec, 0, T, out);
+  assertEq(out[0], p0, "septic t=0 → p0 exactly");
+  // t=1: within ~1 ULP, NOT bit-exact — the jerk bases H3/H7 carry the
+  // non-dyadic coefficients 1/6 and 2/3, whose f64 sum at t=1 rounds to ~1e-16
+  // rather than exactly 0 (quintic stays exact because its coefficients are
+  // all dyadic). The residual is scaled by T³·jerk; assert a tight band.
+  evaluateSepticHermiteTrajectoryInto(prev, curr, spec, 1, T, out);
+  assert(
+    Math.abs(out[0]! - p1) <= 8 * Number.EPSILON * Math.max(1, Math.abs(p1)),
+    `septic t=1 → p1 within ULP band (got ${out[0]}, want ${p1})`,
+  );
+
+  const P = (t: number): number => {
+    const o = new Float64Array(1);
+    evaluateSepticHermiteTrajectoryInto(prev, curr, spec, t, T, o);
+    return o[0]!;
+  };
+  const e = 1e-3;
+  const d1 = (t: number) => (P(t + e) - P(t - e)) / (2 * e);
+  const d2 = (t: number) => (P(t + e) - 2 * P(t) + P(t - e)) / (e * e);
+  const d3 = (t: number) =>
+    (P(t + 2 * e) - 2 * P(t + e) + 2 * P(t - e) - P(t - 2 * e)) / (2 * e * e * e);
+  const VTOL = 1e-5, ATOL = 1e-3, JTOL = 1e-2;
+  assert(Math.abs(d1(0) / T - v0) < VTOL, `septic v(0) ≈ ${v0}`);
+  assert(Math.abs(d1(1) / T - v1) < VTOL, `septic v(1) ≈ ${v1}`);
+  assert(Math.abs(d2(0) / (T * T) - a0) < ATOL, `septic a(0) ≈ ${a0}`);
+  assert(Math.abs(d2(1) / (T * T) - a1) < ATOL, `septic a(1) ≈ ${a1}`);
+  assert(Math.abs(d3(0) / (T * T * T) - j0) < JTOL, `septic j(0) ≈ ${j0}`);
+  assert(Math.abs(d3(1) / (T * T * T) - j1) < JTOL, `septic j(1) ≈ ${j1}`);
+
+  ok("trajectory-septic-endpoints-C3");
+}
+
+// ── 88. septic f32 within-ULP over a dense t-grid (0.9.81) ───────────────
+function testTrajectorySepticFloat32Truncation(): void {
+  const rng = mulberry32(0x5F32);
+  const N = 64;
+  const T = 1.5;
+  const prev = new Float32Array(N * 4);
+  const curr = new Float32Array(N * 4);
+  for (let k = 0; k < prev.length; k++) prev[k] = Math.fround((rng() - 0.5) * 1e4);
+  for (let k = 0; k < curr.length; k++) curr[k] = Math.fround((rng() - 0.5) * 1e4);
+  const spec: TrajectorySpec = { order: 4, sampleCount: N };
+  const out = new Float32Array(N);
+
+  const grid = [0, 0.05, 0.25, 0.5, 0.75, 0.95, 0.999, 1];
+  for (const t of grid) {
+    evaluateSepticHermiteTrajectoryInto(prev, curr, spec, t, T, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 4;
+      const ref = Math.fround(
+        septicRef(
+          prev[j]!, prev[j + 1]!, prev[j + 2]!, prev[j + 3]!,
+          curr[j]!, curr[j + 1]!, curr[j + 2]!, curr[j + 3]!,
+          t, T,
+        ),
+      );
+      assertEq(out[i], ref, `septic f32 t=${t} sample ${i} bit-exact vs frounded f64`);
+    }
+  }
+
+  ok("trajectory-septic-f32-truncation");
+}
+
+// ── 89. order-4 jerk lane survives a Bridge push/pull roundtrip (0.9.81) ──
+//
+// Producer guidance pin: an order-4 producer stamps the jerk lane at
+// flat[i*4 + 3]; the wire must preserve every lane verbatim (the trajectory
+// tag is pure metadata — the SAB bytes are a plain f64 array of n*order).
+function testTrajectoryOrder4Roundtrip(): void {
+  const N = 5;
+  const schema = defineSchema({
+    seq: u64(),
+    sEff: f64TrajectoryArray(N, { order: 4, interpolationMode: "septic-hermite" }),
+  });
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  const push = bridge.scratchFrame();
+  push.seq = 7n;
+  push.sEff = new Float64Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    push.sEff[i * 4 + 0] = i + 0.1;        // position
+    push.sEff[i * 4 + 1] = i * 0.5;        // velocity
+    push.sEff[i * 4 + 2] = -i * 0.25;      // acceleration
+    push.sEff[i * 4 + 3] = i * 0.125 + 9;  // jerk — the new lane
+  }
+  assert(bridge.push(push), "push order-4 frame");
+
+  const out = bridge.scratchFrame();
+  assert(bridge.pull(out), "pull order-4 frame");
+  assertEq(out.seq, 7n, "seq survives");
+  assertEq(out.sEff.length, N * 4, "flat length = n * 4 (jerk lane present)");
+  for (let k = 0; k < N * 4; k++) {
+    assertEq(out.sEff[k], push.sEff[k]!, `order-4 element ${k} (incl. jerk) survives roundtrip`);
+  }
+
+  ok("trajectory-order4-roundtrip");
 }
 
 function main(): void {
@@ -901,6 +1092,10 @@ function main(): void {
   testTrajectoryQuinticEndpoints();
   testTrajectoryQuinticFloat32Truncation();
   testHermiteInterpolationModeDispatch();
+  testTrajectorySepticBitExact();
+  testTrajectorySepticEndpoints();
+  testTrajectorySepticFloat32Truncation();
+  testTrajectoryOrder4Roundtrip();
   console.log("\nAll Bridge trajectory tests passed.");
 }
 

@@ -86,7 +86,7 @@ p(t) = H0·p0 + H1·(T·v0) + H2·(T²·a0) + H3·(T³·j0)
 
 Verification: `H0(0)=1`, `H4(1)=1`, `H0+H4 ≡ 1`; first derivatives matched by `H1`/`H5`, seconds by `H2`/`H6`, thirds by `H3`/`H7` ⇒ **C³ across the boundary**. The exact expanded right-end coefficients are pinned by the endpoint-reproduction test and the bit-exact equivalence harness — those tests are the proof of record; the table above is provenance.
 
-> **Implementation note.** Rather than carry the fully-expanded right-end monomial coefficients (cancellation-prone, easy to mistype), the evaluator computes right-end bases from `u = 1 − t` powers reusing the **same** left-end polynomial forms with the `(−1)ᵏ` sign — `H4 = H0(u)`, `H5 = −H1(u)`, etc. This is algebraically identical, less error-prone, and (see below) numerically better near `t=1`.
+> **Implementation note.** The f64 scalar evaluator (`evaluateSepticHermiteTrajectoryInto`) uses the **verified expanded monomial coefficients** above directly — the basis is computed in f64 regardless of the I/O dtype, so the expanded form is exact and the bit-exact test reference mirrors it term-for-term. For the **f32 SIMD port** (Stage 4), where lanes accumulate in f32, the recommended construction is to evaluate the right-end bases from powers of `u = 1 − t` reusing the **same** left-end polynomial forms with the `(−1)ᵏ` sign — `H4 = H0(u)`, `H5 = −H1(u)`, etc. — which is algebraically identical but numerically better near `t=1` (each endpoint's dominant functions are then evaluated with a small argument, away from the cancelling regime).
 
 ## Float32 / numerical stability
 
@@ -96,7 +96,7 @@ The cancellation concern (`6t⁵ − 15t⁴ + 10t³` and the septic analogues lo
 
 1. **Powers-of-`u=1−t` for the right endpoint** — right-end bases are evaluated with small `u` near `t=1` (and left-end with small `t` near `t=0`), so each endpoint's "near" functions avoid the cancelling regime where they dominate.
 2. **Left-to-right accumulation, no implicit FMA** — matches the existing SIMD evaluators and keeps the f64 path bit-exact to scalar JS; the f32 SIMD path is held to the same "within a few ULP" bar as the existing order-3 f32x4 evaluator (measured worst Δ ≈ 1 f32 ULP in 0.9.79).
-3. **Endpoint exactness pins** — `t=0` and `t=1` are asserted to reproduce `p0`/`p1` *exactly* (the basis is `(1,0,…)` / `(…,0,1,0,…)` there, so no rounding), and a finite-difference check confirms the reconstructed 2nd (quintic) and 3rd (septic) derivatives match the producer-stamped a/j at both seams — i.e. C²/C³ continuity is **tested**, not just asserted in prose.
+3. **Endpoint exactness pins** — quintic reproduces `p0`/`p1` *exactly* at `t=0`/`t=1` (its basis coefficients are all dyadic: `0.5`, `1.5`, integers). Septic is exact at `t=0` but only within **~1 ULP** at `t=1`: the jerk bases `H3`/`H7` carry the non-dyadic coefficients `1/6` and `2/3`, whose f64 sum at `t=1` rounds to ~`1e-16` rather than exactly `0` (the residual is scaled by `T³·jerk`). The pins assert exact at `t=0` and a tight ULP band at `t=1`. A finite-difference check confirms the reconstructed 2nd (quintic) and 3rd (septic) derivatives match the producer-stamped a/j at both seams — i.e. C²/C³ continuity is **tested**, not just asserted in prose.
 
 ## Reuse (do not duplicate)
 

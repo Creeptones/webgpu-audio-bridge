@@ -613,7 +613,7 @@ Clamps are pure schema metadata — the SAB bytes are identical to the clamp-fre
 - `'taylor'` (default) — single-frame extrapolation of the producer-stamped derivatives.
 - `'hermite'` — **C¹** cubic interpolation matching endpoint position + velocity. Requires `order >= 2`. Eliminates the first-derivative ("zipper") step.
 - `'quintic-hermite'` (0.9.80) — **C²** degree-5 interpolation also matching endpoint **acceleration**. Requires `order >= 3`; wire-compatible (rides the existing order-3 acceleration lane). Removes the second-derivative step — the residual click cubic Hermite leaves on aggressive FM/LFO modulation.
-- `'septic-hermite'` (0.9.80) — **C³** degree-7 interpolation also matching endpoint **jerk**. Requires `order == 4` (the additive jerk lane). Removes the third-derivative step.
+- `'septic-hermite'` (0.9.81) — **C³** degree-7 interpolation also matching endpoint **jerk**. Requires `order == 4` (the additive jerk lane). Removes the third-derivative step.
 
 The union is **closed at 1.0**. The original 0.8.10 note deferred quintic-Hermite to a post-1.0 additive bump; 0.9.80 brought it forward, landing both higher-order modes additively and wire-compatibly inside the 0.9.x line (the derivation + C²/C³ verification live in `docs/quintic-septic-hermite-design.md`). Adding a mode is always additive — a new arm is a deliberate compile error for exhaustive consumer `switch` statements, never a silent fall-through.
 

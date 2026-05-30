@@ -563,3 +563,139 @@ export function evaluateQuinticHermiteTrajectoryInto(
     out[i] = h0 * p0 + h1s * v0 + h2s * a0 + h3 * p1 + h4s * v1 + h5s * a1;
   }
 }
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Septic Hermite interpolation (0.9.81 — Apollo Mission Phase I, C³)
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * Quintic Hermite matches endpoint (p, v, a) → C². Septic Hermite additionally
+ * matches endpoint JERK → C³ (continuous third derivative across boundaries),
+ * removing the last derivative step a degree-7 reconstruction can. Consumes the
+ * order-4 jerk lane stamped at flat[i*4 + 3].
+ *
+ * Degree-7 basis on local parameter t ∈ [0, 1]. Left-endpoint functions carry
+ * (p0, m0, c0, k0), right-endpoint (p1, m1, c1, k1). The right-end coefficients
+ * below are the verified expansions of the mirror H_right,k(t) = (−1)ᵏ·H_left,k(1−t);
+ * the f32 SIMD port (Stage 4) should evaluate them from powers of u = 1−t for
+ * symmetric conditioning, but the f64 scalar path computes the basis in f64
+ * regardless, so the expanded monomial form is used here (and in the bit-exact
+ * test reference). See docs/quintic-septic-hermite-design.md for the derivation
+ * and the end-to-end C³ finite-difference verification.
+ *
+ *     H0(t) = 1 − 35t⁴ + 84t⁵ − 70t⁶ + 20t⁷          → p0
+ *     H1(t) = t − 20t⁴ + 45t⁵ − 36t⁶ + 10t⁷          → m0 = T·v0
+ *     H2(t) = ½t² − 5t⁴ + 10t⁵ − 7.5t⁶ + 2t⁷         → c0 = T²·a0
+ *     H3(t) = ⅙t³ − ⅔t⁴ + t⁵ − ⅔t⁶ + ⅙t⁷            → k0 = T³·j0
+ *     H4(t) = 35t⁴ − 84t⁵ + 70t⁶ − 20t⁷              → p1
+ *     H5(t) = −15t⁴ + 39t⁵ − 34t⁶ + 10t⁷             → m1 = T·v1
+ *     H6(t) = 2.5t⁴ − 7t⁵ + 6.5t⁶ − 2t⁷              → c1 = T²·a1
+ *     H7(t) = −⅙t⁴ + ½t⁵ − ½t⁶ + ⅙t⁷                → k1 = T³·j1
+ *
+ *     p(t) = H0·p0 + H1·(T·v0) + H2·(T²·a0) + H3·(T³·j0)
+ *          + H4·p1 + H5·(T·v1) + H6·(T²·a1) + H7·(T³·j1)
+ *
+ * Velocity terms scale by T, acceleration by T², jerk by T³ — folded into the
+ * basis coefficients once per call. Requires order == 4. Allocation-free; no
+ * clamp path (same rationale as the cubic/quintic paths). */
+
+/** Septic Hermite (C³) reconstruction between two consecutive trajectory
+ *  frames. Requires `spec.order == 4` (endpoint jerk). `t` ∈ [0, 1] runs from
+ *  `flatPrev` (older frame) to `flatCurr`; `segmentSeconds` is the wall-clock
+ *  segment duration in the producer's velocity-time units. 0.9.81. */
+export function evaluateSepticHermiteTrajectoryInto(
+  flatPrev: Float64Array,
+  flatCurr: Float64Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array,
+): void;
+export function evaluateSepticHermiteTrajectoryInto(
+  flatPrev: Float32Array,
+  flatCurr: Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float32Array,
+): void;
+export function evaluateSepticHermiteTrajectoryInto(
+  flatPrev: Float64Array | Float32Array,
+  flatCurr: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array | Float32Array,
+): void {
+  const { order, sampleCount } = spec;
+  if (order !== 4) {
+    throw new Error(
+      `evaluateSepticHermiteTrajectoryInto: spec.order must be == 4 (septic Hermite needs endpoint jerk for C³), got order=${order}`,
+    );
+  }
+  if (!Number.isFinite(t)) {
+    throw new Error(`evaluateSepticHermiteTrajectoryInto: t must be finite, got ${t}`);
+  }
+  if (!Number.isFinite(segmentSeconds)) {
+    throw new Error(
+      `evaluateSepticHermiteTrajectoryInto: segmentSeconds must be finite, got ${segmentSeconds}`,
+    );
+  }
+  if (out.length < sampleCount) {
+    throw new Error(
+      `evaluateSepticHermiteTrajectoryInto: out length ${out.length} < sampleCount ${sampleCount}`,
+    );
+  }
+  const required = sampleCount * order;
+  if (flatPrev.length < required) {
+    throw new Error(
+      `evaluateSepticHermiteTrajectoryInto: flatPrev length ${flatPrev.length} < sampleCount * order (${required})`,
+    );
+  }
+  if (flatCurr.length < required) {
+    throw new Error(
+      `evaluateSepticHermiteTrajectoryInto: flatCurr length ${flatCurr.length} < sampleCount * order (${required})`,
+    );
+  }
+
+  // Resolve the degree-7 basis once per call (signal-independent).
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const t4 = t3 * t;
+  const t5 = t4 * t;
+  const t6 = t5 * t;
+  const t7 = t6 * t;
+  const h0 = 1 - 35 * t4 + 84 * t5 - 70 * t6 + 20 * t7;
+  const h1 = t - 20 * t4 + 45 * t5 - 36 * t6 + 10 * t7;
+  const h2 = 0.5 * t2 - 5 * t4 + 10 * t5 - 7.5 * t6 + 2 * t7;
+  const h3 = (1 / 6) * t3 - (2 / 3) * t4 + t5 - (2 / 3) * t6 + (1 / 6) * t7;
+  const h4 = 35 * t4 - 84 * t5 + 70 * t6 - 20 * t7;
+  const h5 = -15 * t4 + 39 * t5 - 34 * t6 + 10 * t7;
+  const h6 = 2.5 * t4 - 7 * t5 + 6.5 * t6 - 2 * t7;
+  const h7 = -(1 / 6) * t4 + 0.5 * t5 - 0.5 * t6 + (1 / 6) * t7;
+  // Velocity → ×T, acceleration → ×T², jerk → ×T³.
+  const T = segmentSeconds;
+  const T2 = T * T;
+  const T3 = T2 * T;
+  const h1s = h1 * T;
+  const h5s = h5 * T;
+  const h2s = h2 * T2;
+  const h6s = h6 * T2;
+  const h3s = h3 * T3;
+  const h7s = h7 * T3;
+
+  // stride = 4 (p, v, a, j).
+  for (let i = 0; i < sampleCount; i++) {
+    const j = i * 4;
+    const p0 = flatPrev[j]!;
+    const v0 = flatPrev[j + 1]!;
+    const a0 = flatPrev[j + 2]!;
+    const j0 = flatPrev[j + 3]!;
+    const p1 = flatCurr[j]!;
+    const v1 = flatCurr[j + 1]!;
+    const a1 = flatCurr[j + 2]!;
+    const j1 = flatCurr[j + 3]!;
+    out[i] =
+      h0 * p0 + h1s * v0 + h2s * a0 + h3s * j0 +
+      h4 * p1 + h5s * v1 + h6s * a1 + h7s * j1;
+  }
+}

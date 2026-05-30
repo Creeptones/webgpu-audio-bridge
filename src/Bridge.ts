@@ -268,6 +268,7 @@ import {
   evaluateTrajectoryInto,
   evaluateHermiteTrajectoryInto,
   evaluateQuinticHermiteTrajectoryInto,
+  evaluateSepticHermiteTrajectoryInto,
 } from "./trajectory.js";
 import {
   predictiveExtrapolateInto,
@@ -1123,7 +1124,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
         // Trajectory field. Both prev and curr must carry the same flat
         // payload shape (the schema enforces this at construction). The
         // per-field interpolationMode selects the spline degree: cubic (C¹,
-        // default), quintic (C², 0.9.80), or septic (C³, lands in 0.9.81).
+        // default), quintic (C², 0.9.80), or septic (C³, 0.9.81).
         const mode = field.trajectory.interpolationMode;
         if (field.kind === "f64") {
           const p = prev[name] as Float64Array;
@@ -1132,9 +1133,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
           if (mode === "quintic-hermite") {
             evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           } else if (mode === "septic-hermite") {
-            throw new Error(
-              `evaluateHermiteInto: 'septic-hermite' reconstruction lands in 0.9.81; field '${name}' must use 'hermite' or 'quintic-hermite' in 0.9.80`,
-            );
+            evaluateSepticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           } else {
             evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           }
@@ -1145,9 +1144,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
           if (mode === "quintic-hermite") {
             evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           } else if (mode === "septic-hermite") {
-            throw new Error(
-              `evaluateHermiteInto: 'septic-hermite' reconstruction lands in 0.9.81; field '${name}' must use 'hermite' or 'quintic-hermite' in 0.9.80`,
-            );
+            evaluateSepticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           } else {
             evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
           }

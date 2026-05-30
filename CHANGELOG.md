@@ -4,6 +4,60 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.81] — 2026-05-29
+
+### Added — Septic Hermite (C³) reconstruction (Apollo Mission Phase I, Stage 2)
+
+0.9.80 shipped the quintic (C²) path and the additive order-4 jerk lane, and
+deliberately made `'septic-hermite'` throw a staged "lands in 0.9.81" error
+rather than silently run cubic. This stage delivers the septic evaluator and
+wires it through, completing the JS-side reach of the higher-order series
+(WASM scalar + SIMD ports follow in 0.9.82/0.9.83).
+
+#### What shipped
+
+- **`evaluateSepticHermiteTrajectoryInto(prev, curr, spec, t, segmentSec, out)`**
+  (root export, f64/f32 overloads) — degree-7 Hermite spline matching endpoint
+  position + velocity + acceleration + **jerk** → **C³** across the seam.
+  Requires `order == 4` (the jerk lane). Jerk terms scale by `segmentSeconds³`
+  (acceleration `²`, velocity `¹`), folded into the basis coefficients once per
+  call. The eight basis coefficients are the offline-verified expansions; the
+  f64 scalar path uses them directly (the f32 SIMD port in Stage 4 will use the
+  symmetric `u = 1 − t` construction for the right-end functions).
+- **`Bridge.evaluateHermiteInto` now dispatches `'septic-hermite'`** to the
+  septic evaluator (replacing the 0.9.80 staged throw); cubic/quintic/septic are
+  all selected per field by `interpolationMode`.
+
+#### Correctness
+
+f64 septic is **bit-exact** to the hand-computed degree-7 basis sum; f32 is
+bit-exact to the same f64 expression on f32-widened inputs, frounded once.
+**C³ continuity is tested**: new pins reproduce `p0` exactly at `t=0` and
+finite-difference the reconstructed first/second/**third** derivatives at both
+seams against the stamped velocity/acceleration/jerk. One honest numerical
+detail pinned explicitly: septic reproduces `p1` at `t=1` only **within ~1 ULP**
+(not bit-exact) because the jerk bases `H3`/`H7` carry the non-dyadic
+coefficients `1/6` and `2/3` — quintic stays exact (all-dyadic coefficients).
+A push/pull roundtrip pin proves the order-4 **jerk lane survives the wire
+verbatim**. Pins 86–89 in `tests/Bridge.trajectory.test.ts`; pin 85 updated
+(septic now routes instead of throwing).
+
+### Wire compatibility
+
+Fully additive, no SAB-layout or protocol change. `'septic-hermite'` consumes
+the order-4 jerk lane introduced in 0.9.80; order 1/2/3 schemas are unaffected.
+
+### Tests
+
+44 Node suites green; `Bridge.trajectory` grows to pin 89 (+4 pins, 1 updated).
+`npm run typecheck` clean. `npm run bench` push/pull/pullLatest unchanged.
+
+### Documentation
+
+`docs/quintic-septic-hermite-design.md` implementation note + endpoint-exactness
+section refined (f64 scalar uses expanded monomials; the ~1-ULP septic `t=1`
+detail documented). README interpolation-modes list + ROADMAP 0.9.81 row.
+
 ## [0.9.80] — 2026-05-29
 
 ### Added — Quintic Hermite (C²) reconstruction + order-4 wire lane (Apollo Mission Phase I, Stage 1)

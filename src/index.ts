@@ -274,11 +274,13 @@ export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 // Trajectory evaluator — consumer-side Taylor extrapolation helper that
 // reads the f{32,64}TrajectoryArray tag. See src/trajectory.ts header.
 // 0.7.3 adds the two-frame Hermite cubic reconstruction path; 0.9.80 adds the
-// quintic Hermite (C²) path over the order-3 acceleration lane.
+// quintic Hermite (C²) path over the order-3 acceleration lane; 0.9.81 adds the
+// septic Hermite (C³) path over the order-4 jerk lane.
 export {
   evaluateTrajectoryInto,
   evaluateHermiteTrajectoryInto,
   evaluateQuinticHermiteTrajectoryInto,
+  evaluateSepticHermiteTrajectoryInto,
 } from "./trajectory.js";
 
 // Canonical schemas — see src/schemas/physics.ts.
