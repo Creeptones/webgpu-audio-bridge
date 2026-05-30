@@ -40,7 +40,12 @@ import {
   f64Array, f32Array, u32Array, f64TrajectoryArray, f32TrajectoryArray,
   describeSchemaLayout,
 } from "../src/schema.js";
-import { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto } from "../src/trajectory.js";
+import {
+  evaluateTrajectoryInto,
+  evaluateHermiteTrajectoryInto,
+  evaluateQuinticHermiteTrajectoryInto,
+  evaluateSepticHermiteTrajectoryInto,
+} from "../src/trajectory.js";
 import {
   allocateWorkletMemory,
   instantiateConsumer,
@@ -1933,8 +1938,147 @@ function main(): void {
     ok(`wasm-taylor-o3-simd-vs-scalar (N ∈ {17,32,3} × ${dts.length} dts × {f64 bit-exact, f32 within ULP}; f32 worstΔ=${worstO3F32.toExponential(2)})`);
   }
 
+  // ── 20: WASM scalar Quintic (C²) + Septic (C³) Hermite equivalence (0.9.82) ──
+  // The order-4 wire lane lands the higher-order evaluators in WASM. Both the
+  // f64 AND the f32 scalar paths are BIT-EXACT to the JS evaluators here:
+  // the WASM promotes each f32 load to f64, accumulates in f64 with the same
+  // caller-computed (and identically-expressed) coefficients, and demotes once
+  // on store — exactly the JS Float32Array contract. (Only the SIMD f32 paths,
+  // which do f32-lane math, drop to within-ULP; those land in Stage 4.)
+  {
+    const headerBytes = 32;
+    const cap = 4;
+    const TRAJ_N_LOCAL = 20;
+    const fround = (x: number, f32: boolean) => (f32 ? Math.fround(x) : x);
+    const cases = [
+      { t: 0.0, segS: 1 / 60 }, { t: 0.25, segS: 1 / 60 }, { t: 0.5, segS: 1 / 60 },
+      { t: 0.75, segS: 1 / 60 }, { t: 1.0, segS: 1 / 60 }, { t: 0.413, segS: 0.001 },
+    ];
+
+    // Push prev + curr of an order-`order` trajectory; return slot bases, a
+    // scratch dst region + view, snapshots of the two flat frames for the JS
+    // reference, and the consumer.
+    const setup = <T extends Float64Array | Float32Array>(
+      schema: ReturnType<typeof defineSchema>, elemBytes: number,
+      fillPrev: (a: T) => void, fillCurr: (a: T) => void,
+    ) => {
+      const sabBytes = Bridge.byteLength(cap, schema);
+      const dstBytes = TRAJ_N_LOCAL * elemBytes;
+      const alloc = allocateWorkletMemory({ sabBytes, scratchBytes: dstBytes });
+      const bridge = new Bridge(alloc.sab, cap, schema);
+      const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+      const frameBytes = schema.compiled.frameByteSize;
+      const mask = cap - 1;
+      const trajOff = schema.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+      const dstOff = alloc.scratchByteOffset!;
+      const Ctor = (elemBytes === 8 ? Float64Array : Float32Array) as unknown as
+        { new (b: ArrayBufferLike, o: number, n: number): T; new (a: T): T };
+      const view = new Ctor(alloc.sab, dstOff, TRAJ_N_LOCAL);
+      const pf = bridge.scratchFrame() as unknown as { traj: T };
+      fillPrev(pf.traj); const prevFlat = new Ctor(pf.traj); assert(bridge.push(pf as never), "pin20 push prev");
+      fillCurr(pf.traj); const currFlat = new Ctor(pf.traj); assert(bridge.push(pf as never), "pin20 push curr");
+      const prevSlot = consumer.peekPull(mask); assert(prevSlot >= 0, "pin20 peek prev");
+      const prevBase = headerBytes + prevSlot * frameBytes;
+      consumer.commitPull();
+      const currSlot = consumer.peekPull(mask); assert(currSlot >= 0, "pin20 peek curr");
+      const currBase = headerBytes + currSlot * frameBytes;
+      return { prevBase, currBase, dstOff, view, prevFlat, currFlat, consumer, trajOff,
+               commit: () => consumer.commitPull() };
+    };
+
+    // Quintic over order=3 and order=4 (jerk lane present but ignored on C²).
+    for (const order of [3, 4] as const) {
+      for (const f32 of [false, true] as const) {
+        const elemBytes = f32 ? 4 : 8;
+        const schema = defineSchema(
+          f32 ? { traj: f32TrajectoryArray(TRAJ_N_LOCAL, { order }) }
+              : { traj: f64TrajectoryArray(TRAJ_N_LOCAL, { order }) },
+        );
+        const fill = (a: Float64Array | Float32Array, phase: number) => {
+          for (let k = 0; k < TRAJ_N_LOCAL; k++) {
+            a[k * order] = fround(Math.sin(k * 0.21 + phase), f32);
+            a[k * order + 1] = fround(Math.cos(k * 0.21 + phase) * 40, f32);
+            a[k * order + 2] = fround(-Math.sin(k * 0.21 + phase) * 900, f32);
+            if (order === 4) a[k * order + 3] = fround(Math.cos(k * 0.21 + phase) * 5000, f32);
+          }
+        };
+        const d = setup(schema, elemBytes, (a) => fill(a, 0.7), (a) => fill(a, 1.3));
+        const jsRef = f32 ? new Float32Array(TRAJ_N_LOCAL) : new Float64Array(TRAJ_N_LOCAL);
+        const spec = { order, sampleCount: TRAJ_N_LOCAL } as const;
+        for (const { t, segS } of cases) {
+          const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+          const h0 = 1 - 10 * t3 + 15 * t4 - 6 * t5;
+          const h1 = t - 6 * t3 + 8 * t4 - 3 * t5;
+          const h2 = 0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5;
+          const h3 = 10 * t3 - 15 * t4 + 6 * t5;
+          const h4 = -4 * t3 + 7 * t4 - 3 * t5;
+          const h5 = 0.5 * t3 - t4 + 0.5 * t5;
+          const T = segS, T2 = T * T;
+          const h1s = h1 * T, h4s = h4 * T, h2s = h2 * T2, h5s = h5 * T2;
+          if (f32) {
+            d.consumer.evalQuinticHermiteF32(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.dstOff, TRAJ_N_LOCAL, order, h0, h1s, h2s, h3, h4s, h5s);
+            evaluateQuinticHermiteTrajectoryInto(d.prevFlat as Float32Array, d.currFlat as Float32Array, spec, t, segS, jsRef as Float32Array);
+          } else {
+            d.consumer.evalQuinticHermiteF64(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.dstOff, TRAJ_N_LOCAL, order, h0, h1s, h2s, h3, h4s, h5s);
+            evaluateQuinticHermiteTrajectoryInto(d.prevFlat as Float64Array, d.currFlat as Float64Array, spec, t, segS, jsRef as Float64Array);
+          }
+          for (let k = 0; k < TRAJ_N_LOCAL; k++) {
+            assertEq(d.view[k], jsRef[k]!, `pin20 quintic f${f32 ? 32 : 64} o${order} [${k}] t=${t} segS=${segS}`);
+          }
+        }
+        d.commit();
+      }
+    }
+
+    // Septic over order=4 (consumes the jerk lane).
+    for (const f32 of [false, true] as const) {
+      const elemBytes = f32 ? 4 : 8;
+      const schema = defineSchema(
+        f32 ? { traj: f32TrajectoryArray(TRAJ_N_LOCAL, { order: 4 }) }
+            : { traj: f64TrajectoryArray(TRAJ_N_LOCAL, { order: 4 }) },
+      );
+      const fill = (a: Float64Array | Float32Array, phase: number) => {
+        for (let k = 0; k < TRAJ_N_LOCAL; k++) {
+          a[k * 4] = fround(Math.sin(k * 0.21 + phase), f32);
+          a[k * 4 + 1] = fround(Math.cos(k * 0.21 + phase) * 40, f32);
+          a[k * 4 + 2] = fround(-Math.sin(k * 0.21 + phase) * 900, f32);
+          a[k * 4 + 3] = fround(Math.cos(k * 0.21 + phase) * 5000, f32);
+        }
+      };
+      const d = setup(schema, elemBytes, (a) => fill(a, 0.7), (a) => fill(a, 1.3));
+      const jsRef = f32 ? new Float32Array(TRAJ_N_LOCAL) : new Float64Array(TRAJ_N_LOCAL);
+      const spec = { order: 4, sampleCount: TRAJ_N_LOCAL } as const;
+      for (const { t, segS } of cases) {
+        const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t, t6 = t5 * t, t7 = t6 * t;
+        const h0 = 1 - 35 * t4 + 84 * t5 - 70 * t6 + 20 * t7;
+        const h1 = t - 20 * t4 + 45 * t5 - 36 * t6 + 10 * t7;
+        const h2 = 0.5 * t2 - 5 * t4 + 10 * t5 - 7.5 * t6 + 2 * t7;
+        const h3 = (1 / 6) * t3 - (2 / 3) * t4 + t5 - (2 / 3) * t6 + (1 / 6) * t7;
+        const h4 = 35 * t4 - 84 * t5 + 70 * t6 - 20 * t7;
+        const h5 = -15 * t4 + 39 * t5 - 34 * t6 + 10 * t7;
+        const h6 = 2.5 * t4 - 7 * t5 + 6.5 * t6 - 2 * t7;
+        const h7 = -(1 / 6) * t4 + 0.5 * t5 - 0.5 * t6 + (1 / 6) * t7;
+        const T = segS, T2 = T * T, T3 = T2 * T;
+        const h1s = h1 * T, h5s = h5 * T, h2s = h2 * T2, h6s = h6 * T2, h3s = h3 * T3, h7s = h7 * T3;
+        if (f32) {
+          d.consumer.evalSepticHermiteF32(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.dstOff, TRAJ_N_LOCAL, 4, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          evaluateSepticHermiteTrajectoryInto(d.prevFlat as Float32Array, d.currFlat as Float32Array, spec, t, segS, jsRef as Float32Array);
+        } else {
+          d.consumer.evalSepticHermiteF64(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.dstOff, TRAJ_N_LOCAL, 4, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          evaluateSepticHermiteTrajectoryInto(d.prevFlat as Float64Array, d.currFlat as Float64Array, spec, t, segS, jsRef as Float64Array);
+        }
+        for (let k = 0; k < TRAJ_N_LOCAL; k++) {
+          assertEq(d.view[k], jsRef[k]!, `pin20 septic f${f32 ? 32 : 64} [${k}] t=${t} segS=${segS}`);
+        }
+      }
+      d.commit();
+    }
+
+    ok(`wasm-quintic-septic-scalar-equivalence (quintic o{3,4} + septic o4 × {f64,f32} × ${cases.length} (t,segS) × ${TRAJ_N_LOCAL} samples; all bit-exact)`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 Taylor AND Hermite paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 Taylor AND Hermite paths + quintic (C²) and septic (C³) Hermite scalar evaluators + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
   );
 }
 

@@ -393,6 +393,51 @@ export interface WorkletConsumer {
     h11s: number,
   ): void;
 
+  /** Quintic (C²) Hermite trajectory evaluators (0.9.82). Degree-5
+   *  reconstruction matching the JS `evaluateQuinticHermiteTrajectoryInto`.
+   *  Reads position + velocity + **acceleration** from two consecutive
+   *  frames (`strideElems` = 3 or 4; the order-4 jerk lane is ignored on the
+   *  C² path) and writes `n` interpolated positions. The six basis
+   *  coefficients are CALLER-COMPUTED ONCE per call (acceleration terms fold
+   *  the `segmentSeconds²` curvature scaling, velocity terms `segmentSeconds`):
+   *     h0  = 1 − 10t³ + 15t⁴ − 6t⁵
+   *     h1s = (t − 6t³ + 8t⁴ − 3t⁵) · segmentSeconds
+   *     h2s = (½t² − 3⁄2t³ + 3⁄2t⁴ − ½t⁵) · segmentSeconds²
+   *     h3  = 10t³ − 15t⁴ + 6t⁵
+   *     h4s = (−4t³ + 7t⁴ − 3t⁵) · segmentSeconds
+   *     h5s = (½t³ − t⁴ + ½t⁵) · segmentSeconds²
+   *  f64 is bit-exact to the scalar JS; f32 within a few ULP. */
+  evalQuinticHermiteF64(
+    prevOffset: number, currOffset: number, dstOffset: number,
+    n: number, strideElems: number,
+    h0: number, h1s: number, h2s: number, h3: number, h4s: number, h5s: number,
+  ): void;
+  evalQuinticHermiteF32(
+    prevOffset: number, currOffset: number, dstOffset: number,
+    n: number, strideElems: number,
+    h0: number, h1s: number, h2s: number, h3: number, h4s: number, h5s: number,
+  ): void;
+
+  /** Septic (C³) Hermite trajectory evaluators (0.9.82). Degree-7
+   *  reconstruction matching the JS `evaluateSepticHermiteTrajectoryInto`.
+   *  Reads position + velocity + acceleration + **jerk** (`strideElems` = 4)
+   *  from two consecutive frames. The eight basis coefficients are
+   *  CALLER-COMPUTED ONCE per call (jerk terms fold `segmentSeconds³`,
+   *  acceleration `²`, velocity `¹`). f64 bit-exact to the scalar JS; f32
+   *  within a few ULP. */
+  evalSepticHermiteF64(
+    prevOffset: number, currOffset: number, dstOffset: number,
+    n: number, strideElems: number,
+    h0: number, h1s: number, h2s: number, h3s: number,
+    h4: number, h5s: number, h6s: number, h7s: number,
+  ): void;
+  evalSepticHermiteF32(
+    prevOffset: number, currOffset: number, dstOffset: number,
+    n: number, strideElems: number,
+    h0: number, h1s: number, h2s: number, h3s: number,
+    h4: number, h5s: number, h6s: number, h7s: number,
+  ): void;
+
   /** SIMD-vectorized order=2 Taylor evaluators (0.7.10). Process
    *  4 samples per iteration (f32x4) or 2 samples per iteration
    *  (f64x2) using `i8x16.shuffle` to deinterleave positions from
@@ -559,6 +604,24 @@ export function instantiateConsumer(
       n: number, strideElems: number,
       h00: number, h10s: number, h01: number, h11s: number,
     ) => void;
+    readonly eval_quintic_hermite_f64: (
+      prevOff: number, currOff: number, dstOff: number, n: number, strideElems: number,
+      h0: number, h1s: number, h2s: number, h3: number, h4s: number, h5s: number,
+    ) => void;
+    readonly eval_quintic_hermite_f32: (
+      prevOff: number, currOff: number, dstOff: number, n: number, strideElems: number,
+      h0: number, h1s: number, h2s: number, h3: number, h4s: number, h5s: number,
+    ) => void;
+    readonly eval_septic_hermite_f64: (
+      prevOff: number, currOff: number, dstOff: number, n: number, strideElems: number,
+      h0: number, h1s: number, h2s: number, h3s: number,
+      h4: number, h5s: number, h6s: number, h7s: number,
+    ) => void;
+    readonly eval_septic_hermite_f32: (
+      prevOff: number, currOff: number, dstOff: number, n: number, strideElems: number,
+      h0: number, h1s: number, h2s: number, h3s: number,
+      h4: number, h5s: number, h6s: number, h7s: number,
+    ) => void;
     readonly eval_taylor_f32_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly eval_taylor_f64_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly eval_hermite_f64_o2_simd: (
@@ -610,6 +673,10 @@ export function instantiateConsumer(
     "eval_taylor_f32_o2",
     "eval_taylor_f32_o3",
     "eval_hermite_f32",
+    "eval_quintic_hermite_f64",
+    "eval_quintic_hermite_f32",
+    "eval_septic_hermite_f64",
+    "eval_septic_hermite_f32",
     "eval_taylor_f32_o2_simd",
     "eval_taylor_f64_o2_simd",
     "eval_hermite_f64_o2_simd",
@@ -677,6 +744,14 @@ export function instantiateConsumer(
       exports.eval_taylor_f32_o3(srcOff, dstOff, n, dt),
     evalHermiteF32: (prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s) =>
       exports.eval_hermite_f32(prevOff, currOff, dstOff, n, strideElems, h00, h10s, h01, h11s),
+    evalQuinticHermiteF64: (prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3, h4s, h5s) =>
+      exports.eval_quintic_hermite_f64(prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3, h4s, h5s),
+    evalQuinticHermiteF32: (prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3, h4s, h5s) =>
+      exports.eval_quintic_hermite_f32(prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3, h4s, h5s),
+    evalSepticHermiteF64: (prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s) =>
+      exports.eval_septic_hermite_f64(prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s),
+    evalSepticHermiteF32: (prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s) =>
+      exports.eval_septic_hermite_f32(prevOff, currOff, dstOff, n, strideElems, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s),
     evalTaylorF32O2Simd: (srcOff, dstOff, n, dt) =>
       exports.eval_taylor_f32_o2_simd(srcOff, dstOff, n, dt),
     evalTaylorF64O2Simd: (srcOff, dstOff, n, dt) =>

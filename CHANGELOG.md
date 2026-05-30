@@ -4,6 +4,58 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.82] — 2026-05-29
+
+### Added — WASM scalar Quintic + Septic Hermite evaluators (Apollo Mission Phase I, Stage 3)
+
+The 0.9.80/0.9.81 quintic (C²) and septic (C³) evaluators existed only in JS.
+This stage ports the scalar forms to WASM so the AudioWorklet decode path can
+run them without crossing back into JS — the same harvest pattern the 0.9.77/79
+SIMD work followed (scalar first, SIMD in the next stage).
+
+#### What shipped
+
+- **`eval_quintic_hermite_f64` / `_f32`** (`wasm/decoder.wat`, surfaced as
+  `WorkletConsumer.evalQuinticHermiteF64` / `F32`) — degree-5 reconstruction over
+  a stride-3 or stride-4 trajectory (the order-4 jerk lane is skipped on the C²
+  path). Six caller-computed basis coefficients (acceleration terms fold the
+  `segmentSeconds²` curvature scaling), same convention as the cubic
+  `eval_hermite_f64`.
+- **`eval_septic_hermite_f64` / `_f32`** (`WorkletConsumer.evalSepticHermiteF64`
+  / `F32`) — degree-7 reconstruction over the stride-4 (p, v, a, j) lane; eight
+  caller-computed coefficients (jerk terms fold `segmentSeconds³`).
+
+All four follow the established discipline: f64 accumulates left-to-right with
+no implicit FMA; f32 promotes each load to f64, accumulates in f64, demotes once
+on store (the JS Float32Array contract).
+
+#### Correctness
+
+Both the f64 **and** the f32 scalar paths are **bit-exact** to the JS
+`evaluateQuinticHermiteTrajectoryInto` / `evaluateSepticHermiteTrajectoryInto`
+(the f32 scalar path promotes to f64 and accumulates there, so — unlike the
+SIMD f32 paths, which land in Stage 4 and do f32-lane math — there is no ULP
+drift). New `tests/Bridge.wasmEquivalence.test.ts` **pin 20**: quintic over
+order {3, 4} + septic over order 4, each × {f64, f32} × 6 (t, segmentSeconds)
+cases × 20 samples, all `assertEq` bit-exact against the JS reference.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API on the `webgpu-audio-bridge/worklet`
+subpath (four new `WorkletConsumer` methods); the decoder binary grows ~600 B.
+No SAB-layout or protocol change.
+
+### Tests
+
+44 Node suites green; `wasmEquivalence` grows to pin 20. `npm run typecheck`
+clean. `npm run build:wasm` compiles the new WAT. `npm run bench` push/pull/
+pullLatest within budget (unchanged).
+
+### Documentation
+
+ROADMAP 0.9.82 row. (The basis derivation + stage map already live in
+`docs/quintic-septic-hermite-design.md`.)
+
 ## [0.9.81] — 2026-05-29
 
 ### Added — Septic Hermite (C³) reconstruction (Apollo Mission Phase I, Stage 2)

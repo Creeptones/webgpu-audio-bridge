@@ -969,6 +969,165 @@
       end
     end)
 
+  ;; ─── f64 / f32 Quintic Hermite evaluators (0.9.82, C²) ────────────────
+  ;;
+  ;; Degree-5 reconstruction matching the JS evaluateQuinticHermiteTrajectoryInto
+  ;; (src/trajectory.ts, 0.9.80). Per sample, stride = order (3 or 4 elems):
+  ;;   out[i] = h0·P0 + h1s·V0 + h2s·A0 + h3·P1 + h4s·V1 + h5s·A1
+  ;; (h1s,h2s,h4s,h5s already fold the segmentSeconds / segmentSeconds² tangent
+  ;; + curvature scaling — computed caller-side ONCE per call, like the cubic
+  ;; path). Acceleration is at lane offset 16 (f64) / 8 (f32). The jerk lane
+  ;; (order=4) is ignored on the C² path. f64 accumulates left-to-right with no
+  ;; implicit FMA → bit-exact to the scalar JS; f32 promotes each load to f64,
+  ;; accumulates in f64, demotes on store (matches the JS Float32Array contract).
+
+  (func $eval_quintic_hermite_f64 (export "eval_quintic_hermite_f64")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64)
+        (param $h3 f64) (param $h4s f64) (param $h5s f64)
+    (local $i i32) (local $prevP i32) (local $currP i32) (local $dstP i32) (local $strideBytes i32)
+    local.get $strideElems
+    i32.const 3
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    i32.const 0 local.set $i
+    block $exit
+      loop $loop
+        local.get $i local.get $n i32.ge_u br_if $exit
+        local.get $dstP
+        local.get $prevP f64.load align=1 local.get $h0 f64.mul
+        local.get $prevP i32.const 8 i32.add f64.load align=1 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 16 i32.add f64.load align=1 local.get $h2s f64.mul f64.add
+        local.get $currP f64.load align=1 local.get $h3 f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f64.load align=1 local.get $h4s f64.mul f64.add
+        local.get $currP i32.const 16 i32.add f64.load align=1 local.get $h5s f64.mul f64.add
+        f64.store align=1
+        local.get $prevP local.get $strideBytes i32.add local.set $prevP
+        local.get $currP local.get $strideBytes i32.add local.set $currP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        local.get $i i32.const 1 i32.add local.set $i
+        br $loop
+      end
+    end)
+
+  (func $eval_quintic_hermite_f32 (export "eval_quintic_hermite_f32")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64)
+        (param $h3 f64) (param $h4s f64) (param $h5s f64)
+    (local $i i32) (local $prevP i32) (local $currP i32) (local $dstP i32) (local $strideBytes i32)
+    local.get $strideElems
+    i32.const 2
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    i32.const 0 local.set $i
+    block $exit
+      loop $loop
+        local.get $i local.get $n i32.ge_u br_if $exit
+        local.get $dstP
+        local.get $prevP f32.load align=1 f64.promote_f32 local.get $h0 f64.mul
+        local.get $prevP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h2s f64.mul f64.add
+        local.get $currP f32.load align=1 f64.promote_f32 local.get $h3 f64.mul f64.add
+        local.get $currP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h4s f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h5s f64.mul f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $prevP local.get $strideBytes i32.add local.set $prevP
+        local.get $currP local.get $strideBytes i32.add local.set $currP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        local.get $i i32.const 1 i32.add local.set $i
+        br $loop
+      end
+    end)
+
+  ;; ─── f64 / f32 Septic Hermite evaluators (0.9.82, C³) ─────────────────
+  ;;
+  ;; Degree-7 reconstruction matching the JS evaluateSepticHermiteTrajectoryInto
+  ;; (src/trajectory.ts, 0.9.81). stride = 4 elems (p, v, a, j). Per sample:
+  ;;   out[i] = h0·P0 + h1s·V0 + h2s·A0 + h3s·J0 + h4·P1 + h5s·V1 + h6s·A1 + h7s·J1
+  ;; (h1s/h2s/h3s/h5s/h6s/h7s fold the segmentSeconds / ² / ³ scaling caller-side).
+  ;; Jerk is at lane offset 24 (f64) / 12 (f32). Same f64-accumulate / f32-promote
+  ;; -demote discipline as the quintic path → bit-exact (f64) / within-ULP (f32).
+
+  (func $eval_septic_hermite_f64 (export "eval_septic_hermite_f64")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64) (param $h3s f64)
+        (param $h4 f64) (param $h5s f64) (param $h6s f64) (param $h7s f64)
+    (local $i i32) (local $prevP i32) (local $currP i32) (local $dstP i32) (local $strideBytes i32)
+    local.get $strideElems
+    i32.const 3
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    i32.const 0 local.set $i
+    block $exit
+      loop $loop
+        local.get $i local.get $n i32.ge_u br_if $exit
+        local.get $dstP
+        local.get $prevP f64.load align=1 local.get $h0 f64.mul
+        local.get $prevP i32.const 8 i32.add f64.load align=1 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 16 i32.add f64.load align=1 local.get $h2s f64.mul f64.add
+        local.get $prevP i32.const 24 i32.add f64.load align=1 local.get $h3s f64.mul f64.add
+        local.get $currP f64.load align=1 local.get $h4 f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f64.load align=1 local.get $h5s f64.mul f64.add
+        local.get $currP i32.const 16 i32.add f64.load align=1 local.get $h6s f64.mul f64.add
+        local.get $currP i32.const 24 i32.add f64.load align=1 local.get $h7s f64.mul f64.add
+        f64.store align=1
+        local.get $prevP local.get $strideBytes i32.add local.set $prevP
+        local.get $currP local.get $strideBytes i32.add local.set $currP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        local.get $i i32.const 1 i32.add local.set $i
+        br $loop
+      end
+    end)
+
+  (func $eval_septic_hermite_f32 (export "eval_septic_hermite_f32")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32) (param $strideElems i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64) (param $h3s f64)
+        (param $h4 f64) (param $h5s f64) (param $h6s f64) (param $h7s f64)
+    (local $i i32) (local $prevP i32) (local $currP i32) (local $dstP i32) (local $strideBytes i32)
+    local.get $strideElems
+    i32.const 2
+    i32.shl
+    local.set $strideBytes
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    i32.const 0 local.set $i
+    block $exit
+      loop $loop
+        local.get $i local.get $n i32.ge_u br_if $exit
+        local.get $dstP
+        local.get $prevP f32.load align=1 f64.promote_f32 local.get $h0 f64.mul
+        local.get $prevP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h2s f64.mul f64.add
+        local.get $prevP i32.const 12 i32.add f32.load align=1 f64.promote_f32 local.get $h3s f64.mul f64.add
+        local.get $currP f32.load align=1 f64.promote_f32 local.get $h4 f64.mul f64.add
+        local.get $currP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h5s f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h6s f64.mul f64.add
+        local.get $currP i32.const 12 i32.add f32.load align=1 f64.promote_f32 local.get $h7s f64.mul f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $prevP local.get $strideBytes i32.add local.set $prevP
+        local.get $currP local.get $strideBytes i32.add local.set $currP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        local.get $i i32.const 1 i32.add local.set $i
+        br $loop
+      end
+    end)
+
   ;; ─── SIMD-vectorized order=2 Taylor evaluators (0.7.10) ───────────────
   ;;
   ;; The order=2 interleaved layout `[p_0, v_0, p_1, v_1, …]` is the
