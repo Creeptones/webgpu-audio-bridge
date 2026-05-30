@@ -67,6 +67,7 @@ The concurrent test has a known timing-sensitive `emptyWaitTimeouts === 0` asser
 - `tests/Bridge.concurrent.test.ts` — 1 M-frame cross-thread SPSC stress. Producer is an inline-eval Worker; uses `Bridge.describeLayout()` so schema changes auto-propagate.
 - `tests/Bridge.phaseLock.test.ts` — FFT-based phase-lock spectrum pin (added 0.6.4).
 - `bench/Bridge.bench.ts` — push / pull / pullLatest cells + 0.5.0's `flow_scale recovery` characterization cell + 0.6.7's `trajEval (fast)` / `trajEval (clamp)` cells.
+- `bench/mpmc.bench.ts` — 0.9.908 (Apollo Frontier 3, Stage 2) `MpmcRing` characterization bench (`npm run bench:mpmc`). Four cells: push/pull latency vs `producerCount` (proves producerCount-invariance), MP→SC-vs-SPSC side-by-side (poll-only MP→SC can undercut the notify-bearing SPSC pull), drop-rate at the envelope edge (measured == analytic `(r−1)/r`, torn/overrun = 0), and a `worker_threads` contention curve (throughput + drop% vs N, zero-tear asserted). Gates push/pull < 10 µs at every P. The SPSC bench is structurally unchanged (the primitive never touches `SpscRing`).
 - `CHANGELOG.md` — newest entry at top. Entries follow the established structure.
 - `README.md` — public docs; mirror CHANGELOG entries for shipped features under the relevant section (API reference, Back-pressure, Roadmap, etc.).
 - `docs/standard-mode-design.md` — 0.9.39 design note covering the `MessageChannelBridge<S>` (Standard mode) shape, versioning, and scope decisions; followed by a "Shipped postscript" documenting the actual 0.9.40 ship.

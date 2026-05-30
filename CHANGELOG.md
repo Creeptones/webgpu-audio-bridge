@@ -4,6 +4,77 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.908] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 2: `MpmcRing` bench + characterization
+
+The characterization pass the Stage-1 handoff calls for. New
+**`bench/mpmc.bench.ts`** (`npm run bench:mpmc`) — a standalone tsx headless
+bench mirroring `bench/Bridge.bench.ts` (same `percentile` / `mean` / `fmt` /
+`summarize` harness, same 10 µs hard-budget gate). Four cells over a
+representative small fan-in fixture (`u32 producerId + u32 seq + f64 checksum +
+f64[8] fill` = 80 payload bytes, the Stage-1 cross-thread-stress shape):
+
+- **Cell 1 — enqueue/dequeue latency vs `producerCount`** (single-thread).
+  `push` and `pull` swept over `producerCount ∈ {1,2,4,8}`. A single thread
+  cannot exhibit fetch-add contention, so this isolates the *code-path* cost and
+  proves the hot path is **producerCount-INVARIANT** (SLACK is a constant in the
+  envelope check; the cost does not grow with the declared producer count, only
+  the usable ring depth shrinks).
+- **Cell 2 — MP→SC (producerCount=1) vs the frozen SPSC core**, same schema,
+  side-by-side. Characterizes the additive primitive's per-op cost next to the
+  core it sits beside. Because `MpmcRing` is **poll-only** (no `Atomics.notify`
+  on either side — the worklet discipline), the single-producer MP→SC pull can
+  even *undercut* the notify-bearing SPSC pull.
+- **Cell 3 — drop-rate at the envelope edge** (single-thread, deterministic).
+  Sweeps a push:pull ratio `r ∈ {1,2,4,8,16}` and confirms the steady-state drop
+  fraction tracks the analytic `(r−1)/r` exactly, with `tornFrameCount() === 0`
+  and `overrunLostFrames() === 0` on every row (drop-newest is counted; the
+  envelope holds under a correct `producerCount`).
+- **Cell 4 — cross-thread contention curve** (`worker_threads`). The only cell
+  with genuine fetch-add contention: N producer workers flood the ring while one
+  consumer drains. Reports aggregate consume/enqueue throughput + drop% vs N,
+  asserting conservation + zero tearing per row. Informational (wall-clock,
+  machine-load sensitive); the byte-faithful Policy-B producer source mirrors the
+  Stage-1 concurrent test.
+
+### Why
+
+Stage 1 proved `MpmcRing` *correct* three ways; Stage 2 proves it *fast* — the
+consumer `pull` path stays well inside the 10 µs audio-thread budget at every
+producer count, the per-op floor is documented, and the drop-newest envelope
+behaves exactly as the model predicts. The "SPSC bench is unchanged" claim is
+structural (the new primitive never imports or mutates `SpscRing`); Cell 2 makes
+it concrete by measuring the two beside each other.
+
+### Measurements (Node dev laptop — informational, hardware-relative)
+
+- push / pull medians **~200 ns** at every `producerCount ∈ {1,2,4,8}`
+  (spread 0 ns — producerCount-invariant); both well under the 10 µs hard cap.
+- MP→SC vs SPSC: both ~200 ns medians; MP→SC pull undercuts SPSC pull by ~100 ns
+  on some runs (poll-only, no notify).
+- drop-rate measured == analytic `(r−1)/r` to the reported precision
+  (0% / 50% / 75% / 87.5% / 93.8%); torn = 0, overrunLost = 0 on every ratio.
+- contention curve: one consumer sustains ~1.1–2.0 M frames/s drained while N
+  producers flood unthrottled (~80–93% drop, rising with N as the single
+  consumer saturates); **zero tearing, conservation holds** on every row.
+- core SPSC `push`/`pull`/`pullLatest` cells unchanged at ~1.30 µs (the only
+  `npm run bench` failing line remains the pre-existing, MPMC-unrelated
+  `trajEval (fast)` microbench flake — a separate code path).
+
+### Wire compatibility
+
+Bench + docs only. No `src/` change, no public-API change, no wire/SAB change.
+The frozen SPSC protocol and the `@experimental` MP→SC layout are both untouched.
+
+### Documentation
+
+`package.json` gains the `bench:mpmc` script. `ROADMAP.md` Frontier 3 section +
+descending-table rows updated (Stage 2 shipped; the missing Stage-1 row
+backfilled). `CLAUDE.md` file inventory gains `bench/mpmc.bench.ts`.
+`docs/frontier3-stage1-mpmc-primitive-handoff.md` "After Stage 1" status updated
+to mark Stage 2 done and point at Stage 3 (`connect()` integration).
+
 ## [0.9.907] — 2026-05-30
 
 ### Added — Apollo Frontier 3, Stage 1: the `MpmcRing` primitive (first production code of the frontier)
