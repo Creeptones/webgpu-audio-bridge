@@ -217,8 +217,14 @@ the soak gate — see the internal pre-1.0 cohort plan.
   the `initLayout`-not-re-called discipline) + `tests/connectFanIn.concurrent.test.ts`
   (1.2 M frames through the wiring, bit-exact, `torn=0`), and a live browser smoke
   (`examples/mpmc-fan-in/`, `npm run dev:mpmc-fan-in` — three producers at
-  30/50/120 Hz → one AudioWorklet, zero tearing under flood). **SPMC fan-out,
-  full MPMC, and the multi-edge DAG layer** over `connect()` stage in afterward —
+  30/50/120 Hz → one AudioWorklet, zero tearing under flood). **Stage 4 — SP→MC
+  broadcast fan-out** (one producer → N consumers, every consumer sees every frame)
+  is the next single-edge primitive; its own four-sub-stage arc (formal+probe →
+  primitive → bench → `connectFanOut()`) mirrors the MP→SC arc, with the hard problem
+  moved consumer-side (a slow reader lapped mid-read → a seqlock torn-read guard, vs
+  MP→SC's producer-side envelope). **Kickoff handoff:**
+  [`docs/frontier3-stage4-spmc-fanout-handoff.md`](./docs/frontier3-stage4-spmc-fanout-handoff.md).
+  **Full MPMC and the multi-edge DAG layer** over `connect()` stage in afterward —
   the DAG ("MPMC audio DAGs") is the frontier headline but is only meaningful once
   both single-edge primitives (MP→SC done, SP→MC next) are proven solid.
 
