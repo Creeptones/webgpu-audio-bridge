@@ -301,6 +301,24 @@ export type {
   CrossfadeOptions,
 } from "./crossfade.js";
 
+// ── Live hot-swap orchestration (0.9.88 — God-Node Stage 2) ────────────────
+//
+// `HotSwapConsumer<S>` holds an OLD + a NEW bridge (same schema), reconstructs
+// both per quantum via `pullHermiteLatest`, and crossfades `a → b` over a
+// configurable window driven by the audio clock — the two-bridge orchestration
+// above the Stage-1 seam primitive. State machine idle → priming → fading →
+// complete; the window clock anchors to when `b` becomes ready (not to
+// arm-time) so the fade onset is click-free. Single-responsibility: it owns the
+// swap state + dual reconstruction + the weight schedule (`weightAt`), and the
+// caller blends with `crossfadeInto`. Cross-schema migration is Stage 3. See
+// src/HotSwapConsumer.ts header.
+export { HotSwapConsumer } from "./HotSwapConsumer.js";
+export type {
+  HotSwapPhase,
+  HotSwapConsumerOptions,
+  HotSwapPullResult,
+} from "./HotSwapConsumer.js";
+
 // Canonical schemas — see src/schemas/physics.ts.
 export { physicsControlFrameSchema } from "./schemas/physics.js";
 export type { PhysicsControlFrameSchema } from "./schemas/physics.js";

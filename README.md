@@ -641,7 +641,28 @@ const w = crossfadeWeight("quintic");        // C² weight schedule
 crossfadeInto(reconA, reconB, w(s), out);    // amplitude: (1−w)·A + w·B
 ```
 
-`crossfadeInto` is allocation-free and takes the already-resolved scalar weight (the continuity *order* lives in how `w` evolves sample-to-sample). `mode: "amplitude"` (default, `(1−w)·a + w·b`) is correct for a **parameter swap** — A and B are strongly correlated, so a linear blend preserves amplitude. `mode: "equal-power"` (`cos(½πw)·a + sin(½πw)·b`) is for an **emitter swap** — A and B uncorrelated, so the cos/sin pair keeps `cos² + sin² = 1` with no −3 dB mid-fade notch; the gain envelope is still driven by the C^k weight, so the seam stays click-free. Both modes are endpoint-exact (`w=0` → exactly A, `w=1` → exactly B). Match the crossfade order to the reconstruction order and the *entire* swap — interior reconstruction AND the blend seam — is C^k. `tests/Bridge.phaseLock.test.ts` measures it: a DC-level swap radiates a seam-image band (>500 Hz) of **cubic −85.9 dB → quintic −104.5 dB → septic −117.8 dB** rel total — each higher order drops the broadband click spray 13–19 dB. This is the foundational, LLM-free slice of the God-Node (real-time self-rewriting emitter); the two-bridge orchestration that drives the swap clock from `currentTime` builds on top of it.
+`crossfadeInto` is allocation-free and takes the already-resolved scalar weight (the continuity *order* lives in how `w` evolves sample-to-sample). `mode: "amplitude"` (default, `(1−w)·a + w·b`) is correct for a **parameter swap** — A and B are strongly correlated, so a linear blend preserves amplitude. `mode: "equal-power"` (`cos(½πw)·a + sin(½πw)·b`) is for an **emitter swap** — A and B uncorrelated, so the cos/sin pair keeps `cos² + sin² = 1` with no −3 dB mid-fade notch; the gain envelope is still driven by the C^k weight, so the seam stays click-free. Both modes are endpoint-exact (`w=0` → exactly A, `w=1` → exactly B). Match the crossfade order to the reconstruction order and the *entire* swap — interior reconstruction AND the blend seam — is C^k. `tests/Bridge.phaseLock.test.ts` measures it: a DC-level swap radiates a seam-image band (>500 Hz) of **cubic −85.9 dB → quintic −104.5 dB → septic −117.8 dB** rel total — each higher order drops the broadband click spray 13–19 dB. This is the foundational, LLM-free slice of the God-Node (real-time self-rewriting emitter).
+
+**Live hot-swap — `HotSwapConsumer<S>` (0.9.88).** The two-bridge orchestration above the seam: hold the OLD bridge (`a`, currently audible) and a NEW bridge (`b`, the incoming patch, same schema), reconstruct both per quantum, and crossfade `a → b` over a window driven by the audio clock.
+
+```ts
+import { HotSwapConsumer, crossfadeInto } from "webgpu-audio-bridge";
+
+const swap = new HotSwapConsumer(bridgeA, bridgeB, { continuity: "quintic", windowSeconds: 0.08 });
+swap.armSwap();                                   // request the swap (idle → priming)
+
+// per audio quantum:
+const r = swap.pullLatest(outA, outB, currentTime * 1e9);   // reconstruct both, advance the machine
+for (let i = 0; i < 128; i++) {
+  const w = swap.weightAt((currentTime + i / sampleRate) * 1e9);  // sample-accurate C^k weight
+  aBuf[i] = synth(outA, i);                       // your per-sample synthesis from a's frame
+  bBuf[i] = w === 0 ? 0 : synth(outB, i);
+}
+crossfadeInto(aBuf, bBuf, w, out, { mode: "equal-power" });   // Stage-1 blend (or loop per-sample w)
+// r.phase: "idle" | "priming" | "fading" | "complete"  — tear bridgeA down at "complete"
+```
+
+The state machine is `idle → priming → fading → complete`. The **one timing rule that matters**: the fade-window clock anchors to *when `b` becomes ready*, not to when `armSwap` was called — otherwise the weight would jump from 0 to `w(s_now)` the instant `b` primes (a click). Anchoring to b-ready starts the weight at exactly 0 with vanishing derivatives, so the onset is seamless. `b` is "ready" after `minBFramesForReady` fresh pulls (default 2 → it interpolates between two distinct frames on the first faded sample). The class owns the swap state, the dual `pullHermiteLatest` reconstruction, and the weight schedule (`weightAt`); the **caller** does the blend with `crossfadeInto`, so synthesis and the amplitude-vs-equal-power choice stay yours. At `complete`, `a` is retired (no longer pulled) and you can tear it down. Cross-schema migration — `b` a *different* layout, with field add/remove/rename + default-seeding — is the next slice.
 
 `pullSmoothed` / `pullLatestSmoothed` are trajectory-aware (0.6.4): the α-smoother blends only the position lanes of a trajectory field and passes velocity / acceleration lanes through verbatim from the freshly-pulled frame. Blending a derivative across frames collapses the very signal the trajectory exists to preserve — a perfectly linear position ramp publishes a constant velocity, but a naive elementwise blend would drift that velocity toward the previous frame's reading at the smoother's time constant. The rule is automatic — opt-in by using a trajectory field; no API change.
 

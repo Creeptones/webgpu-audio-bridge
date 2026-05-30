@@ -4,6 +4,84 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.88] — 2026-05-30
+
+### Added — `HotSwapConsumer<S>`: two-bridge live hot-swap orchestration (God-Node Frontier 4, Stage 2)
+
+Stage 1 (0.9.87) shipped the click-free seam math. Stage 2 is the orchestration
+above it: hold the OLD bridge (`a`, currently audible) and a NEW bridge (`b`,
+the incoming patch), reconstruct both per quantum via `pullHermiteLatest`, and
+crossfade `a → b` over a configurable window — driven by the **audio clock** so
+the swap is sample-accurate and click-free.
+
+#### What shipped
+
+- **`src/HotSwapConsumer.ts`** — `HotSwapConsumer<S>` (root export) over two
+  bridges sharing one schema `S` (the foundational parameter / same-schema
+  emitter swap; cross-schema migration is Stage 3):
+  - **State machine** `idle → priming → fading → complete`, read via `phase()`.
+  - **`armSwap(windowSeconds?)`** requests a swap (`idle → priming`).
+  - **`pullLatest(outA, outB, baseConsumerNs, sampleRate?)`** reconstructs both
+    bridges for the quantum and advances the machine; returns
+    `{ phase, weight, windowStartNs, aSkipped, bSkipped, bReady }`. Pulls `a`
+    every quantum until it is retired at `complete`; pulls `b` once armed.
+  - **`weightAt(consumerNs)`** — the pure, sample-accurate C^k weight for any
+    audio-clock time (call it per sample for a seamless fade; blend with the
+    Stage-1 `crossfadeInto`).
+  - **`reset()`** / `isBReady()` / `windowStartNs()` / `continuityOrder()`.
+- Options `HotSwapConsumerOptions` (`continuity` default `"quintic"`,
+  `windowSeconds` default 50 ms, `minBFramesForReady` default 2) + result type
+  `HotSwapPullResult` + `HotSwapPhase`.
+
+#### The one critical timing decision
+
+The fade-window clock anchors to **when `b` becomes ready, not to when
+`armSwap` was called.** If it anchored to arm-time, the weight would advance
+during priming while output was pinned to `a` (weight forced 0), then JUMP from
+0 to `w(s_now)` the instant `b` went ready — a click. Anchoring to b-ready
+makes the weight begin at exactly 0 with vanishing derivatives (the Stage-1 C^k
+property), so the fade onset is seamless. A throwaway two-bridge timing probe
+established this before the class was written; the finding is pinned in the
+test.
+
+#### Readiness
+
+`b` is ready after `minBFramesForReady` **fresh pulls** (each `pullHermiteLatest`
+that consumed a new frame). Default 2 → `b` interpolates between two distinct
+frames on the first faded sample (the C² interior). Because `pullHermiteLatest`
+drains the whole queue per call (skips to newest), two fresh pulls require `b`'s
+frames to arrive across two quanta — exactly the real producer cadence. Set 1
+for hold-ready (lower latency; the first fade samples hold `b`'s single frame).
+
+#### Single responsibility
+
+The class owns the swap state + dual reconstruction + the weight schedule; it
+does **not** blend signals itself. The caller synthesizes per-sample audio from
+`outA` / `outB` as usual and blends with `crossfadeInto` using
+`weightAt(perSampleNs)` — so the class stays agnostic to how a frame becomes
+audio, and the amplitude-vs-equal-power choice remains a per-call decision.
+
+#### Tests
+
+- **`tests/Bridge.hotswap.test.ts`** (new, 6 pins; in both `test` + `test:unit`):
+  idle pre-arm (only `a` pulled, `outB` untouched); priming gap → window
+  anchors to b-ready with weight **exactly 0** at the anchor (the headline);
+  sample-accurate `weightAt` monotone 0→1 with exact endpoints (septic);
+  endpoint-exact completion (weight 1, phase `complete`, `a` retired/untouched);
+  `a`-famine ride-through stays finite; guards + lifecycle (bad opts/window
+  throw, double-arm throws, `reset` re-arms, `minBFramesForReady: 1` hold-ready).
+
+### Wire compatibility
+
+Additive root export only — **no wire / SAB / protocol change**, no public-API
+break. Pure consumer-side composition over the existing `pullHermiteLatest` +
+the Stage-1 crossfade.
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.88 row; README hot-swap subsection under the crossfade
+section.
+
 ## [0.9.87] — 2026-05-30
 
 ### Added — `crossfadeWeight` + `crossfadeInto`: the click-free seam primitive (God-Node Frontier 4, Stage 1)
