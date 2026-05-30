@@ -4,6 +4,93 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.910] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 4.0: SP→MC broadcast ring — formal model + happens-before proof + algorithm probe (NO production code)
+
+The first deliverable of the second single-edge primitive (SP→MC **broadcast**
+fan-out: one producer → N consumers, every consumer sees every frame). Like
+0.9.906 (the MP→SC Stage 0), Stage 4.0 is a **pure correctness-artifact** patch —
+it ships **no `src/` code and no public API**. It models, proves, and *settles
+the open design question* (the torn-read window) for the additive broadcast
+`SpmcRing` primitive before a single production line is written.
+
+- **`formal/SpmcRing.tla` + `formal/SpmcRing.cfg`** — a TLA+/PlusCal model of the
+  SP→MC broadcast protocol (one in-order lap-freely producer, many independent
+  consumers each with their own cursor + a per-consumer **two-phase seqlock**
+  double-check), the **additive sibling** of the frozen `formal/SpscRing.tla` and
+  `formal/MpmcRing.tla` (both untouched). Invariants `NoTornRead` /
+  `PerConsumerFifo` / `Conservation` + the Commit-step asserts (`~cDirty`,
+  `cRead = D`) + liveness `EventuallyDrained` / `HeadProgress`; reuses the wrap
+  algebra verbatim and adds the `Complete(T)=2·T` / `Busy(T)=2·T+1` seqlock
+  encoding (so the window halves: `CAP2_32 > 4·CAPACITY`); small bounded session
+  (`CONSUMERS=2, CAPACITY=2, CAP2_32=16, MAXFRAMES=4`).
+- **`bench/spmc-probe.mjs`** — a throwaway, dependency-free
+  (`node bench/spmc-probe.mjs`) loom/relacy-style **exhaustive** interleaving
+  explorer for 1 producer + C consumers, the runnable half of Stage 4.0 and the
+  sibling of `bench/mpmc-probe.mjs` (roles flipped, the seqlock guard the central
+  step). Walks every interleaving of the choice DAG once (visited-set) and
+  asserts per-consumer no-torn / FIFO / counted-drop / broadcast-consistency +
+  the wait-free witness.
+- **`docs/spmc-happens-before-proof.md`** — the written happens-before proof (the
+  seqlock release/acquire edge made rigorous under the project's `(a−b)|0` /
+  `(idx>>>0)&mask` wrap algebra, per-consumer FIFO + broadcast consistency,
+  wait-freedom) plus the Stage-4.0 finding and the resolved policy.
+
+### Why — the torn-read window is settled (with a correction to the sketch)
+
+The handoff's recommended starting hypothesis (Policy P1, lap-freely + a
+consumer-side seqlock guard) was right in spirit, but its **producer sketch**
+showed a **single** generation release-store, *after* the payload, with no
+in-progress marker. The exhaustive probe **falsifies that sketch**: while the
+producer overwrites a slot for the next lap, the generation still holds
+`Complete(D)` (the bump comes only after the bytes), so a consumer one lap behind
+reads `seq1 = Complete(D)`, reads torn payload, and its re-read sees
+`seq2 = seq1` **still** → the guard passes → **torn bytes delivered**. The probe
+also shows that dropping the re-read tears even with the correct producer. So
+**both halves are load-bearing**: a `Busy(T)` generation store *before* the
+payload (so an overwrite is visible in the generation before the bytes move) AND
+the consumer re-read (so the consumer checks it).
+
+**Resolution — Policy P1 with the TWO-PHASE seqlock:** the decoupled, lap-freely
+producer brackets every payload write between `Busy(T)` and `Complete(T)`
+release-stores; each consumer self-protects with the double-check (gate `d==0` →
+read → re-read; deliver iff unchanged, else counted drop). The probe verifies
+this **exhaustively** — 0 torn / 0 wrong / 0 stall / full per-consumer
+conservation + broadcast consistency, O(1) wait-free both sides
+(`maxConsumerSteps = maxProducerSteps = 1`), e.g. `CONSUMERS=3,C=2` walks 40755
+states. The producer **never reads consumer cursors** (the audio-correct
+property: a stuck consumer never back-pressures the source). **P2**
+(envelope-against-the-slowest consumer — lossless but couples the producer to the
+slowest consumer) is documented as an optional mode only, not the default.
+
+### Wire compatibility
+
+No wire change. **`SpscRing` / `MpmcRing` and `formal/SpscRing.tla` /
+`formal/MpmcRing.tla` are untouched** — the SPSC 1.0 settled-protocol promise and
+the experimental MP→SC format both stand. `SpmcRing` is a separate, additive
+primitive with its own (not-yet-implemented) SAB layout; it will ship
+`experimental` pre-1.0 when Stage 4.1 lands. No `src/`, no public API, no
+SAB/protocol change in this patch.
+
+### Tests
+
+No new Node test suite (Stage 4.0 ships no `src/`). Gates: `npm run typecheck`
+clean; full suite green (nothing in `src/` changed); bench unchanged
+(push/pull/pullLatest within the documented baseline). The runnable probe exits 0
+(all Stage-4.0 expectations met — Scenario A sound, Scenario B confirms the
+single-store sketch tears, Scenario C confirms the re-read is load-bearing); the
+in-CI fuzzer `tests/SpmcRing.interleaving.test.ts` lands with Stage 4.1.
+
+### Documentation
+
+`formal/README.md` gains an SP→MC model section; `ROADMAP.md` Frontier 3 section
+updated to "Stage 4.0 shipped" with a descending-table row; `CLAUDE.md` file
+inventory gains the three new artifacts. Full context in
+`docs/frontier3-stage4-spmc-fanout-handoff.md` (the kickoff handoff), the new
+proof note, and the Stage-4.1 handoff
+`docs/frontier3-stage4.1-spmc-primitive-handoff.md`.
+
 ## [0.9.909] — 2026-05-30
 
 ### Added — Apollo Frontier 3, Stage 3: `connectFanIn()` MP→SC integration

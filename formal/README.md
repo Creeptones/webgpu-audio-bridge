@@ -12,9 +12,16 @@ protocols, modeled under a weak-memory (release/acquire) abstraction.
   0.9.906). A *separate* primitive with its own SAB layout, modeled **beside**
   the untouched SPSC model. See [MP→SC model](#mpsc-model-mpmcring--apollo-frontier-3-stage-0)
   below.
+- `SpmcRing.tla` / `SpmcRing.cfg` — the **additive** single-producer /
+  multi-consumer (SP→MC) broadcast `SpmcRing` protocol (Apollo Frontier 3, Stage
+  4.0, 0.9.910). The second single-edge primitive's model: one in-order producer
+  that laps freely, many independent consumers each with their own cursor and a
+  per-consumer **seqlock** double-check. Modeled **beside** the frozen SPSC *and*
+  MP→SC models. See [SP→MC model](#spmc-model-spmcring--apollo-frontier-3-stage-40)
+  below.
 
-The rest of this section describes the SPSC model; the MP→SC model has its own
-section near the end.
+The rest of this section describes the SPSC model; the MP→SC and SP→MC models
+have their own sections near the end.
 
 The `.tla` is written to be **syntactically faithful TLA+/PlusCal**; it does
 not have to be run inside this repo's toolchain (there is no Java/TLC in the
@@ -199,9 +206,9 @@ Expected result: all four invariants hold and both `WakeLiveness` properties
 hold under the bounded `CAPACITY=2, CAP2_32=16, MAXFRAMES=6` session, with no
 deadlock.
 
-To check the MP→SC model instead, substitute `MpmcRing` for `SpscRing` in both
-commands above (`pcal.trans formal/MpmcRing.tla`, then
-`tlc2.TLC -config formal/MpmcRing.cfg formal/MpmcRing.tla`).
+To check the MP→SC or SP→MC model instead, substitute `MpmcRing` or `SpmcRing`
+for `SpscRing` in both commands above (e.g. `pcal.trans formal/SpmcRing.tla`,
+then `tlc2.TLC -config formal/SpmcRing.cfg formal/SpmcRing.tla`).
 
 ---
 
@@ -277,3 +284,85 @@ upholds the safety invariants — exactly the split the SPSC work used (the `.tl
 proves the safe protocol; the runnable fuzzer explores the broken-ordering
 variants). The Stage-1 in-CI fuzzer `tests/MpmcRing.interleaving.test.ts` will
 carry the mechanical bounded-step wait-free witness (`INV-W`).
+
+---
+
+## SP→MC model (`SpmcRing`) — Apollo Frontier 3, Stage 4.0
+
+`SpmcRing.tla` / `SpmcRing.cfg` model the **additive** single-producer /
+multi-consumer **broadcast** ring (the second single-edge primitive of Apollo
+Frontier 3, shipped as the Stage 4.0 correctness artifact in 0.9.910). It is the
+sibling of the SPSC and MP→SC models; **both of those and their wire formats are
+frozen and untouched** (the frontier's decision 1). Full context:
+[`../docs/frontier3-stage4-spmc-fanout-handoff.md`](../docs/frontier3-stage4-spmc-fanout-handoff.md)
+and the written proof
+[`../docs/spmc-happens-before-proof.md`](../docs/spmc-happens-before-proof.md).
+
+### What is modeled
+
+The **sound design** Stage 4.0 settled on — **Policy P1 (lap-freely + the
+per-consumer seqlock guard)**:
+
+- **One in-order producer** writes tickets 0,1,2,… and **laps the ring freely** —
+  it never reads consumer cursors, so a stuck consumer can never back-pressure
+  the source (the audio-correct property). There is no fetch-add and no envelope;
+  the producer side is the *easy* side (the hard problem moved consumer-side).
+- **Two-phase seqlock publish:** each frame is bracketed by two per-slot
+  generation release-stores — `Busy(T)` (odd) **before** the payload write and
+  `Complete(T)` (even) **after**. The generation encodes BOTH the ticket identity
+  AND a busy/complete bit (`Complete(T)=2·T`, `Busy(T)=2·T+1`), so the consumer's
+  gate distinguishes "my head is in progress" (`d == 1`) from "the slot was
+  reused by a later lap" (`d ≥ 2`).
+- **Many independent consumers**, each owning a cursor, read a slot with a
+  **double-check**: gate (`SignedDiff(gen, 2·head) == 0`) → read payload → **re-read**
+  gen; deliver only if the generation is unchanged, else discard the (possibly
+  torn) frame as a **counted** drop. A per-consumer high-water `W`-skip + the
+  `d ≥ 2` lapped-skip are the overload net (unreachable when the consumer keeps
+  within `CAPACITY` of the frontier).
+
+The wrap algebra (`SignedDiff` / `Slot` / `Incr`) is reused verbatim; the seqlock
+adds the `Complete`/`Busy` encoding at `2·ticket`, so the unambiguous signed-wrap
+window halves — `CAP2_32 > 4·CAPACITY` (vs MP→SC's `> 2·CAPACITY`), enforced by an
+`ASSUME`.
+
+### Invariants & properties
+
+| Name | Meaning |
+|---|---|
+| `NoTornRead` | type-correctness of the `slotOwner` ghost; the load-bearing torn-read check is the `assert ~cDirty[self]` in the consumer's Commit step — a delivery (recheck passed) never had a concurrent overwrite touch its slot (per consumer, seqlock-validated). |
+| `PerConsumerFifo` | `∀c: SignedDiff(dequeuePos[c], 0) = delivered[c] + dropped[c]` — each consumer accounts tickets 0,1,2,… in order, each once, partitioned into delivered vs counted-dropped (no gap, no duplication). |
+| `Conservation` | `∀c: delivered[c] + dropped[c] ≤ committed`. |
+| broadcast consistency / no-wrong-frame | witnessed by `assert cRead[self] = Mod(D)` in the Commit step: a delivered ticket carries exactly the producer's bytes for that ticket, so any two consumers delivering `T` deliver the same bytes. |
+| `EventuallyDrained` / `HeadProgress` (liveness) | every committed frame is eventually accounted by **every** consumer; no consumer stalls and none back-pressures the producer (requires `WF_vars` on all processes, emitted by `fair process`). |
+
+Expected result under the default `CONSUMERS=2, CAPACITY=2, CAP2_32=16,
+MAXFRAMES=4` session: all three state invariants hold, both `assert`s hold, both
+liveness properties hold, no deadlock. Re-run with `CONSUMERS=3` (and/or
+`MAXFRAMES=5,6`) to widen the fan-out; with `CAPACITY=4` set `CAP2_32=32`.
+
+### Why two-phase, not single-store (the Stage-4.0 finding)
+
+The handoff's producer **sketch** showed a **single** generation release-store,
+*after* the payload, with no busy marker. The Stage-4.0 runnable probe
+([`../bench/spmc-probe.mjs`](../bench/spmc-probe.mjs)) **exhaustively** explored
+that variant and found it **unsound**: while the producer overwrites a slot for
+the next lap, the generation still holds `Complete(D)` (the bump comes only after
+the bytes), so a consumer one lap behind reads `seq1 = Complete(D)`, reads torn
+payload, and its re-read sees `seq2 = seq1` **still** → the guard passes → torn
+bytes delivered. The probe also shows that dropping the re-read tears even with
+the correct two-phase producer. So **both** halves are load-bearing — the
+`Busy(T)` marker *before* the payload (so an overwrite is visible in the
+generation before the bytes move) AND the consumer re-read (so the consumer
+checks it).
+
+This mirrors MP→SC's Stage-0 finding in shape (a generation stamp protects the
+*index*, not the *bytes*, unless it moves *before* the bytes are touched) and the
+SPSC/MP→SC split in method: the probe is the better tool for *finding* the
+unsound interleavings (it reports a concrete witness trace); this TLA model is the
+offline cross-check that the **sound** two-phase design upholds the safety
+invariants. The decision (P1 over P2 — keep the producer decoupled; document P2,
+the envelope-against-the-slowest mode, as an optional lossless mode only) is
+recorded in the proof note. The Stage-4.1 in-CI fuzzer
+`tests/SpmcRing.interleaving.test.ts` will carry the mechanical bounded-step
+wait-free witness (`INV-W`) plus the negative pins (single-store ⇒ torn;
+no-recheck ⇒ torn).
