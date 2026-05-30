@@ -4,6 +4,99 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.911] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 4.1: the `SpmcRing` primitive (wait-free SP→MC broadcast fan-out)
+
+The first production code of the SP→MC broadcast edge — the **second
+single-edge primitive** of the frontier (after `MpmcRing`@0.9.907). It implements
+exactly the **Policy P1 (lap-freely + the two-phase seqlock guard)** design Stage
+4.0 (0.9.910) modeled, proved, and probed. One producer, N consumers; every
+consumer sees every frame through its own cursor; the producer is fully decoupled
+(never reads consumer cursors → a stuck consumer never back-pressures the source).
+
+- **`src/SpmcRing.ts`** — the wait-free SP→MC broadcast ring with its OWN SAB
+  layout (header + per-consumer cursor/dropped/tornGuarded region + per-slot
+  generation region + payload), entirely separate from the frozen `SpscRing` AND
+  `MpmcRing` (neither is touched). **Producer `push`** (single writer, laps
+  freely, ALWAYS succeeds): `Atomics.store(gen[slot], Busy(T))` **before** the
+  payload write → write payload → `Atomics.store(gen[slot], Complete(T))` after →
+  plain-advance `writeTicket` — a TWO-PHASE seqlock, no fetch-add, no CAS, no
+  scan of consumer cursors. **Consumer `pull(out, consumerIndex)`** (per consumer,
+  O(1)): gate `d = signedDiff(seq1, 2·D)` (`d==0` candidate, `d==1` busy-head
+  ride, `d<0` not-written ride, `d≥2` lapped-skip) → read payload → **re-read**
+  `seq2`; deliver iff `seq2===seq1`, else counted `tornGuarded` drop (never
+  delivers torn bytes). The generation lane is a seqlock in DOUBLED units
+  (`Complete(T)=2·T`, `Busy(T)=2·T+1`); cursors stay in ticket units. Per-consumer
+  W-skip overload net (counted, freshness-preserving loss). Hard wait-free both
+  sides (no `Atomics.wait` on any path). `consumerCount` fixed at allocation
+  (sizes the per-consumer region; max 64, validated, mirrors `MpmcRing`'s
+  `producerCount`); each consumer mounts with a `consumerIndex`. **Internal-first
+  + `@experimental`** (mirrors `SpscRing` internal@0.6.8 → public@0.6.10 and
+  `MpmcRing`'s pending promotion): exported only from the
+  `webgpu-audio-bridge/experimental` subpath, NOT from `src/index.ts`; a one-shot
+  construction `console.warn` fires.
+- **`tests/SpmcRing.interleaving.test.ts`** — THE load-bearing proof: the
+  in-CI successor to `bench/spmc-probe.mjs`, a loom/relacy-style EXHAUSTIVE
+  interleaving explorer (1 producer + C consumers, every interleaving walked once
+  via a visited-set). Asserts **INV-1** no torn read (per consumer,
+  seqlock-validated), **INV-2** per-consumer counted-drop conservation (no stall),
+  **INV-3** per-consumer FIFO-by-ticket + broadcast consistency, and **INV-W** the
+  wait-free witness (`maxConsumerSteps === 1`, `maxProducerSteps === 1` — O(1)
+  both sides) across `NC=1..3 × C=2,4`. Plus the two NEGATIVE pins: `twoPhase=false`
+  (single-store sketch) ⇒ a torn interleaving MUST be produced (the Busy marker is
+  necessary); `recheck=false` ⇒ torn (the re-read is necessary).
+- **`tests/SpmcRing.test.ts`** — 10 single-thread API pins: byteLength/create +
+  layout sanity, construction guards (capacity / consumerCount / consumerIndex /
+  SAB size), push/pull bit-exact across every FieldKind + arrays, broadcast (N
+  consumers each see every frame, independent cursors), slow-consumer counted-drop
+  via the overload net while a fast consumer keeps up, head-not-written ride,
+  busy-ride (`d==1`), lapped-skip (`d≥2`), peer mount (bare ctor does not re-init),
+  observers + bound-`consumerIndex` default + out-of-range guards.
+- **`tests/SpmcRing.concurrent.test.ts`** — real `worker_threads` stress with the
+  ROLE FLIP vs `MpmcRing.concurrent`: the REAL `SpmcRing` PRODUCER on the main
+  thread, N inline-eval CONSUMER workers each reimplementing the seqlock
+  double-check dequeue byte-faithfully over the SAB. 3 consumers × 1 M frames
+  each, every delivered frame verified bit-exact + per-consumer FIFO; reconciled
+  `delivered === COUNT`, `dropped === 0`, `tornGuarded === 0` in the correctly-sized
+  (test-paced) no-lap regime. Reuses `tests/_mpmcStress.ts`.
+
+### Why — implement the proven design, pin it three ways
+
+Stage 4.0 settled the torn-read window (the single-store seqlock sketch tears; the
+two-phase seqlock is sound). Stage 4.1 builds exactly that and proves it the way
+`MpmcRing` was: an exhaustive in-CI fuzzer (every interleaving, with the
+bounded-step wait-free witness AND the negative pins that make both halves of the
+seqlock load-bearing), plus a real cross-thread stress as the model-drift
+cross-check (the 0.9.901 lesson — keep BOTH; neither alone suffices). The producer
+stays decoupled (the audio-correct property); a consumer that falls behind drops
+oldest (counted, per consumer), never tears, never blocks the producer or its peers.
+
+### Wire compatibility
+
+New additive primitive with its **own** SAB layout. **`SpscRing`, `MpmcRing`, and
+both their wire formats / `.tla` models are untouched** — the SPSC 1.0
+settled-protocol promise and the experimental MP→SC format both stand. The SP→MC
+broadcast wire format is **outside the 1.0 stability contract** until it soaks and
+promotes (the `webgpu-audio-bridge/experimental` subpath; one-shot construction
+warning). No root-surface change.
+
+### Tests
+
+`npm run typecheck` clean. Full suite green, now including the three new SpmcRing
+suites (interleaving fuzzer · single-thread API pins · cross-thread stress;
+registered in `test` / `test:unit` / `test:concurrent`). `npm run bench` core
+cells (`push` / `pull` / `pullLatest`) within the 10 µs budget — SP→MC is a
+separate code path, the SPSC numbers are unchanged.
+
+### Documentation
+
+`README.md` gains an "Experimental SP→MC broadcast — `SpmcRing`" section beside the
+MP→SC `connectFanIn()` one. `ROADMAP.md` Frontier 3 narrative + the descending
+`0.9.9x` table updated (Stage 4.1 shipped). `CLAUDE.md` "What lives where" gains
+the `src/SpmcRing.ts` + test-suite inventory entries. `src/experimental/index.ts`
+exports `SpmcRing` / `SPMC_HEADER_BYTES` / `SpmcRingOptions`.
+
 ## [0.9.910] — 2026-05-30
 
 ### Added — Apollo Frontier 3, Stage 4.0: SP→MC broadcast ring — formal model + happens-before proof + algorithm probe (NO production code)

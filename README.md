@@ -2165,6 +2165,29 @@ Under flood the ring drops newest (counted in `droppedFrames()`) and **never tea
 
 > **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectFanIn`/`mountFanIn`/`MpmcRing` may break across PATCH releases until the MP→SC primitive promotes to the root. Constructing an `MpmcRing` emits a one-shot `console.warn`.
 
+### Experimental SP→MC broadcast — `SpmcRing` (0.9.911)
+
+The mirror of the fan-in edge: one producer, **N consumers, every consumer sees every frame** (the audio *splitter* — one source feeding N voices/effects, each needing the full stream). `SpmcRing` is the wait-free primitive with its own SAB layout (the frozen `SpscRing` and `MpmcRing` cores are never touched). It ships from the **`webgpu-audio-bridge/experimental`** subpath while the SP→MC wire format soaks. (The declarative `connectFanOut()` constructor over it is the next stage; for now you wire the ring directly.)
+
+```ts
+import { SpmcRing } from "webgpu-audio-bridge/experimental";
+
+// Allocating thread — allocate ONCE, fixed consumer count.
+const { ring: producer, sab } = SpmcRing.create(schema, 1024, { consumerCount: 3 });
+
+// Each consumer thread reconstructs the SAME SAB via the bare ctor (no re-init),
+// bound to its own consumerIndex ∈ [0, consumerCount).
+const c0 = new SpmcRing(sab, schema, 1024, { consumerCount: 3, consumerIndex: 0 });
+
+producer.push(frame);          // single writer, laps freely, ALWAYS succeeds
+const out = c0.createFrame();
+c0.pull(out);                  // this consumer's own cursor; never delivers torn bytes
+```
+
+The hard problem moved with the role flip. MP→SC's danger was producer-side (concurrent claims tearing a slot → the envelope); SP→MC's is **consumer-side** — a slow consumer mid-reading a slot while the decoupled producer laps and overwrites it. The defense is a **two-phase seqlock**: the producer brackets every payload write between a `Busy(T)` and a `Complete(T)` per-slot generation release-store, and each consumer double-checks (read generation → read payload → re-read generation; deliver only if unchanged, else a counted `tornGuarded` drop). Both halves are load-bearing — proven exhaustively by `tests/SpmcRing.interleaving.test.ts` (every interleaving, the wait-free witness, and negative pins where dropping either half tears). The producer **never reads consumer cursors**, so a stuck consumer drops oldest (counted, per consumer) and never back-pressures the source or its peers.
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `SpmcRing` may break across PATCH releases until the SP→MC broadcast primitive promotes to the root. Constructing a `SpmcRing` emits a one-shot `console.warn`.
+
 ## What this is, and what it isn't
 
 **This is, and remains, an SAB-first library.** Turbo mode (`Bridge<S>` over `SharedArrayBuffer` + `Atomics`) is the canonical path. The 0.8.x `MessageChannelBridge<S>` is a deliberate explicit second tier with documented worse latency — **not a transparent fallback**. The library will never auto-detect the user's environment and silently pick a transport for them; the choice between `Bridge<S>` and `MessageChannelBridge<S>` is explicit at construction time. See [Two transport tiers](#two-transport-tiers-070) for the framing, [Browser support matrix](#browser-support-matrix) for what works where, and the §FAQ entry "Will the library add a transparent fallback?" (0.7.9) for the long-form answer.

@@ -71,3 +71,17 @@ export type {
   FanInRole,
   MountFanInOptions,
 } from "../connectFanIn.js";
+
+// ── SpmcRing (0.9.911) ──────────────────────────────────────────────────────
+//
+// Apollo Frontier 3's wait-free SP→MC (single-producer, multi-consumer)
+// BROADCAST fan-out edge (Stage 4.1) — one producer, N consumers, every consumer
+// sees every frame through its own cursor. The second single-edge primitive
+// (after MpmcRing). Internal-first + `@experimental`: its SP→MC broadcast wire
+// format is OUTSIDE the 1.0 stability contract until it soaks + promotes
+// (mirrors SpscRing internal@0.6.8 → public@0.6.10, MpmcRing's pending
+// promotion); a one-shot construction warning fires. The `connectFanOut()`
+// topology constructor over it is Stage 4.3. See
+// docs/frontier3-stage4.1-spmc-primitive-handoff.md.
+export { SpmcRing, SPMC_HEADER_BYTES } from "../SpmcRing.js";
+export type { SpmcRingOptions } from "../SpmcRing.js";
