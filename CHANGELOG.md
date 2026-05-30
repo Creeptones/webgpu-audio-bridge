@@ -4,6 +4,76 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.900] — 2026-05-30
+
+> **Patch renumber.** From this release the late-`0.9.x` run uses a **three-digit
+> patch** (`0.9.900 → 0.9.901 → … → 0.9.999`), reserving ~100 ordered checkpoints
+> on the road to `1.0.0`. `0.9.900` is the renumbered successor to what was briefly
+> tagged `0.9.90`; semver ordering holds (`900 > 89`). See `CLAUDE.md`.
+
+### Added — God-Node Stage 4: live cross-schema hot-swap demo + runtime read-path regeneration (Frontier 4, capstone)
+
+Stages 1–3 shipped the *planning* layer of the LLM-free live hot-swap:
+`crossfadeWeight`/`crossfadeInto` (0.9.87), `HotSwapConsumer` (0.9.88), and
+`migratePlan` (0.9.89). Stage 4 is the capstone that composes all three
+end-to-end **on the audio thread** and closes the self-rewriting loop: the
+bridge **regenerates the new patch's read path at runtime, from its schema,
+while audio plays**, and crossfades into it without a click.
+
+#### What shipped
+
+- **`examples/god-node-hotswap/`** — a browser demo (+ `npm run
+  dev:god-node-hotswap`, port **5183**). Two **different-schema** patches stream
+  side by side: A = `{ freq(traj), amp }`, B = `{ freq(traj), amp, res, detune }`.
+  "Morph to B" performs a click-free cross-schema swap:
+  - `HotSwapConsumer` holds both bridges, reconstructs each per quantum via
+    `pullHermiteLatest`, runs the `idle → priming → fading → complete` state
+    machine, and anchors the fade window to **b-ready** (not arm-time).
+  - The weight is the C² (quintic) `crossfadeWeight`, read **per sample** via
+    `weightAt` for a sample-accurate seam; the blend is `crossfadeInto`'s
+    equal-power law (A and B are distinct timbres → uncorrelated).
+  - `migratePlan(A, B)` is computed on the main thread, shown in the UI, and
+    **executed** in the worklet: the new `res`/`detune` fields ramp in from their
+    plan default (0) → B's value across the same window, so B's colour eases in
+    rather than popping. This is the first real *executor* of a migration plan.
+- **Runtime regeneration (the self-rewriting headline).** At button-press the
+  page emits patch B's **entire AudioWorklet module from its schema**
+  (`emitWorkletProcessorModule`), Blobs it (`toWorkletModuleURL`), and
+  `addModule`s it **live** into the running `AudioContext` — a brand-new read
+  path materialized into the audio realm while sound plays — then runs it
+  decoding B's live ring in real time (verified bit-exact headlessly against
+  `Bridge.pull` via the existing `captureProbe` oracle; demonstrated live in the
+  browser by the demo). Each morph materializes a freshly-named processor, so the
+  "regenerated at runtime" story is literal across repeated swaps.
+
+#### Design findings (from the Stage-4 probe + browser smoke-test)
+
+- **The fade must anchor to b-ready, surfaced again.** Driving both rings from
+  the producer throughout means B is primed within a couple of control periods,
+  so the window opens promptly — the crossfade window IS the two-ring overlap.
+- **Retiring A is observable as back-pressure.** Once the swap completes the
+  consumer stops draining ring A, so A's ring fills and the producer's A-pushes
+  reject. The demo's producer-rate diagnostic measures ring B (the patch that
+  stays live) to avoid reading a frozen `pushedA` as "0 Hz" post-complete.
+
+### Tests
+
+No new pins — Stage 4 is an example + a `dev:*` script (no new public surface).
+The runtime-regeneration bit-exactness it rests on is already pinned by
+`tests/captureProbe.test.ts` (`Bridge.pull` vs `emitWorkletReader`), and the
+composed pieces by `tests/Bridge.crossfade.test.ts` / `Bridge.hotswap.test.ts` /
+`Bridge.migrate.test.ts`. Full suite + bench re-run green before the bump.
+
+### Wire compatibility
+
+Example + dev-script only — **no wire / SAB / protocol change**, no public-API
+change. Nothing added to `src/` or `src/index.ts`.
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.900 row; README hot-swap section gains a Stage-4
+subsection (runtime regeneration + the demo).
+
 ## [0.9.89] — 2026-05-30
 
 ### Added — `migratePlan`: cross-schema hot-swap field planner (God-Node Frontier 4, Stage 3)

@@ -33,6 +33,8 @@ The minor-bump triggers remain unchanged from the 0.6.x rule (wire-format change
 
 If a session is genuinely unsure whether the change warrants a minor bump under this stricter rule, default to the patch bump and let the user promote later — same asymmetry as the original 0.6.x rule.
 
+**Three-digit patch in the late `0.9.x` run (post-0.9.900 policy update).** Starting at **`0.9.900`** the patch field is **three digits**: `0.9.900 → 0.9.901 → … → 0.9.999`. This is a deliberate decision to reserve ~100 ordered checkpoints between here and `1.0.0`, so the long final-polish run toward 1.0 has room to land one patch per shipped improvement without ever feeling pressure to promote early. (`0.9.900` is the renumbered successor to the briefly-tagged `0.9.90`; semver ordering is preserved because `900 > 89 > 9`.) The next patch after `0.9.900` is **`0.9.901`**, not `0.9.91`. The minor-bump triggers are unchanged — `1.0.0` is still the deliberate stability commitment, reached when the API is settled, not when the patch counter happens to approach `999`. If `0.9.999` is reached before 1.0 is ready, widen again (`0.9.9990`) rather than forcing a premature `1.0.0`.
+
 ## Commit policy
 
 - Each release-grade change gets its own commit with a multi-line message (subject line names the version + tagline; body describes what shipped, why, and any wire-compat notes).

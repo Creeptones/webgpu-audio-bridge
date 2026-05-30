@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — God-Node live hot-swap (cross-schema, runtime-regenerated)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 860px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #morph { background: #7a3df4; }
+      #morph:hover:not(:disabled) { background: #9355ff; }
+      label { display: block; margin: 12px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; }
+      .wbarwrap { height: 14px; background: #101218; border: 1px solid #21252d; border-radius: 7px; overflow: hidden; margin: 8px 0; }
+      .wbar { height: 100%; width: 0%; background: #2b3550; transition: width 60ms linear; }
+      .wbar.fade { background: linear-gradient(90deg, #7a3df4, #c79bff); }
+      .wbar.done { background: #2f7a55; }
+      .plan { display: grid; gap: 4px; }
+      .prow { display: grid; grid-template-columns: 92px 70px 1fr; gap: 8px; font-size: 12px; align-items: baseline; }
+      .pk { font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; font-size: 10px; padding: 2px 6px; border-radius: 4px; text-align: center; }
+      .pk.xf { background: #14342a; color: #5bd1a0; } .pk.ri { background: #2e2440; color: #c79bff; } .pk.dr { background: #3a2222; color: #ff9b9b; }
+      .pn { color: #e7eaee; } .pd { color: #8893a0; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — God-Node live hot-swap</h1>
+    <p>
+      Two <strong>different-schema</strong> patches stream side by side. Patch <strong>A</strong> is
+      <code>{ freq(traj), amp }</code> — a bare carrier. Patch <strong>B</strong> is
+      <code>{ freq(traj), amp, res, detune }</code> — the same pitch motion, plus resonance and detune for a
+      richer timbre. Press <strong>Morph to B</strong> and the consumer crossfades A→B over
+      <code>~180&nbsp;ms</code> on the audio clock with a <strong>C² (quintic) click-free seam</strong>, while
+      the new <code>res</code>/<code>detune</code> fields <em>ramp in</em> from their defaults — exactly the plan
+      <code>migratePlan(A,&nbsp;B)</code> computes (shown below).
+    </p>
+    <p>
+      The morph also performs the self-rewriting proof: at button-press the page <strong>emits patch&nbsp;B's
+      entire AudioWorklet module from its schema</strong> (<code>emitWorkletProcessorModule</code>), Blobs it
+      (<code>toWorkletModuleURL</code>), and <code>addModule</code>s it <strong>live</strong> — a brand-new read
+      path materialized into the audio realm while sound is playing, then shown decoding B's ring in real time.
+    </p>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="morph" disabled>Morph to B ⟶</button>
+    <button id="reset" disabled>Reset</button>
+
+    <h2>Crossfade weight (audio clock)</h2>
+    <div class="wbarwrap"><div id="wbar" class="wbar"></div></div>
+
+    <h2>migratePlan(A → B)</h2>
+    <div id="plan" class="plan panel"></div>
+
+    <h2>Runtime regeneration (Stage 4)</h2>
+    <div id="regen" class="panel"></div>
+
+    <h2>Producer controls</h2>
+    <div class="grid">
+      <div>
+        <label for="carrier">carrier <span class="val" id="carrier-val"></span> Hz</label>
+        <input id="carrier" type="range" min="80" max="440" step="1" value="220" />
+      </div>
+      <div>
+        <label for="depth">FM depth <span class="val" id="depth-val"></span> Hz</label>
+        <input id="depth" type="range" min="0" max="240" step="1" value="80" />
+      </div>
+      <div>
+        <label for="lfoHz">LFO rate <span class="val" id="lfoHz-val"></span> Hz</label>
+        <input id="lfoHz" type="range" min="0.5" max="16" step="0.5" value="5" />
+      </div>
+      <div>
+        <label for="controlHz">control rate <span class="val" id="controlHz-val"></span> Hz</label>
+        <input id="controlHz" type="range" min="24" max="120" step="1" value="60" />
+      </div>
+      <div>
+        <label for="res">B resonance <span class="val" id="res-val"></span></label>
+        <input id="res" type="range" min="0" max="1" step="0.01" value="0.85" />
+      </div>
+      <div>
+        <label for="detune">B detune <span class="val" id="detune-val"></span> Hz</label>
+        <input id="detune" type="range" min="0" max="20" step="0.5" value="8" />
+      </div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>. Composes
+      <code>crossfadeWeight</code>/<code>crossfadeInto</code> (0.9.87), <code>HotSwapConsumer</code> (0.9.88),
+      <code>migratePlan</code> (0.9.89), and the emit trio (runtime regeneration).
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
