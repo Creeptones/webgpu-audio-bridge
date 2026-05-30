@@ -4,6 +4,58 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.903] — 2026-05-30
+
+### Added — WASM scalar `StatePredictor` kernels (Apollo Frontier 2 — Stage 3 of 4)
+
+Ports the 0.9.901 `StatePredictor` per-lane Kalman math to **hand-written WASM**
+(`wasm/decoder.wat`), so the worklet decode path can run the predictor without
+re-entering JS — the same Phase-I cadence the Hermite evaluators followed
+(0.9.82). **Bit-exact** to the JS reference (left-to-right f64, no implicit FMA),
+which makes the JS path the golden the f32 SIMD port (0.9.904) is validated
+against.
+
+#### What shipped
+
+- **Four new WAT exports** surfaced on `WorkletConsumer`: `kalmanIngestCvF64` /
+  `kalmanPredictCvF64` (2-state CV) and `kalmanIngestCaF64` / `kalmanPredictCaF64`
+  (3-state CA). They operate on caller-laid-out f64 state in linear memory — `x[]`
+  (laneCount × m), `P[]` (laneCount × m·m row-major), the `pos`/`vel`/`acc`
+  measurement lanes, the `val`/`var` output lanes, and a small caller-owned
+  `2·m`-f64 scratch reused per lane for the sequential update's K/row vectors.
+- **Shared generic update kernel.** The sequential scalar measurement update
+  (`y = z − x[idx]; S = P[idx][idx] + r; K = P[:,idx]/S; x += K·y; P −= K·P[idx,:]`)
+  is one looped WAT helper generic over `m`, called by both models — no matrix
+  inversion, just a scalar divide, exactly mirroring `StatePredictor._updateScalar`.
+  The covariance propagation (`F P Fᵀ + Q`) is a per-model closed form
+  reproducing `_propagateCV` / `_propagateCA`'s exact operation order.
+
+### Tests
+
+- New **`tests/StatePredictor.wasm.test.ts`** (3 pins; registered in both `test`
+  and `test:unit`): drives a JS `StatePredictor` and the WASM kernels with
+  IDENTICAL seeds, noisy/curved measurement traces, and `dt`s for 25 frames, and
+  asserts the predicted value AND variance match **bit-exact** (`assertEq`, zero
+  tolerance) every lane every frame — for CV, CA, and the position-only (no
+  stamped velocity) case. A perfect end-to-end match of both the state-mean-
+  dependent value and the covariance-dependent variance over many ingest+predict
+  cycles transitively proves the in-memory state evolution matches without
+  exposing `P`. Skips cleanly if the runtime lacks WASM SIMD/threads.
+- Full suite green (incl. the 1 M-frame concurrent stress, no flake); bench
+  unchanged (core pulls 1.30 µs; the JS `pullKalmanPredict` cell still ~3.2 µs —
+  the WASM path is surfaced for the worklet, the SIMD win lands in 0.9.904).
+
+### Wire compatibility
+
+None affected. Additive WASM exports on the `/worklet` subpath (~1 KB binary
+growth) + their typed `WorkletConsumer` wrappers. No SAB layout, wire-format,
+protocol, or public-API break.
+
+### Documentation
+
+- README `StatePredictor` subsection notes the WASM scalar port shipped.
+- ROADMAP row above 0.9.902.
+
 ## [0.9.902] — 2026-05-30
 
 ### Added — `Bridge.pullKalmanPredictedLatest`: the predictor wired to the ring (Apollo Frontier 2 — Stage 2 of 4)

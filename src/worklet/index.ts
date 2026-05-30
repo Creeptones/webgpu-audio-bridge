@@ -543,6 +543,35 @@ export interface WorkletConsumer {
   evalTaylorF64O2ClampedSimd(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
   evalTaylorF32O2ClampedSimd(srcOffset: number, dstOffset: number, n: number, dt: number, vClamp: number): void;
 
+  /** StatePredictor (classical Kalman) scalar kernels (0.9.903) — the WASM port
+   *  of `src/StatePredictor.ts`, operating on caller-laid-out f64 state in linear
+   *  memory, **bit-exact** to the JS reference (left-to-right f64, no implicit
+   *  FMA). Layout per lane: `x[]` = laneCount × m f64 (m=2 cv / 3 ca) at
+   *  `xOff + i·m·8`; `P[]` = laneCount × m·m f64 row-major at `pOff + i·m·m·8`;
+   *  `pos`/`vel`/`acc`/`val`/`var` = laneCount f64 at `*Off + i·8`. `scratch` is a
+   *  caller-owned `2·m`-f64 region reused per lane for the sequential update's
+   *  K/row.
+   *
+   *  `kalmanIngestCvF64` fuses one frame (propagate if `dt>0`, then a position +
+   *  optional velocity scalar update); `kalmanPredictCvF64` renders value + variance
+   *  forward (read-only on x/P). The CA (3-state) kernels are `kalmanIngestCaF64` /
+   *  `kalmanPredictCaF64`. */
+  kalmanIngestCvF64(
+    xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, useVel: number, scratch: number,
+  ): void;
+  kalmanPredictCvF64(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
+  kalmanIngestCaF64(
+    xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, ra: number,
+    useVel: number, useAcc: number, scratch: number,
+  ): void;
+  kalmanPredictCaF64(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
+
   /** Descriptor-driven whole-frame decode (0.9.74). Decodes an ENTIRE frame
    *  in ONE call by looping over a pre-built descriptor table (one
    *  `memory.copy` per field, slot → scratch). This is the hot-path frame
@@ -682,6 +711,21 @@ export function instantiateConsumer(
     readonly eval_taylor_f32_o3_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number, ac: number) => void;
     readonly eval_taylor_f64_o2_clamped_simd: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
     readonly eval_taylor_f32_o2_clamped_simd: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
+    readonly kalman_ingest_cv_f64: (
+      xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, useVel: number, scratch: number,
+    ) => void;
+    readonly kalman_predict_cv_f64: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
+    readonly kalman_ingest_ca_f64: (
+      xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, ra: number,
+      useVel: number, useAcc: number, scratch: number,
+    ) => void;
+    readonly kalman_predict_ca_f64: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -734,6 +778,10 @@ export function instantiateConsumer(
     "eval_taylor_f32_o3_clamped",
     "eval_taylor_f64_o2_clamped_simd",
     "eval_taylor_f32_o2_clamped_simd",
+    "kalman_ingest_cv_f64",
+    "kalman_predict_cv_f64",
+    "kalman_ingest_ca_f64",
+    "kalman_predict_ca_f64",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -828,6 +876,14 @@ export function instantiateConsumer(
       exports.eval_taylor_f64_o2_clamped_simd(srcOff, dstOff, n, dt, vc),
     evalTaylorF32O2ClampedSimd: (srcOff, dstOff, n, dt, vc) =>
       exports.eval_taylor_f32_o2_clamped_simd(srcOff, dstOff, n, dt, vc),
+    kalmanIngestCvF64: (xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, scratch) =>
+      exports.kalman_ingest_cv_f64(xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, scratch),
+    kalmanPredictCvF64: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_cv_f64(xOff, pOff, valOff, varOff, n, dt, q),
+    kalmanIngestCaF64: (xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, scratch) =>
+      exports.kalman_ingest_ca_f64(xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, scratch),
+    kalmanPredictCaF64: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_ca_f64(xOff, pOff, valOff, varOff, n, dt, q),
   };
 }
 

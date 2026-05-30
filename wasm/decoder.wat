@@ -2577,4 +2577,333 @@
         local.get $dstP i32.const 4 i32.add local.set $dstP
         br $tailLoop
       end
-    end))
+    end)
+
+  ;; ─── StatePredictor (classical Kalman) scalar kernels (0.9.903) ─────────
+  ;;
+  ;; WASM scalar port of src/StatePredictor.ts (Apollo Frontier 2). Operates on
+  ;; caller-laid-out f64 state in linear memory, bit-exact (left-to-right f64,
+  ;; no implicit FMA) to the JS reference so the SIMD port (0.9.904) can be
+  ;; validated against either. Memory layout per lane:
+  ;;   x[] : laneCount × m f64  (m = 2 cv, 3 ca), lane i at xOff + i*m*8
+  ;;   P[] : laneCount × m*m f64 (row-major), lane i at pOff + i*m*m*8
+  ;;   pos/vel/acc/val/var : laneCount f64, lane i at *Off + i*8
+  ;;   scratch : 2*m f64 (K[0..m) then row[0..m)) — caller-owned, reused per lane
+  ;;
+  ;; Sequential scalar measurement update for ONE lane at state index idx
+  ;; (diagonal R): y = z − x[idx]; S = P[idx][idx] + r; K = P[:,idx]/S;
+  ;; x += K·y; P −= K·P[idx,:]. Generic over m via the scratch K/row buffers —
+  ;; identical op order to StatePredictor._updateScalar.
+  (func $kalman_update
+        (param $xLane i32) (param $pLane i32) (param $m i32) (param $idx i32)
+        (param $z f64) (param $r f64) (param $scratch i32)
+    (local $i i32) (local $j i32)
+    (local $S f64) (local $y f64) (local $ki f64) (local $rowj f64)
+    (local $mBytes i32) (local $off i32) (local $kOff i32) (local $rowOff i32)
+    (local.set $mBytes (i32.shl (local.get $m) (i32.const 3)))
+    (local.set $kOff (local.get $scratch))
+    (local.set $rowOff (i32.add (local.get $scratch) (local.get $mBytes)))
+    ;; S = P[idx*m+idx] + r
+    (local.set $off
+      (i32.add (local.get $pLane)
+        (i32.shl (i32.add (i32.mul (local.get $idx) (local.get $m)) (local.get $idx)) (i32.const 3))))
+    (local.set $S (f64.add (f64.load align=1 (local.get $off)) (local.get $r)))
+    ;; y = z - x[idx]
+    (local.set $y
+      (f64.sub (local.get $z)
+        (f64.load align=1 (i32.add (local.get $xLane) (i32.shl (local.get $idx) (i32.const 3))))))
+    ;; K[i] = P[i*m+idx]/S  -> scratch
+    (local.set $i (i32.const 0))
+    (block $ke (loop $kl
+      (br_if $ke (i32.ge_u (local.get $i) (local.get $m)))
+      (f64.store align=1
+        (i32.add (local.get $kOff) (i32.shl (local.get $i) (i32.const 3)))
+        (f64.div
+          (f64.load align=1
+            (i32.add (local.get $pLane)
+              (i32.shl (i32.add (i32.mul (local.get $i) (local.get $m)) (local.get $idx)) (i32.const 3))))
+          (local.get $S)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $kl)))
+    ;; x[i] += K[i]*y
+    (local.set $i (i32.const 0))
+    (block $xe (loop $xl
+      (br_if $xe (i32.ge_u (local.get $i) (local.get $m)))
+      (local.set $off (i32.add (local.get $xLane) (i32.shl (local.get $i) (i32.const 3))))
+      (local.set $ki (f64.load align=1 (i32.add (local.get $kOff) (i32.shl (local.get $i) (i32.const 3)))))
+      (f64.store align=1 (local.get $off)
+        (f64.add (f64.load align=1 (local.get $off)) (f64.mul (local.get $ki) (local.get $y))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $xl)))
+    ;; row[j] = P[idx*m+j]  -> scratch
+    (local.set $j (i32.const 0))
+    (block $re (loop $rl
+      (br_if $re (i32.ge_u (local.get $j) (local.get $m)))
+      (f64.store align=1
+        (i32.add (local.get $rowOff) (i32.shl (local.get $j) (i32.const 3)))
+        (f64.load align=1
+          (i32.add (local.get $pLane)
+            (i32.shl (i32.add (i32.mul (local.get $idx) (local.get $m)) (local.get $j)) (i32.const 3)))))
+      (local.set $j (i32.add (local.get $j) (i32.const 1)))
+      (br $rl)))
+    ;; P[i*m+j] -= K[i]*row[j]
+    (local.set $i (i32.const 0))
+    (block $pie (loop $pil
+      (br_if $pie (i32.ge_u (local.get $i) (local.get $m)))
+      (local.set $ki (f64.load align=1 (i32.add (local.get $kOff) (i32.shl (local.get $i) (i32.const 3)))))
+      (local.set $j (i32.const 0))
+      (block $pje (loop $pjl
+        (br_if $pje (i32.ge_u (local.get $j) (local.get $m)))
+        (local.set $rowj (f64.load align=1 (i32.add (local.get $rowOff) (i32.shl (local.get $j) (i32.const 3)))))
+        (local.set $off
+          (i32.add (local.get $pLane)
+            (i32.shl (i32.add (i32.mul (local.get $i) (local.get $m)) (local.get $j)) (i32.const 3))))
+        (f64.store align=1 (local.get $off)
+          (f64.sub (f64.load align=1 (local.get $off)) (f64.mul (local.get $ki) (local.get $rowj))))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $pjl)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $pil)))
+  )
+
+  ;; CV (m=2) covariance propagate for ONE lane: x ← Fx; P ← F P Fᵀ + Q,
+  ;; Q = q·[[dt³/3,dt²/2],[dt²/2,dt]]. Op order matches _propagateCV.
+  (func $kalman_propagate_cv (param $xLane i32) (param $pLane i32) (param $dt f64) (param $q f64)
+    (local $x0 f64) (local $x1 f64)
+    (local $p00 f64) (local $p01 f64) (local $p10 f64) (local $p11 f64)
+    (local $fp00 f64) (local $fp01 f64) (local $dt2 f64) (local $dt3 f64)
+    (local.set $x0 (f64.load align=1 (local.get $xLane)))
+    (local.set $x1 (f64.load align=1 (i32.add (local.get $xLane) (i32.const 8))))
+    (f64.store align=1 (local.get $xLane)
+      (f64.add (local.get $x0) (f64.mul (local.get $dt) (local.get $x1))))
+    (local.set $p00 (f64.load align=1 (local.get $pLane)))
+    (local.set $p01 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 8))))
+    (local.set $p10 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 16))))
+    (local.set $p11 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 24))))
+    (local.set $fp00 (f64.add (local.get $p00) (f64.mul (local.get $dt) (local.get $p10))))
+    (local.set $fp01 (f64.add (local.get $p01) (f64.mul (local.get $dt) (local.get $p11))))
+    (local.set $dt2 (f64.mul (local.get $dt) (local.get $dt)))
+    (local.set $dt3 (f64.mul (local.get $dt2) (local.get $dt)))
+    ;; P[0] = fp00 + dt*fp01 + q*dt3/3
+    (f64.store align=1 (local.get $pLane)
+      (f64.add
+        (f64.add (local.get $fp00) (f64.mul (local.get $dt) (local.get $fp01)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt3)) (f64.const 3))))
+    ;; P[1] = fp01 + q*dt2/2
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 8))
+      (f64.add (local.get $fp01) (f64.div (f64.mul (local.get $q) (local.get $dt2)) (f64.const 2))))
+    ;; P[2] = p10 + dt*p11 + q*dt2/2   (fp10=p10, fp11=p11)
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 16))
+      (f64.add
+        (f64.add (local.get $p10) (f64.mul (local.get $dt) (local.get $p11)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt2)) (f64.const 2))))
+    ;; P[3] = p11 + q*dt
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 24))
+      (f64.add (local.get $p11) (f64.mul (local.get $q) (local.get $dt))))
+  )
+
+  ;; CV ingest: per lane, propagate (if dt>0) then a position update and an
+  ;; optional velocity update. Mirrors StatePredictor.ingest for model "cv".
+  (func $kalman_ingest_cv_f64 (export "kalman_ingest_cv_f64")
+        (param $xOff i32) (param $pOff i32) (param $posOff i32) (param $velOff i32)
+        (param $n i32) (param $dt f64) (param $q f64) (param $rp f64) (param $rv f64)
+        (param $useVel i32) (param $scratch i32)
+    (local $i i32) (local $xLane i32) (local $pLane i32) (local $lo i32)
+    (local.set $i (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $xLane (i32.add (local.get $xOff) (i32.mul (local.get $i) (i32.const 16))))
+      (local.set $pLane (i32.add (local.get $pOff) (i32.mul (local.get $i) (i32.const 32))))
+      (local.set $lo (i32.shl (local.get $i) (i32.const 3)))
+      (if (f64.gt (local.get $dt) (f64.const 0))
+        (then (call $kalman_propagate_cv (local.get $xLane) (local.get $pLane) (local.get $dt) (local.get $q))))
+      (call $kalman_update (local.get $xLane) (local.get $pLane) (i32.const 2) (i32.const 0)
+        (f64.load align=1 (i32.add (local.get $posOff) (local.get $lo))) (local.get $rp) (local.get $scratch))
+      (if (local.get $useVel)
+        (then (call $kalman_update (local.get $xLane) (local.get $pLane) (i32.const 2) (i32.const 1)
+          (f64.load align=1 (i32.add (local.get $velOff) (local.get $lo))) (local.get $rv) (local.get $scratch))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+  )
+
+  ;; CV predict: per lane, value = p + dt·v ; variance = (F P Fᵀ)₀₀ + q·dt³/3.
+  ;; Read-only on x/P. Mirrors StatePredictor.predictInto for model "cv".
+  (func $kalman_predict_cv_f64 (export "kalman_predict_cv_f64")
+        (param $xOff i32) (param $pOff i32) (param $valOff i32) (param $varOff i32)
+        (param $n i32) (param $dt f64) (param $q f64)
+    (local $i i32) (local $xp i32) (local $pp i32)
+    (local $p00 f64) (local $p01 f64) (local $p10 f64) (local $p11 f64)
+    (local $fp0 f64) (local $fp1 f64)
+    (local.set $i (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $xp (i32.add (local.get $xOff) (i32.mul (local.get $i) (i32.const 16))))
+      (local.set $pp (i32.add (local.get $pOff) (i32.mul (local.get $i) (i32.const 32))))
+      ;; value = x0 + dt*x1
+      (f64.store align=1 (i32.add (local.get $valOff) (i32.shl (local.get $i) (i32.const 3)))
+        (f64.add (f64.load align=1 (local.get $xp))
+          (f64.mul (local.get $dt) (f64.load align=1 (i32.add (local.get $xp) (i32.const 8))))))
+      (local.set $p00 (f64.load align=1 (local.get $pp)))
+      (local.set $p01 (f64.load align=1 (i32.add (local.get $pp) (i32.const 8))))
+      (local.set $p10 (f64.load align=1 (i32.add (local.get $pp) (i32.const 16))))
+      (local.set $p11 (f64.load align=1 (i32.add (local.get $pp) (i32.const 24))))
+      (local.set $fp0 (f64.add (local.get $p00) (f64.mul (local.get $dt) (local.get $p10))))
+      (local.set $fp1 (f64.add (local.get $p01) (f64.mul (local.get $dt) (local.get $p11))))
+      ;; var = (fp0 + dt*fp1) + q*dt*dt*dt/3
+      (f64.store align=1 (i32.add (local.get $varOff) (i32.shl (local.get $i) (i32.const 3)))
+        (f64.add
+          (f64.add (local.get $fp0) (f64.mul (local.get $dt) (local.get $fp1)))
+          (f64.div
+            (f64.mul (f64.mul (f64.mul (local.get $q) (local.get $dt)) (local.get $dt)) (local.get $dt))
+            (f64.const 3))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+  )
+
+  ;; CA (m=3) covariance propagate for ONE lane: x ← Fx; P ← F P Fᵀ + Q (jerk
+  ;; model). Op order matches _propagateCA. h = ½dt².
+  (func $kalman_propagate_ca (param $xLane i32) (param $pLane i32) (param $dt f64) (param $q f64)
+    (local $h f64)
+    (local $x0 f64) (local $x1 f64) (local $x2 f64)
+    (local $p0 f64) (local $p1 f64) (local $p2 f64) (local $p3 f64) (local $p4 f64)
+    (local $p5 f64) (local $p6 f64) (local $p7 f64) (local $p8 f64)
+    (local $f0 f64) (local $f1 f64) (local $f2 f64) (local $f3 f64) (local $f4 f64)
+    (local $f5 f64) (local $f6 f64) (local $f7 f64) (local $f8 f64)
+    (local $dt2 f64) (local $dt3 f64) (local $dt4 f64) (local $dt5 f64)
+    (local.set $h (f64.mul (f64.mul (f64.const 0.5) (local.get $dt)) (local.get $dt)))
+    (local.set $x0 (f64.load align=1 (local.get $xLane)))
+    (local.set $x1 (f64.load align=1 (i32.add (local.get $xLane) (i32.const 8))))
+    (local.set $x2 (f64.load align=1 (i32.add (local.get $xLane) (i32.const 16))))
+    ;; x0' = x0 + dt*x1 + h*x2 ; x1' = x1 + dt*x2 ; x2 unchanged
+    (f64.store align=1 (local.get $xLane)
+      (f64.add (f64.add (local.get $x0) (f64.mul (local.get $dt) (local.get $x1)))
+        (f64.mul (local.get $h) (local.get $x2))))
+    (f64.store align=1 (i32.add (local.get $xLane) (i32.const 8))
+      (f64.add (local.get $x1) (f64.mul (local.get $dt) (local.get $x2))))
+    (local.set $p0 (f64.load align=1 (local.get $pLane)))
+    (local.set $p1 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 8))))
+    (local.set $p2 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 16))))
+    (local.set $p3 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 24))))
+    (local.set $p4 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 32))))
+    (local.set $p5 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 40))))
+    (local.set $p6 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 48))))
+    (local.set $p7 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 56))))
+    (local.set $p8 (f64.load align=1 (i32.add (local.get $pLane) (i32.const 64))))
+    ;; FP = F·P  (f0..f8 row-major)
+    (local.set $f0 (f64.add (f64.add (local.get $p0) (f64.mul (local.get $dt) (local.get $p3))) (f64.mul (local.get $h) (local.get $p6))))
+    (local.set $f1 (f64.add (f64.add (local.get $p1) (f64.mul (local.get $dt) (local.get $p4))) (f64.mul (local.get $h) (local.get $p7))))
+    (local.set $f2 (f64.add (f64.add (local.get $p2) (f64.mul (local.get $dt) (local.get $p5))) (f64.mul (local.get $h) (local.get $p8))))
+    (local.set $f3 (f64.add (local.get $p3) (f64.mul (local.get $dt) (local.get $p6))))
+    (local.set $f4 (f64.add (local.get $p4) (f64.mul (local.get $dt) (local.get $p7))))
+    (local.set $f5 (f64.add (local.get $p5) (f64.mul (local.get $dt) (local.get $p8))))
+    (local.set $f6 (local.get $p6))
+    (local.set $f7 (local.get $p7))
+    (local.set $f8 (local.get $p8))
+    (local.set $dt2 (f64.mul (local.get $dt) (local.get $dt)))
+    (local.set $dt3 (f64.mul (local.get $dt2) (local.get $dt)))
+    (local.set $dt4 (f64.mul (local.get $dt3) (local.get $dt)))
+    (local.set $dt5 (f64.mul (local.get $dt4) (local.get $dt)))
+    ;; P[0] = (f0 + dt*f1 + h*f2) + q*dt5/20
+    (f64.store align=1 (local.get $pLane)
+      (f64.add (f64.add (f64.add (local.get $f0) (f64.mul (local.get $dt) (local.get $f1))) (f64.mul (local.get $h) (local.get $f2)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt5)) (f64.const 20))))
+    ;; P[1] = (f1 + dt*f2) + q*dt4/8
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 8))
+      (f64.add (f64.add (local.get $f1) (f64.mul (local.get $dt) (local.get $f2)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt4)) (f64.const 8))))
+    ;; P[2] = f2 + q*dt3/6
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 16))
+      (f64.add (local.get $f2) (f64.div (f64.mul (local.get $q) (local.get $dt3)) (f64.const 6))))
+    ;; P[3] = (f3 + dt*f4 + h*f5) + q*dt4/8
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 24))
+      (f64.add (f64.add (f64.add (local.get $f3) (f64.mul (local.get $dt) (local.get $f4))) (f64.mul (local.get $h) (local.get $f5)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt4)) (f64.const 8))))
+    ;; P[4] = (f4 + dt*f5) + q*dt3/3
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 32))
+      (f64.add (f64.add (local.get $f4) (f64.mul (local.get $dt) (local.get $f5)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt3)) (f64.const 3))))
+    ;; P[5] = f5 + q*dt2/2
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 40))
+      (f64.add (local.get $f5) (f64.div (f64.mul (local.get $q) (local.get $dt2)) (f64.const 2))))
+    ;; P[6] = (f6 + dt*f7 + h*f8) + q*dt3/6
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 48))
+      (f64.add (f64.add (f64.add (local.get $f6) (f64.mul (local.get $dt) (local.get $f7))) (f64.mul (local.get $h) (local.get $f8)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt3)) (f64.const 6))))
+    ;; P[7] = (f7 + dt*f8) + q*dt2/2
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 56))
+      (f64.add (f64.add (local.get $f7) (f64.mul (local.get $dt) (local.get $f8)))
+        (f64.div (f64.mul (local.get $q) (local.get $dt2)) (f64.const 2))))
+    ;; P[8] = f8 + q*dt
+    (f64.store align=1 (i32.add (local.get $pLane) (i32.const 64))
+      (f64.add (local.get $f8) (f64.mul (local.get $q) (local.get $dt))))
+  )
+
+  ;; CA ingest: per lane, propagate (if dt>0) then position + optional velocity
+  ;; + optional acceleration scalar updates. Mirrors StatePredictor.ingest "ca".
+  (func $kalman_ingest_ca_f64 (export "kalman_ingest_ca_f64")
+        (param $xOff i32) (param $pOff i32) (param $posOff i32) (param $velOff i32) (param $accOff i32)
+        (param $n i32) (param $dt f64) (param $q f64) (param $rp f64) (param $rv f64) (param $ra f64)
+        (param $useVel i32) (param $useAcc i32) (param $scratch i32)
+    (local $i i32) (local $xLane i32) (local $pLane i32) (local $lo i32)
+    (local.set $i (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $xLane (i32.add (local.get $xOff) (i32.mul (local.get $i) (i32.const 24))))
+      (local.set $pLane (i32.add (local.get $pOff) (i32.mul (local.get $i) (i32.const 72))))
+      (local.set $lo (i32.shl (local.get $i) (i32.const 3)))
+      (if (f64.gt (local.get $dt) (f64.const 0))
+        (then (call $kalman_propagate_ca (local.get $xLane) (local.get $pLane) (local.get $dt) (local.get $q))))
+      (call $kalman_update (local.get $xLane) (local.get $pLane) (i32.const 3) (i32.const 0)
+        (f64.load align=1 (i32.add (local.get $posOff) (local.get $lo))) (local.get $rp) (local.get $scratch))
+      (if (local.get $useVel)
+        (then (call $kalman_update (local.get $xLane) (local.get $pLane) (i32.const 3) (i32.const 1)
+          (f64.load align=1 (i32.add (local.get $velOff) (local.get $lo))) (local.get $rv) (local.get $scratch))))
+      (if (local.get $useAcc)
+        (then (call $kalman_update (local.get $xLane) (local.get $pLane) (i32.const 3) (i32.const 2)
+          (f64.load align=1 (i32.add (local.get $accOff) (local.get $lo))) (local.get $ra) (local.get $scratch))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+  )
+
+  ;; CA predict: value = p + dt·v + ½dt²·a ; variance = (F P Fᵀ)₀₀ + q·dt⁵/20.
+  (func $kalman_predict_ca_f64 (export "kalman_predict_ca_f64")
+        (param $xOff i32) (param $pOff i32) (param $valOff i32) (param $varOff i32)
+        (param $n i32) (param $dt f64) (param $q f64)
+    (local $i i32) (local $xp i32) (local $pp i32) (local $h f64)
+    (local $fp0 f64) (local $fp1 f64) (local $fp2 f64) (local $dt2 f64) (local $dt5 f64)
+    (local.set $h (f64.mul (f64.mul (f64.const 0.5) (local.get $dt)) (local.get $dt)))
+    (local.set $i (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $xp (i32.add (local.get $xOff) (i32.mul (local.get $i) (i32.const 24))))
+      (local.set $pp (i32.add (local.get $pOff) (i32.mul (local.get $i) (i32.const 72))))
+      ;; value = x0 + dt*x1 + h*x2
+      (f64.store align=1 (i32.add (local.get $valOff) (i32.shl (local.get $i) (i32.const 3)))
+        (f64.add
+          (f64.add (f64.load align=1 (local.get $xp))
+            (f64.mul (local.get $dt) (f64.load align=1 (i32.add (local.get $xp) (i32.const 8)))))
+          (f64.mul (local.get $h) (f64.load align=1 (i32.add (local.get $xp) (i32.const 16))))))
+      ;; fp0 = P0 + dt*P3 + h*P6
+      (local.set $fp0 (f64.add (f64.add (f64.load align=1 (local.get $pp))
+        (f64.mul (local.get $dt) (f64.load align=1 (i32.add (local.get $pp) (i32.const 24)))))
+        (f64.mul (local.get $h) (f64.load align=1 (i32.add (local.get $pp) (i32.const 48))))))
+      ;; fp1 = P1 + dt*P4 + h*P7
+      (local.set $fp1 (f64.add (f64.add (f64.load align=1 (i32.add (local.get $pp) (i32.const 8)))
+        (f64.mul (local.get $dt) (f64.load align=1 (i32.add (local.get $pp) (i32.const 32)))))
+        (f64.mul (local.get $h) (f64.load align=1 (i32.add (local.get $pp) (i32.const 56))))))
+      ;; fp2 = P2 + dt*P5 + h*P8
+      (local.set $fp2 (f64.add (f64.add (f64.load align=1 (i32.add (local.get $pp) (i32.const 16)))
+        (f64.mul (local.get $dt) (f64.load align=1 (i32.add (local.get $pp) (i32.const 40)))))
+        (f64.mul (local.get $h) (f64.load align=1 (i32.add (local.get $pp) (i32.const 64))))))
+      (local.set $dt2 (f64.mul (local.get $dt) (local.get $dt)))
+      (local.set $dt5 (f64.mul (f64.mul (local.get $dt2) (local.get $dt2)) (local.get $dt)))
+      ;; var = (fp0 + dt*fp1 + h*fp2) + q*dt5/20
+      (f64.store align=1 (i32.add (local.get $varOff) (i32.shl (local.get $i) (i32.const 3)))
+        (f64.add
+          (f64.add (f64.add (local.get $fp0) (f64.mul (local.get $dt) (local.get $fp1)))
+            (f64.mul (local.get $h) (local.get $fp2)))
+          (f64.div (f64.mul (local.get $q) (local.get $dt5)) (f64.const 20))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $loop)))
+  )
+)
