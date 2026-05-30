@@ -4,6 +4,100 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.901] — 2026-05-30
+
+### Added — `StatePredictor`: history-aware classical state predictor (Apollo Frontier 2, de-neuralized — Stage 1 of 4)
+
+Re-opens **Apollo Frontier 2 (Predictive Extrapolation)** in a **non-neural**
+form. The roadmap's original Frontier 2 was *Neural Phase-Locked Extrapolation
+(WebNN-in-worklet)*; this ships the same capability — *predict where the macro
+state will be a few ms ahead, given the last few frames* — with **classical
+estimation** (a per-lane linear Kalman), same Apollo discipline as Phase I
+(closed-form math → bit-exact JS pins → WASM scalar → SIMD), confidence-bounded
+so it is never worse than a hold. Stage 1 lands the pure heap **primitive** +
+its JS pins; the Bridge pull method (0.9.902), WASM scalar (0.9.903), and SIMD
+(0.9.904) ports follow in the staged arc.
+
+#### What shipped
+
+- **`src/StatePredictor.ts`** (root export) — a per-lane history-aware predictor
+  composable alongside the existing trio (`SpscRing` / `FrameSmoother` /
+  `ConsumerClockRecovery`). Pure heap state machine, **allocation-free** after
+  construction, never touches the SAB. `ingest(producerNs, position[, velocity[,
+  acceleration]])` fuses a fresh frame; `predictInto(producerNs, outValue[,
+  outVariance])` renders each lane forward with a **principled covariance** for
+  confidence. `predictLane` / `stateOf` / `reset` round out the surface.
+- **Two motion models, selected by trajectory order.** `model: "cv"` is a
+  2-state `[p, v]` constant-velocity filter; `"ca"` is a 3-state `[p, v, a]`
+  constant-acceleration filter. Both run **sequential scalar measurement
+  updates** with a diagonal noise model (no matrix inversion → bit-exact-reasoned
+  for the WASM ports), and a **variable measurement vector**: position is always
+  measured, stamped velocity/acceleration are *additional* measurements when
+  present (the elegant unification — position-only and stamped-derivative frames
+  are the same filter with different measurement vectors).
+
+#### Why this is new value (vs the existing single-frame Taylor `pullPredictedLatest`)
+
+`predictiveExtrapolateInto` extrapolates off the **single newest frame's**
+stamped derivatives (Taylor). A **history** predictor fixes its three weak spots
+(confirmed by the Stage-0 throwaway probe; see below): position-only fields
+(Taylor = hold) get a real forward step, noisy stamped derivatives are smoothed
+rather than propagated verbatim (the ½a·dt² blow-up), and long stalls get a
+covariance that grows predictably with the horizon instead of a heuristic floor.
+It **complements** the Taylor path — both `pullPredictedLatest` (Taylor) and the
+upcoming `pullKalmanPredictedLatest` (0.9.902) will coexist.
+
+#### Design finding (from the Stage-0 probe, on realistic slow macro fields)
+
+The probe scored forward-prediction RMS (10 ms horizon, 60 Hz frames) against
+single-frame Taylor across four regimes, and **the winning state order depends on
+what the producer stamps** — this drives the CV/CA-by-order mapping:
+
+- With stamped derivatives (order ≥3): **CA** ties Taylor on noise-free smooth
+  (+0.0%), wins noisy stamps (+10.5%), wins through a 12-frame producer stall
+  (+20.3%) with **monotone-nondecreasing** predicted variance.
+- Position-only (order 1): **CA is worse than a hold** (−22%) — estimating
+  acceleration from the 2nd difference of noisy positions amplifies noise — while
+  **CV wins big** (+59–68% across a process-noise sweep; even best-tuned CA
+  (+51%) < CV). So: **CV for order 1–2, CA for order ≥3.**
+- A sliding-window order-2 polynomial least-squares (LS2) lost everywhere
+  (overshoot / noise sensitivity) — **rejected.**
+- Cold/under-observed → enormous variance (→ the Bridge holds); the probe also
+  confirmed the cold single-frame case stays at the seed value.
+
+A second find from Stage 1's own pins: the independent textbook-matrix Kalman
+**cross-check** caught a real covariance bug (a transposed `FP·Fᵀ` in the CA
+propagation) that the exact-recovery goldens could not — zero-innovation traces
+never exercise the Kalman gain, so the bug was invisible to them.
+
+### Tests
+
+- New **`tests/StatePredictor.test.ts`** (11 pins; registered in both `test` and
+  `test:unit`): construction validation; cold/unseeded → zeros + initialVariance;
+  **bit-exact exact-recovery goldens** for CV and CA (a perfect model fed exact
+  measurements has zero innovation → the prediction is bit-exact equal to the
+  analytic ground truth — the reference the WASM ports must reproduce);
+  independent matrix-Kalman cross-check (value/variance/state within 1e-9 over a
+  noisy curved trace); position-only velocity estimation beats a hold; monotone
+  stall variance; cold-safety (variance ≥ initialVariance); `reset`; `predictLane`
+  bit-exact vs `predictInto`; multi-lane independence.
+- Full suite green (incl. the 1 M-frame concurrent SPSC stress, no flake); bench
+  within budget (push/pull/pullLatest 1.20 µs — the predictor is pure heap and
+  not yet on a pull path, so the bench cell lands with 0.9.902).
+
+### Wire compatibility
+
+None affected. New heap-only composable primitive + one root export
+(`StatePredictor`, `StatePredictorModel`, `StatePredictorOptions`). No SAB
+layout, wire-format, protocol, or public-API break — purely additive.
+
+### Documentation
+
+- README "Predictive extrapolation" subsection extended with the `StatePredictor`
+  primitive (CV/CA-by-order, the probe finding, the never-worse-than-hold
+  contract) beside the existing `pullPredictedLatest` docs.
+- ROADMAP row at the top of the descending `0.9.9x` block.
+
 ## [0.9.900] — 2026-05-30
 
 > **Patch renumber.** From this release the late-`0.9.x` run uses a **three-digit

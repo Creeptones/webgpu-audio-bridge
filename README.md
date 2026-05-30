@@ -898,6 +898,37 @@ Frame lifecycle mirrors `pullEvaluatedLatest`: the newest frame is cached, so du
 
 `lastReadbackMedianMs()` returns the median of recently `recordReadbackLatency(ms)`-recorded samples (0 before any sample). Readback latency is a **producer-side** quantity — the wall-clock gap between a compute pass submitting and its `mapAsync` resolving; it can't be recovered from the consumer PLL, which folds the constant delay into its learned offset. So the measuring side records it; if readback is timed on a different thread than the consumer, post the value across and `recordReadbackLatency` on the consumer's handle. Median (not mean) so one stalled readback doesn't yank the lead.
 
+#### `StatePredictor` — history-aware classical prediction (0.9.901)
+
+`pullPredictedLatest` extrapolates off the **single newest frame's** stamped derivatives (Taylor: `p + v·dt + ½a·dt²`). `StatePredictor` is the **history-aware** companion: it fuses the last few frames under a linear motion model + measurement-noise model (a per-lane Kalman) and carries a **principled covariance** for confidence. Non-neural, fully inspectable — the de-neuralized form of Apollo Frontier 2. It **complements** `pullPredictedLatest`; both coexist.
+
+It fixes the three places single-frame Taylor is weak (each confirmed by a throwaway probe before any code shipped):
+
+1. **Position-only (order-1) fields** — Taylor off one position is just a hold; the predictor *estimates* velocity from the position sequence and takes a real forward step.
+2. **Noisy stamped derivatives** — Taylor trusts a noisy `a` verbatim and the `½a·dt²` term explodes; the Kalman's measurement-noise model smooths it.
+3. **Long stalls** — single-frame Taylor diverges with only a heuristic floor; the Kalman's covariance grows **predictably** with the horizon, giving a first-principles "how far to trust" signal that fades safely to a hold.
+
+```ts
+import { StatePredictor } from "webgpu-audio-bridge";
+
+// One filter per array lane. Model order matches the field's stamped order:
+//   order 1–2 → "cv" ([p, v]);  order ≥3 → "ca" ([p, v, a]).
+const predictor = new StatePredictor({
+  laneCount: 1, model: "ca",
+  processNoise: 1e3, measPosNoise: 4e-4, measVelNoise: 0.25, measAccNoise: 4,
+});
+
+// On each fresh frame (producer-domain ns; velocity/acceleration optional):
+predictor.ingest(producerNs, position, velocity, acceleration);
+
+// Each quantum, predict forward to when the block is heard:
+const value = new Float64Array(1), variance = new Float64Array(1);
+predictor.predictInto(consumerNsMappedToProducer + leadNs, value, variance);
+// Large `variance` ⇒ low confidence ⇒ hold (the never-worse-than-`pullLatest` guarantee).
+```
+
+**Why the model order is chosen by field order** (the probe's key finding): a constant-acceleration filter fed only positions estimates acceleration from the *second difference* of noisy positions, which amplifies noise and ends up **worse than a hold** — so position-only fields use `"cv"`, where the first-difference velocity is robust. When stamped derivatives exist, `"ca"` captures curvature and wins the noisy and stalled regimes. A cold or under-observed filter reports an enormous variance, so the Bridge layer (the upcoming `pullKalmanPredictedLatest`, 0.9.902) folds it straight into the same confidence→horizon crossfade `pullPredictedLatest` already uses. Allocation-free after construction; heap-only (never touches the SAB). Same Apollo discipline as the Hermite work: closed-form, left-to-right f64 accumulation, bit-exact-reasoned for the WASM scalar (0.9.903) + SIMD (0.9.904) ports.
+
 ## BridgeGPUSource
 
 The headline helper the library has been advertising since 0.3.0. Closes the loop from "compute pass on the GPU writes a storage buffer" to "AudioWorklet pulls the result via `Bridge<S>.pullLatest`" by automating the staging-buffer ring + `copyBufferToBuffer` + `mapAsync` orchestration:

@@ -132,6 +132,8 @@ export { FrameSmoother } from "./FrameSmoother.js";
 export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 export type { ConsumerClockRecoveryOptions } from "./ConsumerClockRecovery.js";
 export { AdaptiveFlowController } from "./AdaptiveFlowController.js";
+export { StatePredictor } from "./StatePredictor.js";
+export type { StatePredictorModel, StatePredictorOptions } from "./StatePredictor.js";
 
 export { BridgeConsumer } from "./BridgeConsumer.js";
 export type {
