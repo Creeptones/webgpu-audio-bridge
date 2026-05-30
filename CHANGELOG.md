@@ -4,6 +4,59 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.84] — 2026-05-29
+
+### Added — `pullHermiteLatest`: one-call two-frame Hermite reconstruction (Phase I consolidation, Stage 1)
+
+Phase I shipped quintic (C²) and septic (C³) Hermite end-to-end (JS → WASM →
+SIMD), but only as *primitives*: the lowest-level two-frame call
+`evaluateHermiteInto(prev, curr, t, segmentSec, out)` requires the caller to
+hand-manage the consecutive-frame pair, both timestamps, and the normalized
+`t`. Taylor reconstruction has had one-call sugar since 0.6.5
+(`pullEvaluatedLatest`) and 0.9.71 (`pullPredictedLatest`); Hermite never did —
+so a running AudioWorklet couldn't actually *reach* cubic, quintic, or septic
+without bespoke plumbing. This closes that gap.
+
+#### What shipped
+
+- **`Bridge.pullHermiteLatest(out, baseConsumerNs, sampleRate?, opts?)`** — the
+  high-level entry point. It retains the prev + current frame pair internally
+  (a zero-copy ping-pong of two reusable scratch frames), derives `t ∈ [0, 1]`
+  and `segmentSeconds` from the PLL-mapped consumer clock versus the two frames'
+  timestamps, and reconstructs every trajectory field through `evaluateHermiteInto`
+  — so the schema's `interpolationMode` (cubic / quintic / septic) selects the
+  spline degree automatically. Non-trajectory fields pass through.
+
+#### Semantics
+
+- `t` is **clamped to [0, 1]** — this is an *interpolator*: before the prev
+  frame it holds prev, past the current frame it holds curr. Forward
+  extrapolation past the newest frame remains `pullPredictedLatest`'s job.
+- Fresh-pull gating + famine ride-through mirror `pullEvaluatedLatest`: the PLL
+  is observed once per fresh pull (re-feeding a stale stamp would poison the
+  residual), and a producer famine reconstructs from the cached pair (returns
+  `-1`, still writes `out`).
+- Until a second distinct frame arrives there is no `prev`, so it holds the
+  current frame's positions (Hermite needs two endpoints).
+
+#### Tests
+
+New `tests/Bridge.hermiteLatest.test.ts` (pins 120–124): hold-before-second-frame,
+interior interpolation verified against both the `evaluateHermiteInto` and the
+`evaluateQuinticHermiteTrajectoryInto` oracles (and proven distinct from cubic,
+so the quintic dispatch is real), boundary clamping, famine ride-through, and
+validation. The PLL is its own oracle (`phaseLockedTime` is public), so the pins
+are robust to lock dynamics. 45 Node suites green; `npm run typecheck` clean;
+`npm run bench` unchanged.
+
+### Wire compatibility
+
+Fully additive — one new public `Bridge` method, no wire/SAB/protocol change.
+
+### Documentation
+
+README API-reference entry for `pullHermiteLatest`; ROADMAP 0.9.84 row.
+
 ## [0.9.83] — 2026-05-29
 
 ### Added — SIMD Quintic + Septic Hermite evaluators (Apollo Mission Phase I, Stage 4 — mission complete)

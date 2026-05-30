@@ -622,6 +622,21 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *  Reused across calls — the predictive hot loop allocates nothing. */
   private _predictHoldScratch: Record<string, Float64Array | Float32Array> | null = null;
 
+  /** Two-frame ping-pong cache for `pullHermiteLatest` (0.9.84). Hermite
+   *  reconstruction needs the PREVIOUS + CURRENT frame pair; the single
+   *  `cachedRawFrame` above is insufficient. `_hermiteA` / `_hermiteB` are the
+   *  two reusable scratch frames; `_hermiteCurr` points at whichever holds the
+   *  newest pulled frame and `_hermitePrev` at the one before it (null until a
+   *  second distinct frame arrives). Each fresh pull rotates the references and
+   *  the timestamp pair rather than copying. Lazily allocated. */
+  private _hermiteA: FrameFor<S> | null = null;
+  private _hermiteB: FrameFor<S> | null = null;
+  private _hermitePrev: FrameFor<S> | null = null;
+  private _hermiteCurr: FrameFor<S> | null = null;
+  /** Producer timestamps (ns) of `_hermitePrev` / `_hermiteCurr`. */
+  private _hermitePrevTsNs: number = 0;
+  private _hermiteCurrTsNs: number = 0;
+
   /** Rolling window of recent readback-latency samples (ms) backing
    *  `lastReadbackMedianMs()` (0.9.71). A fixed-size circular buffer; `_count`
    *  saturates at the window length and `_head` is the next write slot. Fed by
@@ -1293,6 +1308,106 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     const producerNs = this.phaseLockedTime(consumerNs);
     const dt_s = (producerNs - this.cachedTimestampNs) * 1e-9;
     this.evaluateInto(this.cachedRawFrame as FrameFor<S>, dt_s, out);
+  }
+
+  /**
+   * One-call **two-frame Hermite reconstruction** (0.9.84). The high-level
+   * consumer entry point that `evaluateHermiteInto` was missing: it retains the
+   * previous + current frame pair internally, derives the normalized segment
+   * position `t ∈ [0, 1]` and `segmentSeconds` from the PLL-mapped consumer
+   * clock versus the two frames' timestamps, and reconstructs every trajectory
+   * field via the schema's `interpolationMode` (cubic C¹ / quintic C² / septic
+   * C³). Non-trajectory fields pass through from the current frame.
+   *
+   * This is to `evaluateHermiteInto` what `pullEvaluatedLatest` is to
+   * `evaluateInto`: the caller no longer hand-manages the frame pair, the
+   * timestamps, or `t`.
+   *
+   * Semantics:
+   *   - `t` is **clamped to [0, 1]** — this is an INTERPOLATOR. Before the prev
+   *     frame it holds prev; past the current frame it holds curr. Forward
+   *     extrapolation past the newest frame is `pullPredictedLatest`'s job.
+   *   - On a fresh pull the reference pair rotates (ping-pong, zero-copy) and
+   *     the PLL is observed once (same fresh-pull gating as
+   *     `pullEvaluatedLatest`). On a producer famine it rides the cached pair.
+   *   - Until a SECOND distinct frame has been pulled there is no `prev`, so it
+   *     holds the current frame's positions (Hermite needs two endpoints).
+   *
+   * `out` must be an evaluated-shape frame (trajectory fields sized to
+   * `sampleCount`), e.g. from `scratchEvaluatedFrame()`. Returns the number of
+   * frames skipped to reach the newest (≥ 0 on a fresh pull), or `-1` when the
+   * ring is empty and nothing has ever been pulled. Heap-only; never allocates
+   * after the first call.
+   */
+  pullHermiteLatest(
+    out: FrameFor<S>,
+    baseConsumerNs: number,
+    sampleRate?: number,
+    opts?: { timestamp?: TimestampRoleOf<S> },
+  ): number {
+    if (!Number.isFinite(baseConsumerNs)) {
+      throw new Error(
+        `pullHermiteLatest: baseConsumerNs must be finite, got ${baseConsumerNs}`,
+      );
+    }
+    if (this.schema.timestamps === null) {
+      throw new Error(
+        `pullHermiteLatest: schema has no .withTimestamps(...) attached`,
+      );
+    }
+    const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
+    const role = this.schema.timestamps.roles[roleName];
+    if (!role) {
+      throw new Error(
+        `pullHermiteLatest: unknown timestamp role '${String(roleName)}'`,
+      );
+    }
+    const sr = sampleRate ?? this.defaultSampleRate;
+    if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
+      throw new Error(
+        `pullHermiteLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
+      );
+    }
+    if (this._hermiteA === null || this._hermiteB === null) {
+      this._hermiteA = this.scratchFrame();
+      this._hermiteB = this.scratchFrame();
+    }
+    // Pull into whichever buffer is NOT the current one (the old prev, whose
+    // contents are now discardable). On a fresh pull, rotate references.
+    const pullTarget = this._hermiteCurr === this._hermiteA ? this._hermiteB : this._hermiteA;
+    const skipped = this.pullLatest(pullTarget);
+    if (skipped >= 0) {
+      const rawValue = (pullTarget as unknown as Record<string, unknown>)[role.field];
+      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
+      const tsNs = this._timestampToNs(numericRaw, role.unit, sr);
+      // Rotate: old curr becomes prev; the freshly-pulled buffer becomes curr.
+      this._hermitePrev = this._hermiteCurr;
+      this._hermitePrevTsNs = this._hermiteCurrTsNs;
+      this._hermiteCurr = pullTarget;
+      this._hermiteCurrTsNs = tsNs;
+      // Drive the PLL once, gated on the fresh pull (same rationale as
+      // pullEvaluatedLatest: re-feeding a stale stamp poisons the residual).
+      this.observeConsumerTime(baseConsumerNs, tsNs);
+    } else if (this._hermiteCurr === null) {
+      // Ring empty and we've never pulled a frame — nothing to reconstruct.
+      return -1;
+    }
+
+    const curr = this._hermiteCurr as FrameFor<S>;
+    const seg = this._hermiteCurrTsNs - this._hermitePrevTsNs;
+    if (this._hermitePrev === null || !(seg > 0)) {
+      // Only one frame seen, or non-monotonic/duplicate stamps — Hermite needs
+      // two distinct endpoints, so hold the current frame's positions
+      // (evaluateInto at dt=0 yields the position lane + passes scalars through).
+      this.evaluateInto(curr, 0, out);
+      return skipped;
+    }
+    const producerNs = this.phaseLockedTime(baseConsumerNs);
+    let t = (producerNs - this._hermitePrevTsNs) / seg;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+    this.evaluateHermiteInto(this._hermitePrev, curr, t, seg * 1e-9, out);
+    return skipped;
   }
 
   /**

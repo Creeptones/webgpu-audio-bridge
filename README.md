@@ -310,6 +310,10 @@ Consumer side. Drains to the newest available frame into `out`, discarding older
 
 **This is the typical AudioWorklet read path:** the worklet wants the freshest macro state per quantum, not a queue.
 
+#### `pullHermiteLatest(out, baseConsumerNs, sampleRate?, opts?) → number`
+
+Consumer side, **one-call two-frame Hermite reconstruction** (0.9.84). The high-level entry point for `interpolationMode` reconstruction: it retains the previous + current frame pair internally, derives the normalized segment position `t ∈ [0, 1]` and `segmentSeconds` from the PLL-mapped consumer clock versus the two frames' timestamps, and reconstructs every trajectory field via the schema's mode — cubic (C¹), `'quintic-hermite'` (C²), or `'septic-hermite'` (C³). This is to `evaluateHermiteInto` what `pullEvaluatedLatest` is to `evaluateInto` — the caller no longer hand-manages the frame pair, the timestamps, or `t`. `t` is **clamped to [0, 1]**, so it is an *interpolator*: it holds the endpoints rather than extrapolating past the newest frame (that is `pullPredictedLatest`'s job). Until a second distinct frame has arrived it holds the current frame's positions. Rides the cached pair through a producer famine (returns `-1`, still reconstructs). `out` must be a `scratchEvaluatedFrame()`; requires `.withTimestamps(...)`. Returns skipped-frame count, or `-1` when the ring is empty and nothing has ever been pulled.
+
 #### `pullPredictedLatest(out, opts?) → PredictedPullResult`
 
 Consumer side, **first-class "negative latency" mode** (0.9.71). Drains to the newest frame and renders every trajectory field **forward by `opts.leadMs`**, confidence-bounded by the PLL, so the block carries where the macro state is *expected to be* once heard. Degrades to a plain latest-frame hold when the clock is cold / below `opts.confidenceFloor` / the lead exceeds `opts.maxLeadMs` — always at least as safe as `pullLatest`. `out` must be a `scratchEvaluatedFrame()`. Use only for **smooth** macro fields (envelopes, positions, spectra, surfaces), never discontinuous events. See [`pullPredictedLatest`](#pullpredictedlatest--first-class-negative-latency-mode-0971).
