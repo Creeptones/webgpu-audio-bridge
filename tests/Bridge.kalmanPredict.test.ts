@@ -13,6 +13,11 @@
  *     both collapse to the hold;
  *   - non-trajectory fields pass through; the cached frame rides a producer
  *     famine; `.withTimestamps(...)` is required.
+ *   - famine-aware advancing horizon (0.9.905, pins 12–15): default-off is
+ *     bit-exact with the fixed-lead 0.9.902 path; an opt-in stall with an
+ *     advancing `consumerNs` grows the covariance so the weight fades monotone
+ *     → an exact hold; normal streaming stays ≈ invisible; an unlocked PLL /
+ *     missing `consumerNs` falls back to the fixed lead.
  *
  *   npx tsx tests/Bridge.kalmanPredict.test.ts
  */
@@ -259,6 +264,120 @@ function main(): void {
     pushFrame(bridge, 2, 1, 1_000_000);
     bad(() => bridge.pullKalmanPredictedLatest(out, { leadMs: 5, consumerNs: NaN }), "non-finite consumerNs");
     ok("kalman-validation");
+  }
+
+  // ── 12: famineAwareHorizon default-off is bit-exact with 0.9.902 ──────────
+  // Famine pulls don't ingest (the filter state is frozen), so repeated pulls on
+  // the same warmed bridge are idempotent — omitted / explicit-false / true-but-
+  // no-consumerNs must all yield the IDENTICAL fixed-lead output.
+  {
+    const bridge = makeBridge(2);
+    warm(bridge, 2, 30);
+    const a = bridge.scratchEvaluatedFrame();
+    const b = bridge.scratchEvaluatedFrame();
+    const c = bridge.scratchEvaluatedFrame();
+    const base = { leadMs: 6, trustedLeadMs: 6 };
+    const ra = bridge.pullKalmanPredictedLatest(a, { ...base }); // omitted
+    const rb = bridge.pullKalmanPredictedLatest(b, { ...base, famineAwareHorizon: false });
+    // true but no consumerNs → must fall back to the fixed lead.
+    const rc = bridge.pullKalmanPredictedLatest(c, { ...base, famineAwareHorizon: true });
+    for (let i = 0; i < N; i++) {
+      assertEq(b.vEff[i], a.vEff[i], `false ≡ omitted lane ${i}`);
+      assertEq(c.vEff[i], a.vEff[i], `true-no-consumerNs ≡ omitted lane ${i}`);
+    }
+    assertEq(rb.confidenceWeight, ra.confidenceWeight, "false ≡ omitted weight");
+    assertEq(rc.confidenceWeight, ra.confidenceWeight, "true-no-consumerNs ≡ omitted weight");
+    assertEq(ra.forwardDistanceSeconds, base.leadMs * 1e-3, "fixed-lead forwardDistance == requested lead");
+    ok("kalman-famine-aware-default-off-bit-exact");
+  }
+
+  // ── 13: famineAwareHorizon — fade is monotone → exact hold ────────────────
+  // Warm with consumerNs == producer time so the PLL locks (offset ≈ 0). Then a
+  // stall with an ADVANCING consumerNs grows the predict horizon (and thus the
+  // covariance) → the variance gate fades the weight monotonically to 0 ⇒ an
+  // EXACT latest-frame hold. The predictor's headline benefit, realized.
+  {
+    const bridge = makeBridge(2);
+    const evalFrame = bridge.scratchEvaluatedFrame();
+    let tNs = 1_000_000;
+    const COUNT = 30;
+    for (let k = 0; k < COUNT; k++) {
+      pushFrame(bridge, 2, k + 1, tNs);
+      bridge.pullKalmanPredictedLatest(evalFrame, { leadMs: 0, consumerNs: tNs });
+      if (k < COUNT - 1) tNs += PERIOD_NS;
+    }
+    const tLast = tNs;
+    const out = bridge.scratchEvaluatedFrame();
+    const opts = { leadMs: 2, trustedLeadMs: 2, varianceFloor: 10, famineAwareHorizon: true };
+    let prevW = Infinity, prevVar = -Infinity, prevFwd = -Infinity;
+    let reachedHold = false;
+    let consumerNs = tLast;
+    for (let k = 0; k < 120; k++) {
+      consumerNs += PERIOD_NS; // advance the consumer clock through the famine
+      const r = bridge.pullKalmanPredictedLatest(out, { ...opts, consumerNs });
+      assertEq(r.skipped, -1, `famine pull ${k}: ring empty`);
+      assert(r.confidenceWeight <= prevW + 1e-12, `weight monotone-nonincreasing at ${k} (${r.confidenceWeight} > ${prevW})`);
+      assert(r.maxVariance >= prevVar - 1e-9, `variance monotone-nondecreasing at ${k}`);
+      assert(r.forwardDistanceSeconds > prevFwd, `forward distance grows at ${k}`);
+      prevW = r.confidenceWeight; prevVar = r.maxVariance; prevFwd = r.forwardDistanceSeconds;
+      if (r.confidenceWeight === 0) {
+        assertEq(r.predicted, false, "w=0 ⇒ predicted false");
+        for (let i = 0; i < N; i++) {
+          assertEq(out.vEff[i], truthPos(2, i, tLast * 1e-9), `exact hold lane ${i}`);
+        }
+        reachedHold = true;
+        break;
+      }
+    }
+    assert(reachedHold, "famine fade reached the exact hold (w=0) within the stall window");
+    ok("kalman-famine-aware-fade-to-hold");
+  }
+
+  // ── 14: normal operation — famineAwareHorizon is ≈ invisible ──────────────
+  // A fresh frame every quantum with a correctly-advancing consumerNs: the PLL
+  // maps the consumer clock back onto ~the freshest stamp, so the advancing
+  // target ≈ the fixed lead. Not bit-exact (the PLL offset adds a sub-µs delta);
+  // approx tolerance.
+  {
+    const off = makeBridge(2);
+    const on = makeBridge(2);
+    const oOff = off.scratchEvaluatedFrame();
+    const oOn = on.scratchEvaluatedFrame();
+    const SKEW = 250_000; // 0.25 ms consumer/producer skew → PLL learns the offset
+    let tNs = 1_000_000;
+    const COUNT = 40;
+    let last: { off: Float64Array; on: Float64Array } | null = null;
+    for (let k = 0; k < COUNT; k++) {
+      pushFrame(off, 2, k + 1, tNs);
+      pushFrame(on, 2, k + 1, tNs);
+      const base = { leadMs: 5, trustedLeadMs: 5, consumerNs: tNs + SKEW };
+      off.pullKalmanPredictedLatest(oOff, { ...base });
+      on.pullKalmanPredictedLatest(oOn, { ...base, famineAwareHorizon: true });
+      last = { off: Float64Array.from(oOff.vEff), on: Float64Array.from(oOn.vEff) };
+      if (k < COUNT - 1) tNs += PERIOD_NS;
+    }
+    for (let i = 0; i < N; i++) {
+      assert(Math.abs(last!.on[i]! - last!.off[i]!) < 1e-3, `normal-op parity lane ${i} (${last!.on[i]} vs ${last!.off[i]})`);
+    }
+    ok("kalman-famine-aware-normal-op-parity");
+  }
+
+  // ── 15: unlocked PLL → famineAwareHorizon falls back to the fixed lead ─────
+  // Warmed WITHOUT consumerNs (PLL stays cold). A famine pull with
+  // famineAwareHorizon:true AND a consumerNs must still take the fixed-lead path
+  // because the `this.pll.locked` guard is false → bit-exact with off.
+  {
+    const bridge = makeBridge(2);
+    warm(bridge, 2, 30); // no consumerNs ⇒ PLL never observes ⇒ unlocked
+    const a = bridge.scratchEvaluatedFrame();
+    const b = bridge.scratchEvaluatedFrame();
+    const base = { leadMs: 6, trustedLeadMs: 6 };
+    bridge.pullKalmanPredictedLatest(a, { ...base }); // off, no consumerNs
+    bridge.pullKalmanPredictedLatest(b, { ...base, famineAwareHorizon: true, consumerNs: 999_999_999 });
+    for (let i = 0; i < N; i++) {
+      assertEq(b.vEff[i], a.vEff[i], `unlocked fallback lane ${i}`);
+    }
+    ok("kalman-famine-aware-unlocked-fallback");
   }
 
   console.log("\nAll Bridge.pullKalmanPredictedLatest pins passed.");

@@ -4,6 +4,76 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.905] — 2026-05-30
+
+### Added — famine-aware advancing-horizon fade (Apollo Frontier 2 follow-up — realizes the predictor's headline benefit)
+
+A JS-only, opt-in, default-off change to `Bridge.pullKalmanPredictedLatest` that
+turns the predictor's covariance-grows-through-a-stall property (pinned at
+0.9.901) into an actual **graceful crossfade-to-hold** as a producer famine
+lengthens. The Frontier 2 arc shipped the machinery; this patch makes the
+headline benefit fire.
+
+#### What shipped
+
+- **New opt-in option `famineAwareHorizon?: boolean`** on `KalmanPredictedPullOptions`.
+  When true AND `consumerNs` is provided AND the PLL is locked, the predict target
+  advances with the PLL-mapped **consumer** clock (`phaseLockedTime(consumerNs) +
+  lead`) instead of a fixed lead off the freshest frame's frozen stamp. During a
+  famine the consumer clock keeps advancing while the producer stamp is frozen, so
+  the forward horizon — and thus the Kalman covariance (∝ `q·dtᵏ`, k=3 CV / 5 CA) —
+  grows, driving `c_variance = clamp01(1 − maxVariance/varianceFloor)` → 0 → an
+  **exact latest-frame hold**. Default `false` keeps 0.9.902 behavior bit-exact.
+- **Forward-only clamp.** The advancing target is clamped to never fall behind the
+  freshest stamp (`mapped > baseNs`), so `dt ≥ lead` and the variance formula's
+  odd-power process-noise terms stay well-defined through early-lock / clock jitter.
+- **`observeConsumerTime` stays fresh-path only.** `consumerNs` is now read +
+  validated once up front (the famine path needs it for the advancing target), but
+  the PLL is still observed only on a fresh pull — feeding a stale producer stamp at
+  an advancing consumer time would poison the PLL residual.
+- **New observability field `forwardDistanceSeconds`** on `KalmanPredictedPullResult`
+  = `(targetNs − cachedTimestampNs)·1e−9`. Equals the requested lead in fixed-lead
+  mode; under `famineAwareHorizon` it also reflects the famine staleness the
+  advancing clock adds, so callers see the true horizon the covariance grew over
+  (unlike `dtEffectiveSeconds`, which is scaled by the requested lead only).
+
+### Why
+
+The 0.9.902 pull predicted at a **fixed** lead off `cachedTimestampNs`, which is
+frozen during a famine — so `dt`, the covariance, and the confidence weight all
+stayed constant: the prediction held a fixed forward step indefinitely,
+increasingly stale-but-confident. The principled "fade to hold as the stall
+lengthens" — the entire point of a covariance-aware predictor — never fired.
+This patch wires the advancing consumer clock in so it does.
+
+### Tests
+
+- **`tests/Bridge.kalmanPredict.test.ts`** grows four pins (12–15):
+  default-off bit-exact compat (omitted ≡ `false` ≡ true-without-`consumerNs`);
+  famine fade is monotone (`confidenceWeight` nonincreasing, `maxVariance`
+  nondecreasing, `forwardDistanceSeconds` growing) → reaches `w = 0` ⇒ an exact
+  hold; normal streaming with an advancing `consumerNs` stays ≈ invisible (approx
+  tolerance, PLL sub-µs delta); an unlocked PLL / missing `consumerNs` falls back
+  to the fixed lead bit-exact.
+- Full suite green (incl. the 1 M-frame concurrent stress, no flake).
+
+### Performance
+
+- `pullKalmanPredict` bench cell unchanged at ~3.1 µs median — the advancing-target
+  branch is a couple of extra ops on the non-fresh path, in the noise. Core
+  push/pull/pullLatest ~1.3 µs.
+
+### Wire compatibility
+
+None affected. Additive opt-in option + additive result field, both JS-only on the
+Bridge layer. The `StatePredictor` primitive and the WASM/SIMD kernels are
+untouched. No SAB layout, wire-format, protocol, or breaking public-API change.
+
+### Documentation
+
+- README predictive-extrapolation subsection extends the `StatePredictor` "famine"
+  sentence to note the advancing-horizon fade. ROADMAP row above 0.9.904.
+
 ## [0.9.904] — 2026-05-30
 
 ### Added — SoA f64x2 SIMD `StatePredictor` kernels (Apollo Frontier 2 — Stage 4 of 4, **mission complete**)

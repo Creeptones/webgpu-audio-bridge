@@ -481,6 +481,20 @@ export interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>>
    *  timestamps, a fresh pull warms the PLL (`observeConsumerTime`) so telemetry
    *  stays live — the Kalman prediction itself does not depend on the PLL. */
   readonly consumerNs?: number;
+  /** When true AND `consumerNs` is provided AND the PLL is locked, predict at the
+   *  PLL-mapped consumer time + lead (an ADVANCING target) rather than a fixed
+   *  lead off the freshest frame's stamp. During a producer famine the consumer
+   *  clock keeps advancing while the freshest frame's stamp is frozen, so the
+   *  forward horizon — and thus the Kalman covariance — grows, fading the
+   *  prediction to a hold as the stall lengthens (the predictor's headline
+   *  benefit). Default `false` (fixed lead, bit-exact with 0.9.902). Requires the
+   *  caller to pass the REAL consumer wall-clock each quantum (a fixed/stale
+   *  `consumerNs` produces no advance, so the feature is a correct no-op). The
+   *  growing covariance — not the requested-lead horizon taper — drives the fade:
+   *  `c_variance = clamp01(1 − maxVariance/varianceFloor)` falls as variance
+   *  grows ∝ q·dtᵏ (k=3 CV, 5 CA), so a lengthening stall reaches `w = 0` ⇒ an
+   *  exact hold. (0.9.905) */
+  readonly famineAwareHorizon?: boolean;
   /** Sample rate (Hz) for a `samples`-unit timestamp role. Falls back to
    *  `setSampleRate(rate)`. */
   readonly sampleRate?: number;
@@ -514,6 +528,13 @@ export interface KalmanPredictedPullResult {
   /** Largest predicted position variance across trajectory lanes (value-units²).
    *  The first-principles confidence signal driving the fade. */
   readonly maxVariance: number;
+  /** True forward distance from the freshest frame's stamp to the predict target,
+   *  in seconds (`(targetNs − cachedTimestampNs)·1e−9`). Equals `leadSecondsRequested`
+   *  in the default fixed-lead mode; under `famineAwareHorizon` it ALSO includes the
+   *  staleness the advancing consumer clock adds during a producer famine, so it
+   *  reflects the real horizon the covariance grew over (unlike `dtEffectiveSeconds`,
+   *  which is scaled by the requested lead only). 0 when nothing was predicted. (0.9.905) */
+  readonly forwardDistanceSeconds: number;
 }
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
@@ -1897,6 +1918,18 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     const leadSeconds = leadMs * 1e-3;
     const trustedLeadMs = opts?.trustedLeadMs ?? 0;
     const confidenceFloor = opts?.confidenceFloor ?? 0;
+    const famineAwareHorizon = opts?.famineAwareHorizon ?? false;
+
+    // Read + validate `consumerNs` ONCE, before the fresh/famine branch — the
+    // famine path needs it for the advancing target, but it's only OBSERVED on a
+    // fresh pull (observing a stale stamp at an advancing consumer time would
+    // poison the PLL residual). (0.9.905)
+    const consumerNs = opts?.consumerNs;
+    if (consumerNs !== undefined && !Number.isFinite(consumerNs)) {
+      throw new Error(
+        `pullKalmanPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
+      );
+    }
 
     // Lazily build the per-field filters + scratch (tuning captured here, once).
     if (this._kalmanPredictors === null) this._buildKalmanPredictors(opts);
@@ -1928,13 +1961,9 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
       const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
       this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
-      const consumerNs = opts?.consumerNs;
+      // Observe ONLY on a fresh pull (validated up top). The famine path must not
+      // feed a stale producer stamp at an advancing consumer time.
       if (consumerNs !== undefined) {
-        if (!Number.isFinite(consumerNs)) {
-          throw new Error(
-            `pullKalmanPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
-          );
-        }
         this.observeConsumerTime(consumerNs, this.cachedTimestampNs);
       }
       this.cachedEvalValid = true;
@@ -1949,6 +1978,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
         leadSecondsRequested: leadSeconds,
         valueUncertainty: 0,
         maxVariance: 0,
+        forwardDistanceSeconds: 0,
       };
     }
 
@@ -1963,7 +1993,18 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     if (cHorizon < 0) cHorizon = 0;
     else if (cHorizon > 1) cHorizon = 1;
 
-    const targetNs = this.cachedTimestampNs + leadSeconds * 1e9;
+    // Advancing target (0.9.905): under `famineAwareHorizon`, predict at the
+    // PLL-mapped consumer time + lead. During a famine `cachedTimestampNs` is
+    // frozen but the consumer clock advances, so `dt` (and the covariance) grow
+    // → the variance gate fades `w` → an exact hold. Forward-only: never predict
+    // BEHIND the freshest stamp (a backward dt makes the variance formula's
+    // odd-power process-noise terms ill-defined; clamping keeps `dt ≥ lead`).
+    let baseNs = this.cachedTimestampNs;
+    if (famineAwareHorizon && consumerNs !== undefined && this.pll.locked) {
+      const mapped = this.pll.phaseLockedTime(consumerNs);
+      if (mapped > baseNs) baseNs = mapped;
+    }
+    const targetNs = baseNs + leadSeconds * 1e9;
     const src = this.cachedRawFrame as unknown as Record<string, unknown>;
     const dst = out as unknown as Record<string, unknown>;
     const fields = this.schema.compiled.fields;
@@ -2034,6 +2075,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       leadSecondsRequested: leadSeconds,
       valueUncertainty: resultMaxVar > 0 ? Math.sqrt(resultMaxVar) : 0,
       maxVariance: resultMaxVar,
+      forwardDistanceSeconds: (targetNs - this.cachedTimestampNs) * 1e-9,
     };
   }
 
