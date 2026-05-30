@@ -625,6 +625,24 @@ The higher orders aren't just *continuous* — they're measurably *quieter*. `te
 
 Hear it: [`examples/hermite-orders/`](./examples/hermite-orders/) (`npm run dev:hermite-orders`, http://localhost:5182) drives an aggressive FM control trajectory through a `Bridge<S>` and lets you **toggle cubic / quintic / septic live** while a spectrum shows the high-sideband spray thin out with each order. Drop the control-rate slider toward 24–30 Hz to make the cubic seam buzz audible. (The demo reconstructs the *completed* segment one frame behind newest — interior `t` — rather than `pullHermiteLatest`, whose [0,1]-clamped freshest-interpolation pins `t` to the boundary where all orders agree; see `worklet.js` for the full reasoning.)
 
+**Click-free crossfade — `crossfadeWeight(order)` + `crossfadeInto(a, b, w, out, opts?)` (0.9.87).** The same Hermite basis that smooths the *interior* also makes a live **hot-swap** seamless. To blend signal A → B over a window `s ∈ [0,1]` with no click, the blend weight `w(s)` must hit `w(0)=0`, `w(1)=1` and have its first *k* derivatives vanish at both ends — which is exactly the position-to-position Hermite basis:
+
+| Continuity | `crossfadeWeight(order)` | = Hermite basis |
+| --- | --- | --- |
+| C¹ | `"cubic"` → `3s² − 2s³` | `h01` |
+| C² | `"quintic"` → `6s⁵ − 15s⁴ + 10s³` | `H3` |
+| C³ | `"septic"` → `35s⁴ − 84s⁵ + 70s⁶ − 20s⁷` | `H4` |
+
+```ts
+import { crossfadeWeight, crossfadeInto } from "webgpu-audio-bridge";
+
+const w = crossfadeWeight("quintic");        // C² weight schedule
+// per audio sample, s sweeping 0→1 across the swap window on the audio clock:
+crossfadeInto(reconA, reconB, w(s), out);    // amplitude: (1−w)·A + w·B
+```
+
+`crossfadeInto` is allocation-free and takes the already-resolved scalar weight (the continuity *order* lives in how `w` evolves sample-to-sample). `mode: "amplitude"` (default, `(1−w)·a + w·b`) is correct for a **parameter swap** — A and B are strongly correlated, so a linear blend preserves amplitude. `mode: "equal-power"` (`cos(½πw)·a + sin(½πw)·b`) is for an **emitter swap** — A and B uncorrelated, so the cos/sin pair keeps `cos² + sin² = 1` with no −3 dB mid-fade notch; the gain envelope is still driven by the C^k weight, so the seam stays click-free. Both modes are endpoint-exact (`w=0` → exactly A, `w=1` → exactly B). Match the crossfade order to the reconstruction order and the *entire* swap — interior reconstruction AND the blend seam — is C^k. `tests/Bridge.phaseLock.test.ts` measures it: a DC-level swap radiates a seam-image band (>500 Hz) of **cubic −85.9 dB → quintic −104.5 dB → septic −117.8 dB** rel total — each higher order drops the broadband click spray 13–19 dB. This is the foundational, LLM-free slice of the God-Node (real-time self-rewriting emitter); the two-bridge orchestration that drives the swap clock from `currentTime` builds on top of it.
+
 `pullSmoothed` / `pullLatestSmoothed` are trajectory-aware (0.6.4): the α-smoother blends only the position lanes of a trajectory field and passes velocity / acceleration lanes through verbatim from the freshly-pulled frame. Blending a derivative across frames collapses the very signal the trajectory exists to preserve — a perfectly linear position ramp publishes a constant velocity, but a naive elementwise blend would drift that velocity toward the previous frame's reading at the smoother's time constant. The rule is automatic — opt-in by using a trajectory field; no API change.
 
 This is the Pillar 1 release of the [Phase-Locked Extrapolation plan](https://github.com/Creeptones/webgpu-audio-bridge#roadmap) — the schema + evaluator half. Pillars 2 (nanosecond PLL for clock recovery between producer and consumer) and 3 (`bridge.pullEvaluated(out, sampleOffset)` that wraps pull + PLL + evaluate into one hot-path call) remain on the roadmap. Until they land, the consumer wires the dt by hand as shown above.

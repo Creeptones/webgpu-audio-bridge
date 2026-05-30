@@ -65,6 +65,8 @@ import {
   evaluateQuinticHermiteTrajectoryInto,
   evaluateSepticHermiteTrajectoryInto,
 } from "../src/trajectory.js";
+import { crossfadeWeight, crossfadeInto } from "../src/crossfade.js";
+import type { CrossfadeContinuity } from "../src/crossfade.js";
 
 // ─── FFT ───────────────────────────────────────────────────────────────────
 
@@ -708,10 +710,143 @@ function runHermiteOrderRolloffSpectrum(): void {
   );
 }
 
+// ─── Pin (0.9.87) — Crossfade seam-image rolloff (cubic vs quintic vs septic) ─
+//
+// Apollo Frontier 4 (God-Node) Stage 1 shipped `crossfadeWeight(order)` +
+// `crossfadeInto`: the click-free seam-blend underneath a live hot-swap. The
+// headline claim — matching the crossfade continuity order to the
+// reconstruction order makes the swap seam click-free — is, like the Hermite
+// reconstruction claim, fundamentally SPECTRAL. A crossfade weight that is
+// C^k continuous (but not C^{k+1}) injects a transition whose Fourier tail
+// decays ~ f^-(k+2); so the broadband "seam image" energy a swap radiates
+// should be strictly ordered cubic (C¹) > quintic (C²) > septic (C³). The
+// crossfade.test finite-difference pins prove the seam continuity ORDER; THIS
+// pin turns it into a measurement, mirroring the Hermite-order rolloff pin
+// above.
+//
+// ─── Why a DC-level swap ─────────────────────────────────────────────────────
+//
+// The purest isolation of the crossfade WEIGHT's own spectral quality is a
+// parameter swap between two constants: a = +1, b = −1. The blended output
+// y(t) = (1−w)·a + w·b = 1 − 2·w(s(t)) is exactly the weight envelope mapped to
+// [+1, −1] — so its spectrum IS the weight schedule's spectrum, with no carrier
+// or signal structure to muddy the band measurement. (A sine amplitude-swap
+// gives the same ordering via sidebands, but the DC swap puts every bit of the
+// measured energy on the envelope, making the order separation unambiguous.)
+// The swap runs over a finite window centered in the buffer; the flat ±1
+// regions either side carry only DC + the Hann taper, so the high band is
+// purely the seam transition's tail.
+
+const XFADE_WINDOW_SAMPLES = 1024;            // ≈ 21 ms swap window @ 48 kHz
+// Image band: well above the window fundamental (48000/1024 ≈ 46.9 Hz) so the
+// transition main lobe is excluded and only the continuity-ordered tail counts.
+const XFADE_IMAGE_CUTOFF_HZ = 500;
+// Measured (DC swap, window 1024, FFT 16384): high-band RMS rel total reads
+// cubic −85.9 dB → quintic −104.5 dB → septic −117.8 dB, i.e. each higher order
+// drops the seam-image band by ≈13–19 dB. −6 dB thresholds are loose regression
+// guards (~2–3× margin) that never flake on FFT bin-edge placement.
+const XFADE_QUINTIC_VS_CUBIC_DB = -6;
+const XFADE_SEPTIC_VS_QUINTIC_DB = -6;
+
+function runCrossfadeSeamRolloffSpectrum(): void {
+  const aLevel = 1;
+  const bLevel = -1;
+  const n0 = Math.floor((SIM_SAMPLE_COUNT - XFADE_WINDOW_SAMPLES) / 2); // window start
+  const n1 = n0 + XFADE_WINDOW_SAMPLES;                                 // window end
+
+  const orders: CrossfadeContinuity[] = ["cubic", "quintic", "septic"];
+  const aBuf = new Float64Array(1);
+  const bBuf = new Float64Array(1);
+  const oBuf = new Float64Array(1);
+  aBuf[0] = aLevel;
+  bBuf[0] = bLevel;
+
+  const buffers: Record<CrossfadeContinuity, Float64Array> = {
+    cubic: new Float64Array(SIM_SAMPLE_COUNT),
+    quintic: new Float64Array(SIM_SAMPLE_COUNT),
+    septic: new Float64Array(SIM_SAMPLE_COUNT),
+  };
+  for (const order of orders) {
+    const wf = crossfadeWeight(order);
+    const audio = buffers[order];
+    for (let n = 0; n < SIM_SAMPLE_COUNT; n++) {
+      if (n <= n0) {
+        audio[n] = aLevel;
+      } else if (n >= n1) {
+        audio[n] = bLevel;
+      } else {
+        // Sample-accurate sweep: s advances across the window on the audio
+        // clock; the C^k weight schedule is what keeps the seam click-free.
+        const s = (n - n0) / XFADE_WINDOW_SAMPLES;
+        crossfadeInto(aBuf, bBuf, wf(s), oBuf);
+        audio[n] = oBuf[0]!;
+      }
+    }
+  }
+
+  const specs: Record<CrossfadeContinuity, { re: Float64Array; im: Float64Array }> = {
+    cubic: spectrumOf(buffers.cubic),
+    quintic: spectrumOf(buffers.quintic),
+    septic: spectrumOf(buffers.septic),
+  };
+
+  const binHz = SAMPLE_RATE / FFT_SIZE;
+  const kCut = Math.ceil(XFADE_IMAGE_CUTOFF_HZ / binHz);
+  const kHigh = FFT_SIZE / 2 - 1;
+  // Total RMS (all AC bins) as the normalizing reference — the transition's
+  // gross shape (nearly identical across orders) sits here; the high band is
+  // the order-dependent tail.
+  const totalRms = (s: { re: Float64Array; im: Float64Array }): number => {
+    let sumSq = 0;
+    for (let k = 1; k <= kHigh; k++) {
+      const m = mag(s.re, s.im, k);
+      sumSq += m * m;
+    }
+    return Math.sqrt(sumSq);
+  };
+  const bandRms = (s: { re: Float64Array; im: Float64Array }): number => {
+    let sumSq = 0;
+    for (let k = kCut; k <= kHigh; k++) {
+      const m = mag(s.re, s.im, k);
+      sumSq += m * m;
+    }
+    return Math.sqrt(sumSq);
+  };
+
+  const cubicBandDb = dB(bandRms(specs.cubic), totalRms(specs.cubic));
+  const quinticBandDb = dB(bandRms(specs.quintic), totalRms(specs.quintic));
+  const septicBandDb = dB(bandRms(specs.septic), totalRms(specs.septic));
+  const quinticVsCubic = quinticBandDb - cubicBandDb;
+  const septicVsQuintic = septicBandDb - quinticBandDb;
+
+  // (a) Quintic's seam-image band ≥6 dB below cubic's — the C¹→C² step.
+  assert(
+    quinticVsCubic <= XFADE_QUINTIC_VS_CUBIC_DB,
+    `quintic seam-image band must be ≥${-XFADE_QUINTIC_VS_CUBIC_DB} dB below cubic. ` +
+    `cubic=${cubicBandDb.toFixed(1)} dB, quintic=${quinticBandDb.toFixed(1)} dB, ` +
+    `Δ=${quinticVsCubic.toFixed(1)} dB`,
+  );
+  // (b) Septic's seam-image band ≥6 dB below quintic's — the C²→C³ step.
+  assert(
+    septicVsQuintic <= XFADE_SEPTIC_VS_QUINTIC_DB,
+    `septic seam-image band must be ≥${-XFADE_SEPTIC_VS_QUINTIC_DB} dB below quintic. ` +
+    `quintic=${quinticBandDb.toFixed(1)} dB, septic=${septicBandDb.toFixed(1)} dB, ` +
+    `Δ=${septicVsQuintic.toFixed(1)} dB`,
+  );
+
+  ok(
+    `crossfade-seam-rolloff-fft (DC swap, window ${XFADE_WINDOW_SAMPLES}; ` +
+    `image band >${XFADE_IMAGE_CUTOFF_HZ}Hz rel total: cubic=${cubicBandDb.toFixed(1)}dB → ` +
+    `quintic=${quinticBandDb.toFixed(1)}dB (Δ${quinticVsCubic.toFixed(1)}) → ` +
+    `septic=${septicBandDb.toFixed(1)}dB (Δ${septicVsQuintic.toFixed(1)}))`,
+  );
+}
+
 function main(): void {
   runPhaseLockSpectrum();
   runHermiteVsTaylorSpectrum();
   runHermiteOrderRolloffSpectrum();
+  runCrossfadeSeamRolloffSpectrum();
   console.log("\nAll Bridge.phaseLock tests passed.");
 }
 

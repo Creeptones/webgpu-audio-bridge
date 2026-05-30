@@ -4,6 +4,78 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.87] — 2026-05-30
+
+### Added — `crossfadeWeight` + `crossfadeInto`: the click-free seam primitive (God-Node Frontier 4, Stage 1)
+
+Apollo Phase I (quintic & septic Hermite) is complete. This opens **Frontier 4
+— the God-Node** (real-time self-rewriting emitter), starting with its
+foundational, LLM-free slice: swap from signal A to signal B mid-stream with no
+click at the seam. Stage 1 is the pure math core of that swap — and it falls
+straight out of the Phase I basis, because **the crossfade that makes a swap
+seamless is the same Hermite polynomial that killed the FM/zipper click.**
+
+#### What shipped
+
+- **`src/crossfade.ts`** — two root exports:
+  - **`crossfadeWeight(order)`** returns the C^k crossfade weight evaluator
+    `(s) => w`, where `order` is `"cubic"` (C¹ smoothstep `3s²−2s³`),
+    `"quintic"` (C² smootherstep `6s⁵−15s⁴+10s³`), or `"septic"` (C³
+    `35s⁴−84s⁵+70s⁶−20s⁷`). Each is the **position-to-position Hermite basis**
+    of the matching order (`h01` / `H3` / `H4`) — the exact closed-form
+    constants already in `src/trajectory.ts`.
+  - **`crossfadeInto(a, b, w, out, opts?)`** blends two evaluated signal
+    buffers `a → b` under weight `w ∈ [0,1]`, allocation-free, in place.
+    `mode: "amplitude"` (`(1−w)·a + w·b`, for a correlated parameter swap) or
+    `mode: "equal-power"` (`cos(½πw)·a + sin(½πw)·b`, for an uncorrelated
+    emitter swap with no −3 dB mid-fade notch). Default `"amplitude"`.
+- Types `CrossfadeContinuity` / `CrossfadeMode` / `CrossfadeOptions`.
+
+#### Why the weight schedule IS the Hermite basis
+
+For the blended output `y = (1−w)·A + w·B` to be C^k-continuous in time at the
+window edges (no derivative step → no click), `w(s)` must hit `w(0)=0`,
+`w(1)=1` AND have its first `k` derivatives vanish at both ends. The jump in
+`y^(j)` across the seam is governed entirely by `w^(j)` at the ends, so the
+crossfade's continuity order is a free knob that **reuses the Phase-I closed
+forms**. Match the crossfade order to the reconstruction order and the whole
+swap — interior reconstruction AND the blend seam — is C^k.
+
+#### Correctness
+
+- **Endpoint exactness:** `w=0` yields exactly `a`, `w=1` exactly `b`, in both
+  modes. Equal-power snaps the gains at the exact endpoints (`cos(½π·1)` is
+  6.12e-17, not 0) so a completed swap retires `a` with **no femto-ghost**.
+- The blend is driven by the same Hermite constants the trajectory evaluators
+  already ship — no new math, no duplicated coefficients.
+
+#### Tests
+
+- **`tests/Bridge.crossfade.test.ts`** (new, 12 pins; registered in both `test`
+  and `test:unit`): endpoint exactness (both modes); weight shape (`w(0)=0`,
+  `w(1)=1`, monotone, complementarity `w(s)+w(1−s)=1`); the continuity headline
+  **two independent ways** — (a) the weight's endpoint derivatives vanish to
+  order `k` and break at `k+1` (cubic w″≈6, quintic w‴≈60, septic w⁗≈840), and
+  (b) end-to-end finite-difference of a blended A→B signal across a swap window
+  shows the seam jump is ~0 for `j ≤ k` and O(1) at `j = k+1`; equal-power gain
+  law `cos²+sin²=1` (vs the amplitude mode's confirmed 0.5 mid-fade notch);
+  length-mismatch + non-finite guards.
+- **`tests/Bridge.phaseLock.test.ts` — fourth pin `runCrossfadeSeamRolloffSpectrum`**:
+  the spectral "click-free" proof, mirroring the Hermite-order rolloff pin. A
+  DC-level swap (±1) isolates the weight's own spectrum; the >500 Hz seam-image
+  band rel total reads **cubic −85.9 dB → quintic −104.5 dB → septic −117.8 dB**
+  — each higher order drops the broadband seam spray 13–19 dB.
+
+### Wire compatibility
+
+Additive root exports only — **no wire / SAB / protocol change**, no public-API
+break. A pure consumer-side helper module; no Bridge surface touched.
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.87 row; README API-reference entry for the crossfade
+primitive under the trajectory/reconstruction section.
+
 ## [0.9.86] — 2026-05-29
 
 ### Added — `examples/hermite-orders`: audible cubic/quintic/septic A/B demo (Phase I consolidation, Stage 3)

@@ -283,6 +283,24 @@ export {
   evaluateSepticHermiteTrajectoryInto,
 } from "./trajectory.js";
 
+// ── Click-free crossfade primitive (0.9.87 — God-Node Stage 1) ─────────────
+//
+// The seam-blend math underneath a live hot-swap: `crossfadeWeight(order)`
+// returns the C^k smootherstep weight schedule (cubic/quintic/septic = the
+// SAME position-to-position Hermite basis as the trajectory evaluators above),
+// and `crossfadeInto(a, b, w, out, opts?)` blends two evaluated signal buffers
+// `a → b` under that weight (amplitude or equal-power). Matching the crossfade
+// order to the reconstruction order makes the whole swap — interior AND seam —
+// C^k continuous, so the transition is click-free. Foundational slice of
+// Apollo Frontier 4 (the real-time self-rewriting emitter). See
+// src/crossfade.ts header for the continuity proof + mode rationale.
+export { crossfadeWeight, crossfadeInto } from "./crossfade.js";
+export type {
+  CrossfadeContinuity,
+  CrossfadeMode,
+  CrossfadeOptions,
+} from "./crossfade.js";
+
 // Canonical schemas — see src/schemas/physics.ts.
 export { physicsControlFrameSchema } from "./schemas/physics.js";
 export type { PhysicsControlFrameSchema } from "./schemas/physics.js";
