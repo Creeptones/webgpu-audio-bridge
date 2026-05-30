@@ -193,9 +193,12 @@ export function kindTsType(kind: FieldKind): "bigint" | "number" {
 
 /** Trajectory order — number of derivative components stored per sample.
  *  1 = position only (byte-compatible with a plain array).
- *  2 = position + velocity (linear Taylor extrapolation).
- *  3 = position + velocity + acceleration (quadratic Taylor / cubic Hermite). */
-export type TrajectoryOrder = 1 | 2 | 3;
+ *  2 = position + velocity (linear Taylor extrapolation / cubic Hermite).
+ *  3 = position + velocity + acceleration (quadratic Taylor / quintic Hermite).
+ *  4 = position + velocity + acceleration + jerk (cubic Taylor / septic Hermite,
+ *      0.9.80). The order-4 jerk lane is interleaved as `[p, v, a, j, …]`; it is
+ *      an **additive** widening — order 1/2/3 producers are byte-unchanged. */
+export type TrajectoryOrder = 1 | 2 | 3 | 4;
 
 /** Behavior of the clamped trajectory evaluator when a per-sample clamp band is
  *  exceeded (0.6.7). Only consulted when `maxDeltaPerSample` is set.
@@ -227,16 +230,31 @@ export type TrajectoryOverflowFallback = "hold" | "linear" | "saturate";
  *               (continuous tangent at frame boundaries → no first-derivative
  *               step), eliminating the "zipper" sound on slowly-varying
  *               envelopes.
+ *    'quintic-hermite' — C²-continuous degree-5 interpolation matching endpoint
+ *               position + velocity + acceleration (0.9.80). Requires
+ *               `order >= 3` (the order-3 acceleration lane already exists, so
+ *               this is wire-compatible — pure consumer-side reconstruction).
+ *               Removes the second-derivative step at frame boundaries.
+ *    'septic-hermite' — C³-continuous degree-7 interpolation matching endpoint
+ *               position + velocity + acceleration + jerk (0.9.80). Requires
+ *               `order == 4` (the additive jerk lane). Removes the
+ *               third-derivative step. Both higher-order modes use the same
+ *               two-frame `Bridge.evaluateHermiteInto` entry point.
  *
- *  **Stability commitment (0.8.10 → 1.0):** this union is **closed at
- *  1.0** at `'taylor' | 'hermite'`. A future quintic-Hermite path that
- *  consumes acceleration at both endpoints for full C² continuity will
- *  land in 1.x as a separate `'quintic-hermite'` value — an **additive**
- *  minor bump, not an in-place widening. This keeps consumer `switch`
- *  statements exhaustive at 1.0 (no default branch needed; a 1.x consumer
- *  that gates on the new arm sees a compile error rather than silent
- *  fall-through). */
-export type TrajectoryInterpolationMode = "taylor" | "hermite";
+ *  **Stability commitment (0.8.10 → 0.9.80 → 1.0):** the original 0.8.10 note
+ *  closed this union at `'taylor' | 'hermite'` and deferred quintic-Hermite to
+ *  a post-1.0 additive bump. 0.9.80 brought that forward: the higher-order
+ *  modes landed **additively and wire-compatibly inside the 0.9.x line**
+ *  (quintic over the existing order-3 wire; septic over the additive order-4
+ *  jerk lane). The union is now closed at 1.0 at
+ *  `'taylor' | 'hermite' | 'quintic-hermite' | 'septic-hermite'`. Adding a mode
+ *  remains always additive — a new arm is a deliberate compile error for
+ *  exhaustive consumer `switch`es, never a silent fall-through. */
+export type TrajectoryInterpolationMode =
+  | "taylor"
+  | "hermite"
+  | "quintic-hermite"
+  | "septic-hermite";
 
 /** Descriptive metadata attached to fields built via
  *  `f{32,64}TrajectoryArray(n, { order })`. The underlying storage is a flat
@@ -353,17 +371,18 @@ export interface TrajectoryArrayOptions {
    *  `order=3`. */
   readonly overflowFallback?: TrajectoryOverflowFallback;
   /** Reconstruction strategy passed through to the consumer-side evaluator
-   *  (0.7.3). The union is **closed at 1.0** at `'taylor' | 'hermite'`; a
-   *  future `'quintic-hermite'` arm is deferred to 1.x as an additive
-   *  minor bump (so consumer `switch` statements can stay exhaustive
-   *  without a default branch). `'hermite'` requires `order >= 2`.
+   *  (0.7.3, extended 0.9.80). `'hermite'` requires `order >= 2`,
+   *  `'quintic-hermite'` (C²) requires `order >= 3`, `'septic-hermite'` (C³)
+   *  requires `order == 4`. The union is **closed at 1.0** at
+   *  `'taylor' | 'hermite' | 'quintic-hermite' | 'septic-hermite'` (so consumer
+   *  `switch` statements can stay exhaustive without a default branch).
    *  Default `'taylor'`. */
   readonly interpolationMode?: TrajectoryInterpolationMode;
 }
 
 const VALID_INTERPOLATION_MODES: ReadonlySet<TrajectoryInterpolationMode> = new Set<
   TrajectoryInterpolationMode
->(["taylor", "hermite"]);
+>(["taylor", "hermite", "quintic-hermite", "septic-hermite"]);
 
 const VALID_OVERFLOW_FALLBACKS: ReadonlySet<TrajectoryOverflowFallback> = new Set<
   TrajectoryOverflowFallback
@@ -388,9 +407,9 @@ function trajectoryArray<T>(
     );
   }
   const { order } = opts;
-  if (order !== 1 && order !== 2 && order !== 3) {
+  if (order !== 1 && order !== 2 && order !== 3 && order !== 4) {
     throw new Error(
-      `Schema: trajectory order must be 1 | 2 | 3, got ${String(order)}`,
+      `Schema: trajectory order must be 1 | 2 | 3 | 4, got ${String(order)}`,
     );
   }
   if (opts.velocityClamp !== undefined) {
@@ -415,12 +434,22 @@ function trajectoryArray<T>(
     !VALID_INTERPOLATION_MODES.has(opts.interpolationMode)
   ) {
     throw new Error(
-      `Schema: trajectory interpolationMode must be 'taylor' | 'hermite', got ${String(opts.interpolationMode)}`,
+      `Schema: trajectory interpolationMode must be 'taylor' | 'hermite' | 'quintic-hermite' | 'septic-hermite', got ${String(opts.interpolationMode)}`,
     );
   }
   if (opts.interpolationMode === "hermite" && order < 2) {
     throw new Error(
       `Schema: trajectory interpolationMode 'hermite' requires order >= 2 (need endpoint velocities), got order=${order}`,
+    );
+  }
+  if (opts.interpolationMode === "quintic-hermite" && order < 3) {
+    throw new Error(
+      `Schema: trajectory interpolationMode 'quintic-hermite' requires order >= 3 (need endpoint accelerations for C² continuity), got order=${order}`,
+    );
+  }
+  if (opts.interpolationMode === "septic-hermite" && order !== 4) {
+    throw new Error(
+      `Schema: trajectory interpolationMode 'septic-hermite' requires order == 4 (need endpoint jerk for C³ continuity), got order=${order}`,
     );
   }
   const flatLength = sampleCount * order;

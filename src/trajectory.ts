@@ -2,19 +2,22 @@
  * Trajectory evaluation — Taylor extrapolation of interleaved (p, v, [a])
  * streams produced by `f{32,64}TrajectoryArray(n, { order })`.
  *
- * The producer packs N samples of position (and velocity, and acceleration
- * if order=3) into a flat interleaved typed-array of `N * order` elements:
+ * The producer packs N samples of position (and velocity, acceleration if
+ * order>=3, jerk if order=4) into a flat interleaved typed-array of
+ * `N * order` elements:
  *
  *     order=1:  [p0, p1, ..., p_{N-1}]
  *     order=2:  [p0, v0, p1, v1, ..., p_{N-1}, v_{N-1}]
  *     order=3:  [p0, v0, a0, p1, v1, a1, ..., p_{N-1}, v_{N-1}, a_{N-1}]
+ *     order=4:  [p0, v0, a0, j0, p1, v1, a1, j1, ...]   (jerk lane, 0.9.80)
  *
  * The consumer calls `evaluateTrajectoryInto(flat, spec, dt, out)` to
  * compute the extrapolated scalar at elapsed time `dt` for each sample.
  *
- *     order=1:  out[i] = p_i                              (dt ignored)
- *     order=2:  out[i] = p_i + v_i · dt                   (linear Taylor)
- *     order=3:  out[i] = p_i + v_i · dt + ½ · a_i · dt²   (quadratic Taylor)
+ *     order=1:  out[i] = p_i                                       (dt ignored)
+ *     order=2:  out[i] = p_i + v_i · dt                            (linear Taylor)
+ *     order=3:  out[i] = p_i + v_i · dt + ½ · a_i · dt²            (quadratic Taylor)
+ *     order=4:  out[i] = p_i + v_i · dt + ½ · a_i · dt² + ⅙ · j_i · dt³  (cubic Taylor)
  *
  * ─── Units ────────────────────────────────────────────────────────────────
  *
@@ -149,6 +152,22 @@ export function evaluateTrajectoryInto(
       }
       return;
     }
+    case 4: {
+      // Cubic Taylor (0.9.80): p + v·dt + ½a·dt² + ⅙j·dt³. Coefficients
+      // resolved once; same left-to-right (no implicit FMA) accumulation as
+      // the lower orders so the WASM scalar/SIMD ports stay bit-exact.
+      const halfDt2 = 0.5 * dt * dt;
+      const sixthDt3 = (1 / 6) * dt * dt * dt;
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 4;
+        out[i] =
+          flat[j]! +
+          flat[j + 1]! * dt +
+          flat[j + 2]! * halfDt2 +
+          flat[j + 3]! * sixthDt3;
+      }
+      return;
+    }
   }
 }
 
@@ -177,6 +196,16 @@ function evaluateClamped(
   let fallbackId = 0;
   if (spec.overflowFallback === "hold") fallbackId = 1;
   else if (spec.overflowFallback === "linear") fallbackId = 2;
+
+  // Order-4 (jerk) clamps are deferred (0.9.80): no producer-overflow incident
+  // has driven the need, and the linear/saturate fallback semantics for a cubic
+  // Taylor term want their own design pass. Throw rather than silently dropping
+  // the jerk term, mirroring the schema-time guards.
+  if (order === 4) {
+    throw new Error(
+      "evaluateTrajectoryInto: safety clamps are not supported for order=4 trajectories yet (0.9.80); evaluate the order-4 cubic Taylor on the clamp-free fast path",
+    );
+  }
 
   switch (order) {
     case 1: {
@@ -307,18 +336,10 @@ function evaluateClamped(
  *          are unit-free.
  *
  * Order=1 trajectories carry no velocity, so 'hermite' is rejected at
- * schema-construction time. Order=3 trajectories carry acceleration; this
- * first cut IGNORES it (standard cubic Hermite is C¹, not C²).
- *
- * The `interpolationMode` union is **closed at 1.0**, fixed to
- * `'taylor' | 'hermite'`. A quintic-Hermite path that consumes (p, v, a) at
- * both endpoints for full C² continuity is **deferred to 1.x** as a
- * separate `'quintic-hermite'` value — added via an additive minor bump
- * (e.g. 1.1.0), not by widening the closed 1.0 union in place. Closing the
- * union at 1.0 lets consumers `switch` on the mode without a default
- * branch; the additive-name path keeps that exhaustive-check shape valid
- * post-1.0 (a new arm is a deliberate compile error, not a silent fall-
- * through).
+ * schema-construction time. This cubic path IGNORES the acceleration lane on
+ * order>=3 (standard cubic Hermite is C¹, not C²); consume it via the
+ * 'quintic-hermite' mode (`evaluateQuinticHermiteTrajectoryInto`, 0.9.80)
+ * below for full C² continuity, or 'septic-hermite' (order-4 jerk lane) for C³.
  *
  * Allocation-free: the caller owns prev/curr/out buffers. No clamp path
  * yet — clamps land in a follow-up when there's a use case (the linear
@@ -401,11 +422,11 @@ export function evaluateHermiteTrajectoryInto(
   const h10s = h10 * segmentSeconds;
   const h11s = h11 * segmentSeconds;
 
-  // The per-sample stride is `order`; for order=2 it's (p, v), for order=3
-  // it's (p, v, a). The acceleration lane is ignored on the cubic path; a
-  // quintic-Hermite path that consumes acceleration at both endpoints is
-  // deferred to 1.x as a separate `'quintic-hermite'` interpolationMode
-  // value (additive minor bump, not a 1.0 union widening).
+  // The per-sample stride is `order`; for order=2 it's (p, v), for order>=3
+  // it's (p, v, a, …). The acceleration (and jerk) lanes are ignored on the
+  // cubic path; consume acceleration via 'quintic-hermite'
+  // (`evaluateQuinticHermiteTrajectoryInto`) for C², and jerk via
+  // 'septic-hermite' for C³ (both 0.9.80).
   const stride = order;
   for (let i = 0; i < sampleCount; i++) {
     const j = i * stride;
@@ -414,5 +435,131 @@ export function evaluateHermiteTrajectoryInto(
     const p1 = flatCurr[j]!;
     const m1 = flatCurr[j + 1]!;
     out[i] = h00 * p0 + h10s * m0 + h01 * p1 + h11s * m1;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Quintic Hermite interpolation (0.9.80 — Apollo Mission Phase I, C²)
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * Cubic Hermite (above) matches endpoint position + velocity → C¹. The second
+ * derivative still STEPS at the frame seam, leaving a residual click on
+ * aggressive FM/LFO modulation. Quintic Hermite additionally matches endpoint
+ * ACCELERATION, giving a C²-continuous reconstruction (continuous curvature
+ * across boundaries → the second-derivative step is gone).
+ *
+ * Degree-5 basis on local parameter t ∈ [0, 1] (see docs/quintic-septic-
+ * hermite-design.md for the derivation + endpoint/partition verification):
+ *
+ *     H0(t) =  1 − 10t³ + 15t⁴ −  6t⁵    → p0
+ *     H1(t) =  t −  6t³ +  8t⁴ −  3t⁵    → m0 = T·v0   (tangent in local-t)
+ *     H2(t) = ½t² − 3⁄2 t³ + 3⁄2 t⁴ − ½t⁵ → c0 = T²·a0  (curvature in local-t)
+ *     H3(t) =      10t³ − 15t⁴ +  6t⁵    → p1
+ *     H4(t) =     − 4t³ +  7t⁴ −  3t⁵    → m1 = T·v1
+ *     H5(t) =     ½t³ −     t⁴ + ½t⁵     → c1 = T²·a1
+ *
+ *     p(t) = H0·p0 + H1·(T·v0) + H2·(T²·a0) + H3·p1 + H4·(T·v1) + H5·(T²·a1)
+ *
+ * T = segmentSeconds. Velocity terms scale by T, acceleration by T² — the only
+ * place the time unit enters (endpoint derivatives in producer units → t-space
+ * derivatives). The scaling is folded into the basis coefficients once per
+ * call, so the per-sample loop is a flat sum just like the cubic path.
+ *
+ * Requires order >= 3 (acceleration lane at both endpoints). The order-3 wire
+ * already carries acceleration, so this is a pure consumer-side reconstruction
+ * change — no SAB byte change. On order=4 the jerk lane is present but unused
+ * by this evaluator (use 'septic-hermite' to consume it for C³). Allocation-
+ * free; no clamp path yet (same rationale as the cubic path). */
+
+/** Quintic Hermite (C²) reconstruction between two consecutive trajectory
+ *  frames. Requires `spec.order >= 3` (endpoint accelerations). `t` is the
+ *  normalized position in `[0, 1]` from `flatPrev` (older frame) to `flatCurr`;
+ *  `segmentSeconds` is the wall-clock segment duration in the producer's
+ *  velocity-time units. 0.9.80. */
+export function evaluateQuinticHermiteTrajectoryInto(
+  flatPrev: Float64Array,
+  flatCurr: Float64Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array,
+): void;
+export function evaluateQuinticHermiteTrajectoryInto(
+  flatPrev: Float32Array,
+  flatCurr: Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float32Array,
+): void;
+export function evaluateQuinticHermiteTrajectoryInto(
+  flatPrev: Float64Array | Float32Array,
+  flatCurr: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array | Float32Array,
+): void {
+  const { order, sampleCount } = spec;
+  if (order < 3) {
+    throw new Error(
+      `evaluateQuinticHermiteTrajectoryInto: spec.order must be >= 3 (quintic Hermite needs endpoint accelerations for C²), got order=${order}`,
+    );
+  }
+  if (!Number.isFinite(t)) {
+    throw new Error(`evaluateQuinticHermiteTrajectoryInto: t must be finite, got ${t}`);
+  }
+  if (!Number.isFinite(segmentSeconds)) {
+    throw new Error(
+      `evaluateQuinticHermiteTrajectoryInto: segmentSeconds must be finite, got ${segmentSeconds}`,
+    );
+  }
+  if (out.length < sampleCount) {
+    throw new Error(
+      `evaluateQuinticHermiteTrajectoryInto: out length ${out.length} < sampleCount ${sampleCount}`,
+    );
+  }
+  const required = sampleCount * order;
+  if (flatPrev.length < required) {
+    throw new Error(
+      `evaluateQuinticHermiteTrajectoryInto: flatPrev length ${flatPrev.length} < sampleCount * order (${required})`,
+    );
+  }
+  if (flatCurr.length < required) {
+    throw new Error(
+      `evaluateQuinticHermiteTrajectoryInto: flatCurr length ${flatCurr.length} < sampleCount * order (${required})`,
+    );
+  }
+
+  // Resolve the degree-5 basis once per call (signal-independent).
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const t4 = t3 * t;
+  const t5 = t4 * t;
+  const h0 = 1 - 10 * t3 + 15 * t4 - 6 * t5;
+  const h1 = t - 6 * t3 + 8 * t4 - 3 * t5;
+  const h2 = 0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5;
+  const h3 = 10 * t3 - 15 * t4 + 6 * t5;
+  const h4 = -4 * t3 + 7 * t4 - 3 * t5;
+  const h5 = 0.5 * t3 - t4 + 0.5 * t5;
+  // Velocity → local-t tangent (× T); acceleration → local-t curvature (× T²).
+  const T = segmentSeconds;
+  const T2 = T * T;
+  const h1s = h1 * T;
+  const h4s = h4 * T;
+  const h2s = h2 * T2;
+  const h5s = h5 * T2;
+
+  // stride = order (3 or 4). The jerk lane (order=4) is skipped here.
+  const stride = order;
+  for (let i = 0; i < sampleCount; i++) {
+    const j = i * stride;
+    const p0 = flatPrev[j]!;
+    const v0 = flatPrev[j + 1]!;
+    const a0 = flatPrev[j + 2]!;
+    const p1 = flatCurr[j]!;
+    const v1 = flatCurr[j + 1]!;
+    const a1 = flatCurr[j + 2]!;
+    out[i] = h0 * p0 + h1s * v0 + h2s * a0 + h3 * p1 + h4s * v1 + h5s * a1;
   }
 }

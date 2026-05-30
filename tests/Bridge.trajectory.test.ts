@@ -17,6 +17,11 @@
  *  59. testTrajectoryDeltaSaturate
  *  60. testTrajectoryClampFreeBitExact
  *  80. testForEachSampleInQuantum
+ *  81. testTrajectoryOrder4Taylor               (0.9.80 — cubic Taylor + clamp guard)
+ *  82. testTrajectoryQuinticBitExact            (0.9.80 — quintic Hermite closed-form)
+ *  83. testTrajectoryQuinticEndpoints           (0.9.80 — C² continuity at the seam)
+ *  84. testTrajectoryQuinticFloat32Truncation   (0.9.80 — f32 within-ULP grid sweep)
+ *  85. testHermiteInterpolationModeDispatch      (0.9.80 — evaluateHermiteInto mode routing)
  */
 
 import {
@@ -39,7 +44,10 @@ import {
   u8Array,
 } from "../src/schema.js";
 import { physicsControlFrameSchema } from "../src/schemas/physics.js";
-import { evaluateTrajectoryInto } from "../src/trajectory.js";
+import {
+  evaluateQuinticHermiteTrajectoryInto,
+  evaluateTrajectoryInto,
+} from "../src/trajectory.js";
 
 
 // ── 44. evaluateInto round-trip on a mixed-field schema (0.6.3, Pillar 3) ──
@@ -592,6 +600,292 @@ function testForEachSampleInQuantum(): void {
   ok("for-each-sample-in-quantum");
 }
 
+// ── Quintic basis reference (mirrors src/trajectory.ts accumulation order
+// exactly so f64 comparisons are bit-exact, not within-tolerance). ──────────
+function quinticRef(
+  p0: number, v0: number, a0: number,
+  p1: number, v1: number, a1: number,
+  t: number, T: number,
+): number {
+  const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+  const h0 = 1 - 10 * t3 + 15 * t4 - 6 * t5;
+  const h1 = t - 6 * t3 + 8 * t4 - 3 * t5;
+  const h2 = 0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5;
+  const h3 = 10 * t3 - 15 * t4 + 6 * t5;
+  const h4 = -4 * t3 + 7 * t4 - 3 * t5;
+  const h5 = 0.5 * t3 - t4 + 0.5 * t5;
+  const T2 = T * T;
+  return h0 * p0 + (h1 * T) * v0 + (h2 * T2) * a0 + h3 * p1 + (h4 * T) * v1 + (h5 * T2) * a1;
+}
+
+// ── 81. order-4 cubic Taylor + clamp guard (0.9.80) ──────────────────────
+//
+// The new order-4 wire lane (p, v, a, j) must evaluate the cubic Taylor
+// p + v·dt + ½a·dt² + ⅙j·dt³ on the clamp-free fast path, and reject clamps
+// (deferred) with a throw rather than silently dropping the jerk term.
+function testTrajectoryOrder4Taylor(): void {
+  const rng = mulberry32(0x4A3B);
+  const N = 96;
+  const dt = 0.2718;
+
+  // f64 bit-exact closed form.
+  {
+    const flat = new Float64Array(N * 4);
+    for (let k = 0; k < flat.length; k++) flat[k] = (rng() - 0.5) * 1000;
+    const spec: TrajectorySpec = { order: 4, sampleCount: N };
+    const out = new Float64Array(N);
+    const halfDt2 = 0.5 * dt * dt;
+    const sixthDt3 = (1 / 6) * dt * dt * dt;
+    evaluateTrajectoryInto(flat, spec, dt, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 4;
+      const want =
+        flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2 + flat[j + 3]! * sixthDt3;
+      assertEq(out[i], want, `order=4 cubic Taylor sample ${i} bit-exact`);
+    }
+  }
+
+  // dt=0 collapses to position regardless of v/a/j.
+  {
+    const flat = new Float64Array([5, 99, -7, 42, -3, 1, 1, 1]);
+    const out = new Float64Array(2);
+    evaluateTrajectoryInto(flat, { order: 4, sampleCount: 2 }, 0, out);
+    assertEq(out[0], 5, "order=4 dt=0 → p0");
+    assertEq(out[1], -3, "order=4 dt=0 → p1");
+  }
+
+  // Schema rejects clamps on order=4 at construction; the evaluator's clamped
+  // path also guards directly (mirrors the schema guard for raw-spec callers).
+  {
+    let threw = false;
+    try {
+      evaluateTrajectoryInto(
+        new Float64Array(8),
+        { order: 4, sampleCount: 2, velocityClamp: 5 },
+        1.0,
+        new Float64Array(2),
+      );
+    } catch {
+      threw = true;
+    }
+    assert(threw, "order=4 + clamp throws (clamps deferred)");
+  }
+
+  ok("trajectory-order4-taylor");
+}
+
+// ── 82. quintic Hermite closed-form bit-exact (0.9.80) ───────────────────
+//
+// f64 quintic Hermite must equal the hand-computed degree-5 basis sum, and a
+// quintic evaluated over an order-4 array (jerk lane present) must equal the
+// same evaluated over the order-3 projection — the jerk lane is ignored on
+// the C² path.
+function testTrajectoryQuinticBitExact(): void {
+  const rng = mulberry32(0x517E);
+  const N = 100;
+  const t = 0.41237;
+  const T = 1.5;
+
+  // ── order=3 (stride 3) ───────────────────────────────────────────────
+  {
+    const prev = new Float64Array(N * 3);
+    const curr = new Float64Array(N * 3);
+    for (let k = 0; k < prev.length; k++) prev[k] = (rng() - 0.5) * 200;
+    for (let k = 0; k < curr.length; k++) curr[k] = (rng() - 0.5) * 200;
+    const spec: TrajectorySpec = { order: 3, sampleCount: N };
+    const out = new Float64Array(N);
+    evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, t, T, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 3;
+      const want = quinticRef(
+        prev[j]!, prev[j + 1]!, prev[j + 2]!,
+        curr[j]!, curr[j + 1]!, curr[j + 2]!,
+        t, T,
+      );
+      assertEq(out[i], want, `quintic order=3 sample ${i} bit-exact`);
+    }
+  }
+
+  // ── order=4 (stride 4) ignores the jerk lane → same as order-3 slice ──
+  {
+    const prev4 = new Float64Array(N * 4);
+    const curr4 = new Float64Array(N * 4);
+    for (let k = 0; k < prev4.length; k++) prev4[k] = (rng() - 0.5) * 200;
+    for (let k = 0; k < curr4.length; k++) curr4[k] = (rng() - 0.5) * 200;
+    const out = new Float64Array(N);
+    evaluateQuinticHermiteTrajectoryInto(prev4, curr4, { order: 4, sampleCount: N }, t, T, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 4;
+      const want = quinticRef(
+        prev4[j]!, prev4[j + 1]!, prev4[j + 2]!,
+        curr4[j]!, curr4[j + 1]!, curr4[j + 2]!,
+        t, T,
+      );
+      assertEq(out[i], want, `quintic order=4 (jerk ignored) sample ${i} bit-exact`);
+    }
+  }
+
+  // ── order < 3 rejected ────────────────────────────────────────────────
+  {
+    let threw = false;
+    try {
+      evaluateQuinticHermiteTrajectoryInto(
+        new Float64Array(4), new Float64Array(4),
+        { order: 2, sampleCount: 2 }, t, T, new Float64Array(2),
+      );
+    } catch {
+      threw = true;
+    }
+    assert(threw, "quintic rejects order < 3");
+  }
+
+  ok("trajectory-quintic-bit-exact");
+}
+
+// ── 83. quintic C² continuity at the seam (0.9.80) ───────────────────────
+//
+// The headline claim, tested not asserted: at t=0 the reconstruction equals
+// the prev-frame position EXACTLY (basis is (1,0,0,0,0,0)); at t=1 the
+// curr-frame position EXACTLY. The reconstructed first/second derivatives at
+// each seam match the stamped endpoint velocity/acceleration (finite-diff,
+// scaled out of local-t space by T / T²) → C² across the boundary.
+function testTrajectoryQuinticEndpoints(): void {
+  const T = 1.25;
+  // Single sample, distinct (p, v, a) at each endpoint.
+  const p0 = 0.4, v0 = 1.1, a0 = -0.7;
+  const p1 = -0.3, v1 = 0.5, a1 = 1.2;
+  const prev = new Float64Array([p0, v0, a0]);
+  const curr = new Float64Array([p1, v1, a1]);
+  const spec: TrajectorySpec = { order: 3, sampleCount: 1 };
+  const out = new Float64Array(1);
+
+  // Endpoint value reproduction is EXACT (no rounding — basis is 0/1 there).
+  evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, 0, T, out);
+  assertEq(out[0], p0, "quintic t=0 → p0 exactly");
+  evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, 1, T, out);
+  assertEq(out[0], p1, "quintic t=1 → p1 exactly");
+
+  // Sample p(t) on a tiny stencil and finite-difference the derivatives.
+  const P = (t: number): number => {
+    const o = new Float64Array(1);
+    evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, t, T, o);
+    return o[0]!;
+  };
+  const e = 1e-4;
+  // d/dτ = (1/T)·d/dt. central 1st & 2nd differences.
+  const dP_dt0 = (P(e) - P(-e)) / (2 * e);
+  const d2P_dt0 = (P(e) - 2 * P(0) + P(-e)) / (e * e);
+  const dP_dt1 = (P(1 + e) - P(1 - e)) / (2 * e);
+  const d2P_dt1 = (P(1 + e) - 2 * P(1) + P(1 - e)) / (e * e);
+  const reconV0 = dP_dt0 / T, reconA0 = d2P_dt0 / (T * T);
+  const reconV1 = dP_dt1 / T, reconA1 = d2P_dt1 / (T * T);
+  const VTOL = 1e-5, ATOL = 1e-3; // finite-diff error budget (2nd diff is O(e²·scale))
+  assert(Math.abs(reconV0 - v0) < VTOL, `quintic v(0)=${reconV0} ≈ ${v0}`);
+  assert(Math.abs(reconV1 - v1) < VTOL, `quintic v(1)=${reconV1} ≈ ${v1}`);
+  assert(Math.abs(reconA0 - a0) < ATOL, `quintic a(0)=${reconA0} ≈ ${a0}`);
+  assert(Math.abs(reconA1 - a1) < ATOL, `quintic a(1)=${reconA1} ≈ ${a1}`);
+
+  ok("trajectory-quintic-endpoints-C2");
+}
+
+// ── 84. quintic f32 within-ULP over a dense t-grid (0.9.80) ──────────────
+//
+// JS computes the basis in f64; f32 only enters at input-read and the out
+// store. So the f32 path is bit-exact to a reference that computes the same
+// f64 expression from the f32-widened inputs and frounds the result. Swept
+// over a dense t-grid and a wide dynamic range to exercise the cancellation-
+// prone region near t→1.
+function testTrajectoryQuinticFloat32Truncation(): void {
+  const rng = mulberry32(0xF32C);
+  const N = 64;
+  const T = 2.0;
+  const prev = new Float32Array(N * 3);
+  const curr = new Float32Array(N * 3);
+  for (let k = 0; k < prev.length; k++) prev[k] = Math.fround((rng() - 0.5) * 1e4);
+  for (let k = 0; k < curr.length; k++) curr[k] = Math.fround((rng() - 0.5) * 1e4);
+  const spec: TrajectorySpec = { order: 3, sampleCount: N };
+  const out = new Float32Array(N);
+
+  const grid = [0, 0.05, 0.25, 0.5, 0.75, 0.95, 0.999, 1];
+  for (const t of grid) {
+    evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, t, T, out);
+    for (let i = 0; i < N; i++) {
+      const j = i * 3;
+      // Reference: same f64 expression on f32-widened inputs, frounded once.
+      const ref = Math.fround(
+        quinticRef(prev[j]!, prev[j + 1]!, prev[j + 2]!, curr[j]!, curr[j + 1]!, curr[j + 2]!, t, T),
+      );
+      assertEq(out[i], ref, `quintic f32 t=${t} sample ${i} bit-exact vs frounded f64`);
+    }
+  }
+
+  ok("trajectory-quintic-f32-truncation");
+}
+
+// ── 85. evaluateHermiteInto interpolationMode dispatch (0.9.80) ───────────
+//
+// A 'quintic-hermite' field must route through the quintic evaluator (output
+// matches the standalone `evaluateQuinticHermiteTrajectoryInto`); a default
+// (cubic) field still routes through the cubic evaluator; a 'septic-hermite'
+// field throws the staged "lands in 0.9.81" error.
+function testHermiteInterpolationModeDispatch(): void {
+  const N = 6;
+  const t = 0.37, segSec = 1.0;
+  const schema = defineSchema({
+    seq: u64(),
+    qEff: f64TrajectoryArray(N, { order: 3, interpolationMode: "quintic-hermite" }),
+    cEff: f64TrajectoryArray(N, { order: 3, interpolationMode: "hermite" }),
+  });
+  const { sab, capacity } = Bridge.allocate(4, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  const prev = bridge.scratchFrame();
+  const curr = bridge.scratchFrame();
+  const rng = mulberry32(0x9D17);
+  prev.seq = 1n; curr.seq = 2n;
+  prev.qEff = new Float64Array(N * 3);
+  curr.qEff = new Float64Array(N * 3);
+  prev.cEff = new Float64Array(N * 3);
+  curr.cEff = new Float64Array(N * 3);
+  for (let k = 0; k < N * 3; k++) {
+    prev.qEff[k] = (rng() - 0.5) * 50; curr.qEff[k] = (rng() - 0.5) * 50;
+    prev.cEff[k] = prev.qEff[k]!; curr.cEff[k] = curr.qEff[k]!;
+  }
+
+  const outFrame = bridge.scratchEvaluatedFrame();
+  bridge.evaluateHermiteInto(prev, curr, t, segSec, outFrame);
+
+  // qEff must match the standalone quintic evaluator; cEff the cubic one.
+  const refQ = new Float64Array(N);
+  evaluateQuinticHermiteTrajectoryInto(
+    prev.qEff, curr.qEff, { order: 3, sampleCount: N }, t, segSec, refQ,
+  );
+  for (let i = 0; i < N; i++) {
+    assertEq(outFrame.qEff[i], refQ[i]!, `evaluateHermiteInto quintic dispatch sample ${i}`);
+  }
+  // cEff (cubic) ignores acceleration → differs from quintic on the same data.
+  let anyDiff = false;
+  for (let i = 0; i < N; i++) if (outFrame.cEff[i] !== outFrame.qEff[i]) anyDiff = true;
+  assert(anyDiff, "cubic and quintic produce different output on identical (p,v,a) data");
+
+  // 'septic-hermite' (order=4) throws the staged error.
+  const septicSchema = defineSchema({
+    seq: u64(),
+    sEff: f64TrajectoryArray(N, { order: 4, interpolationMode: "septic-hermite" }),
+  });
+  const { sab: sab2, capacity: cap2 } = Bridge.allocate(4, septicSchema);
+  const b2 = new Bridge(sab2, cap2, septicSchema);
+  const p2 = b2.scratchFrame(); const c2 = b2.scratchFrame();
+  p2.seq = 1n; c2.seq = 2n;
+  p2.sEff = new Float64Array(N * 4); c2.sEff = new Float64Array(N * 4);
+  const of2 = b2.scratchEvaluatedFrame();
+  let threw = false;
+  try { b2.evaluateHermiteInto(p2, c2, t, segSec, of2); } catch { threw = true; }
+  assert(threw, "evaluateHermiteInto 'septic-hermite' throws (lands in 0.9.81)");
+
+  ok("hermite-interpolation-mode-dispatch");
+}
+
 function main(): void {
   testEvaluateIntoMixedSchema();
   testEvaluateIntoNoTrajectorySchema();
@@ -602,6 +896,11 @@ function main(): void {
   testTrajectoryDeltaSaturate();
   testTrajectoryClampFreeBitExact();
   testForEachSampleInQuantum();
+  testTrajectoryOrder4Taylor();
+  testTrajectoryQuinticBitExact();
+  testTrajectoryQuinticEndpoints();
+  testTrajectoryQuinticFloat32Truncation();
+  testHermiteInterpolationModeDispatch();
   console.log("\nAll Bridge trajectory tests passed.");
 }
 

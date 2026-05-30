@@ -4,6 +4,79 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.80] — 2026-05-29
+
+### Added — Quintic Hermite (C²) reconstruction + order-4 wire lane (Apollo Mission Phase I, Stage 1)
+
+Consumer-side reconstruction has topped out at cubic Hermite (`'hermite'`, 0.7.3):
+**C¹**-continuous — the value and first derivative are continuous across the
+frame seam, but the **second derivative steps**, leaving a residual click on
+aggressive FM/LFO modulation (the cubic path even *ignored* the acceleration
+lane it already received). This stage adds the next degree up and lays the wire
+groundwork for the one after, the first of a staged series (0.9.80 → 0.9.83)
+toward full C²/C³ reconstruction.
+
+The basis polynomials were derived **symbolically offline** and baked in as
+closed-form coefficients (no Python/SymPy added to the tree); the derivation,
+endpoint/partition verification, and the float32 cancellation analysis live in
+the new design note. Evaluation is left-to-right f64 accumulation with no
+implicit FMA — bit-exact-reasoned so the forthcoming WASM scalar/SIMD ports
+(Stages 3–4) can be held bit-exact to it.
+
+#### What shipped
+
+- **`evaluateQuinticHermiteTrajectoryInto(prev, curr, spec, t, segmentSec, out)`**
+  (root export, f64/f32 overloads) — degree-5 Hermite spline matching endpoint
+  position + velocity + **acceleration** → **C²** across the seam. Requires
+  `order >= 3`. The acceleration terms scale by `segmentSeconds²` (velocity by
+  `segmentSeconds`), folded into the basis coefficients once per call so the
+  per-sample loop stays a flat sum like the cubic path.
+- **`'quintic-hermite'` interpolationMode** — wire-compatible: it rides the
+  **existing order-3 acceleration lane**, so it is a pure consumer-side
+  reconstruction change with zero SAB churn. `Bridge.evaluateHermiteInto` now
+  dispatches per field on the mode (cubic / quintic).
+- **`TrajectoryOrder` widened `1 | 2 | 3` → `1 | 2 | 3 | 4`** — the additive
+  **order-4 jerk lane** `[p, v, a, j, …]`. The single-frame Taylor evaluator
+  gains the cubic arm `p + v·dt + ½a·dt² + ⅙j·dt³`; clamps on order-4 throw
+  (deferred — no producer-overflow incident has driven the need). This lane
+  backs the next mode:
+- **`'septic-hermite'` interpolationMode** — accepted at schema-construction
+  (requires `order == 4`), but `Bridge.evaluateHermiteInto` throws a clear
+  "lands in 0.9.81" error for it in 0.9.80 (no silent fall-through). The septic
+  evaluator itself ships in Stage 2.
+
+#### Correctness
+
+The f64 quintic path is **bit-exact** to the hand-computed degree-5 basis sum;
+the f32 path is bit-exact to the same f64 expression on f32-widened inputs,
+frounded once (JS computes the basis in f64 regardless — f32 enters only at
+input-read and the output store). **C² continuity is tested, not asserted**:
+new pins reproduce `p0`/`p1` exactly at `t=0`/`t=1` and finite-difference the
+reconstructed first/second derivatives at both seams, confirming they match the
+stamped endpoint velocity/acceleration. Pins 81–85 in
+`tests/Bridge.trajectory.test.ts` (order-4 Taylor + clamp guard; quintic
+bit-exact incl. order-4 jerk-lane-ignored; C² endpoints; f32 grid sweep;
+`evaluateHermiteInto` mode dispatch) + new schema mode-vs-order validation pins.
+
+### Wire compatibility
+
+Fully additive. `'quintic-hermite'` is wire-equivalent (order-3 bytes
+unchanged). The order-4 jerk lane is a new opt-in packing — order 1/2/3
+producers are byte-unchanged. No SAB-layout or protocol change for existing
+schemas.
+
+### Tests
+
+44 Node suites green; `Bridge.trajectory` grows to pin 85 (+ 5 pins),
+`schema` gains order-4 + interpolationMode-guard coverage. `npm run typecheck`
+clean. `npm run bench` push/pull/pullLatest unchanged.
+
+### Documentation
+
+New `docs/quintic-septic-hermite-design.md` (offline derivation, quintic +
+septic basis tables, `T^k` scaling, float32 cancellation analysis, stage map).
+README trajectory section + interpolation-modes list updated; ROADMAP 0.9.80 row.
+
 ## [0.9.79] — 2026-05-29
 
 ### Added — Hermite + order-3 Taylor SIMD evaluators (SIMD harvest, Stage 5)

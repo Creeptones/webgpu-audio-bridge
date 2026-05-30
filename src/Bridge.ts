@@ -267,6 +267,7 @@ import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 import {
   evaluateTrajectoryInto,
   evaluateHermiteTrajectoryInto,
+  evaluateQuinticHermiteTrajectoryInto,
 } from "./trajectory.js";
 import {
   predictiveExtrapolateInto,
@@ -1120,25 +1121,36 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       const name = field.name;
       if (field.trajectory) {
         // Trajectory field. Both prev and curr must carry the same flat
-        // payload shape (the schema enforces this at construction).
+        // payload shape (the schema enforces this at construction). The
+        // per-field interpolationMode selects the spline degree: cubic (C¹,
+        // default), quintic (C², 0.9.80), or septic (C³, lands in 0.9.81).
+        const mode = field.trajectory.interpolationMode;
         if (field.kind === "f64") {
-          evaluateHermiteTrajectoryInto(
-            prev[name] as Float64Array,
-            curr[name] as Float64Array,
-            field.trajectory,
-            t,
-            segmentSeconds,
-            out[name] as Float64Array,
-          );
+          const p = prev[name] as Float64Array;
+          const c = curr[name] as Float64Array;
+          const o = out[name] as Float64Array;
+          if (mode === "quintic-hermite") {
+            evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
+          } else if (mode === "septic-hermite") {
+            throw new Error(
+              `evaluateHermiteInto: 'septic-hermite' reconstruction lands in 0.9.81; field '${name}' must use 'hermite' or 'quintic-hermite' in 0.9.80`,
+            );
+          } else {
+            evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
+          }
         } else if (field.kind === "f32") {
-          evaluateHermiteTrajectoryInto(
-            prev[name] as Float32Array,
-            curr[name] as Float32Array,
-            field.trajectory,
-            t,
-            segmentSeconds,
-            out[name] as Float32Array,
-          );
+          const p = prev[name] as Float32Array;
+          const c = curr[name] as Float32Array;
+          const o = out[name] as Float32Array;
+          if (mode === "quintic-hermite") {
+            evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
+          } else if (mode === "septic-hermite") {
+            throw new Error(
+              `evaluateHermiteInto: 'septic-hermite' reconstruction lands in 0.9.81; field '${name}' must use 'hermite' or 'quintic-hermite' in 0.9.80`,
+            );
+          } else {
+            evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
+          }
         } else {
           // Defensive — the DSL only tags trajectory on f64/f32.
           throw new Error(

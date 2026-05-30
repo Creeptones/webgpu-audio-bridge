@@ -468,16 +468,54 @@ function testTrajectoryArrays(): void {
   assertEq(t3.trajectory?.order, 3, "f32 order=3 tag.order");
   assertEq(t3.trajectory?.sampleCount, 32, "f32 order=3 tag.sampleCount");
 
-  // Validation: order must be 1 | 2 | 3.
+  // order=4 (jerk lane, 0.9.80) is valid: flat length = n * 4.
+  const t4 = f64TrajectoryArray(16, { order: 4 });
+  assertEq(t4.byteSize, 8 * 16 * 4, "f64 order=4 byteSize = 8 * n * 4");
+  assertEq(t4.length, 64, "f64 order=4 flat length = n * 4");
+  assertEq(t4.trajectory?.order, 4, "f64 order=4 tag.order");
+
+  // Validation: order must be 1 | 2 | 3 | 4.
   let threw = false;
   try { f64TrajectoryArray(8, { order: 0 as unknown as TrajectoryOrder }); } catch { threw = true; }
   assert(threw, "order=0 rejected");
   threw = false;
-  try { f64TrajectoryArray(8, { order: 4 as unknown as TrajectoryOrder }); } catch { threw = true; }
-  assert(threw, "order=4 rejected");
+  try { f64TrajectoryArray(8, { order: 5 as unknown as TrajectoryOrder }); } catch { threw = true; }
+  assert(threw, "order=5 rejected");
   threw = false;
   try { f64TrajectoryArray(8, { order: 2.5 as unknown as TrajectoryOrder }); } catch { threw = true; }
   assert(threw, "non-integer order rejected");
+
+  // Validation: interpolationMode mode-vs-order guards (0.7.3 + 0.9.80).
+  threw = false;
+  try { f64TrajectoryArray(8, { order: 1, interpolationMode: "hermite" }); } catch { threw = true; }
+  assert(threw, "'hermite' requires order >= 2");
+  threw = false;
+  try { f64TrajectoryArray(8, { order: 2, interpolationMode: "quintic-hermite" }); } catch { threw = true; }
+  assert(threw, "'quintic-hermite' requires order >= 3");
+  threw = false;
+  try { f64TrajectoryArray(8, { order: 3, interpolationMode: "septic-hermite" }); } catch { threw = true; }
+  assert(threw, "'septic-hermite' requires order == 4");
+  // Valid combinations construct cleanly and carry the mode tag.
+  assertEq(
+    f64TrajectoryArray(8, { order: 3, interpolationMode: "quintic-hermite" }).trajectory
+      ?.interpolationMode,
+    "quintic-hermite",
+    "order=3 quintic-hermite valid",
+  );
+  assertEq(
+    f64TrajectoryArray(8, { order: 4, interpolationMode: "septic-hermite" }).trajectory
+      ?.interpolationMode,
+    "septic-hermite",
+    "order=4 septic-hermite valid",
+  );
+  threw = false;
+  try {
+    f64TrajectoryArray(8, {
+      order: 3,
+      interpolationMode: "bogus" as unknown as "taylor",
+    });
+  } catch { threw = true; }
+  assert(threw, "unknown interpolationMode rejected");
 
   // Validation: sampleCount must be a positive integer.
   threw = false;
