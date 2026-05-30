@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MP→SC fan-in — webgpu-audio-bridge (Apollo Frontier 3, Stage 3)</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131825; --line: #232b3d; --txt: #d7e0f0;
+    --dim: #8a97b1; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    --p0: #38bdf8; --p1: #a78bfa; --p2: #fb7185;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--txt);
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; padding: 28px; }
+  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--dim); margin: 0 0 20px; max-width: 760px; }
+  .sub code { color: var(--txt); background: #1c2230; padding: 1px 5px; border-radius: 4px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 920px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+    margin: 0 0 12px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
+  .k { color: var(--dim); } .v { font-variant-numeric: tabular-nums; }
+  .v.ok { color: var(--ok); } .v.warn { color: var(--warn); } .v.err { color: var(--err); } .v.hot { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  th:first-child, td:first-child { text-align: left; }
+  td.warn { color: var(--warn); }
+  .pid { font-weight: 600; } .pid.p0 { color: var(--p0); } .pid.p1 { color: var(--p1); } .pid.p2 { color: var(--p2); }
+  .controls { margin: 18px 0 24px; display: flex; gap: 10px; }
+  button { font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+    background: #1c2230; color: var(--txt); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #3a455e; background: #222a3b; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.hot { background: #3a1722; border-color: var(--err); color: #ffd5dc; }
+  .wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+  <h1>MP→SC fan-in — three producers, one audio thread</h1>
+  <p class="sub">
+    Apollo Frontier 3 · Stage 3. Three Web Workers each <code>mountFanIn(role:'producer')</code> the same
+    wait-free <code>MpmcRing</code> and push control frames at <b>different rates</b> (30 / 50 / 120 Hz);
+    one AudioWorklet <code>mountFanIn(role:'consumer')</code> drains them per quantum and sums three sines.
+    Allocated once by <code>connectFanIn()</code>. The invariant to watch: <b>tornFrameCount() stays 0</b> —
+    even under <b>Flood</b>, where producers overrun the ring and you see graceful, counted drop-newest.
+  </p>
+
+  <div class="controls">
+    <button id="start">Start audio</button>
+    <button id="flood" disabled>Flood (overrun the ring)</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <div class="grid">
+    <div class="panel"><h2>Topology</h2><div id="status"></div></div>
+    <div class="panel"><h2>Consumer (one audio thread)</h2><div id="consumer"></div></div>
+    <div class="panel wide">
+      <h2>Producers (three concurrent threads)</h2>
+      <table>
+        <thead><tr><th>thread</th><th>rate</th><th>pushed</th><th>dropped</th><th>latest freq</th><th>latest amp</th></tr></thead>
+        <tbody id="producers"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

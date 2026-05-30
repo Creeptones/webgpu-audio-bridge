@@ -2140,6 +2140,31 @@ The identity is `frameAudioMs · capacity = latency`, so a 60 ms budget on 1024-
 
 With `connect()` and the `Bridge<S, Role>` lattice shipped, all five frontier tracks are landed — no remaining design-only specs.
 
+### Experimental MP→SC fan-in — `connectFanIn()` (0.9.909)
+
+`connect()` builds an **SPSC** topology (one producer, one consumer). Apollo Frontier 3 adds the **MP→SC fan-in** edge: many producer threads, one audio consumer, over a single wait-free `MpmcRing` (the additive primitive with its own SAB layout — the frozen SPSC core is never touched). It ships from the **`webgpu-audio-bridge/experimental`** subpath while the MP→SC wire format soaks (same internal-first discipline `SpscRing` followed before its public promotion), so it stays off the 1.0-track `connect()` surface for now.
+
+```ts
+import { connectFanIn, mountFanIn } from "webgpu-audio-bridge/experimental";
+
+// Allocating thread — allocate the shared ring ONCE, fixed producer count.
+const topo = connectFanIn({ schema, producerCount: 3, latencyHint: "balanced" });
+topo.handle.sizing.usableDepth;   // capacity − reservedSlack (SLACK = producerCount − 1)
+
+// Each producer worker + the single consumer mount the SAME clone-safe handle.
+const producer = mountFanIn(topo.handle, { role: "producer", schema }); // producer.push(frame)
+const consumer = mountFanIn(topo.handle, { role: "consumer", schema }); // consumer.pull(out)
+```
+
+The split mirrors `connect()`: `connectFanIn(spec)` runs once (sizes + `initLayout`s the SAB), `mountFanIn(handle, {role})` reconstructs a ring on each thread via the bare constructor (no re-init). Both roles return the raw `MpmcRing<S>`. Two hard differences from `connect()`:
+
+- **Turbo-only.** A non-isolated environment throws `ConnectUnsupportedError('isolation-required')` — there is **no** `MessageChannel` fallback (the fan-in edge's whole point is the wait-free SAB fetch-add ticket, which `MessageChannel` cannot provide). Deploy COOP/COEP.
+- **`producerCount` is fixed at allocation.** It sets `SLACK = producerCount − 1` in the tear-freedom envelope (under-declaring it is the one way to tear), so it travels in the handle and every producer mount uses that value. The ring stays producer-id-agnostic; tell producers apart with an app-level `producerId` schema field.
+
+Under flood the ring drops newest (counted in `droppedFrames()`) and **never tears** (`tornFrameCount()` stays 0). See the live demo: `npm run dev:mpmc-fan-in` (`examples/mpmc-fan-in/` — three producers at 30/50/120 Hz → one AudioWorklet).
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectFanIn`/`mountFanIn`/`MpmcRing` may break across PATCH releases until the MP→SC primitive promotes to the root. Constructing an `MpmcRing` emits a one-shot `console.warn`.
+
 ## What this is, and what it isn't
 
 **This is, and remains, an SAB-first library.** Turbo mode (`Bridge<S>` over `SharedArrayBuffer` + `Atomics`) is the canonical path. The 0.8.x `MessageChannelBridge<S>` is a deliberate explicit second tier with documented worse latency — **not a transparent fallback**. The library will never auto-detect the user's environment and silently pick a transport for them; the choice between `Bridge<S>` and `MessageChannelBridge<S>` is explicit at construction time. See [Two transport tiers](#two-transport-tiers-070) for the framing, [Browser support matrix](#browser-support-matrix) for what works where, and the §FAQ entry "Will the library add a transparent fallback?" (0.7.9) for the long-form answer.

@@ -46,3 +46,28 @@ export type {
   MeasureRenderQuantumOptions,
   AudioContextCtorLike,
 } from "./renderQuantum.js";
+
+// ── MpmcRing + connectFanIn/mountFanIn (0.9.907 / 0.9.909) ──────────────────
+//
+// Apollo Frontier 3's wait-free MP→SC (multi-producer, single-consumer) fan-in
+// edge. `MpmcRing` is the primitive (Stage 1); `connectFanIn`/`mountFanIn` are
+// the declarative `connect()`-style topology constructor over it (Stage 3) —
+// allocate the shared SAB once, hand a clone-safe handle to N producer threads +
+// 1 consumer, each `mountFanIn`s an `MpmcRing` over it. Turbo-ONLY: a
+// non-isolated environment throws `ConnectUnsupportedError('isolation-required')`
+// — there is NO MessageChannel fallback (the point is the wait-free SAB
+// fetch-add). The MP→SC wire format is OUTSIDE the 1.0 stability contract until
+// it soaks + promotes (mirrors SpscRing internal@0.6.8 → public@0.6.10); a
+// one-shot construction warning fires. See docs/frontier3-stage3-connect-
+// integration-handoff.md.
+export { MpmcRing, MPMC_HEADER_BYTES } from "../MpmcRing.js";
+export type { MpmcRingOptions } from "../MpmcRing.js";
+export { connectFanIn, mountFanIn } from "../connectFanIn.js";
+export type {
+  ConnectFanInSpec,
+  FanInHandle,
+  FanInTopology,
+  FanInSizing,
+  FanInRole,
+  MountFanInOptions,
+} from "../connectFanIn.js";

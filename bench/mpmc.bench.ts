@@ -339,6 +339,7 @@ async function runContentionCurve(producerCounts: number[]): Promise<
     dropped: number;
     elapsedMs: number;
     framesPerSec: number;
+    pushedPerSec: number;
     dropFrac: number;
   }>
 > {

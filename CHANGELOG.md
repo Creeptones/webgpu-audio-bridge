@@ -4,6 +4,110 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.909] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 3: `connectFanIn()` MP→SC integration
+
+The step that turns the proven `MpmcRing` primitive into something an app can
+stand up: a declarative `connect()`-style topology constructor for the wait-free
+MP→SC (multi-producer, single-consumer) fan-in edge. **Internal-first +
+`@experimental`**, shipped from the **`webgpu-audio-bridge/experimental`
+subpath** — NOT the stable root — so the experimental MP→SC wire format never
+leaks onto the 1.0-track `connect()` surface before it soaks (mirrors SpscRing
+internal@0.6.8 → public@0.6.10; graduates to the root when `MpmcRing` promotes).
+
+- **`src/connectFanIn.ts`** — `connectFanIn(spec) → FanInTopology` +
+  `mountFanIn(handle, opts) → MpmcRing<S>`. The same allocate-once / mount-many
+  split as `connect()`: `connectFanIn` runs once on the allocating thread —
+  probes the environment, sizes the ring, `MpmcRing.create`s the SAB and calls
+  `initLayout()` exactly once — and returns a frozen, structured-clone-safe
+  `handle` carrying the shared SAB. Every producer worker AND the single consumer
+  worklet then `mountFanIn` an `MpmcRing` over it via the **bare constructor**
+  (which does NOT re-init — re-init mid-flight would strand frames). Both roles
+  return the raw `MpmcRing<S>` (producers `push`, the consumer polls `pull`).
+- **Turbo-ONLY, no Standard fallback.** Unlike `connect()`, there is no
+  `MessageChannelBridge` degradation path — the fan-in edge's whole point is the
+  wait-free SAB fetch-add ticket, which has no `MessageChannel` analogue. A
+  non-isolated environment throws `ConnectUnsupportedError('isolation-required')`
+  with a fan-in-specific message; it never silently degrades.
+- **`producerCount` is fixed at allocation** (it sets `SLACK = producerCount − 1`
+  in the envelope — under-declaring it is the one way to break tear-freedom), so
+  it travels in the handle and every producer mount uses the same value. The ring
+  stays producer-id-agnostic; app-level producer identity is a schema field.
+- **Sizing (`FanInSizing`)** — the `latencyHint` resolves a target backlog
+  (reusing `connect()`'s macro-lane heuristic incl. `LatencyBudget` block-math /
+  `producerHz`), then `capacity = nextPow2(max(backlog + SLACK, producerCount+1))`
+  so usable depth ≥ the requested backlog AND `capacity > producerCount` (the
+  ctor floor). `reservedSlack` + `usableDepth` are always surfaced so the slack
+  cost is legible.
+- **Exported from `src/experimental/index.ts`**: `connectFanIn`, `mountFanIn`,
+  and (re-exported for convenience) `MpmcRing` / `MPMC_HEADER_BYTES` + the
+  `ConnectFanInSpec` / `FanInHandle` / `FanInTopology` / `FanInSizing` /
+  `FanInRole` / `MountFanInOptions` / `MpmcRingOptions` types.
+- **Browser smoke — `examples/mpmc-fan-in/`** (`npm run dev:mpmc-fan-in`, port
+  5184). Three producer `Worker`s push control frames at 30 / 50 / 120 Hz into
+  one shared `MpmcRing`; one `AudioWorklet` drains per quantum and sums three
+  sines; a live HUD shows per-producer push/drop counts and the consumer's
+  `droppedFrames()` / `overrunLostFrames()` / **`tornFrameCount()`** /
+  `available()`. A **Flood** button overruns the ring to demonstrate graceful,
+  counted drop-newest with tearing pinned at zero. Verified in-browser
+  (cross-origin isolated, three independent rates fanning in, `torn=0` under both
+  normal pacing and flood).
+
+### Why
+
+Stage 1 built + triple-proved the primitive and Stage 2 characterized it, but the
+MP→SC edge had never been wired into a real producer→consumer topology. Stage 3
+makes it *usable* — one `connectFanIn` call hands N producer threads + one audio
+consumer a working shared ring — while keeping the frontier's load-bearing
+discipline: additive, experimental-gated, and **the stable `connect()` /
+`SpscRing` SPSC path is never opened** (a separate file, a separate SAB layout, a
+separate ring), so the "SPSC bit-exact" gate is structurally automatic.
+
+### Wire compatibility
+
+**Purely additive.** No `src/index.ts` (root) surface change; the new API lives
+on the `webgpu-audio-bridge/experimental` subpath. The frozen SPSC protocol,
+`src/SpscRing.ts`, `src/connect.ts`, and the SPSC `connect.test.ts` pins are
+**untouched and bit-exact**. The `@experimental` MP→SC SAB layout is unchanged
+from 0.9.907 (the one-shot construction warning still cites its 0.9.907
+provenance). The fan-in surface is outside the 1.0 stability contract until the
+primitive promotes.
+
+### Tests
+
+- **`tests/connectFanIn.test.ts`** — 9 single-thread API pins: Turbo-only env
+  gate (standard → `isolation-required` with no fallback, unsupported →
+  `unsupported`), `producerCount` validation, sizing + envelope guard
+  (`usableDepth` / `reservedSlack`, `capacity > producerCount`, override
+  floored), allocate-once / mount-many **bit-exact round-trip across every
+  FieldKind** (two producers + one consumer over ONE SAB, FIFO-by-ticket),
+  drop-newest counted through the mount surface, the **`initLayout`-not-re-called**
+  discipline (a late peer mount must NOT reset the ring), the layout-skew guard
+  (byteSize + full field-shape), `LatencyBudget` block sizing, and
+  `topology.mount()` ↔ free `mountFanIn()` symmetry.
+- **`tests/connectFanIn.concurrent.test.ts`** — `tests/MpmcRing.concurrent.test.ts`
+  re-pointed THROUGH the wiring: the ring is allocated by `connectFanIn` and the
+  consumer reconstructed by `mountFanIn`, then 3 real producer `worker_threads`
+  flood 1.2 M frames. Bit-exact + conservation (`consumed + dropped === attempted`,
+  `tornFrameCount() === 0`, `overrunLostFrames() === 0`), deadlock watchdog —
+  proving the wiring doesn't corrupt the proven primitive.
+- Registered in `test` / `test:unit` (single-thread) + `test` / `test:concurrent`
+  (cross-thread). The existing `connect.test.ts` SPSC pins run **unchanged** as
+  the bit-exactness gate.
+- **Drive-by fix:** `bench/mpmc.bench.ts`'s `runContentionCurve` return-type
+  annotation was missing `pushedPerSec` (the value was returned but not typed),
+  failing `npm run typecheck` on the pristine 0.9.908 tree; added the field so the
+  mandatory typecheck gate is clean again. Runtime behavior unchanged.
+
+### Documentation
+
+`README.md` Roadmap + Back-pressure/topology sections note the experimental
+fan-in surface. `ROADMAP.md` Frontier 3 narrative + descending-table row updated
+(Stage 3 shipped). `package.json` gains the `dev:mpmc-fan-in` script.
+`docs/frontier3-stage3-connect-integration-handoff.md` is the design record
+(decisions A/a, B/raw-ring, C/throw confirmed with the user).
+
 ## [0.9.908] — 2026-05-30
 
 ### Added — Apollo Frontier 3, Stage 2: `MpmcRing` bench + characterization
