@@ -4,6 +4,148 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.907] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 1: the `MpmcRing` primitive (first production code of the frontier)
+
+The wait-free MP→SC (multi-producer, single-consumer) fan-in ring, implementing
+the **Policy B (envelope-guaranteed)** design that Stage 0 (0.9.906) proved
+sound. Internal-first + `@experimental` (mirrors SpscRing internal@0.6.8 →
+public@0.6.10): NOT exported from `src/index.ts`; promotion is a later patch.
+
+- **`src/MpmcRing.ts`** — its OWN SAB layout (header + per-slot generation
+  region + payload), entirely separate from `SpscRing` (the frozen SPSC core is
+  never touched). Producer enqueue is a single `Atomics.add` fetch-add ticket +
+  per-slot generation release-store, gated by a producer-side envelope check
+  (drop-newest *before* claiming when `Buffered ≥ CAPACITY − SLACK`,
+  `SLACK = producerCount − 1`). Consumer dequeue is an O(1) head check with a
+  strict `d == 0` generation gate + a W-skip overload net. Hard wait-free on
+  both sides — no CAS-retry, no `Atomics.wait`. A one-shot runtime warning fires
+  on construction. Surface: `byteLength` / `create` / `push` / `pull` /
+  `available` / `droppedFrames` / `overrunLostFrames` / `tornFrameCount` /
+  `createFrame` / `describeLayout` + the `producerCount` option (validated —
+  under-declaring it is the one way to break the tear-freedom envelope).
+
+### Why
+
+Frontier 3's headline ("wait-free MPMC audio DAGs") needs a proven MP→SC edge
+primitive first. Stage 0 settled the design (Policy A as sketched tears + stalls
+under lapping; the envelope must be enforced producer-side); Stage 1 builds that
+proven design and pins it three ways.
+
+### Wire compatibility
+
+Purely additive — the frozen SPSC wire format is untouched. `MpmcRing` is a
+brand-new primitive with its own SAB layout; `src/SpscRing.ts` and the SPSC
+protocol are unchanged, and `MpmcRing` is not yet exported. The MP→SC wire
+format is `@experimental` and outside the 1.0 stability contract until promotion.
+
+### Tests
+
+Three new suites (registered in `test`, `test:unit`, and `test:concurrent`):
+
+- **`tests/MpmcRing.interleaving.test.ts`** — the in-CI successor to the Stage-0
+  throwaway probe: an exhaustive loom-style DFS over every interleaving of N
+  producers + 1 consumer for bounded N/C, asserting INV-1 (no torn read), INV-2
+  (no loss beyond the counted overload net), INV-3 (FIFO-by-ticket +
+  conservation), and **INV-W** (a mechanical wait-free witness:
+  `maxConsumerSteps === 1`; producer transitions monotone with no retry). Plus
+  negative pins proving the envelope and the consumer gates are load-bearing
+  (lapping → torn/stall; no-W → stall; `d ≥ 0` → wrong frame).
+- **`tests/MpmcRing.test.ts`** — single-thread API pins (construction guards,
+  bit-exact round-trip across every FieldKind, drop-newest-when-full counted,
+  empty-pull, head-of-line gap rides over, the overload-net counted-loss path,
+  producerCount SLACK reserve).
+- **`tests/MpmcRing.concurrent.test.ts`** — real `worker_threads` stress: 3
+  producer threads × 400 000 frames (1.2 M attempted) reconciled bit-exact
+  against the drop counter (`consumed + dropped === attempted`, zero torn, zero
+  overrun loss), with a deadlock watchdog (helpers in `tests/_mpmcStress.ts` +
+  `tests/_mpmcStress.worker.ts`).
+
+Gates: `npm run typecheck` clean; full suite green (incl. the 3 new suites);
+bench within budget (push/pull/pullLatest well under the 10 µs hard cap).
+
+### Documentation
+
+Self-contained `src/MpmcRing.ts` file header documents the layout, every
+invariant, and the happens-before/memory-ordering argument. `ROADMAP.md` Frontier
+3 section + descending-table row updated to "Stage 1 shipped"; `CLAUDE.md` file
+inventory gains `src/MpmcRing.ts` + the new test files and notes the probe is now
+superseded. Stage-1 charter: `docs/frontier3-stage1-mpmc-primitive-handoff.md`.
+
+## [0.9.906] — 2026-05-30
+
+### Added — Apollo Frontier 3, Stage 0: MP→SC wait-free ring — formal model + happens-before proof + algorithm probe (NO production code)
+
+The first deliverable of the un-parked Frontier 3 (Wait-Free MPMC audio DAGs).
+Stage 0 is a **pure correctness-artifact** patch — it ships **no `src/` code and
+no public API**, exactly like 0.9.44 shipped `formal/SpscRing.tla` ahead of any
+consumer. It models, proves, and *settles the open design question* for the
+additive MP→SC (`MpmcRing`) primitive before a single production line is written.
+
+- **`formal/MpmcRing.tla` + `formal/MpmcRing.cfg`** — a TLA+/PlusCal model of the
+  MP→SC protocol (multiple fetch-add producers, per-slot generation release,
+  single in-order consumer), the **additive sibling** of the frozen
+  `formal/SpscRing.tla` (which is untouched). Invariants `NoOverwrite` /
+  `NoTornRead` / `FifoByTicketNoGap` / `Conservation` + liveness
+  `EventuallyDrained` / `HeadProgress`; reuses the SPSC wrap algebra verbatim;
+  small bounded session (`NPRODUCERS=2, CAPACITY=2, CAP2_32=16, MAXFRAMES=4`).
+- **`bench/mpmc-probe.mjs`** — a throwaway, dependency-free
+  (`node bench/mpmc-probe.mjs`) loom/relacy-style **exhaustive** interleaving
+  explorer for N producers + 1 consumer, the runnable half of the Stage 0
+  deliverable. Walks every interleaving of the choice DAG once (visited-set) and
+  asserts no torn read, overwrite detection, FIFO-by-ticket, conservation, and
+  the wait-free witness (O(1) consumer steps).
+- **`docs/mpmc-happens-before-proof.md`** — the written happens-before proof
+  (per-slot release/acquire edge, the three-way signed-wrap generation decision,
+  wait-freedom, FIFO + head-of-line gap) plus the Stage-0 finding and the
+  resolved policy.
+
+### Why — the open design question is settled (with a correction to the sketch)
+
+The handoff's recommended starting hypothesis was **Policy A** ("wait-free
+overwrite-with-detection" on a ring allowed to lap). The exhaustive probe
+**falsifies it**: under lapping the unconditional per-slot publish produces both
+**torn reads** (an older producer corrupts a reused slot a newer producer already
+stamped — the strict `d==0` consumer still tears) and **stalls** (out-of-order
+same-slot publish regresses the generation, stranding a frame). Making the
+publish monotonic reintroduces the CAS-retry the handoff rejected (Vyukov).
+
+**Resolution — Policy B (envelope-guaranteed):** size the ring so in-flight
+tickets stay `< CAPACITY`, so a slot is never reused while occupied; the
+unconditional fetch-add publish is then sound and **wait-free O(1) on both
+sides**, which the probe verifies exhaustively (0 torn / 0 stall / full
+conservation across P=2..4 × C=2,4; e.g. P=4/C=4 walks 4037 states). The envelope
+is a **hard precondition for tear-freedom**, to be enforced producer-side in
+Stage 1 (drop-newest before claiming when full, with `NPRODUCERS−1` slack for the
+non-atomic check+fetch-add). The consumer's high-water skip + strict `d==0`
+equality are retained as the loss-detecting / stall-avoiding overload net (both
+shown load-bearing: dropping either stalls or delivers a wrong frame).
+
+### Wire compatibility
+
+No wire change. **`SpscRing` and `formal/SpscRing.tla` are untouched** — the 1.0
+settled-protocol promise stands. `MpmcRing` is a separate, additive primitive
+with its own (not-yet-implemented) SAB layout; it will ship `experimental`
+pre-1.0 when Stage 1 lands. No `src/`, no public API, no SAB/protocol change in
+this patch.
+
+### Tests
+
+No new Node test suite (Stage 0 ships no `src/`). Gates: `npm run typecheck`
+clean; full suite green (nothing in `src/` changed); bench unchanged
+(push/pull/pullLatest ~1.20–1.30 µs). The runnable probe exits 0 (all Stage-0
+expectations met); the in-CI fuzzer `tests/MpmcRing.interleaving.test.ts` lands
+with Stage 1.
+
+### Documentation
+
+`formal/README.md` gains an MP→SC model section; `ROADMAP.md` Frontier 3 section
+updated to "Stage 0 shipped" with a descending-table row; `CLAUDE.md` file
+inventory gains the three new artifacts. Full context in
+`docs/frontier3-wait-free-mpmc-handoff.md` (the kickoff handoff) and the new
+proof note.
+
 ## [0.9.905] — 2026-05-30
 
 ### Added — famine-aware advancing-horizon fade (Apollo Frontier 2 follow-up — realizes the predictor's headline benefit)

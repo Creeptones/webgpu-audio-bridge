@@ -1,12 +1,20 @@
-# Formal model of the SpscRing SPSC protocol (TLA+/PlusCal)
+# Formal models of the ring protocols (TLA+/PlusCal)
 
-This directory holds a machine-checkable formal model of the single-producer
-single-consumer (SPSC) ring protocol implemented in
-[`../src/SpscRing.ts`](../src/SpscRing.ts), modeled under a weak-memory
-(release/acquire) abstraction.
+This directory holds machine-checkable formal models of the bridge's ring
+protocols, modeled under a weak-memory (release/acquire) abstraction.
 
-- `SpscRing.tla` — the PlusCal algorithm + TLA+ invariants/properties.
-- `SpscRing.cfg` — the TLC model-checker configuration (small bounded session).
+- `SpscRing.tla` / `SpscRing.cfg` — the single-producer single-consumer (SPSC)
+  protocol implemented in [`../src/SpscRing.ts`](../src/SpscRing.ts). The
+  PlusCal algorithm + TLA+ invariants/properties and the TLC config (small
+  bounded session). **This model and the SPSC wire format are frozen.**
+- `MpmcRing.tla` / `MpmcRing.cfg` — the **additive** multi-producer /
+  single-consumer (MP→SC) `MpmcRing` protocol (Apollo Frontier 3, Stage 0,
+  0.9.906). A *separate* primitive with its own SAB layout, modeled **beside**
+  the untouched SPSC model. See [MP→SC model](#mpsc-model-mpmcring--apollo-frontier-3-stage-0)
+  below.
+
+The rest of this section describes the SPSC model; the MP→SC model has its own
+section near the end.
 
 The `.tla` is written to be **syntactically faithful TLA+/PlusCal**; it does
 not have to be run inside this repo's toolchain (there is no Java/TLC in the
@@ -190,3 +198,82 @@ java -cp tla2tools.jar tlc2.TLC -config formal/SpscRing.cfg formal/SpscRing.tla
 Expected result: all four invariants hold and both `WakeLiveness` properties
 hold under the bounded `CAPACITY=2, CAP2_32=16, MAXFRAMES=6` session, with no
 deadlock.
+
+To check the MP→SC model instead, substitute `MpmcRing` for `SpscRing` in both
+commands above (`pcal.trans formal/MpmcRing.tla`, then
+`tlc2.TLC -config formal/MpmcRing.cfg formal/MpmcRing.tla`).
+
+---
+
+## MP→SC model (`MpmcRing`) — Apollo Frontier 3, Stage 0
+
+`MpmcRing.tla` / `MpmcRing.cfg` model the **additive** multi-producer /
+single-consumer ring (the first topology of Apollo Frontier 3, shipped as the
+Stage 0 correctness artifact in 0.9.906). It is the sibling of the SPSC model;
+the SPSC model and the SPSC wire format are **frozen and untouched** (handoff
+decision 2 — the 1.0 settled-protocol promise stands). Full context:
+[`../docs/frontier3-wait-free-mpmc-handoff.md`](../docs/frontier3-wait-free-mpmc-handoff.md)
+and the written proof
+[`../docs/mpmc-happens-before-proof.md`](../docs/mpmc-happens-before-proof.md).
+
+### What is modeled
+
+The **sound operating regime** Stage 0 settled on — the **envelope-guaranteed
+(Policy B)** MP→SC ring:
+
+- **Multiple producers** claim a unique slot by a wait-free fetch-add on a shared
+  `enqueueTicket` (`Atomics.add`, returning the old value — **not** a CAS-retry;
+  this is the handoff's reason for rejecting the lock-free Vyukov position-CAS).
+- **Per-slot generation publish:** each producer release-stores its ticket as the
+  slot's `generation`. This **per-slot** release-store replaces SPSC's single
+  global `write_index` release-store as the per-frame happens-before edge — the
+  central new hazard the model must re-establish `NoTornRead` against.
+- **One in-order consumer** reads a slot only at exact signed-wrap equality
+  (`SignedDiff(seq, head) == 0`); a `d < 0` head is the head-of-line gap (ride to
+  the next quantum); the high-water catch-up + the `d > 0` overwrite branch are
+  the *overload safety net* (unreachable under the envelope).
+- The **envelope** (in-flight tickets `< CAPACITY`) is modeled as a guard fused
+  with the fetch-add into one atomic `Claim` step, so a slot is never reused while
+  a prior frame is unconsumed. That is the property (unique slot ownership) that
+  makes the *unconditional* per-slot publish safe.
+
+The wrap algebra (`SignedDiff` / `Slot` / `Incr`) is reused verbatim from the
+SPSC model; `CAP2_32` is a small power of two (`> 2*CAPACITY`, enforced by an
+`ASSUME`) so TLC crosses the wrap boundary while keeping the live generation span
+clear of the `±(CAP2_32/2)` ambiguity.
+
+### Invariants & properties
+
+| Name | Meaning |
+|---|---|
+| `NoOverwrite` | in-flight `∈ [0, CAPACITY]` — the envelope holds (no slot reused while unread). |
+| `NoTornRead` | the consumer never reads a slot a producer is mid-writing (per-slot release/acquire; witnessed by a `slotOwner` ghost + an `assert` in the consumer's `Dequeue` step, plus a no-wrong-frame `assert`). |
+| `FifoByTicketNoGap` | `SignedDiff(dequeuePos, 0) = consumed` — deliveries are ticket 0,1,2,… in order, no gap, no duplication. |
+| `Conservation` | `consumed ≤ produced`. |
+| `EventuallyDrained` / `HeadProgress` (liveness) | every published frame is eventually delivered; no permanent stall under the envelope (requires `WF_vars` on both processes, emitted by the `fair process` declarations). |
+
+Expected result under the default `NPRODUCERS=2, CAPACITY=2, CAP2_32=16,
+MAXFRAMES=4` session: all four invariants hold, both liveness properties hold, no
+deadlock. Re-run with `NPRODUCERS=3` (and/or `CAPACITY=4`) to widen the fan-in.
+
+### Why only the envelope regime is modeled here (the Stage-0 finding)
+
+The handoff's recommended starting hypothesis was **Policy A** — let the ring
+*lap* (overwrite) with an *unconditional* per-slot publish and have the consumer
+*detect* overwrite. The Stage-0 runnable probe
+([`../bench/mpmc-probe.mjs`](../bench/mpmc-probe.mjs)) **exhaustively** explored
+that lapping regime and found it **unsound** in two ways the sketch did not
+anticipate: a **torn read** (an older producer re-entering a reused slot corrupts
+the payload while a newer producer's generation already reads the head as ready)
+and a **stall** (an older same-slot ticket publishing after a newer one regresses
+the generation, stranding the newer frame). Making the publish monotonic
+reintroduces a CAS-retry (Vyukov), which the handoff rejected.
+
+So the resolution is **Policy B** (envelope-guaranteed), with overwrite-detection
+retained only as a never-tears overload safety net. The probe is the better tool
+for *finding* the unsound interleavings (it reports a concrete witness trace);
+this TLA model is the offline cross-check that the **sound** envelope regime
+upholds the safety invariants — exactly the split the SPSC work used (the `.tla`
+proves the safe protocol; the runnable fuzzer explores the broken-ordering
+variants). The Stage-1 in-CI fuzzer `tests/MpmcRing.interleaving.test.ts` will
+carry the mechanical bounded-step wait-free witness (`INV-W`).
