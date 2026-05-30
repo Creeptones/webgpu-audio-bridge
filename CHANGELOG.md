@@ -4,6 +4,71 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.83] — 2026-05-29
+
+### Added — SIMD Quintic + Septic Hermite evaluators (Apollo Mission Phase I, Stage 4 — mission complete)
+
+The final stage of the higher-order Hermite series vectorizes the 0.9.82 WASM
+scalar evaluators and lets the bench decide each path — mirroring the 0.9.79
+SIMD harvest, which broke through its own deferral. Every new path is a net win.
+
+#### What shipped
+
+- **`eval_quintic_hermite_f64_o3_simd`** (`WorkletConsumer.evalQuinticHermiteF64O3Simd`)
+  — f64x2, 2 samples/iter. Reuses the clean stride-3 `[p,v,a]` deinterleave
+  proven by the order-3 Taylor SIMD (three two-input shuffles), applied to both
+  the prev and curr frames. **Stride-3 only** (quintic over an order-4 array
+  keeps the scalar path).
+- **`eval_septic_hermite_f64_simd` / `eval_septic_hermite_f32_simd`**
+  (`evalSepticHermiteF64Simd` / `F32Simd`) — the clean stride-4 `[p,v,a,j]` pack.
+  f64x2 (2 samples/iter) is one two-input shuffle per lane-group; f32x4 (4
+  samples/iter) is a 4×4 AoS→SoA transpose (8 shuffles).
+
+#### Correctness
+
+The **f64** paths accumulate left-to-right in f64 with no implicit FMA →
+**bit-exact** to their scalar siblings (and the JS evaluators). The **f32x4**
+septic path does f32-lane math → within a few ULP (worst Δ = 1.19e-7, one f32
+ULP). `tests/Bridge.wasmEquivalence.test.ts` **pin 21** (SIMD-vs-scalar across
+N ∈ {17, 32, 3} so each width's scalar tail is exercised: quintic/septic f64x2
+tail 0..1, septic f32x4 tail 0..3).
+
+#### Bench (`npm run bench:eval-simd`, eval-only, N=64, batched)
+
+| evaluator | scalar p50 | SIMD p50 | speedup |
+| --- | --- | --- | --- |
+| Quintic o3 f64 | 130 ns | 94 ns | 1.39× |
+| Septic o4 f64 | 180 ns | 131 ns | 1.37× |
+| Septic o4 f32 | 257 ns | 124 ns | 2.08× |
+
+Every higher-order path wins, including the 8-shuffle f32x4 septic transpose.
+The f32x4 quintic stride-3 gather (6 shuffles × 2 frames) remains
+assessed-and-deferred — the scalar quintic + the f64x2 SIMD cover the common
+cases, and no bench signal yet justifies the awkward 2-frame stride-3 gather.
+
+#### Mission complete
+
+This closes Apollo Mission Phase I (Quintic & Septic Hermite, C²/C³). The full
+reach now exists end-to-end: schema modes + wire (0.9.80) → JS evaluators
+(0.9.80/0.9.81) → WASM scalar (0.9.82) → WASM SIMD (0.9.83).
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API on the `webgpu-audio-bridge/worklet`
+subpath (three new `WorkletConsumer` methods); the decoder binary grows ~2 KB
+(5.6 → 7.6 KB). No SAB-layout or protocol change.
+
+### Tests
+
+44 Node suites green; `wasmEquivalence` grows to pin 21. `npm run typecheck`
+clean. `npm run build:wasm` compiles the new SIMD WAT. `npm run bench` push/
+pull/pullLatest within budget (unchanged).
+
+### Documentation
+
+`bench/eval-simd.bench.ts` gains the three higher-order cells. ROADMAP 0.9.83
+row. (Derivation + stage map in `docs/quintic-septic-hermite-design.md`.)
+
 ## [0.9.82] — 2026-05-29
 
 ### Added — WASM scalar Quintic + Septic Hermite evaluators (Apollo Mission Phase I, Stage 3)

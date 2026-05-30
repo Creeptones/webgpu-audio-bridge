@@ -11,8 +11,14 @@
  *   - Taylor  order-3 (f64x2 / f32x4) — the stride-3 [p,v,a] deinterleave the
  *     0.7.10 note flagged ("deinterleave cost dwarfs the per-sample win").
  *
+ * 0.9.83 (Apollo Phase I, Stage 4) adds the higher-order Hermite SIMD paths:
+ *   - Quintic (C²) order-3 (f64x2) — the clean stride-3 [p,v,a] deinterleave
+ *     on both frames.
+ *   - Septic (C³) order-4 (f64x2 / f32x4) — the clean stride-4 [p,v,a,j] pack
+ *     (one shuffle per lane-group for f64x2; a 4×4 AoS→SoA transpose for f32x4).
+ *
  * Correctness is proven (bit-exact f64 / within-ULP f32) in
- * tests/Bridge.wasmEquivalence.test.ts pins 18–19. This bench answers the
+ * tests/Bridge.wasmEquivalence.test.ts pins 18–21. This bench answers the
  * SEPARATE throughput question: does each SIMD path actually BEAT its scalar
  * sibling, and by how much? The order-3 f32x4 path in particular pays 6
  * shuffles per 4 samples — the bench decides whether that breaks through.
@@ -77,7 +83,7 @@ function readWasm(): Uint8Array<ArrayBuffer> {
 /** Stand up a single-trajectory bridge + consumer, push one filled frame, and
  *  return the consumer plus the absolute src offset of the trajectory + two
  *  scratch offsets (scalar / simd). */
-function setup(order: 2 | 3, elem: 4 | 8): {
+function setup(order: 2 | 3 | 4, elem: 4 | 8): {
   consumer: WorkletConsumer; srcOff: number; scalarOff: number; simdOff: number; prevOff: number;
 } {
   const schema = elem === 8
@@ -96,7 +102,8 @@ function setup(order: 2 | 3, elem: 4 | 8): {
     const c = Math.cos(k * 0.19 + 0.5), sN = Math.sin(k * 0.19 + 0.5);
     pf.traj[k * order] = c;
     pf.traj[k * order + 1] = -omega * sN;
-    if (order === 3) pf.traj[k * order + 2] = -omega * omega * c;
+    if (order >= 3) pf.traj[k * order + 2] = -omega * omega * c;
+    if (order >= 4) pf.traj[k * order + 3] = omega * omega * omega * sN;
   }
   // Push twice so Hermite has prev+curr; bench against slot 0 (prev) / slot 1.
   bridge.push(pf);
@@ -119,9 +126,26 @@ function main(): void {
   const dt = 0.0166667;
   // Hermite basis at a representative (t, segmentSeconds).
   const t = 0.37, segS = 1 / 60;
-  const t2 = t * t, t3 = t2 * t;
+  const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t, t6 = t5 * t, t7 = t6 * t;
   const h00 = 2 * t3 - 3 * t2 + 1, h10s = (t3 - 2 * t2 + t) * segS;
   const h01 = -2 * t3 + 3 * t2, h11s = (t3 - t2) * segS;
+  // Quintic (C²) basis — acceleration terms scale by segS².
+  const T2 = segS * segS, T3 = T2 * segS;
+  const q0 = 1 - 10 * t3 + 15 * t4 - 6 * t5;
+  const q1s = (t - 6 * t3 + 8 * t4 - 3 * t5) * segS;
+  const q2s = (0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5) * T2;
+  const q3 = 10 * t3 - 15 * t4 + 6 * t5;
+  const q4s = (-4 * t3 + 7 * t4 - 3 * t5) * segS;
+  const q5s = (0.5 * t3 - t4 + 0.5 * t5) * T2;
+  // Septic (C³) basis — jerk terms scale by segS³.
+  const p0c = 1 - 35 * t4 + 84 * t5 - 70 * t6 + 20 * t7;
+  const p1s = (t - 20 * t4 + 45 * t5 - 36 * t6 + 10 * t7) * segS;
+  const p2s = (0.5 * t2 - 5 * t4 + 10 * t5 - 7.5 * t6 + 2 * t7) * T2;
+  const p3s = ((1 / 6) * t3 - (2 / 3) * t4 + t5 - (2 / 3) * t6 + (1 / 6) * t7) * T3;
+  const p4c = 35 * t4 - 84 * t5 + 70 * t6 - 20 * t7;
+  const p5s = (-15 * t4 + 39 * t5 - 34 * t6 + 10 * t7) * segS;
+  const p6s = (2.5 * t4 - 7 * t5 + 6.5 * t6 - 2 * t7) * T2;
+  const p7s = (-(1 / 6) * t4 + 0.5 * t5 - 0.5 * t6 + (1 / 6) * t7) * T3;
 
   const rows: Array<{ group: string; scalar: ReturnType<typeof summarize>; simd: ReturnType<typeof summarize> }> = [];
 
@@ -161,6 +185,33 @@ function main(): void {
       simd: summarize("f32x4", () => s.consumer.evalTaylorF32O3Simd(s.srcOff, s.simdOff, N, dt)),
     });
   }
+  // Quintic order-3 f64 (C²) — f64x2 stride-3
+  {
+    const s = setup(3, 8);
+    rows.push({
+      group: "Quintic o3 f64",
+      scalar: summarize("scalar", () => s.consumer.evalQuinticHermiteF64(s.prevOff, s.srcOff, s.scalarOff, N, 3, q0, q1s, q2s, q3, q4s, q5s)),
+      simd: summarize("f64x2", () => s.consumer.evalQuinticHermiteF64O3Simd(s.prevOff, s.srcOff, s.simdOff, N, q0, q1s, q2s, q3, q4s, q5s)),
+    });
+  }
+  // Septic order-4 f64 (C³) — f64x2 stride-4
+  {
+    const s = setup(4, 8);
+    rows.push({
+      group: "Septic o4 f64",
+      scalar: summarize("scalar", () => s.consumer.evalSepticHermiteF64(s.prevOff, s.srcOff, s.scalarOff, N, 4, p0c, p1s, p2s, p3s, p4c, p5s, p6s, p7s)),
+      simd: summarize("f64x2", () => s.consumer.evalSepticHermiteF64Simd(s.prevOff, s.srcOff, s.simdOff, N, p0c, p1s, p2s, p3s, p4c, p5s, p6s, p7s)),
+    });
+  }
+  // Septic order-4 f32 (C³) — f32x4 stride-4 (4×4 transpose)
+  {
+    const s = setup(4, 4);
+    rows.push({
+      group: "Septic o4 f32",
+      scalar: summarize("scalar", () => s.consumer.evalSepticHermiteF32(s.prevOff, s.srcOff, s.scalarOff, N, 4, p0c, p1s, p2s, p3s, p4c, p5s, p6s, p7s)),
+      simd: summarize("f32x4", () => s.consumer.evalSepticHermiteF32Simd(s.prevOff, s.srcOff, s.simdOff, N, p0c, p1s, p2s, p3s, p4c, p5s, p6s, p7s)),
+    });
+  }
 
   const pad = (x: string, n: number) => x.padEnd(n);
   console.log(`\neval-simd bench — N=${N} samples/call, ${(SAMPLES * BATCH).toLocaleString()} evals/cell\n`);
@@ -178,7 +229,7 @@ function main(): void {
   }
   console.log(
     "\nf64 paths are bit-exact to scalar; f32 paths within a few ULP " +
-      "(proven in tests/Bridge.wasmEquivalence.test.ts pins 18–19). " +
+      "(proven in tests/Bridge.wasmEquivalence.test.ts pins 18–21). " +
       "A speedup < 1.0 means the deinterleave cost outweighs the vector win for that path.",
   );
 }

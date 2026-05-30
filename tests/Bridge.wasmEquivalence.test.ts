@@ -2077,6 +2077,153 @@ function main(): void {
     ok(`wasm-quintic-septic-scalar-equivalence (quintic o{3,4} + septic o4 × {f64,f32} × ${cases.length} (t,segS) × ${TRAJ_N_LOCAL} samples; all bit-exact)`);
   }
 
+  // ── 21: WASM SIMD vs scalar — Quintic (f64x2) + Septic (f64x2/f32x4) (0.9.83) ──
+  // Across N ∈ {17,32,3} so each width's scalar tail is exercised (quintic f64x2
+  // / septic f64x2 tail 0..1; septic f32x4 tail 0..3). f64 paths are BIT-EXACT
+  // to their scalar siblings (left-to-right f64 accumulate, no implicit FMA);
+  // the septic f32x4 path does f32-lane math → within a few ULP.
+  {
+    const headerBytes = 32;
+    const cap = 4;
+    const F32_TOL_ABS = 1e-5;
+    const F32_TOL_REL = 8 * Math.pow(2, -23);
+    const cases = [
+      { t: 0.0, segS: 1 / 60 }, { t: 0.5, segS: 1 / 60 }, { t: 1.0, segS: 1 / 60 },
+      { t: 0.413, segS: 0.001 },
+    ];
+    let worstF32 = 0;
+
+    // Push prev + curr of an order-`order` trajectory; expose two scratch dst
+    // regions (scalar + simd) with views, plus slot bases + consumer.
+    const drive = <T extends Float64Array | Float32Array>(
+      schema: ReturnType<typeof defineSchema>, elemBytes: number,
+      fill: (a: T, phase: number) => void,
+    ) => {
+      const sabBytes = Bridge.byteLength(cap, schema);
+      const dstBytes = NLOCAL * elemBytes;
+      const alloc = allocateWorkletMemory({ sabBytes, scratchBytes: dstBytes * 2 });
+      const bridge = new Bridge(alloc.sab, cap, schema);
+      const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+      const frameBytes = schema.compiled.frameByteSize;
+      const mask = cap - 1;
+      const trajOff = schema.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+      const scalarOff = alloc.scratchByteOffset!;
+      const simdOff = scalarOff + dstBytes;
+      const Ctor = (elemBytes === 8 ? Float64Array : Float32Array) as unknown as
+        { new (b: ArrayBufferLike, o: number, n: number): T };
+      const scalarView = new Ctor(alloc.sab, scalarOff, NLOCAL);
+      const simdView = new Ctor(alloc.sab, simdOff, NLOCAL);
+      const pf = bridge.scratchFrame() as unknown as { traj: T };
+      fill(pf.traj, 0.7); assert(bridge.push(pf as never), `pin21 push prev`);
+      fill(pf.traj, 1.3); assert(bridge.push(pf as never), `pin21 push curr`);
+      const prevSlot = consumer.peekPull(mask); assert(prevSlot >= 0, "pin21 peek prev");
+      const prevBase = headerBytes + prevSlot * frameBytes;
+      consumer.commitPull();
+      const currSlot = consumer.peekPull(mask); assert(currSlot >= 0, "pin21 peek curr");
+      const currBase = headerBytes + currSlot * frameBytes;
+      return { prevBase, currBase, scalarOff, simdOff, scalarView, simdView, consumer, trajOff,
+               commit: () => consumer.commitPull() };
+    };
+
+    let NLOCAL = 0;
+    const quinticBasis = (t: number, segS: number) => {
+      const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+      const T = segS, T2 = T * T;
+      return [
+        1 - 10 * t3 + 15 * t4 - 6 * t5,
+        (t - 6 * t3 + 8 * t4 - 3 * t5) * T,
+        (0.5 * t2 - 1.5 * t3 + 1.5 * t4 - 0.5 * t5) * T2,
+        10 * t3 - 15 * t4 + 6 * t5,
+        (-4 * t3 + 7 * t4 - 3 * t5) * T,
+        (0.5 * t3 - t4 + 0.5 * t5) * T2,
+      ] as const;
+    };
+    const septicBasis = (t: number, segS: number) => {
+      const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t, t6 = t5 * t, t7 = t6 * t;
+      const T = segS, T2 = T * T, T3 = T2 * T;
+      return [
+        1 - 35 * t4 + 84 * t5 - 70 * t6 + 20 * t7,
+        (t - 20 * t4 + 45 * t5 - 36 * t6 + 10 * t7) * T,
+        (0.5 * t2 - 5 * t4 + 10 * t5 - 7.5 * t6 + 2 * t7) * T2,
+        ((1 / 6) * t3 - (2 / 3) * t4 + t5 - (2 / 3) * t6 + (1 / 6) * t7) * T3,
+        35 * t4 - 84 * t5 + 70 * t6 - 20 * t7,
+        (-15 * t4 + 39 * t5 - 34 * t6 + 10 * t7) * T,
+        (2.5 * t4 - 7 * t5 + 6.5 * t6 - 2 * t7) * T2,
+        (-(1 / 6) * t4 + 0.5 * t5 - 0.5 * t6 + (1 / 6) * t7) * T3,
+      ] as const;
+    };
+
+    for (NLOCAL of [17, 32, 3]) {
+      // Quintic f64x2 over stride-3 — bit-exact.
+      {
+        const schema = defineSchema({ traj: f64TrajectoryArray(NLOCAL, { order: 3 }) });
+        const d = drive<Float64Array>(schema, 8, (a, ph) => {
+          for (let k = 0; k < NLOCAL; k++) {
+            a[k * 3] = Math.sin(k * 0.19 + ph);
+            a[k * 3 + 1] = Math.cos(k * 0.19 + ph) * 50;
+            a[k * 3 + 2] = -Math.sin(k * 0.19 + ph) * 1100;
+          }
+        });
+        for (const { t, segS } of cases) {
+          const [h0, h1s, h2s, h3, h4s, h5s] = quinticBasis(t, segS);
+          d.consumer.evalQuinticHermiteF64(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.scalarOff, NLOCAL, 3, h0, h1s, h2s, h3, h4s, h5s);
+          d.consumer.evalQuinticHermiteF64O3Simd(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.simdOff, NLOCAL, h0, h1s, h2s, h3, h4s, h5s);
+          for (let k = 0; k < NLOCAL; k++) {
+            assertEq(d.simdView[k], d.scalarView[k], `pin21 quintic f64 simd-vs-scalar [${k}] N=${NLOCAL} t=${t}`);
+          }
+        }
+        d.commit();
+      }
+      // Septic f64x2 over stride-4 — bit-exact.
+      {
+        const schema = defineSchema({ traj: f64TrajectoryArray(NLOCAL, { order: 4 }) });
+        const d = drive<Float64Array>(schema, 8, (a, ph) => {
+          for (let k = 0; k < NLOCAL; k++) {
+            a[k * 4] = Math.sin(k * 0.19 + ph);
+            a[k * 4 + 1] = Math.cos(k * 0.19 + ph) * 50;
+            a[k * 4 + 2] = -Math.sin(k * 0.19 + ph) * 1100;
+            a[k * 4 + 3] = Math.cos(k * 0.19 + ph) * 7000;
+          }
+        });
+        for (const { t, segS } of cases) {
+          const [h0, h1s, h2s, h3s, h4, h5s, h6s, h7s] = septicBasis(t, segS);
+          d.consumer.evalSepticHermiteF64(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.scalarOff, NLOCAL, 4, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          d.consumer.evalSepticHermiteF64Simd(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.simdOff, NLOCAL, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          for (let k = 0; k < NLOCAL; k++) {
+            assertEq(d.simdView[k], d.scalarView[k], `pin21 septic f64 simd-vs-scalar [${k}] N=${NLOCAL} t=${t}`);
+          }
+        }
+        d.commit();
+      }
+      // Septic f32x4 over stride-4 — within a few ULP.
+      {
+        const schema = defineSchema({ traj: f32TrajectoryArray(NLOCAL, { order: 4 }) });
+        const d = drive<Float32Array>(schema, 4, (a, ph) => {
+          for (let k = 0; k < NLOCAL; k++) {
+            a[k * 4] = Math.fround(Math.sin(k * 0.19 + ph));
+            a[k * 4 + 1] = Math.fround(Math.cos(k * 0.19 + ph) * 50);
+            a[k * 4 + 2] = Math.fround(-Math.sin(k * 0.19 + ph) * 1100);
+            a[k * 4 + 3] = Math.fround(Math.cos(k * 0.19 + ph) * 7000);
+          }
+        });
+        for (const { t, segS } of cases) {
+          const [h0, h1s, h2s, h3s, h4, h5s, h6s, h7s] = septicBasis(t, segS);
+          d.consumer.evalSepticHermiteF32(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.scalarOff, NLOCAL, 4, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          d.consumer.evalSepticHermiteF32Simd(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.simdOff, NLOCAL, h0, h1s, h2s, h3s, h4, h5s, h6s, h7s);
+          for (let k = 0; k < NLOCAL; k++) {
+            const s = d.scalarView[k]!, v = d.simdView[k]!;
+            const tol = F32_TOL_ABS + Math.max(Math.abs(s), Math.abs(v)) * F32_TOL_REL;
+            const delta = Math.abs(s - v);
+            if (delta > worstF32) worstF32 = delta;
+            assert(delta <= tol, `pin21 septic f32 simd-vs-scalar [${k}] N=${NLOCAL} t=${t}: scalar=${s} simd=${v} |Δ|=${delta} > tol=${tol}`);
+          }
+        }
+        d.commit();
+      }
+    }
+    ok(`wasm-quintic-septic-simd-vs-scalar (N ∈ {17,32,3} × ${cases.length} (t,segS) × {quintic f64x2 + septic f64x2 bit-exact, septic f32x4 within ULP}; f32 worstΔ=${worstF32.toExponential(2)})`);
+  }
+
   console.log(
     "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 Taylor AND Hermite paths + quintic (C²) and septic (C³) Hermite scalar evaluators + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
   );

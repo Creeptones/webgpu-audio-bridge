@@ -1993,6 +1993,279 @@
       end
     end)
 
+  ;; ─── f64x2 Quintic Hermite SIMD, stride-3 (0.9.83, C²) ────────────────
+  ;;
+  ;; 2 samples/iter. Reuses the CLEAN stride-3 f64x2 deinterleave proven by
+  ;; eval_taylor_f64_o3_simd (3 two-input shuffles → P, V, A), applied to BOTH
+  ;; the prev and curr frames, then the lane-wise quintic basis sum. f64
+  ;; left-to-right accumulate, no implicit FMA → BIT-EXACT to the scalar
+  ;; eval_quintic_hermite_f64 / JS. Order-3 (stride-3) only — the quintic over
+  ;; an order-4 array (jerk ignored) keeps the scalar path; the f32x4 stride-3
+  ;; gather (6 shuffles × 2 frames) is assessed-and-deferred pending bench signal.
+  (func $eval_quintic_hermite_f64_o3_simd (export "eval_quintic_hermite_f64_o3_simd")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32) (param $n i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64)
+        (param $h3 f64) (param $h4s f64) (param $h5s f64)
+    (local $prevP i32) (local $currP i32) (local $dstP i32) (local $simdEnd i32) (local $tailEnd i32)
+    (local $h0V v128) (local $h1sV v128) (local $h2sV v128)
+    (local $h3V v128) (local $h4sV v128) (local $h5sV v128)
+    (local $L0 v128) (local $L1 v128) (local $L2 v128)
+    (local $P0 v128) (local $M0 v128) (local $A0 v128)
+    (local $P1 v128) (local $M1 v128) (local $A1 v128)
+    local.get $h0 f64x2.splat local.set $h0V
+    local.get $h1s f64x2.splat local.set $h1sV
+    local.get $h2s f64x2.splat local.set $h2sV
+    local.get $h3 f64x2.splat local.set $h3V
+    local.get $h4s f64x2.splat local.set $h4sV
+    local.get $h5s f64x2.splat local.set $h5sV
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = prevOff + n*24 ; simdEnd = prevOff + (n>>1)*48
+    local.get $prevOff local.get $n i32.const 8 i32.mul i32.const 3 i32.mul i32.add local.set $tailEnd
+    local.get $prevOff local.get $n i32.const 1 i32.shr_u i32.const 48 i32.mul i32.add local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $prevP local.get $simdEnd i32.ge_u br_if $simdExit
+        ;; prev → P0, M0, A0
+        local.get $prevP v128.load align=1 local.set $L0
+        local.get $prevP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $prevP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $L0 local.get $L1 i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31 local.set $P0
+        local.get $L0 local.get $L2 i8x16.shuffle 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 local.set $M0
+        local.get $L1 local.get $L2 i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31 local.set $A0
+        ;; curr → P1, M1, A1
+        local.get $currP v128.load align=1 local.set $L0
+        local.get $currP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $currP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $L0 local.get $L1 i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31 local.set $P1
+        local.get $L0 local.get $L2 i8x16.shuffle 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 local.set $M1
+        local.get $L1 local.get $L2 i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31 local.set $A1
+        ;; out = ((((h0·P0 + h1s·M0) + h2s·A0) + h3·P1) + h4s·M1) + h5s·A1
+        local.get $dstP
+        local.get $h0V local.get $P0 f64x2.mul
+        local.get $h1sV local.get $M0 f64x2.mul f64x2.add
+        local.get $h2sV local.get $A0 f64x2.mul f64x2.add
+        local.get $h3V local.get $P1 f64x2.mul f64x2.add
+        local.get $h4sV local.get $M1 f64x2.mul f64x2.add
+        local.get $h5sV local.get $A1 f64x2.mul f64x2.add
+        v128.store align=1
+        local.get $prevP i32.const 48 i32.add local.set $prevP
+        local.get $currP i32.const 48 i32.add local.set $currP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..1 sample) — same left-to-right f64 op order as scalar quintic.
+    block $tailExit
+      loop $tailLoop
+        local.get $prevP local.get $tailEnd i32.ge_u br_if $tailExit
+        local.get $dstP
+        local.get $prevP f64.load align=1 local.get $h0 f64.mul
+        local.get $prevP i32.const 8 i32.add f64.load align=1 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 16 i32.add f64.load align=1 local.get $h2s f64.mul f64.add
+        local.get $currP f64.load align=1 local.get $h3 f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f64.load align=1 local.get $h4s f64.mul f64.add
+        local.get $currP i32.const 16 i32.add f64.load align=1 local.get $h5s f64.mul f64.add
+        f64.store align=1
+        local.get $prevP i32.const 24 i32.add local.set $prevP
+        local.get $currP i32.const 24 i32.add local.set $currP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; ─── f64x2 Septic Hermite SIMD, stride-4 (0.9.83, C³) ─────────────────
+  ;;
+  ;; 2 samples/iter. Stride-4 (p,v,a,j) is the CLEAN f64x2 pack: 4 loads cover
+  ;; 2 samples, and each lane-group (P,V,A,J) is one two-input shuffle. Applied
+  ;; to prev + curr, then the 8-term lane-wise septic sum. f64 left-to-right,
+  ;; no implicit FMA → BIT-EXACT to scalar eval_septic_hermite_f64 / JS.
+  (func $eval_septic_hermite_f64_simd (export "eval_septic_hermite_f64_simd")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32) (param $n i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64) (param $h3s f64)
+        (param $h4 f64) (param $h5s f64) (param $h6s f64) (param $h7s f64)
+    (local $prevP i32) (local $currP i32) (local $dstP i32) (local $simdEnd i32) (local $tailEnd i32)
+    (local $h0V v128) (local $h1sV v128) (local $h2sV v128) (local $h3sV v128)
+    (local $h4V v128) (local $h5sV v128) (local $h6sV v128) (local $h7sV v128)
+    (local $L0 v128) (local $L1 v128) (local $L2 v128) (local $L3 v128)
+    (local $P0 v128) (local $V0 v128) (local $A0 v128) (local $J0 v128)
+    (local $P1 v128) (local $V1 v128) (local $A1 v128) (local $J1 v128)
+    local.get $h0 f64x2.splat local.set $h0V
+    local.get $h1s f64x2.splat local.set $h1sV
+    local.get $h2s f64x2.splat local.set $h2sV
+    local.get $h3s f64x2.splat local.set $h3sV
+    local.get $h4 f64x2.splat local.set $h4V
+    local.get $h5s f64x2.splat local.set $h5sV
+    local.get $h6s f64x2.splat local.set $h6sV
+    local.get $h7s f64x2.splat local.set $h7sV
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = prevOff + n*32 ; simdEnd = prevOff + (n>>1)*64
+    local.get $prevOff local.get $n i32.const 32 i32.mul i32.add local.set $tailEnd
+    local.get $prevOff local.get $n i32.const 1 i32.shr_u i32.const 64 i32.mul i32.add local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $prevP local.get $simdEnd i32.ge_u br_if $simdExit
+        ;; prev: L0=[p0,v0] L1=[a0,j0] L2=[p1,v1] L3=[a1,j1]
+        local.get $prevP v128.load align=1 local.set $L0
+        local.get $prevP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $prevP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $prevP i32.const 48 i32.add v128.load align=1 local.set $L3
+        local.get $L0 local.get $L2 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $P0
+        local.get $L0 local.get $L2 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $V0
+        local.get $L1 local.get $L3 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $A0
+        local.get $L1 local.get $L3 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $J0
+        ;; curr
+        local.get $currP v128.load align=1 local.set $L0
+        local.get $currP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $currP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $currP i32.const 48 i32.add v128.load align=1 local.set $L3
+        local.get $L0 local.get $L2 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $P1
+        local.get $L0 local.get $L2 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $V1
+        local.get $L1 local.get $L3 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $A1
+        local.get $L1 local.get $L3 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $J1
+        ;; out = h0·P0 + h1s·V0 + h2s·A0 + h3s·J0 + h4·P1 + h5s·V1 + h6s·A1 + h7s·J1
+        local.get $dstP
+        local.get $h0V local.get $P0 f64x2.mul
+        local.get $h1sV local.get $V0 f64x2.mul f64x2.add
+        local.get $h2sV local.get $A0 f64x2.mul f64x2.add
+        local.get $h3sV local.get $J0 f64x2.mul f64x2.add
+        local.get $h4V local.get $P1 f64x2.mul f64x2.add
+        local.get $h5sV local.get $V1 f64x2.mul f64x2.add
+        local.get $h6sV local.get $A1 f64x2.mul f64x2.add
+        local.get $h7sV local.get $J1 f64x2.mul f64x2.add
+        v128.store align=1
+        local.get $prevP i32.const 64 i32.add local.set $prevP
+        local.get $currP i32.const 64 i32.add local.set $currP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    block $tailExit
+      loop $tailLoop
+        local.get $prevP local.get $tailEnd i32.ge_u br_if $tailExit
+        local.get $dstP
+        local.get $prevP f64.load align=1 local.get $h0 f64.mul
+        local.get $prevP i32.const 8 i32.add f64.load align=1 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 16 i32.add f64.load align=1 local.get $h2s f64.mul f64.add
+        local.get $prevP i32.const 24 i32.add f64.load align=1 local.get $h3s f64.mul f64.add
+        local.get $currP f64.load align=1 local.get $h4 f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f64.load align=1 local.get $h5s f64.mul f64.add
+        local.get $currP i32.const 16 i32.add f64.load align=1 local.get $h6s f64.mul f64.add
+        local.get $currP i32.const 24 i32.add f64.load align=1 local.get $h7s f64.mul f64.add
+        f64.store align=1
+        local.get $prevP i32.const 32 i32.add local.set $prevP
+        local.get $currP i32.const 32 i32.add local.set $currP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; ─── f32x4 Septic Hermite SIMD, stride-4 (0.9.83, C³) ─────────────────
+  ;;
+  ;; 4 samples/iter. Each sample [p,v,a,j] is one v128; 4 loads + a 4×4 AoS→SoA
+  ;; transpose (2 unpack-lo/hi + 2 combine shuffles per group) yield P,V,A,J as
+  ;; f32x4. Applied to prev + curr, then the f32-lane septic sum. Coefficients
+  ;; demoted f64→f32 and splatted once. f32-lane math → within a few ULP of the
+  ;; f64-accumulating scalar (NOT bit-exact), same as every f32 SIMD path here.
+  (func $eval_septic_hermite_f32_simd (export "eval_septic_hermite_f32_simd")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32) (param $n i32)
+        (param $h0 f64) (param $h1s f64) (param $h2s f64) (param $h3s f64)
+        (param $h4 f64) (param $h5s f64) (param $h6s f64) (param $h7s f64)
+    (local $prevP i32) (local $currP i32) (local $dstP i32) (local $simdEnd i32) (local $tailEnd i32)
+    (local $h0V v128) (local $h1sV v128) (local $h2sV v128) (local $h3sV v128)
+    (local $h4V v128) (local $h5sV v128) (local $h6sV v128) (local $h7sV v128)
+    (local $L0 v128) (local $L1 v128) (local $L2 v128) (local $L3 v128)
+    (local $t0 v128) (local $t1 v128) (local $t2 v128) (local $t3 v128)
+    (local $P0 v128) (local $V0 v128) (local $A0 v128) (local $J0 v128)
+    (local $P1 v128) (local $V1 v128) (local $A1 v128) (local $J1 v128)
+    local.get $h0 f32.demote_f64 f32x4.splat local.set $h0V
+    local.get $h1s f32.demote_f64 f32x4.splat local.set $h1sV
+    local.get $h2s f32.demote_f64 f32x4.splat local.set $h2sV
+    local.get $h3s f32.demote_f64 f32x4.splat local.set $h3sV
+    local.get $h4 f32.demote_f64 f32x4.splat local.set $h4V
+    local.get $h5s f32.demote_f64 f32x4.splat local.set $h5sV
+    local.get $h6s f32.demote_f64 f32x4.splat local.set $h6sV
+    local.get $h7s f32.demote_f64 f32x4.splat local.set $h7sV
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = prevOff + n*16 ; simdEnd = prevOff + (n>>2)*64
+    local.get $prevOff local.get $n i32.const 4 i32.shl i32.add local.set $tailEnd
+    local.get $prevOff local.get $n i32.const 2 i32.shr_u i32.const 64 i32.mul i32.add local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $prevP local.get $simdEnd i32.ge_u br_if $simdExit
+        ;; prev transpose
+        local.get $prevP v128.load align=1 local.set $L0
+        local.get $prevP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $prevP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $prevP i32.const 48 i32.add v128.load align=1 local.set $L3
+        local.get $L0 local.get $L1 i8x16.shuffle 0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23 local.set $t0
+        local.get $L0 local.get $L1 i8x16.shuffle 8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31 local.set $t1
+        local.get $L2 local.get $L3 i8x16.shuffle 0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23 local.set $t2
+        local.get $L2 local.get $L3 i8x16.shuffle 8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31 local.set $t3
+        local.get $t0 local.get $t2 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $P0
+        local.get $t0 local.get $t2 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $V0
+        local.get $t1 local.get $t3 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $A0
+        local.get $t1 local.get $t3 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $J0
+        ;; curr transpose
+        local.get $currP v128.load align=1 local.set $L0
+        local.get $currP i32.const 16 i32.add v128.load align=1 local.set $L1
+        local.get $currP i32.const 32 i32.add v128.load align=1 local.set $L2
+        local.get $currP i32.const 48 i32.add v128.load align=1 local.set $L3
+        local.get $L0 local.get $L1 i8x16.shuffle 0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23 local.set $t0
+        local.get $L0 local.get $L1 i8x16.shuffle 8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31 local.set $t1
+        local.get $L2 local.get $L3 i8x16.shuffle 0 1 2 3 16 17 18 19 4 5 6 7 20 21 22 23 local.set $t2
+        local.get $L2 local.get $L3 i8x16.shuffle 8 9 10 11 24 25 26 27 12 13 14 15 28 29 30 31 local.set $t3
+        local.get $t0 local.get $t2 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $P1
+        local.get $t0 local.get $t2 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $V1
+        local.get $t1 local.get $t3 i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23 local.set $A1
+        local.get $t1 local.get $t3 i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31 local.set $J1
+        ;; out = h0·P0 + h1s·V0 + h2s·A0 + h3s·J0 + h4·P1 + h5s·V1 + h6s·A1 + h7s·J1 (f32 lanes)
+        local.get $dstP
+        local.get $h0V local.get $P0 f32x4.mul
+        local.get $h1sV local.get $V0 f32x4.mul f32x4.add
+        local.get $h2sV local.get $A0 f32x4.mul f32x4.add
+        local.get $h3sV local.get $J0 f32x4.mul f32x4.add
+        local.get $h4V local.get $P1 f32x4.mul f32x4.add
+        local.get $h5sV local.get $V1 f32x4.mul f32x4.add
+        local.get $h6sV local.get $A1 f32x4.mul f32x4.add
+        local.get $h7sV local.get $J1 f32x4.mul f32x4.add
+        v128.store align=1
+        local.get $prevP i32.const 64 i32.add local.set $prevP
+        local.get $currP i32.const 64 i32.add local.set $currP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..3 samples) — f32 promote→f64 accumulate→demote, matching
+    ;; eval_septic_hermite_f32 (NOTE: tail is f64-accumulated; the SIMD body is
+    ;; f32-lane, so tail samples can differ from body samples by a ULP — both
+    ;; are within the f32 tolerance the equivalence pin asserts).
+    block $tailExit
+      loop $tailLoop
+        local.get $prevP local.get $tailEnd i32.ge_u br_if $tailExit
+        local.get $dstP
+        local.get $prevP f32.load align=1 f64.promote_f32 local.get $h0 f64.mul
+        local.get $prevP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h1s f64.mul f64.add
+        local.get $prevP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h2s f64.mul f64.add
+        local.get $prevP i32.const 12 i32.add f32.load align=1 f64.promote_f32 local.get $h3s f64.mul f64.add
+        local.get $currP f32.load align=1 f64.promote_f32 local.get $h4 f64.mul f64.add
+        local.get $currP i32.const 4 i32.add f32.load align=1 f64.promote_f32 local.get $h5s f64.mul f64.add
+        local.get $currP i32.const 8 i32.add f32.load align=1 f64.promote_f32 local.get $h6s f64.mul f64.add
+        local.get $currP i32.const 12 i32.add f32.load align=1 f64.promote_f32 local.get $h7s f64.mul f64.add
+        f32.demote_f64
+        f32.store align=1
+        local.get $prevP i32.const 16 i32.add local.set $prevP
+        local.get $currP i32.const 16 i32.add local.set $currP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
   ;; ─── Descriptor-driven whole-frame decode (0.9.74) ────────────────────
   ;;
   ;; ONE JS↔WASM crossing decodes an ENTIRE frame. The per-field readers
