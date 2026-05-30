@@ -167,11 +167,28 @@ the soak gate — see the internal pre-1.0 cohort plan.
   visualization path next to the AudioWorklet path. Exercises the
   bridge under a different real consumer pattern.
 
-## Beyond 1.0
+## Pulled ahead of 1.0 — Apollo Frontier 3 (Wait-Free MPMC audio DAGs)
 
-- **Topology variants** — MPSC (multiple producers → one consumer)
-  and SPMC (one producer → multiple consumers). SPSC stays the
-  canonical case.
+- **Topology variants — MPSC / SPMC / MPMC DAGs** — *previously parked
+  Beyond 1.0 as the highest-risk frontier; pulled ahead of 1.0 by user
+  decision (2026-05-30).* Shipped as an **additive `MpmcRing` primitive
+  with its own SAB layout**, leaving the frozen `SpscRing` protocol (and
+  the 1.0 settled-protocol promise) untouched. Stage 1 targets **MP→SC
+  fan-in, hard wait-free** (fetch-add ticketing, per-slot generation
+  sequences — no unbounded CAS-retry on any path); SPMC fan-out, full
+  MPMC, and the multi-edge DAG topology layer over `connect()` stage in
+  afterward. Discipline is **formal-first**: `formal/MpmcRing.tla` + an
+  exhaustive interleaving fuzzer (extending `tests/Bridge.interleaving.test.ts`
+  pins 9–10, which already model the drop-oldest two-writer race) + a
+  cross-thread stress, all bit-exact, with a mechanical **wait-free
+  witness** (bounded step count on every interleaving). Ships
+  `experimental` pre-1.0 (own version story, like `notify:'waiter-flag'`).
+  **Kickoff handoff:** [`docs/frontier3-wait-free-mpmc-handoff.md`](./docs/frontier3-wait-free-mpmc-handoff.md).
+  First deliverable (Stage 0, ~0.9.906): the TLA+ model + happens-before
+  proof + a throwaway algorithm probe — **no production code** until the
+  design is proven sound. SPSC stays the canonical case.
+
+## Beyond 1.0
 - **Lane-width variants** — `f16` / quantized lanes for control buses
   where `f64` is overkill; ~4× bandwidth savings on mobile / Apple
   Silicon.
