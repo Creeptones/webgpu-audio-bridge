@@ -866,6 +866,23 @@ function main(): void {
         );
       }
 
+      // f64x2 SIMD Hermite (order-2) — BIT-EXACT to the scalar/JS reference
+      // (f64 left-to-right accumulation, no implicit FMA). Overwrites the same
+      // dst region and re-asserts against the same jsRef.
+      trajConsumer.evalHermiteF64O2Simd(
+        prevBase + trajOff.tO2!,
+        currBase + trajOff.tO2!,
+        dstHermO2Off,
+        TRAJ_N,
+        h00, h10s, h01, h11s,
+      );
+      for (let k = 0; k < TRAJ_N; k++) {
+        assertEq(
+          dstHermO2View[k], jsRefHermO2[k],
+          `pin9b hermite-o2-simd[${k}] t=${t} segS=${segS}`,
+        );
+      }
+
       // WASM Hermite over order=3 trajectory (acceleration lane ignored)
       trajConsumer.evalHermiteF64(
         prevBase + trajOff.tO3!,
@@ -1712,8 +1729,212 @@ function main(): void {
     ok(`wasm-clamped-taylor-equivalence (5 rows × 3 dts × {f64 o2/o3 scalar+simd, f32 o2 scalar+simd}; f32-simd worstΔ=${worstF32Simd.toExponential(2)})`);
   }
 
+  // ── 18: Hermite order=2 SIMD vs scalar across body + tail (0.9.79) ─────
+  // Mirrors pin 11's SIMD-vs-scalar structure for the new f64x2 / f32x4
+  // Hermite evaluators. Two consecutive frames feed the cubic; the SIMD
+  // output is compared against the WASM SCALAR Hermite (itself bit-exact to
+  // evaluateHermiteTrajectoryInto, proven in pins 9b/10b), so this is a
+  // self-contained transitive proof. Sample counts span the SIMD/tail edge:
+  //   17 — f32 SIMD: 4 chunks + 1 tail; f64 SIMD: 8 chunks + 1 tail.
+  //   32 — clean multiple of 4 (no tail either width).
+  //   3  — below f32 SIMD width (all tail); f64 SIMD does 1 chunk + 1 tail.
+  // f64x2 is BIT-EXACT (f64 left-to-right accumulate, no FMA); f32x4 is
+  // within a few ULP (f32-lane math). The basis sweep includes t=0 and t=1
+  // (endpoint reproduction) and a tiny segmentSeconds.
+  {
+    const hermCases = [
+      { t: 0.0, segS: 1 / 60 },
+      { t: 0.37, segS: 1 / 60 },
+      { t: 1.0, segS: 1 / 60 },
+      { t: 0.6, segS: 0.001 },
+    ];
+    // 8 × f32 epsilon: Hermite's 4-mul + 3-add chain (vs Taylor's 1+1) plus
+    // possible inter-term cancellation warrants a looser band than pin 11's 4×;
+    // still ~1e-6, far below the O(1) error a shuffle misalignment would cause.
+    const F32_TOL_REL = 8 * Math.pow(2, -23);
+    let worstHermF32 = 0;
+    for (const N of [17, 32, 3]) {
+      const sF64 = defineSchema({ traj: f64TrajectoryArray(N, { order: 2 }) });
+      const sF32 = defineSchema({ traj: f32TrajectoryArray(N, { order: 2 }) });
+      const cap = 4;
+      const headerBytes = 32;
+
+      // Shared driver: push prev + curr, peek both slot bases (prev stays
+      // intact after its commit — the producer never overruns at cap=4/2-frames).
+      const drive = <T extends Float64Array | Float32Array>(
+        schema: typeof sF64 | typeof sF32,
+        elemBytes: number,
+        fillPrev: (f: { traj: T }) => void,
+        fillCurr: (f: { traj: T }) => void,
+      ): { prevBase: number; currBase: number; scalarOff: number; simdOff: number;
+           scalarView: T; simdView: T; consumer: ReturnType<typeof instantiateConsumer>;
+           trajOff: number; commit: () => void } => {
+        const sabBytes = Bridge.byteLength(cap, schema);
+        const dstBytes = N * elemBytes;
+        const alloc = allocateWorkletMemory({ sabBytes, scratchBytes: dstBytes * 2 });
+        const bridge = new Bridge(alloc.sab, cap, schema);
+        const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+        const frameBytes = schema.compiled.frameByteSize;
+        const mask = cap - 1;
+        const trajOff = schema.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+        const scratchBase = alloc.scratchByteOffset!;
+        const scalarOff = scratchBase;
+        const simdOff = scratchBase + dstBytes;
+        const Ctor = (elemBytes === 8 ? Float64Array : Float32Array) as unknown as
+          { new (b: ArrayBufferLike, o: number, n: number): T };
+        const scalarView = new Ctor(alloc.sab, scalarOff, N);
+        const simdView = new Ctor(alloc.sab, simdOff, N);
+        const pf = bridge.scratchFrame() as unknown as { traj: T };
+        fillPrev(pf); assert(bridge.push(pf as never), `pin18 N=${N}: push prev`);
+        fillCurr(pf); assert(bridge.push(pf as never), `pin18 N=${N}: push curr`);
+        const prevSlot = consumer.peekPull(mask); assert(prevSlot >= 0, `pin18 N=${N}: peek prev`);
+        const prevBase = headerBytes + prevSlot * frameBytes;
+        consumer.commitPull();
+        const currSlot = consumer.peekPull(mask); assert(currSlot >= 0, `pin18 N=${N}: peek curr`);
+        const currBase = headerBytes + currSlot * frameBytes;
+        return { prevBase, currBase, scalarOff, simdOff, scalarView, simdView, consumer, trajOff,
+                 commit: () => consumer.commitPull() };
+      };
+
+      // f64 — bit-exact.
+      {
+        const d = drive<Float64Array>(sF64, 8,
+          (f) => { for (let k = 0; k < N; k++) { f.traj[k * 2] = Math.sin(k * 0.17 + 1); f.traj[k * 2 + 1] = Math.cos(k * 0.17 + 1) * 90; } },
+          (f) => { for (let k = 0; k < N; k++) { f.traj[k * 2] = Math.sin(k * 0.17 + 1.5); f.traj[k * 2 + 1] = Math.cos(k * 0.17 + 1.5) * 90; } },
+        );
+        for (const { t, segS } of hermCases) {
+          const t2 = t * t, t3 = t2 * t;
+          const h00 = 2 * t3 - 3 * t2 + 1, h10s = (t3 - 2 * t2 + t) * segS;
+          const h01 = -2 * t3 + 3 * t2, h11s = (t3 - t2) * segS;
+          d.consumer.evalHermiteF64(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.scalarOff, N, 2, h00, h10s, h01, h11s);
+          d.consumer.evalHermiteF64O2Simd(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.simdOff, N, h00, h10s, h01, h11s);
+          for (let k = 0; k < N; k++) {
+            assertEq(d.simdView[k], d.scalarView[k], `pin18 f64 herm simd-vs-scalar [${k}] N=${N} t=${t} segS=${segS}`);
+          }
+        }
+        d.commit();
+      }
+
+      // f32 — within a few ULP.
+      {
+        const d = drive<Float32Array>(sF32, 4,
+          (f) => { for (let k = 0; k < N; k++) { f.traj[k * 2] = Math.fround(Math.sin(k * 0.17 + 1)); f.traj[k * 2 + 1] = Math.fround(Math.cos(k * 0.17 + 1) * 90); } },
+          (f) => { for (let k = 0; k < N; k++) { f.traj[k * 2] = Math.fround(Math.sin(k * 0.17 + 1.5)); f.traj[k * 2 + 1] = Math.fround(Math.cos(k * 0.17 + 1.5) * 90); } },
+        );
+        for (const { t, segS } of hermCases) {
+          const t2 = t * t, t3 = t2 * t;
+          const h00 = 2 * t3 - 3 * t2 + 1, h10s = (t3 - 2 * t2 + t) * segS;
+          const h01 = -2 * t3 + 3 * t2, h11s = (t3 - t2) * segS;
+          d.consumer.evalHermiteF32(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.scalarOff, N, 2, h00, h10s, h01, h11s);
+          d.consumer.evalHermiteF32O2Simd(d.prevBase + d.trajOff, d.currBase + d.trajOff, d.simdOff, N, h00, h10s, h01, h11s);
+          for (let k = 0; k < N; k++) {
+            const s = d.scalarView[k]!, v = d.simdView[k]!;
+            const tol = Math.max(Math.abs(s), Math.abs(v), 1) * F32_TOL_REL;
+            const delta = Math.abs(s - v);
+            if (delta > worstHermF32) worstHermF32 = delta;
+            assert(delta <= tol, `pin18 f32 herm simd-vs-scalar [${k}] N=${N} t=${t} segS=${segS}: scalar=${s} simd=${v} |Δ|=${delta} > tol=${tol}`);
+          }
+        }
+        d.commit();
+      }
+    }
+    ok(`wasm-hermite-simd-vs-scalar (N ∈ {17,32,3} × ${hermCases.length} (t,segS) × {f64 bit-exact, f32 within ULP}; f32 worstΔ=${worstHermF32.toExponential(2)})`);
+  }
+
+  // ── 19: order-3 Taylor SIMD vs scalar across body + tail (0.9.79) ──────
+  // The stride-3 deinterleave break-through. f64x2 (2 samples/iter, clean
+  // 3-shuffle deinterleave) is BIT-EXACT to the scalar `evalTaylorF64O3`;
+  // f32x4 (4 samples/iter, 6-shuffle 3-register gather, f32-lane math) is
+  // within a few ULP. Same sample-count edge cases as pins 11/18 so the
+  // scalar tail of each width is exercised. Physics-shaped p/v/a so the
+  // quadratic term is non-trivial.
+  {
+    const dts = [0, 0.001, 0.0166667];
+    const F32_O3_ABS = 1e-5;
+    const F32_O3_REL = 8 * Math.pow(2, -23);
+    let worstO3F32 = 0;
+    for (const N of [17, 32, 3]) {
+      const sF64 = defineSchema({ traj: f64TrajectoryArray(N, { order: 3 }) });
+      const sF32 = defineSchema({ traj: f32TrajectoryArray(N, { order: 3 }) });
+      const cap = 4;
+      const headerBytes = 32;
+      const omega = 2 * Math.PI * 3;
+
+      // f64 — bit-exact.
+      {
+        const sabBytes = Bridge.byteLength(cap, sF64);
+        const dstBytes = N * 8;
+        const alloc = allocateWorkletMemory({ sabBytes, scratchBytes: dstBytes * 2 });
+        const bridge = new Bridge(alloc.sab, cap, sF64);
+        const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+        const frameBytes = sF64.compiled.frameByteSize;
+        const mask = cap - 1;
+        const trajOff = sF64.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+        const base = alloc.scratchByteOffset!;
+        const scalarOff = base, simdOff = base + dstBytes;
+        const scalarView = new Float64Array(alloc.sab, scalarOff, N);
+        const simdView = new Float64Array(alloc.sab, simdOff, N);
+        const pf = bridge.scratchFrame();
+        for (let k = 0; k < N; k++) {
+          pf.traj[k * 3] = Math.cos(k * 0.19 + 0.5);
+          pf.traj[k * 3 + 1] = -omega * Math.sin(k * 0.19 + 0.5);
+          pf.traj[k * 3 + 2] = -omega * omega * Math.cos(k * 0.19 + 0.5);
+        }
+        assert(bridge.push(pf), `pin19 f64 N=${N}: push`);
+        const slot = consumer.peekPull(mask); assert(slot >= 0, `pin19 f64 N=${N}: peek`);
+        const slotBase = headerBytes + slot * frameBytes;
+        for (const dt of dts) {
+          consumer.evalTaylorF64O3(slotBase + trajOff, scalarOff, N, dt);
+          consumer.evalTaylorF64O3Simd(slotBase + trajOff, simdOff, N, dt);
+          for (let k = 0; k < N; k++) {
+            assertEq(simdView[k], scalarView[k], `pin19 f64 o3 simd-vs-scalar [${k}] N=${N} dt=${dt}`);
+          }
+        }
+        consumer.commitPull();
+      }
+
+      // f32 — within a few ULP.
+      {
+        const sabBytes = Bridge.byteLength(cap, sF32);
+        const dstBytes = N * 4;
+        const alloc = allocateWorkletMemory({ sabBytes, scratchBytes: dstBytes * 2 });
+        const bridge = new Bridge(alloc.sab, cap, sF32);
+        const consumer = instantiateConsumer(wasmBytes, alloc.memory);
+        const frameBytes = sF32.compiled.frameByteSize;
+        const mask = cap - 1;
+        const trajOff = sF32.compiled.fields.find((f) => f.name === "traj")!.byteOffset;
+        const base = alloc.scratchByteOffset!;
+        const scalarOff = base, simdOff = base + dstBytes;
+        const scalarView = new Float32Array(alloc.sab, scalarOff, N);
+        const simdView = new Float32Array(alloc.sab, simdOff, N);
+        const pf = bridge.scratchFrame();
+        for (let k = 0; k < N; k++) {
+          pf.traj[k * 3] = Math.fround(Math.cos(k * 0.19 + 0.5));
+          pf.traj[k * 3 + 1] = Math.fround(-omega * Math.sin(k * 0.19 + 0.5));
+          pf.traj[k * 3 + 2] = Math.fround(-omega * omega * Math.cos(k * 0.19 + 0.5));
+        }
+        assert(bridge.push(pf), `pin19 f32 N=${N}: push`);
+        const slot = consumer.peekPull(mask); assert(slot >= 0, `pin19 f32 N=${N}: peek`);
+        const slotBase = headerBytes + slot * frameBytes;
+        for (const dt of dts) {
+          consumer.evalTaylorF32O3(slotBase + trajOff, scalarOff, N, dt);
+          consumer.evalTaylorF32O3Simd(slotBase + trajOff, simdOff, N, dt);
+          for (let k = 0; k < N; k++) {
+            const s = scalarView[k]!, v = simdView[k]!;
+            const tol = F32_O3_ABS + Math.max(Math.abs(s), Math.abs(v)) * F32_O3_REL;
+            const delta = Math.abs(s - v);
+            if (delta > worstO3F32) worstO3F32 = delta;
+            assert(delta <= tol, `pin19 f32 o3 simd-vs-scalar [${k}] N=${N} dt=${dt}: scalar=${s} simd=${v} |Δ|=${delta} > tol=${tol}`);
+          }
+        }
+        consumer.commitPull();
+      }
+    }
+    ok(`wasm-taylor-o3-simd-vs-scalar (N ∈ {17,32,3} × ${dts.length} dts × {f64 bit-exact, f32 within ULP}; f32 worstΔ=${worstO3F32.toExponential(2)})`);
+  }
+
   console.log(
-    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
+    "\nBridge.wasmEquivalence: WASM decoder reads SAB header + drives SPSC dance + decodes all 10 scalar kinds + bulk-copies array fields + evaluates f64/f32 Taylor/Hermite trajectories + SIMD-vectorized order=2 Taylor AND Hermite paths + invariant-lane f64 decode + CAS-aware drop-oldest commits + whole-frame descriptor decode + clamped (velocity/acceleration) Taylor evaluators in agreement with JS atomics.",
   );
 }
 

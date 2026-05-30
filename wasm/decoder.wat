@@ -1227,6 +1227,613 @@
       end
     end)
 
+  ;; ─── f64 Hermite order=2 SIMD (0.9.79) ────────────────────────────────
+  ;;
+  ;; Vectorized cubic Hermite for stride-2 (order=2) trajectories: 2 samples
+  ;; per iteration. The interleaved [p, v] deinterleave is identical to
+  ;; `eval_taylor_f64_o2_simd` (same i8x16.shuffle masks), applied to BOTH
+  ;; the prev and curr frames. The four basis coefficients (h00/h10s/h01/h11s,
+  ;; segmentSeconds already folded into h10s/h11s by the caller) are splatted
+  ;; to f64x2 once and reused across the loop.
+  ;;
+  ;; Accumulation is LEFT-TO-RIGHT — h00·P0 + h10s·M0 + h01·P1 + h11s·M1 —
+  ;; matching the JS `evaluateHermiteTrajectoryInto` op order exactly. WASM
+  ;; f64x2 mul/add are IEEE-754 with no implicit FMA, so each lane reproduces
+  ;; the JS rounding step-for-step: this path is BIT-EXACT to the scalar
+  ;; `eval_hermite_f64` and to JS. A scalar tail handles the trailing 0..1
+  ;; sample (same op order). Order-3 hermite needs the stride-3 deinterleave
+  ;; (a separate function) — this is stride-2 only.
+  (func $eval_hermite_f64_o2_simd (export "eval_hermite_f64_o2_simd")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32)
+        (param $h00 f64) (param $h10s f64) (param $h01 f64) (param $h11s f64)
+    (local $prevP i32)
+    (local $currP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $h00V v128)
+    (local $h10sV v128)
+    (local $h01V v128)
+    (local $h11sV v128)
+    (local $a0 v128)
+    (local $a1 v128)
+    (local $P0 v128)
+    (local $M0 v128)
+    (local $P1 v128)
+    (local $M1 v128)
+    local.get $h00 f64x2.splat local.set $h00V
+    local.get $h10s f64x2.splat local.set $h10sV
+    local.get $h01 f64x2.splat local.set $h01V
+    local.get $h11s f64x2.splat local.set $h11sV
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = prevOff + n*16  (stride-2 f64 = 16 bytes/sample)
+    local.get $prevOff
+    local.get $n
+    i32.const 4
+    i32.shl
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = prevOff + (n>>1)*32  (2 samples = 32 bytes)
+    local.get $prevOff
+    local.get $n
+    i32.const 1
+    i32.shr_u
+    i32.const 5
+    i32.shl
+    i32.add
+    local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $prevP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        ;; prev: deinterleave [p,v,p,v] -> P0=[p_i,p_{i+1}], M0=[v_i,v_{i+1}]
+        local.get $prevP
+        v128.load align=1
+        local.set $a0
+        local.get $prevP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $a1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+        local.set $P0
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+        local.set $M0
+        ;; curr: same deinterleave -> P1, M1
+        local.get $currP
+        v128.load align=1
+        local.set $a0
+        local.get $currP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $a1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+        local.set $P1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+        local.set $M1
+        ;; acc = ((h00*P0 + h10s*M0) + h01*P1) + h11s*M1   (left-to-right)
+        local.get $dstP
+        local.get $h00V
+        local.get $P0
+        f64x2.mul
+        local.get $h10sV
+        local.get $M0
+        f64x2.mul
+        f64x2.add
+        local.get $h01V
+        local.get $P1
+        f64x2.mul
+        f64x2.add
+        local.get $h11sV
+        local.get $M1
+        f64x2.mul
+        f64x2.add
+        v128.store align=1
+        local.get $prevP i32.const 32 i32.add local.set $prevP
+        local.get $currP i32.const 32 i32.add local.set $currP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..1 sample) — same left-to-right f64 op order.
+    block $tailExit
+      loop $tailLoop
+        local.get $prevP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $prevP
+        f64.load align=1
+        local.get $h00
+        f64.mul
+        local.get $prevP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $h10s
+        f64.mul
+        f64.add
+        local.get $currP
+        f64.load align=1
+        local.get $h01
+        f64.mul
+        f64.add
+        local.get $currP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $h11s
+        f64.mul
+        f64.add
+        f64.store align=1
+        local.get $prevP i32.const 16 i32.add local.set $prevP
+        local.get $currP i32.const 16 i32.add local.set $currP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; ─── f32 Hermite order=2 SIMD (0.9.79) ────────────────────────────────
+  ;;
+  ;; f32x4 mirror of the f64x2 Hermite above: 4 samples per iteration, same
+  ;; deinterleave masks as `eval_taylor_f32_o2_simd`. The basis coefficients
+  ;; are demoted f64->f32 once and splatted. Like every f32 SIMD path here the
+  ;; per-lane math runs in f32 (no per-lane widen), so — unlike the f64 path —
+  ;; it is NOT bit-exact to the f64-accumulating JS evaluator; it agrees within
+  ;; a few ULP (the equivalence pin uses an epsilon tolerance, as for the
+  ;; f32 order-2 Taylor SIMD).
+  (func $eval_hermite_f32_o2_simd (export "eval_hermite_f32_o2_simd")
+        (param $prevOff i32) (param $currOff i32) (param $dstOff i32)
+        (param $n i32)
+        (param $h00 f64) (param $h10s f64) (param $h01 f64) (param $h11s f64)
+    (local $prevP i32)
+    (local $currP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $h00f f32)
+    (local $h10sf f32)
+    (local $h01f f32)
+    (local $h11sf f32)
+    (local $h00V v128)
+    (local $h10sV v128)
+    (local $h01V v128)
+    (local $h11sV v128)
+    (local $a0 v128)
+    (local $a1 v128)
+    (local $P0 v128)
+    (local $M0 v128)
+    (local $P1 v128)
+    (local $M1 v128)
+    local.get $h00 f32.demote_f64 local.tee $h00f f32x4.splat local.set $h00V
+    local.get $h10s f32.demote_f64 local.tee $h10sf f32x4.splat local.set $h10sV
+    local.get $h01 f32.demote_f64 local.tee $h01f f32x4.splat local.set $h01V
+    local.get $h11s f32.demote_f64 local.tee $h11sf f32x4.splat local.set $h11sV
+    local.get $prevOff local.set $prevP
+    local.get $currOff local.set $currP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = prevOff + n*8  (stride-2 f32 = 8 bytes/sample)
+    local.get $prevOff
+    local.get $n
+    i32.const 3
+    i32.shl
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = prevOff + (n>>2)*32  (4 samples = 32 bytes)
+    local.get $prevOff
+    local.get $n
+    i32.const 2
+    i32.shr_u
+    i32.const 5
+    i32.shl
+    i32.add
+    local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $prevP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        ;; prev deinterleave
+        local.get $prevP
+        v128.load align=1
+        local.set $a0
+        local.get $prevP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $a1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 0 1 2 3 8 9 10 11 16 17 18 19 24 25 26 27
+        local.set $P0
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 4 5 6 7 12 13 14 15 20 21 22 23 28 29 30 31
+        local.set $M0
+        ;; curr deinterleave
+        local.get $currP
+        v128.load align=1
+        local.set $a0
+        local.get $currP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $a1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 0 1 2 3 8 9 10 11 16 17 18 19 24 25 26 27
+        local.set $P1
+        local.get $a0
+        local.get $a1
+        i8x16.shuffle 4 5 6 7 12 13 14 15 20 21 22 23 28 29 30 31
+        local.set $M1
+        ;; acc = ((h00*P0 + h10s*M0) + h01*P1) + h11s*M1  (f32x4)
+        local.get $dstP
+        local.get $h00V
+        local.get $P0
+        f32x4.mul
+        local.get $h10sV
+        local.get $M0
+        f32x4.mul
+        f32x4.add
+        local.get $h01V
+        local.get $P1
+        f32x4.mul
+        f32x4.add
+        local.get $h11sV
+        local.get $M1
+        f32x4.mul
+        f32x4.add
+        v128.store align=1
+        local.get $prevP i32.const 32 i32.add local.set $prevP
+        local.get $currP i32.const 32 i32.add local.set $currP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..3 samples), f32 math (matches the SIMD body's precision).
+    block $tailExit
+      loop $tailLoop
+        local.get $prevP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $prevP
+        f32.load align=1
+        local.get $h00f
+        f32.mul
+        local.get $prevP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        local.get $h10sf
+        f32.mul
+        f32.add
+        local.get $currP
+        f32.load align=1
+        local.get $h01f
+        f32.mul
+        f32.add
+        local.get $currP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        local.get $h11sf
+        f32.mul
+        f32.add
+        f32.store align=1
+        local.get $prevP i32.const 8 i32.add local.set $prevP
+        local.get $currP i32.const 8 i32.add local.set $currP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; ─── f64 order=3 Taylor SIMD (0.9.79 — the stride-3 break-through) ─────
+  ;;
+  ;; Deferred since the 0.7.10 SIMD cut: order-3's 24-byte (f64) sample stride
+  ;; doesn't pack into v128 multiples, so the deinterleave was assumed to dwarf
+  ;; the per-sample win. The f64x2 case is actually CLEAN: 2 samples = 48 bytes
+  ;; = three v128 loads, and each of the p/v/a output lanes draws from exactly
+  ;; TWO of those three registers, so three two-input i8x16.shuffles suffice —
+  ;; no 3-input gather. Per 2-sample step:
+  ;;   V0 = [p_i,   v_i  ]   (bytes  0..15)
+  ;;   V1 = [a_i,   p_i+1]   (bytes 16..31)
+  ;;   V2 = [v_i+1, a_i+1]   (bytes 32..47)
+  ;;   P = shuffle(V0,V1, 0..7 , 24..31) = [p_i,   p_i+1]
+  ;;   V = shuffle(V0,V2, 8..15, 16..23) = [v_i,   v_i+1]
+  ;;   A = shuffle(V1,V2, 0..7 , 24..31) = [a_i,   a_i+1]
+  ;;   out = (P + V·dt) + A·halfDt2
+  ;; Accumulation is left-to-right in f64 with no FMA, and halfDt2 = (dt·dt)·0.5
+  ;; exactly as the scalar `eval_taylor_f64_o3` computes it, so this is
+  ;; BIT-EXACT to the scalar path and to `evaluateTrajectoryInto`. A scalar
+  ;; tail handles the trailing 0..1 sample.
+  (func $eval_taylor_f64_o3_simd (export "eval_taylor_f64_o3_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $halfDt2 f64)
+    (local $dtV v128)
+    (local $halfV v128)
+    (local $V0 v128)
+    (local $V1 v128)
+    (local $V2 v128)
+    (local $P v128)
+    (local $V v128)
+    (local $A v128)
+    local.get $dt
+    local.get $dt
+    f64.mul
+    f64.const 0.5
+    f64.mul
+    local.set $halfDt2
+    local.get $dt f64x2.splat local.set $dtV
+    local.get $halfDt2 f64x2.splat local.set $halfV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = srcOff + n*24
+    local.get $srcOff
+    local.get $n
+    i32.const 8
+    i32.mul
+    i32.const 3
+    i32.mul
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = srcOff + (n>>1)*48  (2 samples = 48 bytes)
+    local.get $srcOff
+    local.get $n
+    i32.const 1
+    i32.shr_u
+    i32.const 48
+    i32.mul
+    i32.add
+    local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        local.get $srcP
+        v128.load align=1
+        local.set $V0
+        local.get $srcP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $V1
+        local.get $srcP
+        i32.const 32
+        i32.add
+        v128.load align=1
+        local.set $V2
+        local.get $V0
+        local.get $V1
+        i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31
+        local.set $P
+        local.get $V0
+        local.get $V2
+        i8x16.shuffle 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+        local.set $V
+        local.get $V1
+        local.get $V2
+        i8x16.shuffle 0 1 2 3 4 5 6 7 24 25 26 27 28 29 30 31
+        local.set $A
+        ;; out = (P + V*dtV) + A*halfV
+        local.get $dstP
+        local.get $P
+        local.get $V
+        local.get $dtV
+        f64x2.mul
+        f64x2.add
+        local.get $A
+        local.get $halfV
+        f64x2.mul
+        f64x2.add
+        v128.store align=1
+        local.get $srcP i32.const 48 i32.add local.set $srcP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..1 sample) — same op order as eval_taylor_f64_o3.
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $srcP
+        f64.load align=1
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f64.load align=1
+        local.get $dt
+        f64.mul
+        f64.add
+        local.get $srcP
+        i32.const 16
+        i32.add
+        f64.load align=1
+        local.get $halfDt2
+        f64.mul
+        f64.add
+        f64.store align=1
+        local.get $srcP i32.const 24 i32.add local.set $srcP
+        local.get $dstP i32.const 8 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
+  ;; ─── f32 order=3 Taylor SIMD (0.9.79 — the stride-3 break-through) ─────
+  ;;
+  ;; f32x4 case: 4 samples = 48 bytes = three v128 loads, but each p/v/a output
+  ;; lane now draws from up to THREE registers, so the deinterleave needs TWO
+  ;; chained shuffles per lane-group (6 total) — the cost the 0.7.10 note
+  ;; flagged. Built + benched anyway (the f64x2 sibling is clean; this one the
+  ;; data decides). Per 4-sample step:
+  ;;   V0 = [p0,v0,a0,p1]  V1 = [v1,a1,p2,v2]  V2 = [a2,p3,v3,a3]
+  ;;   P:  shuffle(V0,V1, p0 p1 p2 _) then shuffle(.,V2, _ _ _ p3)
+  ;;   V:  shuffle(V0,V1, v0 v1 v2 _) then shuffle(.,V2, _ _ _ v3)
+  ;;   A:  shuffle(V0,V1, a0 a1 _ _ ) then shuffle(.,V2, _ _ a2 a3)
+  ;; f32-lane math (no per-lane widen), so — like every f32 SIMD path here —
+  ;; it agrees with the f64-accumulating scalar within a few ULP, not bit-exact.
+  (func $eval_taylor_f32_o3_simd (export "eval_taylor_f32_o3_simd")
+        (param $srcOff i32) (param $dstOff i32) (param $n i32) (param $dt f64)
+    (local $srcP i32)
+    (local $dstP i32)
+    (local $simdEnd i32)
+    (local $tailEnd i32)
+    (local $dt32 f32)
+    (local $halfDt2 f32)
+    (local $dtV v128)
+    (local $halfV v128)
+    (local $V0 v128)
+    (local $V1 v128)
+    (local $V2 v128)
+    (local $P v128)
+    (local $V v128)
+    (local $A v128)
+    local.get $dt f32.demote_f64 local.set $dt32
+    ;; halfDt2 = (dt32 * dt32) * 0.5 in f32
+    local.get $dt32
+    local.get $dt32
+    f32.mul
+    f32.const 0.5
+    f32.mul
+    local.set $halfDt2
+    local.get $dt32 f32x4.splat local.set $dtV
+    local.get $halfDt2 f32x4.splat local.set $halfV
+    local.get $srcOff local.set $srcP
+    local.get $dstOff local.set $dstP
+    ;; tailEnd = srcOff + n*12
+    local.get $srcOff
+    local.get $n
+    i32.const 4
+    i32.mul
+    i32.const 3
+    i32.mul
+    i32.add
+    local.set $tailEnd
+    ;; simdEnd = srcOff + (n>>2)*48  (4 samples = 48 bytes)
+    local.get $srcOff
+    local.get $n
+    i32.const 2
+    i32.shr_u
+    i32.const 48
+    i32.mul
+    i32.add
+    local.set $simdEnd
+    block $simdExit
+      loop $simdLoop
+        local.get $srcP
+        local.get $simdEnd
+        i32.ge_u
+        br_if $simdExit
+        local.get $srcP
+        v128.load align=1
+        local.set $V0
+        local.get $srcP
+        i32.const 16
+        i32.add
+        v128.load align=1
+        local.set $V1
+        local.get $srcP
+        i32.const 32
+        i32.add
+        v128.load align=1
+        local.set $V2
+        ;; P = [p0,p1,p2,p3]: p0=V0.0 p1=V0.3 p2=V1.2(=24..27) ; then p3=V2.1(=20..23)
+        local.get $V0
+        local.get $V1
+        i8x16.shuffle 0 1 2 3 12 13 14 15 24 25 26 27 0 1 2 3
+        local.get $V2
+        i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 20 21 22 23
+        local.set $P
+        ;; V = [v0,v1,v2,v3]: v0=V0.1 v1=V1.0(=16..19) v2=V1.3(=28..31) ; v3=V2.2(=24..27)
+        local.get $V0
+        local.get $V1
+        i8x16.shuffle 4 5 6 7 16 17 18 19 28 29 30 31 4 5 6 7
+        local.get $V2
+        i8x16.shuffle 0 1 2 3 4 5 6 7 8 9 10 11 24 25 26 27
+        local.set $V
+        ;; A = [a0,a1,a2,a3]: a0=V0.2 a1=V1.1(=20..23) ; a2=V2.0(=16..19) a3=V2.3(=28..31)
+        local.get $V0
+        local.get $V1
+        i8x16.shuffle 8 9 10 11 20 21 22 23 8 9 10 11 8 9 10 11
+        local.get $V2
+        i8x16.shuffle 0 1 2 3 4 5 6 7 16 17 18 19 28 29 30 31
+        local.set $A
+        ;; out = (P + V*dtV) + A*halfV
+        local.get $dstP
+        local.get $P
+        local.get $V
+        local.get $dtV
+        f32x4.mul
+        f32x4.add
+        local.get $A
+        local.get $halfV
+        f32x4.mul
+        f32x4.add
+        v128.store align=1
+        local.get $srcP i32.const 48 i32.add local.set $srcP
+        local.get $dstP i32.const 16 i32.add local.set $dstP
+        br $simdLoop
+      end
+    end
+    ;; Scalar tail (0..3 samples), f32 math (matches the SIMD body precision).
+    block $tailExit
+      loop $tailLoop
+        local.get $srcP
+        local.get $tailEnd
+        i32.ge_u
+        br_if $tailExit
+        local.get $dstP
+        local.get $srcP
+        f32.load align=1
+        local.get $srcP
+        i32.const 4
+        i32.add
+        f32.load align=1
+        local.get $dt32
+        f32.mul
+        f32.add
+        local.get $srcP
+        i32.const 8
+        i32.add
+        f32.load align=1
+        local.get $halfDt2
+        f32.mul
+        f32.add
+        f32.store align=1
+        local.get $srcP i32.const 12 i32.add local.set $srcP
+        local.get $dstP i32.const 4 i32.add local.set $dstP
+        br $tailLoop
+      end
+    end)
+
   ;; ─── Descriptor-driven whole-frame decode (0.9.74) ────────────────────
   ;;
   ;; ONE JS↔WASM crossing decodes an ENTIRE frame. The per-field readers

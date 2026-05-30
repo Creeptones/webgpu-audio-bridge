@@ -405,6 +405,50 @@ export interface WorkletConsumer {
   evalTaylorF32O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
   evalTaylorF64O2Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
 
+  /** SIMD-vectorized cubic Hermite evaluators for **order-2 (stride-2)**
+   *  trajectories (0.9.79). Process 2 samples per iteration (f64x2) or 4
+   *  (f32x4) using the same interleaved `[p, v]` deinterleave as the order-2
+   *  Taylor SIMD evaluators, applied to BOTH the prev and curr frames, then
+   *  `h00·P0 + h10s·M0 + h01·P1 + h11s·M1` lane-wise. The basis coefficients
+   *  are the same caller-computed scalars `evalHermiteF64`/`F32` take (with
+   *  `segmentSeconds` already folded into `h10s`/`h11s`).
+   *
+   *  Unlike the strided scalar `evalHermiteF64`/`F32` there is NO `strideElems`
+   *  param: these are order-2-only (the stride-3 order-3 deinterleave is a
+   *  separate problem). Use the scalar evaluator for order-3 Hermite.
+   *
+   *  Bit-exactness: the **f64x2** path accumulates left-to-right in f64 with no
+   *  implicit FMA, so it is **bit-exact** to `evaluateHermiteTrajectoryInto`
+   *  and to the scalar `evalHermiteF64`. The **f32x4** path does its math in
+   *  f32 (no per-lane widen), so it agrees within a few ULP — like the f32
+   *  order-2 Taylor SIMD evaluator. */
+  evalHermiteF64O2Simd(
+    prevOffset: number, currOffset: number, dstOffset: number, n: number,
+    h00: number, h10s: number, h01: number, h11s: number,
+  ): void;
+  evalHermiteF32O2Simd(
+    prevOffset: number, currOffset: number, dstOffset: number, n: number,
+    h00: number, h10s: number, h01: number, h11s: number,
+  ): void;
+
+  /** SIMD-vectorized **order-3** quadratic Taylor evaluators (0.9.79) — the
+   *  stride-3 `[p, v, a]` deinterleave that was deferred at the 0.7.10 SIMD
+   *  cut. `out[i] = p_i + v_i·dt + a_i·½dt²`.
+   *
+   *  The **f64x2** path (2 samples/iter) deinterleaves cleanly: 2 samples span
+   *  three v128 loads and each p/v/a lane draws from exactly two of them, so
+   *  three two-input shuffles suffice. It accumulates left-to-right in f64 with
+   *  no FMA and computes `halfDt2` identically to the scalar path, so it is
+   *  **bit-exact** to `evalTaylorF64O3` and `evaluateTrajectoryInto`.
+   *
+   *  The **f32x4** path (4 samples/iter) needs a 3-register gather (two chained
+   *  shuffles per p/v/a group), and runs f32-lane math, so it agrees within a
+   *  few ULP — not bit-exact. Whether it actually beats the scalar f32 path is
+   *  data-dependent (the deinterleave cost is real); see
+   *  `bench/eval-simd.bench.ts`. */
+  evalTaylorF64O3Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+  evalTaylorF32O3Simd(srcOffset: number, dstOffset: number, n: number, dt: number): void;
+
   /** Clamped Taylor evaluators (0.9.77). Port of `evaluateTrajectoryInto`'s
    *  clamped path for the **derivative-clamp-only** case: each loaded velocity
    *  (and, at order 3, acceleration) is clamped to `[-clamp, +clamp]` before
@@ -517,6 +561,16 @@ export function instantiateConsumer(
     ) => void;
     readonly eval_taylor_f32_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly eval_taylor_f64_o2_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_hermite_f64_o2_simd: (
+      prevOff: number, currOff: number, dstOff: number, n: number,
+      h00: number, h10s: number, h01: number, h11s: number,
+    ) => void;
+    readonly eval_hermite_f32_o2_simd: (
+      prevOff: number, currOff: number, dstOff: number, n: number,
+      h00: number, h10s: number, h01: number, h11s: number,
+    ) => void;
+    readonly eval_taylor_f64_o3_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
+    readonly eval_taylor_f32_o3_simd: (srcOff: number, dstOff: number, n: number, dt: number) => void;
     readonly decode_frame: (slotBase: number, descPtr: number, descCount: number) => void;
     readonly eval_taylor_f64_o2_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number) => void;
     readonly eval_taylor_f64_o3_clamped: (srcOff: number, dstOff: number, n: number, dt: number, vc: number, ac: number) => void;
@@ -558,6 +612,10 @@ export function instantiateConsumer(
     "eval_hermite_f32",
     "eval_taylor_f32_o2_simd",
     "eval_taylor_f64_o2_simd",
+    "eval_hermite_f64_o2_simd",
+    "eval_hermite_f32_o2_simd",
+    "eval_taylor_f64_o3_simd",
+    "eval_taylor_f32_o3_simd",
     "decode_frame",
     "eval_taylor_f64_o2_clamped",
     "eval_taylor_f64_o3_clamped",
@@ -623,6 +681,14 @@ export function instantiateConsumer(
       exports.eval_taylor_f32_o2_simd(srcOff, dstOff, n, dt),
     evalTaylorF64O2Simd: (srcOff, dstOff, n, dt) =>
       exports.eval_taylor_f64_o2_simd(srcOff, dstOff, n, dt),
+    evalHermiteF64O2Simd: (prevOff, currOff, dstOff, n, h00, h10s, h01, h11s) =>
+      exports.eval_hermite_f64_o2_simd(prevOff, currOff, dstOff, n, h00, h10s, h01, h11s),
+    evalHermiteF32O2Simd: (prevOff, currOff, dstOff, n, h00, h10s, h01, h11s) =>
+      exports.eval_hermite_f32_o2_simd(prevOff, currOff, dstOff, n, h00, h10s, h01, h11s),
+    evalTaylorF64O3Simd: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f64_o3_simd(srcOff, dstOff, n, dt),
+    evalTaylorF32O3Simd: (srcOff, dstOff, n, dt) =>
+      exports.eval_taylor_f32_o3_simd(srcOff, dstOff, n, dt),
     decodeFrame: (slotBase, descPtr, descCount) =>
       exports.decode_frame(slotBase, descPtr, descCount),
     evalTaylorF64O2Clamped: (srcOff, dstOff, n, dt, vc) =>

@@ -4,6 +4,73 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.79] — 2026-05-29
+
+### Added — Hermite + order-3 Taylor SIMD evaluators (SIMD harvest, Stage 5)
+
+0.9.77 shipped the order-2 clamped SIMD evaluators and **assessed-and-deferred**
+two SIMD paths: cubic Hermite, and order-3 Taylor. The deferral note reasoned
+that order-3's 24-byte (f64) / 12-byte (f32) sample stride "does not pack into
+v128 multiples cleanly — the deinterleave cost dwarfs the per-sample win." This
+patch builds all four and lets the **bench** decide — and the bench breaks
+through the deferral: every path is a net win, including the one the note
+expected to lose.
+
+#### What shipped
+
+- **`evalHermiteF64O2Simd` / `evalHermiteF32O2Simd`** (`wasm/decoder.wat`,
+  surfaced on `WorkletConsumer`) — vectorized cubic Hermite for **order-2
+  (stride-2)** trajectories: 2 (f64x2) / 4 (f32x4) samples per iteration, the
+  same interleaved `[p, v]` deinterleave as the order-2 Taylor SIMD, applied to
+  both the prev and curr frames, then `h00·P0 + h10s·M0 + h01·P1 + h11s·M1`
+  lane-wise. No `strideElems` param (order-2-only; order-3 Hermite keeps the
+  scalar path).
+- **`evalTaylorF64O3Simd` / `evalTaylorF32O3Simd`** — the deferred **order-3**
+  Taylor SIMD. The f64x2 case turns out to deinterleave **cleanly**: 2 samples
+  span three v128 loads and each p/v/a lane draws from exactly two of them, so
+  three two-input `i8x16.shuffle`s suffice (no 3-input gather). The f32x4 case
+  needs a 3-register gather (two chained shuffles per p/v/a group, 6 total) —
+  the cost the 0.7.10 note flagged — and still wins.
+
+#### Correctness
+
+The **f64** paths accumulate left-to-right in f64 with no implicit FMA and
+compute `halfDt2` identically to the scalar path, so they are **bit-exact** to
+`evalHermiteF64` / `evalTaylorF64O3` and to the JS `evaluateHermiteTrajectoryInto`
+/ `evaluateTrajectoryInto`. The **f32** paths run f32-lane math, so — like every
+f32 SIMD path here — they agree **within a few ULP** (measured worst Δ = 1.19e-7,
+i.e. one f32 ULP). Pinned by `tests/Bridge.wasmEquivalence.test.ts` **pins 18–19**
+(SIMD-vs-scalar across N ∈ {17, 32, 3} so the scalar tail of each width is
+exercised) plus a bit-exact f64 Hermite SIMD leg added to pin 9b.
+
+#### Bench (`npm run bench:eval-simd`, eval-only, N=64, batched)
+
+| evaluator | scalar p50 | SIMD p50 | speedup |
+| --- | --- | --- | --- |
+| Hermite o2 f64 | 119 ns | 82 ns | 1.45× |
+| Hermite o2 f32 | 132 ns | 37 ns | 3.56× |
+| Taylor o3 f64 | 82 ns | 55 ns | 1.49× |
+| Taylor o3 f32 | 101 ns | 65 ns | 1.55× |
+
+Even the order-3 f32x4 path (6 shuffles / 4 samples) is 1.55× faster — the
+deferral was conservative.
+
+### Wire compatibility
+
+Fully wire-equivalent. Additive public API on the `webgpu-audio-bridge/worklet`
+subpath (four new `WorkletConsumer` methods); the decoder binary grows ~700 B.
+No SAB-layout or protocol change.
+
+### Tests
+
+44 Node suites green; `wasmEquivalence` grows to pin 19 (+ a SIMD leg in 9b).
+`npm run typecheck` clean. `npm run bench` push/pull/pullLatest 1.20 µs
+(unchanged).
+
+### Documentation
+
+New `bench/eval-simd.bench.ts` (`npm run bench:eval-simd`).
+
 ## [0.9.78] — 2026-05-29
 
 ### Added — `emitWasmDecoder(schema)`: monomorphized whole-frame WAT decoder codegen (SIMD harvest, Stage 4)
