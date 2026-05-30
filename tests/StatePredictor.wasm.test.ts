@@ -203,6 +203,87 @@ function main(): void {
     ok("StatePredictor-wasm-position-only-bit-exact");
   }
 
+  // ── SoA f64x2 SIMD: full ingest+predict pipeline vs JS, bit-exact ────────
+  // Struct-of-arrays layout: each derivative / covariance element is its own
+  // contiguous n-f64 array (x_k at xOff+k·n·8, P_idx at pOff+idx·n·8). Even n.
+  function layoutSoA(n: number, m: number) {
+    let off = 1024;
+    const xOff = off; off += m * n * 8;
+    const pOff = off; off += m * m * n * 8;
+    const posOff = off; off += n * 8;
+    const velOff = off; off += n * 8;
+    const accOff = off; off += n * 8;
+    const valOff = off; off += n * 8;
+    const varOff = off; off += n * 8;
+    const vscratch = off; off += 2 * m * 16;
+    return { xOff, pOff, posOff, velOff, accOff, valOff, varOff, vscratch };
+  }
+
+  function runSoaSimd(model: "cv" | "ca", N: number): void {
+    const m = model === "ca" ? 3 : 2;
+    const q = model === "ca" ? 5e2 : 1e3, rp = model === "ca" ? 1e-3 : 4e-4;
+    const rv = model === "ca" ? 1e-2 : 0.25, ra = 1e-1, p0 = 1e6;
+    const L = layoutSoA(N, m);
+    const sp = new StatePredictor({
+      laneCount: N, model, processNoise: q, measPosNoise: rp,
+      measVelNoise: rv, measAccNoise: ra, initialVariance: p0,
+    });
+    let seed = model === "ca" ? 4242 : 271828;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff - 0.5; };
+    // Seed frame 0.
+    const pos0 = new Float64Array(N), vel0 = new Float64Array(N), acc0 = new Float64Array(N);
+    for (let i = 0; i < N; i++) { pos0[i] = Math.sin(i) + 0.01 * rnd(); vel0[i] = Math.cos(i); acc0[i] = -Math.sin(i); }
+    sp.ingest(0, pos0, vel0, model === "ca" ? acc0 : undefined);
+    // SoA seed: x_k[i], P diag at indices 0, m+1, 2m+2.
+    for (let i = 0; i < N; i++) {
+      f64[L.xOff / 8 + 0 * N + i] = pos0[i]!;
+      f64[L.xOff / 8 + 1 * N + i] = vel0[i]!;
+      if (m === 3) f64[L.xOff / 8 + 2 * N + i] = acc0[i]!;
+      for (let k = 0; k < m * m; k++) f64[L.pOff / 8 + k * N + i] = 0;
+      f64[L.pOff / 8 + 0 * N + i] = p0;
+      f64[L.pOff / 8 + (m + 1) * N + i] = p0;
+      if (m === 3) f64[L.pOff / 8 + (2 * m + 2) * N + i] = p0;
+    }
+    let lastNs = 0;
+    const period = 16_666_667;
+    for (let frame = 1; frame <= 25; frame++) {
+      const tNs = frame * period;
+      const s = tNs * 1e-9;
+      const pos = new Float64Array(N), vel = new Float64Array(N), acc = new Float64Array(N);
+      for (let i = 0; i < N; i++) {
+        pos[i] = Math.sin(s + i) + 0.01 * rnd();
+        vel[i] = Math.cos(s + i) + 0.05 * rnd();
+        acc[i] = -Math.sin(s + i) + 0.2 * rnd();
+      }
+      sp.ingest(tNs, pos, vel, model === "ca" ? acc : undefined);
+      for (let i = 0; i < N; i++) {
+        f64[L.posOff / 8 + i] = pos[i]!; f64[L.velOff / 8 + i] = vel[i]!; f64[L.accOff / 8 + i] = acc[i]!;
+      }
+      const dt = (tNs - lastNs) * 1e-9;
+      if (m === 3) {
+        c.kalmanIngestCaF64SoaSimd(L.xOff, L.pOff, L.posOff, L.velOff, L.accOff, N, dt, q, rp, rv, ra, 1, 1, L.vscratch);
+      } else {
+        c.kalmanIngestCvF64SoaSimd(L.xOff, L.pOff, L.posOff, L.velOff, N, dt, q, rp, rv, 1, L.vscratch);
+      }
+      lastNs = tNs;
+      const targetNs = tNs + 8 * 1e-3 * NS;
+      const jsVal = new Float64Array(N), jsVar = new Float64Array(N);
+      sp.predictInto(targetNs, jsVal, jsVar);
+      const pdt = (targetNs - lastNs) * 1e-9;
+      if (m === 3) c.kalmanPredictCaF64SoaSimd(L.xOff, L.pOff, L.valOff, L.varOff, N, pdt, q);
+      else c.kalmanPredictCvF64SoaSimd(L.xOff, L.pOff, L.valOff, L.varOff, N, pdt, q);
+      for (let i = 0; i < N; i++) {
+        assertEq(f64[L.valOff / 8 + i], jsVal[i], `${model} SIMD frame ${frame} lane ${i} value bit-exact`);
+        assertEq(f64[L.varOff / 8 + i], jsVar[i], `${model} SIMD frame ${frame} lane ${i} variance bit-exact`);
+      }
+    }
+  }
+
+  runSoaSimd("cv", 6);
+  ok("StatePredictor-wasm-cv-soa-simd-bit-exact");
+  runSoaSimd("ca", 4);
+  ok("StatePredictor-wasm-ca-soa-simd-bit-exact");
+
   console.log("\nAll StatePredictor WASM-equivalence pins passed.");
 }
 

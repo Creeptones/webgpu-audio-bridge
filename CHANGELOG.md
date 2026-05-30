@@ -4,6 +4,63 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.904] — 2026-05-30
+
+### Added — SoA f64x2 SIMD `StatePredictor` kernels (Apollo Frontier 2 — Stage 4 of 4, **mission complete**)
+
+Closes the Apollo Frontier 2 arc: schema/wire → JS primitive (0.9.901) → Bridge
+pull (0.9.902) → WASM scalar (0.9.903) → **WASM SIMD** (this). Vectorizes the
+per-lane Kalman across lanes with f64x2 (2 lanes/iter) over a **struct-of-arrays**
+state layout — and the bench confirms it wins.
+
+#### What shipped
+
+- **Four new WAT exports** on `WorkletConsumer`: `kalmanIngestCvF64SoaSimd` /
+  `kalmanPredictCvF64SoaSimd` (CV) and `kalmanIngestCaF64SoaSimd` /
+  `kalmanPredictCaF64SoaSimd` (CA). Lane-parallel f64x2: each derivative /
+  covariance element is its OWN contiguous `n`-f64 array across lanes (SoA), so
+  every load/store is a contiguous `v128.load`/`store` (NO gather) and the whole
+  propagate + sequential-update + predict math is f64x2-vectorized. A generic
+  SoA-SIMD update kernel (v128 K/row scratch) is shared by both models, mirroring
+  the scalar generic update.
+- **Why SoA (the design finding behind the user's chosen path).** The per-lane
+  state is array-of-structs; a naive lane-parallel SIMD over it would be
+  **gather-bound** (two scalar loads + `replace_lane` per element — no load-count
+  win), unlike the Hermite SIMD which streamed contiguous strided trajectory
+  data. Transposing the state to struct-of-arrays makes the SIMD loads
+  contiguous, which is what turns the vectorization into a real speedup.
+- **Bit-exact** to the scalar kernels / JS reference: f64x2 ops are per-lane IEEE
+  f64 in the same left-to-right order, so the result is identical (not merely
+  within-ULP). **Requires even `n`** (no scalar tail — the caller pads an odd
+  lane count; trivial for a fixed-width macro field).
+
+### Tests
+
+- **`tests/StatePredictor.wasm.test.ts`** grows two SoA-SIMD pins (CV + CA): drive
+  a JS `StatePredictor` and the SoA-SIMD kernels through the FULL ingest+predict
+  pipeline with identical seeds + 25-frame noisy/curved traces, asserting value
+  AND variance **bit-exact** (`assertEq`) every lane every frame. A new
+  `StatePredictor.debugCopyState` hook supports the harness.
+- Full suite green (incl. the 1 M-frame concurrent stress, no flake).
+
+### Performance
+
+- New bench `bench/kalman-simd.bench.ts` (`npm run bench:kalman-simd`): at N=64
+  lanes, order-3 CA, SoA f64x2 SIMD beats the AoS scalar kernel **predict 1.60×**,
+  **ingest 1.52×** — every SIMD path wins, per the project discipline. Core
+  push/pull/pullLatest unchanged at ~1.3 µs.
+
+### Wire compatibility
+
+None affected. Additive WASM exports on the `/worklet` subpath (~3 KB binary
+growth) + typed `WorkletConsumer` wrappers + a test-only `StatePredictor`
+diagnostic hook. No SAB layout, wire-format, protocol, or public-API break.
+
+### Documentation
+
+- README `StatePredictor` subsection notes the SIMD port shipped (mission
+  complete). ROADMAP row above 0.9.903.
+
 ## [0.9.903] — 2026-05-30
 
 ### Added — WASM scalar `StatePredictor` kernels (Apollo Frontier 2 — Stage 3 of 4)

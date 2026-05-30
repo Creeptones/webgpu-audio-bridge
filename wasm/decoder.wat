@@ -2906,4 +2906,364 @@
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $loop)))
   )
+
+  ;; ─── StatePredictor SoA f64x2 SIMD kernels (0.9.904) ────────────────────
+  ;;
+  ;; Lane-parallel (2 lanes / f64x2) port over a STRUCT-OF-ARRAYS state layout:
+  ;; each derivative / covariance element is its OWN contiguous array across
+  ;; lanes, so every load/store is a contiguous `v128.load`/`store` (NO gather)
+  ;; and the math is fully vectorized. SoA layout (per-array base, element lane
+  ;; at +lane*8; nBytes = n*8 is the stride between successive arrays):
+  ;;   x : m arrays at xOff + k*nBytes      (k = 0..m-1)
+  ;;   P : m*m arrays at pOff + (r*m+c)*nBytes  (row-major)
+  ;;   pos/vel/acc/val/var : one array each at *Off
+  ;;   vscratch : 2*m × v128 (K[0..m) then row[0..m)) — caller-owned
+  ;; f64x2 ops are per-lane IEEE f64, same order as the scalar kernels above ⇒
+  ;; **bit-exact** to scalar/JS. **Requires even n** (no scalar tail — the
+  ;; caller pads an odd lane count; trivial for a fixed-width macro field).
+
+  ;; Generic SoA SIMD sequential scalar update for a lane-PAIR at byte offset jb.
+  (func $kalman_update_soa_simd
+        (param $xOff i32) (param $pOff i32) (param $nBytes i32) (param $m i32) (param $idx i32)
+        (param $zOff i32) (param $r f64) (param $vscratch i32) (param $jb i32)
+    (local $i i32) (local $j i32)
+    (local $vS v128) (local $vy v128) (local $vki v128) (local $vrowj v128)
+    (local $off i32) (local $kOff i32) (local $rowOff i32)
+    (local.set $kOff (local.get $vscratch))
+    (local.set $rowOff (i32.add (local.get $vscratch) (i32.mul (local.get $m) (i32.const 16))))
+    ;; vS = P[idx*m+idx] + r
+    (local.set $off (i32.add (i32.add (local.get $pOff)
+      (i32.mul (i32.add (i32.mul (local.get $idx) (local.get $m)) (local.get $idx)) (local.get $nBytes)))
+      (local.get $jb)))
+    (local.set $vS (f64x2.add (v128.load align=1 (local.get $off)) (f64x2.splat (local.get $r))))
+    ;; vy = z - x[idx]
+    (local.set $vy (f64x2.sub
+      (v128.load align=1 (i32.add (local.get $zOff) (local.get $jb)))
+      (v128.load align=1 (i32.add (i32.add (local.get $xOff) (i32.mul (local.get $idx) (local.get $nBytes))) (local.get $jb)))))
+    ;; K[i] = P[i*m+idx]/vS
+    (local.set $i (i32.const 0))
+    (block $ke (loop $kl
+      (br_if $ke (i32.ge_u (local.get $i) (local.get $m)))
+      (v128.store align=1 (i32.add (local.get $kOff) (i32.mul (local.get $i) (i32.const 16)))
+        (f64x2.div
+          (v128.load align=1 (i32.add (i32.add (local.get $pOff)
+            (i32.mul (i32.add (i32.mul (local.get $i) (local.get $m)) (local.get $idx)) (local.get $nBytes)))
+            (local.get $jb)))
+          (local.get $vS)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $kl)))
+    ;; x[i] += K[i]*vy
+    (local.set $i (i32.const 0))
+    (block $xe (loop $xl
+      (br_if $xe (i32.ge_u (local.get $i) (local.get $m)))
+      (local.set $off (i32.add (i32.add (local.get $xOff) (i32.mul (local.get $i) (local.get $nBytes))) (local.get $jb)))
+      (local.set $vki (v128.load align=1 (i32.add (local.get $kOff) (i32.mul (local.get $i) (i32.const 16)))))
+      (v128.store align=1 (local.get $off)
+        (f64x2.add (v128.load align=1 (local.get $off)) (f64x2.mul (local.get $vki) (local.get $vy))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $xl)))
+    ;; row[j] = P[idx*m+j]
+    (local.set $j (i32.const 0))
+    (block $re (loop $rl
+      (br_if $re (i32.ge_u (local.get $j) (local.get $m)))
+      (v128.store align=1 (i32.add (local.get $rowOff) (i32.mul (local.get $j) (i32.const 16)))
+        (v128.load align=1 (i32.add (i32.add (local.get $pOff)
+          (i32.mul (i32.add (i32.mul (local.get $idx) (local.get $m)) (local.get $j)) (local.get $nBytes)))
+          (local.get $jb))))
+      (local.set $j (i32.add (local.get $j) (i32.const 1)))
+      (br $rl)))
+    ;; P[i*m+j] -= K[i]*row[j]
+    (local.set $i (i32.const 0))
+    (block $pie (loop $pil
+      (br_if $pie (i32.ge_u (local.get $i) (local.get $m)))
+      (local.set $vki (v128.load align=1 (i32.add (local.get $kOff) (i32.mul (local.get $i) (i32.const 16)))))
+      (local.set $j (i32.const 0))
+      (block $pje (loop $pjl
+        (br_if $pje (i32.ge_u (local.get $j) (local.get $m)))
+        (local.set $vrowj (v128.load align=1 (i32.add (local.get $rowOff) (i32.mul (local.get $j) (i32.const 16)))))
+        (local.set $off (i32.add (i32.add (local.get $pOff)
+          (i32.mul (i32.add (i32.mul (local.get $i) (local.get $m)) (local.get $j)) (local.get $nBytes)))
+          (local.get $jb)))
+        (v128.store align=1 (local.get $off)
+          (f64x2.sub (v128.load align=1 (local.get $off)) (f64x2.mul (local.get $vki) (local.get $vrowj))))
+        (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        (br $pjl)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $pil)))
+  )
+
+  ;; CV SoA SIMD propagate for a lane-pair (jb). x ← Fx; P ← F P Fᵀ + Q.
+  (func $kalman_propagate_cv_soa_simd
+        (param $xOff i32) (param $pOff i32) (param $nBytes i32) (param $dt f64) (param $q f64) (param $jb i32)
+    (local $vdt v128) (local $vq v128) (local $vx0 v128) (local $vx1 v128)
+    (local $p00 v128) (local $p01 v128) (local $p10 v128) (local $p11 v128)
+    (local $f00 v128) (local $f01 v128) (local $vdt2 v128) (local $vdt3 v128)
+    (local $b1 i32) (local $b2 i32) (local $b3 i32)
+    (local.set $vdt (f64x2.splat (local.get $dt)))
+    (local.set $vq (f64x2.splat (local.get $q)))
+    (local.set $b1 (i32.add (local.get $pOff) (local.get $nBytes)))
+    (local.set $b2 (i32.add (local.get $b1) (local.get $nBytes)))
+    (local.set $b3 (i32.add (local.get $b2) (local.get $nBytes)))
+    (local.set $vx0 (v128.load align=1 (i32.add (local.get $xOff) (local.get $jb))))
+    (local.set $vx1 (v128.load align=1 (i32.add (i32.add (local.get $xOff) (local.get $nBytes)) (local.get $jb))))
+    (v128.store align=1 (i32.add (local.get $xOff) (local.get $jb))
+      (f64x2.add (local.get $vx0) (f64x2.mul (local.get $vdt) (local.get $vx1))))
+    (local.set $p00 (v128.load align=1 (i32.add (local.get $pOff) (local.get $jb))))
+    (local.set $p01 (v128.load align=1 (i32.add (local.get $b1) (local.get $jb))))
+    (local.set $p10 (v128.load align=1 (i32.add (local.get $b2) (local.get $jb))))
+    (local.set $p11 (v128.load align=1 (i32.add (local.get $b3) (local.get $jb))))
+    (local.set $f00 (f64x2.add (local.get $p00) (f64x2.mul (local.get $vdt) (local.get $p10))))
+    (local.set $f01 (f64x2.add (local.get $p01) (f64x2.mul (local.get $vdt) (local.get $p11))))
+    (local.set $vdt2 (f64x2.mul (local.get $vdt) (local.get $vdt)))
+    (local.set $vdt3 (f64x2.mul (local.get $vdt2) (local.get $vdt)))
+    ;; P00 = f00 + dt*f01 + q*dt3/3
+    (v128.store align=1 (i32.add (local.get $pOff) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $f00) (f64x2.mul (local.get $vdt) (local.get $f01)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $vdt3)) (f64x2.splat (f64.const 3)))))
+    ;; P01 = f01 + q*dt2/2
+    (v128.store align=1 (i32.add (local.get $b1) (local.get $jb))
+      (f64x2.add (local.get $f01) (f64x2.div (f64x2.mul (local.get $vq) (local.get $vdt2)) (f64x2.splat (f64.const 2)))))
+    ;; P10 = p10 + dt*p11 + q*dt2/2
+    (v128.store align=1 (i32.add (local.get $b2) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $p10) (f64x2.mul (local.get $vdt) (local.get $p11)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $vdt2)) (f64x2.splat (f64.const 2)))))
+    ;; P11 = p11 + q*dt
+    (v128.store align=1 (i32.add (local.get $b3) (local.get $jb))
+      (f64x2.add (local.get $p11) (f64x2.mul (local.get $vq) (local.get $vdt))))
+  )
+
+  ;; CV SoA SIMD ingest (even n). Loops lane-pairs; propagate (if dt>0) + a
+  ;; position update + optional velocity update.
+  (func $kalman_ingest_cv_f64_soa_simd (export "kalman_ingest_cv_f64_soa_simd")
+        (param $xOff i32) (param $pOff i32) (param $posOff i32) (param $velOff i32)
+        (param $n i32) (param $dt f64) (param $q f64) (param $rp f64) (param $rv f64)
+        (param $useVel i32) (param $vscratch i32)
+    (local $j i32) (local $jb i32) (local $nBytes i32) (local $doProp i32)
+    (local.set $nBytes (i32.shl (local.get $n) (i32.const 3)))
+    (local.set $doProp (f64.gt (local.get $dt) (f64.const 0)))
+    (local.set $j (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $j) (local.get $n)))
+      (local.set $jb (i32.shl (local.get $j) (i32.const 3)))
+      (if (local.get $doProp)
+        (then (call $kalman_propagate_cv_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (local.get $dt) (local.get $q) (local.get $jb))))
+      (call $kalman_update_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (i32.const 2) (i32.const 0)
+        (local.get $posOff) (local.get $rp) (local.get $vscratch) (local.get $jb))
+      (if (local.get $useVel)
+        (then (call $kalman_update_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (i32.const 2) (i32.const 1)
+          (local.get $velOff) (local.get $rv) (local.get $vscratch) (local.get $jb))))
+      (local.set $j (i32.add (local.get $j) (i32.const 2)))
+      (br $loop)))
+  )
+
+  ;; CV SoA SIMD predict (even n). value = p + dt·v ; var = (F P Fᵀ)₀₀ + q·dt³/3.
+  (func $kalman_predict_cv_f64_soa_simd (export "kalman_predict_cv_f64_soa_simd")
+        (param $xOff i32) (param $pOff i32) (param $valOff i32) (param $varOff i32)
+        (param $n i32) (param $dt f64) (param $q f64)
+    (local $j i32) (local $jb i32) (local $nBytes i32)
+    (local $vdt v128) (local $vq v128) (local $b1 i32) (local $b2 i32) (local $b3 i32)
+    (local $vp00 v128) (local $vp01 v128) (local $vp10 v128) (local $vp11 v128)
+    (local $vfp0 v128) (local $vfp1 v128)
+    (local.set $nBytes (i32.shl (local.get $n) (i32.const 3)))
+    (local.set $vdt (f64x2.splat (local.get $dt)))
+    (local.set $vq (f64x2.splat (local.get $q)))
+    (local.set $b1 (i32.add (local.get $pOff) (local.get $nBytes)))
+    (local.set $b2 (i32.add (local.get $b1) (local.get $nBytes)))
+    (local.set $b3 (i32.add (local.get $b2) (local.get $nBytes)))
+    (local.set $j (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $j) (local.get $n)))
+      (local.set $jb (i32.shl (local.get $j) (i32.const 3)))
+      ;; value = x0 + dt*x1
+      (v128.store align=1 (i32.add (local.get $valOff) (local.get $jb))
+        (f64x2.add (v128.load align=1 (i32.add (local.get $xOff) (local.get $jb)))
+          (f64x2.mul (local.get $vdt) (v128.load align=1 (i32.add (i32.add (local.get $xOff) (local.get $nBytes)) (local.get $jb))))))
+      (local.set $vp00 (v128.load align=1 (i32.add (local.get $pOff) (local.get $jb))))
+      (local.set $vp01 (v128.load align=1 (i32.add (local.get $b1) (local.get $jb))))
+      (local.set $vp10 (v128.load align=1 (i32.add (local.get $b2) (local.get $jb))))
+      (local.set $vp11 (v128.load align=1 (i32.add (local.get $b3) (local.get $jb))))
+      (local.set $vfp0 (f64x2.add (local.get $vp00) (f64x2.mul (local.get $vdt) (local.get $vp10))))
+      (local.set $vfp1 (f64x2.add (local.get $vp01) (f64x2.mul (local.get $vdt) (local.get $vp11))))
+      ;; var = (vfp0 + dt*vfp1) + q*dt*dt*dt/3
+      (v128.store align=1 (i32.add (local.get $varOff) (local.get $jb))
+        (f64x2.add
+          (f64x2.add (local.get $vfp0) (f64x2.mul (local.get $vdt) (local.get $vfp1)))
+          (f64x2.div
+            (f64x2.mul (f64x2.mul (f64x2.mul (local.get $vq) (local.get $vdt)) (local.get $vdt)) (local.get $vdt))
+            (f64x2.splat (f64.const 3)))))
+      (local.set $j (i32.add (local.get $j) (i32.const 2)))
+      (br $loop)))
+  )
+
+  ;; CA SoA SIMD propagate for a lane-pair (jb). m=3, jerk Q.
+  (func $kalman_propagate_ca_soa_simd
+        (param $xOff i32) (param $pOff i32) (param $nBytes i32) (param $dt f64) (param $q f64) (param $jb i32)
+    (local $vdt v128) (local $vq v128) (local $vh v128)
+    (local $x0 v128) (local $x1 v128) (local $x2 v128)
+    (local $p0 v128) (local $p1 v128) (local $p2 v128) (local $p3 v128) (local $p4 v128)
+    (local $p5 v128) (local $p6 v128) (local $p7 v128) (local $p8 v128)
+    (local $f0 v128) (local $f1 v128) (local $f2 v128) (local $f3 v128) (local $f4 v128)
+    (local $f5 v128) (local $f6 v128) (local $f7 v128) (local $f8 v128)
+    (local $d2 v128) (local $d3 v128) (local $d4 v128) (local $d5 v128)
+    (local $xb1 i32) (local $xb2 i32) (local $e i32)
+    (local.set $vdt (f64x2.splat (local.get $dt)))
+    (local.set $vq (f64x2.splat (local.get $q)))
+    (local.set $vh (f64x2.mul (f64x2.mul (f64x2.splat (f64.const 0.5)) (local.get $vdt)) (local.get $vdt)))
+    (local.set $xb1 (i32.add (local.get $xOff) (local.get $nBytes)))
+    (local.set $xb2 (i32.add (local.get $xb1) (local.get $nBytes)))
+    (local.set $x0 (v128.load align=1 (i32.add (local.get $xOff) (local.get $jb))))
+    (local.set $x1 (v128.load align=1 (i32.add (local.get $xb1) (local.get $jb))))
+    (local.set $x2 (v128.load align=1 (i32.add (local.get $xb2) (local.get $jb))))
+    (v128.store align=1 (i32.add (local.get $xOff) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $x0) (f64x2.mul (local.get $vdt) (local.get $x1))) (f64x2.mul (local.get $vh) (local.get $x2))))
+    (v128.store align=1 (i32.add (local.get $xb1) (local.get $jb))
+      (f64x2.add (local.get $x1) (f64x2.mul (local.get $vdt) (local.get $x2))))
+    ;; load P0..P8 (each array at pOff + k*nBytes)
+    (local.set $e (local.get $pOff))
+    (local.set $p0 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p1 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p2 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p3 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p4 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p5 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p6 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p7 (v128.load align=1 (i32.add (local.get $e) (local.get $jb)))) (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    (local.set $p8 (v128.load align=1 (i32.add (local.get $e) (local.get $jb))))
+    ;; FP = F·P
+    (local.set $f0 (f64x2.add (f64x2.add (local.get $p0) (f64x2.mul (local.get $vdt) (local.get $p3))) (f64x2.mul (local.get $vh) (local.get $p6))))
+    (local.set $f1 (f64x2.add (f64x2.add (local.get $p1) (f64x2.mul (local.get $vdt) (local.get $p4))) (f64x2.mul (local.get $vh) (local.get $p7))))
+    (local.set $f2 (f64x2.add (f64x2.add (local.get $p2) (f64x2.mul (local.get $vdt) (local.get $p5))) (f64x2.mul (local.get $vh) (local.get $p8))))
+    (local.set $f3 (f64x2.add (local.get $p3) (f64x2.mul (local.get $vdt) (local.get $p6))))
+    (local.set $f4 (f64x2.add (local.get $p4) (f64x2.mul (local.get $vdt) (local.get $p7))))
+    (local.set $f5 (f64x2.add (local.get $p5) (f64x2.mul (local.get $vdt) (local.get $p8))))
+    (local.set $f6 (local.get $p6)) (local.set $f7 (local.get $p7)) (local.set $f8 (local.get $p8))
+    (local.set $d2 (f64x2.mul (local.get $vdt) (local.get $vdt)))
+    (local.set $d3 (f64x2.mul (local.get $d2) (local.get $vdt)))
+    (local.set $d4 (f64x2.mul (local.get $d3) (local.get $vdt)))
+    (local.set $d5 (f64x2.mul (local.get $d4) (local.get $vdt)))
+    (local.set $e (local.get $pOff))
+    ;; P0 = (f0 + dt*f1 + h*f2) + q*d5/20
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (f64x2.add (local.get $f0) (f64x2.mul (local.get $vdt) (local.get $f1))) (f64x2.mul (local.get $vh) (local.get $f2)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d5)) (f64x2.splat (f64.const 20)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P1 = (f1 + dt*f2) + q*d4/8
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $f1) (f64x2.mul (local.get $vdt) (local.get $f2)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d4)) (f64x2.splat (f64.const 8)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P2 = f2 + q*d3/6
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (local.get $f2) (f64x2.div (f64x2.mul (local.get $vq) (local.get $d3)) (f64x2.splat (f64.const 6)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P3 = (f3 + dt*f4 + h*f5) + q*d4/8
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (f64x2.add (local.get $f3) (f64x2.mul (local.get $vdt) (local.get $f4))) (f64x2.mul (local.get $vh) (local.get $f5)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d4)) (f64x2.splat (f64.const 8)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P4 = (f4 + dt*f5) + q*d3/3
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $f4) (f64x2.mul (local.get $vdt) (local.get $f5)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d3)) (f64x2.splat (f64.const 3)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P5 = f5 + q*d2/2
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (local.get $f5) (f64x2.div (f64x2.mul (local.get $vq) (local.get $d2)) (f64x2.splat (f64.const 2)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P6 = (f6 + dt*f7 + h*f8) + q*d3/6
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (f64x2.add (local.get $f6) (f64x2.mul (local.get $vdt) (local.get $f7))) (f64x2.mul (local.get $vh) (local.get $f8)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d3)) (f64x2.splat (f64.const 6)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P7 = (f7 + dt*f8) + q*d2/2
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (f64x2.add (local.get $f7) (f64x2.mul (local.get $vdt) (local.get $f8)))
+        (f64x2.div (f64x2.mul (local.get $vq) (local.get $d2)) (f64x2.splat (f64.const 2)))))
+    (local.set $e (i32.add (local.get $e) (local.get $nBytes)))
+    ;; P8 = f8 + q*dt
+    (v128.store align=1 (i32.add (local.get $e) (local.get $jb))
+      (f64x2.add (local.get $f8) (f64x2.mul (local.get $vq) (local.get $vdt))))
+  )
+
+  ;; CA SoA SIMD ingest (even n).
+  (func $kalman_ingest_ca_f64_soa_simd (export "kalman_ingest_ca_f64_soa_simd")
+        (param $xOff i32) (param $pOff i32) (param $posOff i32) (param $velOff i32) (param $accOff i32)
+        (param $n i32) (param $dt f64) (param $q f64) (param $rp f64) (param $rv f64) (param $ra f64)
+        (param $useVel i32) (param $useAcc i32) (param $vscratch i32)
+    (local $j i32) (local $jb i32) (local $nBytes i32) (local $doProp i32)
+    (local.set $nBytes (i32.shl (local.get $n) (i32.const 3)))
+    (local.set $doProp (f64.gt (local.get $dt) (f64.const 0)))
+    (local.set $j (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $j) (local.get $n)))
+      (local.set $jb (i32.shl (local.get $j) (i32.const 3)))
+      (if (local.get $doProp)
+        (then (call $kalman_propagate_ca_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (local.get $dt) (local.get $q) (local.get $jb))))
+      (call $kalman_update_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (i32.const 3) (i32.const 0)
+        (local.get $posOff) (local.get $rp) (local.get $vscratch) (local.get $jb))
+      (if (local.get $useVel)
+        (then (call $kalman_update_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (i32.const 3) (i32.const 1)
+          (local.get $velOff) (local.get $rv) (local.get $vscratch) (local.get $jb))))
+      (if (local.get $useAcc)
+        (then (call $kalman_update_soa_simd (local.get $xOff) (local.get $pOff) (local.get $nBytes) (i32.const 3) (i32.const 2)
+          (local.get $accOff) (local.get $ra) (local.get $vscratch) (local.get $jb))))
+      (local.set $j (i32.add (local.get $j) (i32.const 2)))
+      (br $loop)))
+  )
+
+  ;; CA SoA SIMD predict (even n). value = p + dt·v + ½dt²·a ; var = (F P Fᵀ)₀₀ + q·dt⁵/20.
+  (func $kalman_predict_ca_f64_soa_simd (export "kalman_predict_ca_f64_soa_simd")
+        (param $xOff i32) (param $pOff i32) (param $valOff i32) (param $varOff i32)
+        (param $n i32) (param $dt f64) (param $q f64)
+    (local $j i32) (local $jb i32) (local $nBytes i32)
+    (local $vdt v128) (local $vq v128) (local $vh v128) (local $d2 v128) (local $d5 v128)
+    (local $xb1 i32) (local $xb2 i32)
+    (local $b1 i32) (local $b2 i32) (local $b3 i32) (local $b4 i32) (local $b5 i32) (local $b6 i32) (local $b7 i32) (local $b8 i32)
+    (local $fp0 v128) (local $fp1 v128) (local $fp2 v128)
+    (local.set $nBytes (i32.shl (local.get $n) (i32.const 3)))
+    (local.set $vdt (f64x2.splat (local.get $dt)))
+    (local.set $vq (f64x2.splat (local.get $q)))
+    (local.set $vh (f64x2.mul (f64x2.mul (f64x2.splat (f64.const 0.5)) (local.get $vdt)) (local.get $vdt)))
+    (local.set $d2 (f64x2.mul (local.get $vdt) (local.get $vdt)))
+    (local.set $d5 (f64x2.mul (f64x2.mul (local.get $d2) (local.get $d2)) (local.get $vdt)))
+    (local.set $xb1 (i32.add (local.get $xOff) (local.get $nBytes)))
+    (local.set $xb2 (i32.add (local.get $xb1) (local.get $nBytes)))
+    (local.set $b1 (i32.add (local.get $pOff) (local.get $nBytes)))
+    (local.set $b2 (i32.add (local.get $b1) (local.get $nBytes)))
+    (local.set $b3 (i32.add (local.get $b2) (local.get $nBytes)))
+    (local.set $b4 (i32.add (local.get $b3) (local.get $nBytes)))
+    (local.set $b5 (i32.add (local.get $b4) (local.get $nBytes)))
+    (local.set $b6 (i32.add (local.get $b5) (local.get $nBytes)))
+    (local.set $b7 (i32.add (local.get $b6) (local.get $nBytes)))
+    (local.set $b8 (i32.add (local.get $b7) (local.get $nBytes)))
+    (local.set $j (i32.const 0))
+    (block $exit (loop $loop
+      (br_if $exit (i32.ge_u (local.get $j) (local.get $n)))
+      (local.set $jb (i32.shl (local.get $j) (i32.const 3)))
+      ;; value = x0 + dt*x1 + h*x2
+      (v128.store align=1 (i32.add (local.get $valOff) (local.get $jb))
+        (f64x2.add
+          (f64x2.add (v128.load align=1 (i32.add (local.get $xOff) (local.get $jb)))
+            (f64x2.mul (local.get $vdt) (v128.load align=1 (i32.add (local.get $xb1) (local.get $jb)))))
+          (f64x2.mul (local.get $vh) (v128.load align=1 (i32.add (local.get $xb2) (local.get $jb))))))
+      ;; fp0 = P0 + dt*P3 + h*P6
+      (local.set $fp0 (f64x2.add (f64x2.add (v128.load align=1 (i32.add (local.get $pOff) (local.get $jb)))
+        (f64x2.mul (local.get $vdt) (v128.load align=1 (i32.add (local.get $b3) (local.get $jb)))))
+        (f64x2.mul (local.get $vh) (v128.load align=1 (i32.add (local.get $b6) (local.get $jb))))))
+      ;; fp1 = P1 + dt*P4 + h*P7
+      (local.set $fp1 (f64x2.add (f64x2.add (v128.load align=1 (i32.add (local.get $b1) (local.get $jb)))
+        (f64x2.mul (local.get $vdt) (v128.load align=1 (i32.add (local.get $b4) (local.get $jb)))))
+        (f64x2.mul (local.get $vh) (v128.load align=1 (i32.add (local.get $b7) (local.get $jb))))))
+      ;; fp2 = P2 + dt*P5 + h*P8
+      (local.set $fp2 (f64x2.add (f64x2.add (v128.load align=1 (i32.add (local.get $b2) (local.get $jb)))
+        (f64x2.mul (local.get $vdt) (v128.load align=1 (i32.add (local.get $b5) (local.get $jb)))))
+        (f64x2.mul (local.get $vh) (v128.load align=1 (i32.add (local.get $b8) (local.get $jb))))))
+      ;; var = (fp0 + dt*fp1 + h*fp2) + q*d5/20
+      (v128.store align=1 (i32.add (local.get $varOff) (local.get $jb))
+        (f64x2.add
+          (f64x2.add (f64x2.add (local.get $fp0) (f64x2.mul (local.get $vdt) (local.get $fp1))) (f64x2.mul (local.get $vh) (local.get $fp2)))
+          (f64x2.div (f64x2.mul (local.get $vq) (local.get $d5)) (f64x2.splat (f64.const 20)))))
+      (local.set $j (i32.add (local.get $j) (i32.const 2)))
+      (br $loop)))
+  )
 )

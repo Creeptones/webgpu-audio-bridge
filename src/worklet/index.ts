@@ -572,6 +572,31 @@ export interface WorkletConsumer {
     xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
   ): void;
 
+  /** SoA f64x2 SIMD `StatePredictor` kernels (0.9.904) — lane-parallel (2 lanes
+   *  per f64x2) over a **struct-of-arrays** state layout, so every load/store is
+   *  contiguous (no gather) and the math is fully vectorized. SoA layout: each
+   *  derivative / covariance element is its own contiguous `n`-f64 array — `x`'s
+   *  m arrays at `xOff + k·n·8`, `P`'s m·m arrays (row-major) at `pOff +
+   *  (r·m+c)·n·8`, the pos/vel/acc/val/var arrays at `*Off`. `vscratch` is a
+   *  caller-owned `2·m·16`-byte (v128 K/row) region. **Requires even `n`** (no
+   *  scalar tail — pad an odd lane count). **Bit-exact** to the scalar kernels /
+   *  JS (f64x2 ops are per-lane IEEE f64 in the same order). */
+  kalmanIngestCvF64SoaSimd(
+    xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, useVel: number, vscratch: number,
+  ): void;
+  kalmanPredictCvF64SoaSimd(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
+  kalmanIngestCaF64SoaSimd(
+    xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, ra: number,
+    useVel: number, useAcc: number, vscratch: number,
+  ): void;
+  kalmanPredictCaF64SoaSimd(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
+
   /** Descriptor-driven whole-frame decode (0.9.74). Decodes an ENTIRE frame
    *  in ONE call by looping over a pre-built descriptor table (one
    *  `memory.copy` per field, slot → scratch). This is the hot-path frame
@@ -726,6 +751,21 @@ export function instantiateConsumer(
     readonly kalman_predict_ca_f64: (
       xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
     ) => void;
+    readonly kalman_ingest_cv_f64_soa_simd: (
+      xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, useVel: number, vscratch: number,
+    ) => void;
+    readonly kalman_predict_cv_f64_soa_simd: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
+    readonly kalman_ingest_ca_f64_soa_simd: (
+      xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, ra: number,
+      useVel: number, useAcc: number, vscratch: number,
+    ) => void;
+    readonly kalman_predict_ca_f64_soa_simd: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -782,6 +822,10 @@ export function instantiateConsumer(
     "kalman_predict_cv_f64",
     "kalman_ingest_ca_f64",
     "kalman_predict_ca_f64",
+    "kalman_ingest_cv_f64_soa_simd",
+    "kalman_predict_cv_f64_soa_simd",
+    "kalman_ingest_ca_f64_soa_simd",
+    "kalman_predict_ca_f64_soa_simd",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -884,6 +928,14 @@ export function instantiateConsumer(
       exports.kalman_ingest_ca_f64(xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, scratch),
     kalmanPredictCaF64: (xOff, pOff, valOff, varOff, n, dt, q) =>
       exports.kalman_predict_ca_f64(xOff, pOff, valOff, varOff, n, dt, q),
+    kalmanIngestCvF64SoaSimd: (xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, vscratch) =>
+      exports.kalman_ingest_cv_f64_soa_simd(xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, vscratch),
+    kalmanPredictCvF64SoaSimd: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_cv_f64_soa_simd(xOff, pOff, valOff, varOff, n, dt, q),
+    kalmanIngestCaF64SoaSimd: (xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, vscratch) =>
+      exports.kalman_ingest_ca_f64_soa_simd(xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, vscratch),
+    kalmanPredictCaF64SoaSimd: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_ca_f64_soa_simd(xOff, pOff, valOff, varOff, n, dt, q),
   };
 }
 

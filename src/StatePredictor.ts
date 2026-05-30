@@ -449,6 +449,19 @@ export class StatePredictor {
     return { value, variance: fpft00 + q * dt * dt * dt / 3 };
   }
 
+  /** Test/diagnostic hook: copy the full per-lane state mean and covariance out
+   *  in the internal AoS layout (`x[lane*m + k]`, `P[lane*m*m + r*m + c]`). Used
+   *  by the WASM SIMD equivalence harness to seed an evolved SoA state without
+   *  re-running ingest. Not a hot-path API. Throws if the buffers are too small. */
+  debugCopyState(xOut: Float64Array, pOut: Float64Array): void {
+    const nx = this._laneCount * this._m;
+    const np = this._laneCount * this._m * this._m;
+    if (xOut.length < nx) throw new Error(`StatePredictor.debugCopyState: xOut length ${xOut.length} < ${nx}`);
+    if (pOut.length < np) throw new Error(`StatePredictor.debugCopyState: pOut length ${pOut.length} < ${np}`);
+    xOut.set(this._x.subarray(0, nx));
+    pOut.set(this._P.subarray(0, np));
+  }
+
   /** Read a lane's current smoothed state estimate (post-ingest), for tests /
    *  diagnostics. Length-2 `[p, v]` (CV) or length-3 `[p, v, a]` (CA). */
   stateOf(lane: number): number[] {
