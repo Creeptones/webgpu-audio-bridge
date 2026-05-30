@@ -662,7 +662,28 @@ crossfadeInto(aBuf, bBuf, w, out, { mode: "equal-power" });   // Stage-1 blend (
 // r.phase: "idle" | "priming" | "fading" | "complete"  — tear bridgeA down at "complete"
 ```
 
-The state machine is `idle → priming → fading → complete`. The **one timing rule that matters**: the fade-window clock anchors to *when `b` becomes ready*, not to when `armSwap` was called — otherwise the weight would jump from 0 to `w(s_now)` the instant `b` primes (a click). Anchoring to b-ready starts the weight at exactly 0 with vanishing derivatives, so the onset is seamless. `b` is "ready" after `minBFramesForReady` fresh pulls (default 2 → it interpolates between two distinct frames on the first faded sample). The class owns the swap state, the dual `pullHermiteLatest` reconstruction, and the weight schedule (`weightAt`); the **caller** does the blend with `crossfadeInto`, so synthesis and the amplitude-vs-equal-power choice stay yours. At `complete`, `a` is retired (no longer pulled) and you can tear it down. Cross-schema migration — `b` a *different* layout, with field add/remove/rename + default-seeding — is the next slice.
+The state machine is `idle → priming → fading → complete`. The **one timing rule that matters**: the fade-window clock anchors to *when `b` becomes ready*, not to when `armSwap` was called — otherwise the weight would jump from 0 to `w(s_now)` the instant `b` primes (a click). Anchoring to b-ready starts the weight at exactly 0 with vanishing derivatives, so the onset is seamless. `b` is "ready" after `minBFramesForReady` fresh pulls (default 2 → it interpolates between two distinct frames on the first faded sample). The class owns the swap state, the dual `pullHermiteLatest` reconstruction, and the weight schedule (`weightAt`); the **caller** does the blend with `crossfadeInto`, so synthesis and the amplitude-vs-equal-power choice stay yours. At `complete`, `a` is retired (no longer pulled) and you can tear it down.
+
+**Cross-schema migration — `migratePlan(oldLayout, newLayout, opts?)` (0.9.89).** When `b` is a *different* schema (fields added, removed, renamed, reshaped), `migratePlan` diffs the two `describeLayout()` descriptions into a per-field plan — for every field `b`'s synthesis reads, where does its value come from during the fade?
+
+```ts
+import { migratePlan } from "webgpu-audio-bridge";
+
+const plan = migratePlan(bridgeA.describeLayout(), bridgeB.describeLayout(), {
+  rename: { cutoff: "freq" },          // a.cutoff → b.freq
+  defaults: { res: 0.2 },              // b-only `res` fades in from 0.2
+  defaultPolicy: 0,                    // other b-only fields fade in from 0
+});
+// plan.crossfade : [{ to:"freq", from:"cutoff", blend:"numeric", … }, …]  — blend a→b
+// plan.rampIn    : [{ to:"res", default:0.2, reason:"added", … }, …]      — fade in from default
+// plan.drop      : [{ from:"detune", reason:"removed", … }, …]            — fades out
+```
+
+- **`crossfade`** — a compatible `a` counterpart exists (same kind *category* and same *shape*): blend `a → b`. `blend: "numeric"` (integer kinds round); `"take-b"` for bigint counters/ids (switch at w ≥ 0.5). Trajectory fields carry their spec so you blend position lanes and copy derivative lanes.
+- **`rampIn`** — no compatible source (`"added"`, or a same-name field with an incompatible shape): fade in from a `default` (per-field, then `defaultPolicy`), or `"hold"` to appear at `b`'s value with no ramp.
+- **`drop`** — an `a` field with no compatible `b` target (`"removed"` or incompatible): fades out with `a`'s contribution.
+
+A `u64 → f64` change, an array-length change, or a trajectory order change is unblendable, so it splits into ramp-in (`b`) + drop (`a`); kind changes *within* the numeric category (`f64 → f32`) stay crossfade. `migratePlan` is pure (data-in, data-out) — the cross-schema companion to `HotSwapConsumer`: drive the per-field blend from the plan using the swap's `weightAt` schedule and `crossfadeInto`.
 
 `pullSmoothed` / `pullLatestSmoothed` are trajectory-aware (0.6.4): the α-smoother blends only the position lanes of a trajectory field and passes velocity / acceleration lanes through verbatim from the freshly-pulled frame. Blending a derivative across frames collapses the very signal the trajectory exists to preserve — a perfectly linear position ramp publishes a constant velocity, but a naive elementwise blend would drift that velocity toward the previous frame's reading at the smoother's time constant. The rule is automatic — opt-in by using a trajectory field; no API change.
 

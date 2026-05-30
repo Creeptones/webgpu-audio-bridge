@@ -4,6 +4,71 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.89] — 2026-05-30
+
+### Added — `migratePlan`: cross-schema hot-swap field planner (God-Node Frontier 4, Stage 3)
+
+Stage 2 (`HotSwapConsumer`, 0.9.88) swaps between two bridges of the SAME
+schema. Stage 3 handles the cross-schema case — the new patch `b` has a
+DIFFERENT layout (fields added, removed, renamed, or reshaped). `migratePlan`
+diffs the two `describeLayout()` descriptions into a per-field plan answering,
+for every field the new (`b`) synthesis reads: *where does its value come from
+during the fade?*
+
+#### What shipped
+
+- **`src/migratePlan.ts`** — `migratePlan(oldLayout, newLayout, opts?)` (root
+  export) returning a `MigratePlan` with three buckets:
+  - **`crossfade`** — a COMPATIBLE `a` counterpart exists; blend `a → b` with
+    the Stage-1 weight. `blend: "numeric"` (integer kinds round) or
+    `"take-b"` for bigint kinds (`u64`/`i64` counters/ids have no meaningful
+    intermediate). Carries the trajectory spec so the caller blends position
+    lanes and copies derivative lanes (the `FrameSmoother` rule).
+  - **`rampIn`** — no compatible `a` source (`reason: "added"` or
+    `"incompatible"`); fade in from a `default` (`opts.defaults[to]` →
+    `defaultPolicy`, or `"hold"` to appear at `b`'s value immediately).
+  - **`drop`** — an `a` field with no compatible `b` target
+    (`reason: "removed"` or `"incompatible"`); fades out (a `b`-shaped output
+    has no slot for it).
+- Compatibility: same KIND CATEGORY (both numeric, or both bigint) **and** same
+  SHAPE (scalar/array, array length, trajectory presence + order). A
+  `u64 → f64` flip, `f64Array(4) → f64Array(8)`, or `order:2 → order:3`
+  trajectory change splits into ramp-in (`b`) + drop (`a`). Kind changes WITHIN
+  the numeric category (`f64 → f32`) stay crossfade.
+- `opts.rename` (`{ oldName: newName }`) matches a renamed pair for crossfade;
+  bad source/target or a duplicate target throws.
+- Types `MigratePlan` / `MigratePlanOptions` / `MigrateBlend` /
+  `MigrateCrossfadeField` / `MigrateRampInField` / `MigrateDropField`.
+
+#### Single responsibility
+
+Pure data-in (two layout descriptions) → data-out (the plan). It does not touch
+a Bridge, allocate, or blend — the cross-schema companion to `HotSwapConsumer`'s
+same-schema swap. A migrating consumer drives the per-field blend from the plan
+using the swap's `weightAt` schedule + the Stage-1 `crossfadeInto`. Mirrors the
+`crossfadeWeight`-vs-`crossfadeInto` split.
+
+#### Tests
+
+- **`tests/Bridge.migrate.test.ts`** (new, 12 pins; in both `test` + `test:unit`):
+  pure add → ramp-in/added; pure remove → drop/removed; rename → crossfade from
+  the old name (no ramp/drop); kind change `f64 → f32` → crossfade numeric;
+  bigint↔number flip → ramp-in + drop; integer crossfade carries the kind for
+  rounding; array length + trajectory-order changes → ramp-in + drop; same-order
+  trajectory crossfades and carries its spec; defaults policy (per-field +
+  global + `"hold"`); a compound rename+add+remove+stable case with the
+  partition invariant (every `b`-field classified exactly once); rename guards.
+
+### Wire compatibility
+
+Additive root export only — **no wire / SAB / protocol change**, no public-API
+break. A pure planning function over the existing `describeLayout()` JSON.
+
+### Documentation
+
+CHANGELOG + ROADMAP 0.9.89 row; README cross-schema migration subsection under
+the hot-swap section.
+
 ## [0.9.88] — 2026-05-30
 
 ### Added — `HotSwapConsumer<S>`: two-bridge live hot-swap orchestration (God-Node Frontier 4, Stage 2)

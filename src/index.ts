@@ -319,6 +319,25 @@ export type {
   HotSwapPullResult,
 } from "./HotSwapConsumer.js";
 
+// ── Cross-schema migration planner (0.9.89 — God-Node Stage 3) ─────────────
+//
+// `migratePlan(oldLayout, newLayout, opts?)` diffs two `describeLayout()`
+// descriptions into a per-field hot-swap plan: common/renamed fields
+// `crossfade`, b-only fields `rampIn` from a default, a-only fields `drop`.
+// Incompatible reshapes (bigint↔number, array length, trajectory order) split
+// into ramp-in + drop. Pure data-in/data-out — the cross-schema companion to
+// `HotSwapConsumer`'s same-schema swap; the caller drives the per-field blend
+// from the plan using the swap's weight schedule. See src/migratePlan.ts.
+export { migratePlan } from "./migratePlan.js";
+export type {
+  MigratePlan,
+  MigratePlanOptions,
+  MigrateBlend,
+  MigrateCrossfadeField,
+  MigrateRampInField,
+  MigrateDropField,
+} from "./migratePlan.js";
+
 // Canonical schemas — see src/schemas/physics.ts.
 export { physicsControlFrameSchema } from "./schemas/physics.js";
 export type { PhysicsControlFrameSchema } from "./schemas/physics.js";
