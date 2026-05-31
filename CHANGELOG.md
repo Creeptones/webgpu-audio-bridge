@@ -4,6 +4,74 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.925] — 2026-05-31
+
+### Added — Apollo Frontier 6 quick-win #1: the negative cache (memoized rejections)
+
+`KernelCache` now memoizes **rejections**, not just accepts. A repeated bad token
+stream returns its prior verdict with `cached: true` instead of re-running the gate
+stack — killing the reroll waste of a generative emitter (the same illegal stream is
+rejected once, then served from a memo) and giving the future Stage-3b SLM reward loop
+the read it wants ("I already tried this and it failed, skip"). Library + tests only.
+
+- **Two memos, by addressability.** The three gates fail at two different points, so a
+  rejection has two possible keys:
+  - a **SYNTAX** reject (`rejected-source`) has no IR — it is keyed by the flat
+    token-stream text (`tokensToString`), the only stable pre-validation key, and the
+    memo is checked *before* `validateTokens` so a repeat skips even the re-validation;
+  - a **BODY** reject (`unsupported` / `rejected-gate` / `rejected-acoustic`) has a
+    validated IR — it is keyed by `kernelHash`, the **same content address** as the
+    positive store, so a different-signature-but-same-body stream hits the same memo.
+  The two maps can never collide on a key (a body reject implies a valid IR; a syntax
+  reject has none), and a deterministic gate gives exactly one verdict per content
+  address, so the negative cache can never shadow a later accept.
+- **Every `GetOrCompileResult` now carries a `cached` flag** (previously only the
+  `accepted` variant did). `true` ⇒ served from a memo (positive store for an accept,
+  negative cache for a reject) without re-running any gate. Purely additive at the value
+  level — existing consumers reading other fields are unaffected.
+- **New surface:** `RejectVerdict` type (the memoized shape — every non-accepted
+  outcome sans the flag) and a `KernelCache.rejectedSize` getter; `clear()` now wipes
+  the negative cache too. Exported from `src/jit/index.ts` →
+  `webgpu-audio-bridge/experimental`.
+
+### Why — the natural place the reroll cost lives
+
+`getOrCompile` already content-addressed *accepts*, but every rejection re-ran the full
+stack on each repeat — wasteful for a generative loop that rerolls many illegal/insane
+streams before a good one. The body memo skips the expensive recompile (an
+acoustically-rejected kernel compiles to bytes through gate #2 before gate #3 rejects
+it — measurably the costliest reject), and the syntax memo skips re-validation. It is
+the cleanest, most self-contained of the three model-free quick-wins (one file), and
+the read the SLM's reward loop will key off.
+
+### Wire compatibility
+
+**Unchanged.** Additive memoization + an additive `cached` field + one new type/getter,
+all on the experimental subpath. No SAB layout, no wire-format, no breaking signature
+change (`compileIr`/`compileTokens` untouched — the negative cache lives only in
+`KernelCache`). Patch-level.
+
+### Tests
+
+- **`tests/kernelCache.negativeCache.test.ts`** (4 pins, registered in `test` +
+  `test:unit`): (1) syntax reject memoized — a malformed stream twice ⇒ `cached:false`
+  then `cached:true`, distinct bad streams keyed apart, positive store untouched;
+  (2) body reject + **compile-count probe** — an acoustically-rejected kernel
+  (`(x·3e38)·3e38`) HIT invokes `compileWat` **zero** times (the recompile is skipped),
+  and a different-signature/same-body stream hits the same hash-keyed memo;
+  (3) unsupported reject (stride-2) memoized; (4) the negative cache coexists with the
+  positive store, never shadows an accept, `rejectedSize` accounts each class, and
+  `clear()` wipes both (a previously-rejected stream re-misses afterward).
+- `npm run typecheck` clean; full `npm test` green; `npm run bench` push/pull/pullLatest
+  within the ~1.20 µs baseline + 10 µs hard budget — `kernelCache.ts` is not in the
+  bench path, so bench is structurally unaffected.
+
+### Documentation
+
+- This CHANGELOG block + the `kernelCache.ts` file header (the negative-cache section) +
+  the `CLAUDE.md` `src/jit/` entry + `docs/frontier6-quickwins-handoff.md` (quick-win #1
+  marked shipped, next session pointed at #2/#3).
+
 ## [0.9.924] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 3a+: `legalNextOperands` (the operand mask)

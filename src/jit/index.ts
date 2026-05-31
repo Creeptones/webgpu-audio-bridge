@@ -56,7 +56,7 @@ export type {
 export { emitJsKernel } from "./emitJsKernel.js";
 export { KernelCache } from "./kernelCache.js";
 export type {
-  CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult,
+  CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult, RejectVerdict,
 } from "./kernelCache.js";
 
 // ── Stage-2 acoustic gate (gate #3) ──────────────────────────────────────────
