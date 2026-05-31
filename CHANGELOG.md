@@ -4,6 +4,101 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.929] — 2026-05-31
+
+### Added — Apollo Frontier 7, Stage 1: stateful kernels (the recurrence compiler)
+
+The single largest remaining capability in the JIT/grammar stack: a kernel may now carry
+**state across loop iterations** (a one-sample `z⁻¹` register, biquad registers, IIR
+feedback). This lifts the long-standing **stateless ceiling** — until now every kernel
+was a pure `out[i] = f(in[i], …)` map, which is exactly what let it auto-vectorize. A
+recurrence has a loop-carried dependency, so it is **scalar-compiled** (not time-axis
+SIMD — that is structurally unsound for a recurrence, proven in Stage 0); the headline
+honestly narrows from *auto-vectorize* to *auto-compile*, and the entire **biquad filter
+family** (lowpass/highpass/bandpass/peaking/shelf, DC blockers, leaky integrators) is
+unlocked. The stateless SIMD path is untouched, bit-for-bit. **Token/IR path only**
+(the model-emittable surface); the `lower.ts` JS-authoring relaxations are a deferred
+follow-up.
+
+- **IR (`src/jit/ir.ts`)** — a `readState` `IrNode` variant + `IrStateDecl` /
+  `IrStateStore` + **optional** `stateDecls` / `stateStores` on `IrKernel` (+ `isStateful`).
+  `kernelKey` folds a state segment in **only when present**, so a stateless kernel's
+  content address — and the `kernelHash(gain) === "72b5c2e5a7a5f117"` regression pin — is
+  byte-identical to pre-statefulness.
+- **Semantics: SIMULTANEOUS (state-space / delay-line).** Every `readState` in an
+  iteration sees the value committed at the END of the previous iteration; each register
+  (≤1 write per iteration) commits after the iteration. A deliberate, reasoned deviation
+  from the kickoff handoff's *sequential* recommendation: it makes the two-list IR
+  order-independent and makes `evalReference`, the scalar WASM emitter, and the JS
+  fallback **provably identical** with no program-order tracking, and it matches the
+  delay-line mental model. Settled in `docs/frontier7-statefulness-semantics.md` (Stage 0,
+  shipped at 0.9.929-dev as a docs commit) and witnessed by `bench/state-probe.mjs`.
+- **Grammar (`src/jit/kernelGrammar.ts`)** — `state` / `readState` / `writeState` tokens
+  added to the **single** `stepGrammar` machine, so `validateTokens` / `legalNextTokens`
+  / `legalNextOperands` all move together (the non-drift invariant). The KIND mask offers
+  `state` (signature phase) + `readState` (body) + `writeState` (depth 1); the OPERAND
+  mask role-partitions register names to the declared `stateNames` (empty ⇒ no register,
+  exactly like `load` with no inputs). Codec words `state:NAME:init`, `readState:NAME`,
+  `writeState:NAME`. State names are a **separate namespace** from signature params.
+- **`vectorize` → `scalarOnly`** — a stateful kernel returns a plan flagged
+  `scalarOnly: true` (*supported, not SIMD*), never `unsupported`. **`emitScalarModule`**
+  threads registers: load the slab into locals → read them + compute each register's next
+  value into a `$__next_*` local → commit all at the iteration's end (simultaneous) →
+  store back. `paramLayout` appends a `$__state` base-pointer arg after the arrays — only
+  for a stateful kernel (stateless SIMD bytes unchanged). The SIMD emitter is untouched.
+- **The gates** — `gate.ts` gains a **scalar-only mode**: with no SIMD candidate, the
+  proof is **scalar-WASM ≡ `evalReference(ir)`** (the pure-JS IR interpreter — the spec)
+  over a corpus that now includes a **long run** (256/512) so an IIR transient develops.
+  This is a genuine *strengthening* (the scalar is pinned to the spec, not merely trusted
+  as the SIMD reference). NaN sign/payload is IEEE-unspecified, so `NaN ≡ NaN` is a match
+  (a real ±Inf divergence still fails). `evalReference` threads the simultaneous state.
+- **The stability gate is free** — `acousticGate` already rejects `non-finite` /
+  `peak-out-of-bounds`, so an unstable IIR (poles outside the unit circle) is rejected
+  automatically. For stateful kernels it additionally probes **longer (4096)** and adds a
+  second-half/first-half RMS **growth-ratio** check (`unstable-growth`, margin 8×) that
+  catches the slow-divergence a fixed peak bound misses over a short window. Stateless
+  verdicts are byte-identical (the checks don't run).
+- **`emitJsKernel`** — emits a faithful simultaneous-state JS fallback (a trailing
+  persistent state-slab typed-array param — the Stage-2 convention), matching the scalar
+  WASM + reference exactly for f64.
+
+### Why — lift the stateless ceiling, scalar-first
+
+Statefulness was called out as "the real ceiling" of the language→music layer. The
+clean v1 is **scalar-first**: it keeps the gate's correctness story intact, unlocks the
+whole filter family immediately, and defers the genuinely-hard SIMD-across-voices
+reconciliation (Stage 4) to a stage that can stand on a proven scalar base. The
+acoustic-gate-as-stability-gate is the elegant free win.
+
+### Wire compatibility
+
+**Unchanged.** All new IR/grammar surface is additive and `@experimental` (the JIT
+subtree under `webgpu-audio-bridge/experimental`). A stateless kernel's `kernelKey` /
+`kernelHash`, emitted SIMD bytes, `paramLayout`, and acoustic verdict are byte-identical
+to 0.9.928 (frontier-gated by `tests/stateKernel.test.ts` pin 4). No SAB layout or
+wire-format change. Patch-level.
+
+### Tests
+
+`tests/stateKernel.test.ts` (registered in `test` + `test:unit`) — 5 pins through REAL
+wabt: a one-pole lowpass and a biquad **gate-verified** bit-exact + reproduced by the
+deliverable + **persisting state across quanta** (256+256 ≡ 512); the stability gate
+(stable passes, an unstable feedback `rejected-acoustic` and not cached); the
+**stateless-path-untouched** frontier pin (no `$state`, `scalarOnly: false`, the
+`kernelHash(gain)` regression pin); the grammar round-trip + `emitJsKernel`/WASM/reference
+three-way agreement (f64). `tests/legalNextTokens.test.ts` pin 2 updated for the grown
+mask (`state`/`readState`/`writeState`). All JIT-adjacent suites green; the non-drift
+property + the `kernelHash(gain)` pin intact across `kernelGrammar` / `legalNextTokens` /
+`legalNextOperands`.
+
+### Documentation
+
+`docs/frontier7-statefulness-semantics.md` (the Stage-0 design note: recurrence theorem,
+simultaneous-semantics decision, stability-gate plan, the six settled open questions) +
+`bench/state-probe.mjs` (the runnable witnesses). CLAUDE.md `src/jit/` entry + the
+statefulness handoff updated to mark Stage 0 + Stage 1 shipped and Stage 2 (the
+persistent-slab runtime) next.
+
 ## [0.9.928] — 2026-05-31
 
 ### Added — Apollo Frontier 3, Stage 4.3: `connectFanOut()` (the SP→MC broadcast topology)

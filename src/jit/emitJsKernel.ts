@@ -42,7 +42,7 @@
  * `@experimental` — exported from `webgpu-audio-bridge/experimental`.
  */
 
-import { type IrKernel, type IrNode, type IrStore, type UnaryOp, type BinaryOp } from "./ir.js";
+import { type IrKernel, type IrNode, type IrStore, type UnaryOp, type BinaryOp, isStateful } from "./ir.js";
 
 /** ECMAScript reserved words that cannot be used as a binding name in strict-mode
  *  (module) source — the names this emitter must alias away. */
@@ -55,15 +55,28 @@ const JS_RESERVED: ReadonlySet<string> = new Set([
   "protected", "public", "await", "arguments", "eval",
 ]);
 
+interface StateLocal {
+  /** the current (pre-commit) value local. */
+  readonly cur: string;
+  /** the next (to-commit) value temp local. */
+  readonly next: string;
+}
+
 interface NameContext {
   /** original param/array/scalar name → the JS-safe local name to emit. */
   readonly map: ReadonlyMap<string, string>;
   /** the fresh loop variable name (cannot collide with any mapped name). */
   readonly loopVar: string;
+  /** Frontier 7: the trailing state-slab param name (a typed array the caller keeps
+   *  across quanta), or null for a stateless kernel. */
+  readonly stateParam: string | null;
+  /** Frontier 7: state register name → its cur/next JS locals. */
+  readonly stateLocals: ReadonlyMap<string, StateLocal>;
 }
 
-/** Build the original→safe name map + the loop variable, guaranteeing every emitted
- *  identifier is a valid, non-reserved, collision-free JS binding. */
+/** Build the original→safe name map + the loop variable + the state locals,
+ *  guaranteeing every emitted identifier is a valid, non-reserved, collision-free
+ *  JS binding. */
 function buildNameContext(ir: IrKernel): NameContext {
   const names = ir.signature.params.map((p) => p.name);
   const taken = new Set<string>();
@@ -84,10 +97,20 @@ function buildNameContext(ir: IrKernel): NameContext {
     map.set(name, alias);
     taken.add(alias);
   }
+  const fresh = (base: string): string => {
+    let nm = base;
+    while (taken.has(nm) || JS_RESERVED.has(nm)) nm = `_${nm}`;
+    taken.add(nm);
+    return nm;
+  };
   // The loop variable: a fresh name that collides with nothing above.
-  let loopVar = "__i";
-  while (taken.has(loopVar)) loopVar = `${loopVar}_`;
-  return { map, loopVar };
+  const loopVar = fresh("__i");
+  // Frontier 7: the trailing state-slab param + per-register cur/next locals.
+  const decls = ir.stateDecls ?? [];
+  const stateParam = decls.length > 0 ? fresh("__state") : null;
+  const stateLocals = new Map<string, StateLocal>();
+  decls.forEach((d, k) => stateLocals.set(d.name, { cur: fresh(`__st_${k}`), next: fresh(`__next_${k}`) }));
+  return { map, loopVar, stateParam, stateLocals };
 }
 
 function safe(name: string, ctx: NameContext): string {
@@ -135,6 +158,7 @@ function emitExpr(node: IrNode, ctx: NameContext): string {
     case "const": return fmtNum(node.value);
     case "scalar": return safe(node.name, ctx);
     case "load": return `${safe(node.array, ctx)}[${indexExpr(node.stride, node.intercept, ctx)}]`;
+    case "readState": return ctx.stateLocals.get(node.name)!.cur;
     case "unary": return unaryJs(node.op, emitExpr(node.a, ctx));
     case "binary": return binaryJs(node.op, emitExpr(node.a, ctx), emitExpr(node.b, ctx));
   }
@@ -152,15 +176,46 @@ function emitStore(store: IrStore, ctx: NameContext): string {
  */
 export function emitJsKernel(ir: IrKernel, functionName = "kernel"): string {
   const ctx = buildNameContext(ir);
-  const params = ir.signature.params.map((p) => safe(p.name, ctx)).join(", ");
   const bound = ir.bound.kind === "param" ? safe(ir.bound.name, ctx) : fmtNum(ir.bound.value);
   const i = ctx.loopVar;
-  const body = ir.stores.map((s) => `    ${emitStore(s, ctx)}`).join("\n");
+
+  if (!isStateful(ir)) {
+    const params = ir.signature.params.map((p) => safe(p.name, ctx)).join(", ");
+    const body = ir.stores.map((s) => `    ${emitStore(s, ctx)}`).join("\n");
+    return (
+      `function ${functionName}(${params}) {\n` +
+      `  for (let ${i} = 0; ${i} < ${bound}; ${i}++) {\n` +
+      `${body}\n` +
+      `  }\n` +
+      `}`
+    );
+  }
+
+  // ── Frontier 7: the stateful fallback ──────────────────────────────────────
+  // The state slab is a trailing typed-array param the caller keeps across quanta
+  // (persistent, click-free — the Stage-2 convention). SIMULTANEOUS semantics: load
+  // each register from the slab into a `cur` local; read `cur` everywhere this
+  // iteration; compute each register's `next` from the pre-commit `cur`s; commit all
+  // at the END of the iteration; store the `cur`s back to the slab after the loop.
+  // This realizes the exact same loop as the scalar WASM + `evalReference`, so the
+  // fallback is numerically faithful (gated behaviorally by tests/stateKernel.test.ts).
+  const decls = ir.stateDecls ?? [];
+  const stateStores = ir.stateStores ?? [];
+  const params = ir.signature.params.map((p) => safe(p.name, ctx)).concat(ctx.stateParam!).join(", ");
+  const slab = ctx.stateParam!;
+  const preamble = decls.map((d, k) => `  let ${ctx.stateLocals.get(d.name)!.cur} = ${slab}[${k}];`).join("\n");
+  const outStores = ir.stores.map((s) => `    ${emitStore(s, ctx)}`).join("\n");
+  const computeNext = stateStores.map((ss) => `    let ${ctx.stateLocals.get(ss.name)!.next} = ${emitExpr(ss.value, ctx)};`).join("\n");
+  const commit = stateStores.map((ss) => { const l = ctx.stateLocals.get(ss.name)!; return `    ${l.cur} = ${l.next};`; }).join("\n");
+  const loopBody = [outStores, computeNext, commit].filter((x) => x.length > 0).join("\n");
+  const epilogue = decls.map((d, k) => `  ${slab}[${k}] = ${ctx.stateLocals.get(d.name)!.cur};`).join("\n");
   return (
     `function ${functionName}(${params}) {\n` +
+    `${preamble}\n` +
     `  for (let ${i} = 0; ${i} < ${bound}; ${i}++) {\n` +
-    `${body}\n` +
+    `${loopBody}\n` +
     `  }\n` +
+    `${epilogue}\n` +
     `}`
   );
 }

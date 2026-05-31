@@ -20,8 +20,9 @@
  * browser worker it is wabt or a direct binary encoder.
  */
 
-import { type IrKernel, type LaneWidth, ELEM_BYTES, signatureWidth } from "./ir.js";
+import { type IrKernel, type LaneWidth, ELEM_BYTES, signatureWidth, isStateful } from "./ir.js";
 import { type CorpusCase } from "./corpus.js";
+import { evalReference } from "./acousticGate.js";
 import { hasWasmSimd } from "../worklet/wasmSimdSupport.js";
 
 export type CompileWat = (wat: string, name?: string) => Uint8Array;
@@ -29,7 +30,7 @@ export type CompileWat = (wat: string, name?: string) => Uint8Array;
 export type GateStatus = "accepted" | "rejected-gate" | "unsupported";
 
 export interface GateMismatch {
-  readonly kind: "simd-vs-scalar" | "scalar-vs-js";
+  readonly kind: "simd-vs-scalar" | "scalar-vs-js" | "scalar-vs-ref";
   readonly caseIndex: number;
   readonly n: number;
   readonly array: string;
@@ -57,6 +58,10 @@ export interface GateInput {
   readonly jsSource?: string;
   /** f32 ULP budget (default 0 — v1 is bit-exact). */
   readonly maxUlpF32?: number;
+  /** Stateful kernels (Frontier 7): there is no SIMD candidate (the recurrence is
+   *  scalar-only), so the proof is the scalar WASM ≡ `evalReference(ir)` (the IR spec),
+   *  not SIMD ≡ scalar. When set, `simdWat` is ignored and the JS oracle is N/A. */
+  readonly scalarOnly?: boolean;
 }
 
 const dvF64 = new DataView(new ArrayBuffer(8));
@@ -97,6 +102,8 @@ interface Layout {
   readonly offsets: Record<string, number>; // array name → byte offset
   readonly maxN: number;
   readonly pages: number;
+  /** Byte offset of the state slab (Frontier 7), or -1 if the kernel is stateless. */
+  readonly stateOffset: number;
 }
 
 function planLayout(ir: IrKernel, corpus: ReadonlyArray<CorpusCase>): Layout {
@@ -111,10 +118,25 @@ function planLayout(ir: IrKernel, corpus: ReadonlyArray<CorpusCase>): Layout {
       cursor += slot;
     }
   }
+  // The state slab (Frontier 7): one element per declared register, after the arrays.
+  let stateOffset = -1;
+  const decls = ir.stateDecls ?? [];
+  if (decls.length > 0) {
+    stateOffset = cursor;
+    cursor += align16(decls.length * eb);
+  }
   const pages = Math.max(1, Math.ceil(cursor / 65536));
-  return { offsets, maxN, pages };
+  return { offsets, maxN, pages, stateOffset };
 }
 function align16(n: number): number { return (n + 15) & ~15; }
+
+/** Seed the state slab with the declared inits (cold start), matching `evalReference`. */
+function seedState(memory: WebAssembly.Memory, layout: Layout, ir: IrKernel, TA: Float32ArrayConstructor | Float64ArrayConstructor): void {
+  const decls = ir.stateDecls ?? [];
+  if (layout.stateOffset < 0 || decls.length === 0) return;
+  const view = new TA(memory.buffer, layout.stateOffset, decls.length);
+  for (let k = 0; k < decls.length; k++) view[k] = decls[k]!.init;
+}
 
 function instantiate(bytes: Uint8Array, memory: WebAssembly.Memory): WebAssembly.Instance {
   // Copy into a fresh ArrayBuffer-backed view: `compileWat` may hand back a
@@ -132,6 +154,9 @@ function callArgs(ir: IrKernel, layout: Layout, c: CorpusCase, w: LaneWidth): nu
   for (const p of ir.signature.params) {
     if (p.role === "input" || p.role === "output") args.push(layout.offsets[p.name]!);
   }
+  // The state slab base pointer (Frontier 7) — after the arrays, before the scalars,
+  // matching `paramLayout`. Present only for a stateful kernel.
+  if (isStateful(ir) && layout.stateOffset >= 0) args.push(layout.stateOffset);
   for (const p of ir.signature.params) {
     if (p.role === "scalar") args.push(roundW(c.scalars[p.name] ?? 0, w));
   }
@@ -143,6 +168,10 @@ export function runGate(input: GateInput): GateReport {
   const { ir, scalarWat, simdWat, corpus, compileWat } = input;
   const w = signatureWidth(ir.signature);
   const maxUlp = input.maxUlpF32 ?? 0;
+
+  // Frontier 7: a stateful (scalar-only) kernel has no SIMD candidate, so the proof is
+  // scalar WASM ≡ evalReference(ir). No SIMD support needed; no JS oracle.
+  if (input.scalarOnly) return runScalarOnlyGate(input, w, maxUlp);
 
   if (!hasWasmSimd()) {
     return { status: "unsupported", casesChecked: 0, comparisons: 0, worstUlpF32: 0, reason: "no-wasm-simd" };
@@ -220,6 +249,69 @@ export function runGate(input: GateInput): GateReport {
     }
   }
 
+  return { status: "accepted", casesChecked: corpus.length, comparisons, worstUlpF32 };
+}
+
+/**
+ * The scalar-only gate (Frontier 7): proves the deliverable SCALAR WASM equals
+ * `evalReference(ir)` — the pure-JS IR interpreter that IS the spec — over the corpus,
+ * with the state slab seeded to the declared inits and both sides evolving from that
+ * cold state through the whole (long) run. There is no SIMD candidate and no JS oracle;
+ * this is the safety for a stateful kernel, and a genuine strengthening (the scalar
+ * itself is pinned to the spec, not merely trusted as the SIMD reference).
+ */
+function runScalarOnlyGate(input: GateInput, w: LaneWidth, maxUlp: number): GateReport {
+  const { ir, scalarWat, corpus, compileWat } = input;
+  const layout = planLayout(ir, corpus);
+  let scalarInst: WebAssembly.Instance;
+  let memory: WebAssembly.Memory;
+  try {
+    memory = new WebAssembly.Memory({ initial: layout.pages, maximum: 16384, shared: true });
+    scalarInst = instantiate(compileWat(scalarWat, "scalar"), memory);
+  } catch (err) {
+    return { status: "rejected-gate", casesChecked: 0, comparisons: 0, worstUlpF32: 0, reason: `instantiate-failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const scalarFn = scalarInst.exports["kernel"] as (...a: number[]) => void;
+  const TA = typedCtor(w);
+  const outputs = ir.signature.params.filter((p) => p.role === "output").map((p) => p.name);
+  const inputs = ir.signature.params.filter((p) => p.role === "input").map((p) => p.name);
+
+  let comparisons = 0;
+  let worstUlpF32 = 0;
+
+  for (let ci = 0; ci < corpus.length; ci++) {
+    const c = corpus[ci]!;
+    for (const name of inputs) {
+      const view = new TA(memory.buffer, layout.offsets[name]!, layout.maxN);
+      const row = c.arrays[name]!;
+      for (let i = 0; i < c.n; i++) view[i] = row[i]!;
+    }
+    zeroOutputs(memory, layout, outputs, TA);
+    seedState(memory, layout, ir, TA); // cold start = declared inits, matching evalReference
+    scalarFn(...callArgs(ir, layout, c, w));
+
+    // The reference: evalReference threads the same simultaneous state from the inits.
+    const ref = evalReference(ir, c.arrays, c.scalars, c.n);
+    for (const name of outputs) {
+      const got = readOut(memory, layout, name, c.n, TA);
+      const want = ref[name] ?? [];
+      for (let i = 0; i < c.n; i++) {
+        comparisons++;
+        const a = want[i] ?? 0;
+        const b = got[i]!;
+        if (w === "f32") worstUlpF32 = Math.max(worstUlpF32, ulpF32(a, b));
+        // NaN sign/payload is IEEE-UNSPECIFIED: JS arithmetic and WASM produce
+        // different NaN bit patterns (e.g. ffc00000 vs 7fc00000) for the SAME "not a
+        // number" result, so NaN≡NaN is a match. A real +Inf vs −Inf divergence still
+        // fails `equalW`. (The stateless gate avoids this by comparing WASM-vs-WASM;
+        // here the reference is JS, so the tolerance is explicit.)
+        if (!equalW(a, b, w, maxUlp) && !(Number.isNaN(a) && Number.isNaN(b))) {
+          return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+            mismatch: { kind: "scalar-vs-ref", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
+        }
+      }
+    }
+  }
   return { status: "accepted", casesChecked: corpus.length, comparisons, worstUlpF32 };
 }
 

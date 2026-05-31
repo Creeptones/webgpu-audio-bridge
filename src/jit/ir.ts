@@ -37,6 +37,8 @@ export type IrNode =
   | { readonly kind: "scalar"; readonly name: string }
   /** affine load: element index = stride*i + intercept. */
   | { readonly kind: "load"; readonly array: string; readonly stride: number; readonly intercept: number }
+  /** read a single-sample state register's value at iteration start (Frontier 7). */
+  | { readonly kind: "readState"; readonly name: string }
   | { readonly kind: "unary"; readonly op: UnaryOp; readonly a: IrNode }
   | { readonly kind: "binary"; readonly op: BinaryOp; readonly a: IrNode; readonly b: IrNode };
 
@@ -48,6 +50,28 @@ export interface IrStore {
   readonly value: IrNode;
 }
 
+// ── state registers (Apollo Frontier 7, Stage 1) ────────────────────────────
+//
+// A single-sample memory the kernel may read (`readState`) and write (at most
+// once per iteration, `IrStateStore`). Semantics are SIMULTANEOUS / state-space
+// (docs/frontier7-statefulness-semantics.md §2.2): every `readState` in an
+// iteration sees the value committed at the END of the previous iteration (the
+// decl's `init` for iteration 0); each written register commits at the end of
+// the iteration. Registers are NOT signature params — they are internal memory;
+// the emitter threads them through a `$state` base pointer, not a declared arg.
+
+/** A declared single-sample state register and its cold-start value (default 0). */
+export interface IrStateDecl {
+  readonly name: string;
+  readonly init: number;
+}
+
+/** A register's next-iteration value (one per register name per iteration max). */
+export interface IrStateStore {
+  readonly name: string;
+  readonly value: IrNode;
+}
+
 export type LoopBound =
   | { readonly kind: "param"; readonly name: string } // trip count = a `length` param
   | { readonly kind: "const"; readonly value: number }; // compile-time trip count
@@ -56,7 +80,18 @@ export interface IrKernel {
   readonly width: LaneWidth;
   readonly bound: LoopBound;
   readonly stores: ReadonlyArray<IrStore>;
+  /** Declared state registers (Frontier 7). Absent/empty ⇒ a stateless kernel —
+   *  the content address (`kernelKey`/`kernelHash`) is then byte-identical to
+   *  pre-statefulness, so the stateless hash regression pins are preserved. */
+  readonly stateDecls?: ReadonlyArray<IrStateDecl>;
+  /** Per-iteration register commits (Frontier 7). Absent/empty ⇒ stateless. */
+  readonly stateStores?: ReadonlyArray<IrStateStore>;
   readonly signature: KernelSignature;
+}
+
+/** True iff the kernel carries state registers (⇒ scalar-only, not time-axis SIMD). */
+export function isStateful(k: IrKernel): boolean {
+  return (k.stateDecls?.length ?? 0) > 0 || (k.stateStores?.length ?? 0) > 0;
 }
 
 // ── KernelSignature — the declared I/O shape ────────────────────────────────
@@ -97,11 +132,20 @@ export function nodeKey(n: IrNode): string {
     case "const": return `#${n.value}`;
     case "scalar": return `$${n.name}`;
     case "load": return `${n.array}[${n.stride}i+${n.intercept}]`;
+    case "readState": return `@${n.name}`;
     case "unary": return `${n.op}(${nodeKey(n.a)})`;
     case "binary": return `${n.op}(${nodeKey(n.a)},${nodeKey(n.b)})`;
   }
 }
 export function kernelKey(k: IrKernel): string {
   const b = k.bound.kind === "param" ? `n=${k.bound.name}` : `n=${k.bound.value}`;
-  return `${k.width}|${b}|` + k.stores.map((s) => `${s.array}[${s.stride}i+${s.intercept}]=${nodeKey(s.value)}`).join(";");
+  const base = `${k.width}|${b}|` + k.stores.map((s) => `${s.array}[${s.stride}i+${s.intercept}]=${nodeKey(s.value)}`).join(";");
+  // State segment appended ONLY when present, so a stateless kernel's key (and
+  // therefore its hash) is byte-identical to pre-statefulness.
+  const decls = k.stateDecls ?? [];
+  const stores = k.stateStores ?? [];
+  if (decls.length === 0 && stores.length === 0) return base;
+  const dseg = decls.map((d) => `${d.name}=${d.init}`).join(",");
+  const sseg = stores.map((s) => `${s.name}:=${nodeKey(s.value)}`).join(";");
+  return `${base}|state{${dseg}}{${sseg}}`;
 }

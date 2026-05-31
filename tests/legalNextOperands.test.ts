@@ -96,6 +96,9 @@ function admits(choices: OperandChoices, tk: KernelToken): boolean {
     case "const": return !!choices.constValid?.(tk.value);
     case "unary": return !!choices.ops?.includes(tk.op);
     case "binary": return !!choices.ops?.includes(tk.op);
+    case "state": return !!choices.nameIsFresh?.(tk.name) && !!choices.constValid?.(tk.init);
+    case "readState": return !!choices.stateNames?.includes(tk.name);
+    case "writeState": return !!choices.stateNames?.includes(tk.name);
   }
 }
 

@@ -24,8 +24,19 @@
 
 import {
   type IrKernel, type IrNode, type IrStore, type LaneWidth, type UnaryOp, type BinaryOp,
-  ELEM_BYTES, LANES, lengthParamName, kernelKey,
+  ELEM_BYTES, LANES, lengthParamName, kernelKey, isStateful,
 } from "./ir.js";
+
+/** WASM local name for a state register's current (pre-commit) value. */
+function stLocal(name: string): string { return `$__st_${name}`; }
+/** WASM local name for a state register's next (to-commit) value. */
+function nextLocal(name: string): string { return `$__next_${name}`; }
+/** Byte offset of register `name` within the `$state` slab (declaration order). */
+function stateOffset(ir: IrKernel, name: string): number {
+  const decls = ir.stateDecls ?? [];
+  const k = decls.findIndex((d) => d.name === name);
+  return (k < 0 ? 0 : k) * ELEM_BYTES[ir.width];
+}
 
 export interface WasmParam {
   readonly name: string;
@@ -43,6 +54,10 @@ export function paramLayout(ir: IrKernel): WasmParam[] {
   for (const p of ir.signature.params) {
     if (p.role === "input" || p.role === "output") params.push({ name: p.name, wasm: "i32" });
   }
+  // The state slab base pointer (Frontier 7) — appended after the arrays, before the
+  // scalars, ONLY for a stateful kernel, so a stateless layout (and its emitted SIMD
+  // bytes) are byte-identical to pre-statefulness.
+  if (isStateful(ir)) params.push({ name: "__state", wasm: "i32" });
   for (const p of ir.signature.params) {
     if (p.role === "scalar") params.push({ name: p.name, wasm: w });
   }
@@ -67,6 +82,7 @@ function emitScalar(node: IrNode, ir: IrKernel): string {
     case "const": return `(${t}.const ${fmtNum(node.value)})`;
     case "scalar": return `(local.get $${node.name})`;
     case "load": return `(${t}.load ${addr(node.array, node.stride, node.intercept, ir)})`;
+    case "readState": return `(local.get ${stLocal(node.name)})`;
     case "unary": return `(${t}.${unaryOp(node.op)} ${emitScalar(node.a, ir)})`;
     case "binary": return `(${t}.${node.op} ${emitScalar(node.a, ir)} ${emitScalar(node.b, ir)})`;
   }
@@ -80,6 +96,9 @@ function emitVector(node: IrNode, ir: IrKernel): string {
     case "const": return `(${v}.splat (${t}.const ${fmtNum(node.value)}))`;
     case "scalar": return `(${v}.splat (local.get $${node.name}))`;
     case "load": return `(v128.load ${addr(node.array, node.stride, node.intercept, ir)})`;
+    // A stateful kernel is scalar-only (vectorize → scalarOnly), so emitSimdModule is
+    // never called for one; this arm is unreachable and guards the (NR) invariant.
+    case "readState": throw new Error("emitVector: readState has no SIMD lowering (stateful kernels are scalar-only)");
     case "unary": return `(${v}.${unaryOp(node.op)} ${emitVector(node.a, ir)})`;
     case "binary": return `(${v}.${node.op} ${emitVector(node.a, ir)} ${emitVector(node.b, ir)})`;
   }
@@ -122,24 +141,61 @@ function banner(ir: IrKernel, mode: "scalar" | "simd"): string {
 
 const PAGES = { min: 1, max: 16384 };
 
-/** Scalar reference module: one straight loop in single-lane ops. */
+/** Scalar reference module: one straight loop in single-lane ops. For a stateful
+ *  kernel (Frontier 7) it threads the state registers — load the slab into locals
+ *  before the loop, read them (`readState` → `local.get`) and compute each register's
+ *  next value into a `$__next_*` local inside the loop, COMMIT all next-values at the
+ *  END of the iteration body (so every read in the iteration saw the pre-commit value
+ *  — the SIMULTANEOUS semantics, docs/frontier7-statefulness-semantics.md §2.2), and
+ *  store the locals back to the slab after the loop. A stateless kernel emits exactly
+ *  as before (no state preamble/commit/epilogue). */
 export function emitScalarModule(ir: IrKernel, exportName = "kernel"): string {
   const trip = tripName(ir);
-  const body = ir.stores.map((s) => "        " + storeScalar(s, ir)).join("\n");
+  const t = ir.width;
+  const decls = ir.stateDecls ?? [];
+  const stateStores = ir.stateStores ?? [];
+
+  // Per-register locals: $__st_* (current) + $__next_* (to-commit, only if written).
+  const written = new Set(stateStores.map((ss) => ss.name));
+  const stateLocals = decls
+    .map((d) => `    (local ${stLocal(d.name)} ${t})` + (written.has(d.name) ? `\n    (local ${nextLocal(d.name)} ${t})` : ""))
+    .join("\n");
+  // Preamble: load each register from the slab into its $__st_* local.
+  const statePreamble = decls
+    .map((d) => `    (local.set ${stLocal(d.name)} (${t}.load (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)}))))`)
+    .join("\n");
+  // In-loop body: output stores, then compute every next-value, then commit them all.
+  const outStores = ir.stores.map((s) => "        " + storeScalar(s, ir)).join("\n");
+  const computeNext = stateStores
+    .map((ss) => `        (local.set ${nextLocal(ss.name)} ${emitScalar(ss.value, ir)})`)
+    .join("\n");
+  const commitNext = stateStores
+    .map((ss) => `        (local.set ${stLocal(ss.name)} (local.get ${nextLocal(ss.name)}))`)
+    .join("\n");
+  const loopBody = [outStores, computeNext, commitNext].filter((x) => x.length > 0).join("\n");
+  // Epilogue: store each register local back to the slab.
+  const stateEpilogue = decls
+    .map((d) => `    (${t}.store (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)})) (local.get ${stLocal(d.name)}))`)
+    .join("\n");
+
+  const localDecls = stateLocals.length > 0 ? `\n${stateLocals}` : "";
+  const preamble = statePreamble.length > 0 ? `\n${statePreamble}` : "";
+  const epilogue = stateEpilogue.length > 0 ? `\n${stateEpilogue}` : "";
+
   return `${banner(ir, "scalar")}
 (module
   (import "env" "memory" (memory ${PAGES.min} ${PAGES.max} shared))
   (func $${exportName} (export "${exportName}") ${paramDecls(ir)}
-    (local $i i32)
+    (local $i i32)${localDecls}${preamble}
     (local.set $i (i32.const 0))
     (block $tailExit
       (loop $tailLoop
         (br_if $tailExit (i32.ge_s (local.get $i) (local.get $${trip})))
-${body}
+${loopBody}
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $tailLoop)
       )
-    )
+    )${epilogue}
   )
 )`;
 }

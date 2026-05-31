@@ -51,7 +51,7 @@
 
 import {
   type IrKernel, type IrNode, type UnaryOp, type BinaryOp,
-  signatureWidth, paramsByRole,
+  signatureWidth, paramsByRole, isStateful,
 } from "./ir.js";
 
 /** A small, deterministic acoustic fingerprint of a kernel's output over a fixed
@@ -106,6 +106,11 @@ export interface AcousticGateOptions {
   /** Reject if crestFactor exceeds this (degenerate spike), checked only when the
    *  output is not silent. Default 1e4. */
   readonly maxCrestFactor?: number;
+  /** STATEFUL kernels only (Frontier 7): reject if the primary output's second-half
+   *  RMS exceeds its first-half RMS by more than this ratio — a slow-divergence /
+   *  marginally-unstable-pole net the fixed peak bound can miss over a short probe.
+   *  A settling (decaying) transient has ratio < 1 and trivially passes. Default 8. */
+  readonly maxGrowthRatio?: number;
 }
 
 /** The verdict: `ok` carries the profile; a rejection carries the profile (for
@@ -115,12 +120,17 @@ export type AcousticGateResult =
   | { readonly ok: false; readonly profile: AcousticProfile; readonly reason: string };
 
 const DEFAULT_PROBE_LENGTH = 1024;
+/** Stateful kernels probe LONGER by default (Frontier 7 §3): a marginally-unstable
+ *  pole (radius ~1.001) needs more samples to diverge past the peak bound, and the
+ *  growth check wants a long enough run to be meaningful. Cheap (pure-JS reference). */
+const DEFAULT_STATEFUL_PROBE_LENGTH = 4096;
 const DEFAULT_FUNDAMENTAL_BIN = 8;
 const DEFAULT_PROBE_SCALAR = 0.5;
 const DEFAULT_BANDS = 64;
 const DEFAULT_MAX_PEAK = 1e3;
 const DEFAULT_MAX_ABS_DC = 1e3;
 const DEFAULT_MAX_CREST = 1e4;
+const DEFAULT_MAX_GROWTH = 8;
 /** Below this rms the output is treated as silent (crest = 0, crest-bound skipped). */
 const SILENCE_EPS = 1e-12;
 
@@ -182,6 +192,15 @@ export function evalReference(
     else if (cur.length < need) for (let k = cur.length; k < need; k++) cur[k] = 0;
   }
 
+  // State registers (Frontier 7) — SIMULTANEOUS semantics: `readState` sees the value
+  // committed at the END of the previous iteration; writes commit after the iteration.
+  // Initialized to the declared inits (rounded to width). This is the SPEC the scalar
+  // WASM is gated against (docs/frontier7-statefulness-semantics.md §6).
+  const stateDecls = ir.stateDecls ?? [];
+  const stateStores = ir.stateStores ?? [];
+  const states: Record<string, number> = {};
+  for (const d of stateDecls) states[d.name] = round(d.init);
+
   const evalNode = (node: IrNode, i: number): number => {
     switch (node.kind) {
       case "const": return round(node.value);
@@ -191,6 +210,7 @@ export function evalReference(
         const idx = node.stride * i + node.intercept;
         return round((src && idx >= 0 && idx < src.length ? src[idx]! : 0));
       }
+      case "readState": return round(states[node.name] ?? 0);
       case "unary": return round(applyUnary(node.op, evalNode(node.a, i)));
       case "binary": return round(applyBinary(node.op, evalNode(node.a, i), evalNode(node.b, i)));
     }
@@ -199,6 +219,14 @@ export function evalReference(
   for (let i = 0; i < n; i++) {
     for (const s of ir.stores) {
       outputs[s.array]![s.stride * i + s.intercept] = round(evalNode(s.value, i));
+    }
+    // Compute every register's next value from the PRE-commit state, then commit all —
+    // order-independent (simultaneous), so the two passes can never observe a partial
+    // update.
+    if (stateStores.length > 0) {
+      const next: Record<string, number> = {};
+      for (const ss of stateStores) next[ss.name] = round(evalNode(ss.value, i));
+      for (const k in next) states[k] = next[k]!;
     }
   }
   return outputs;
@@ -210,6 +238,7 @@ function collectLoads(node: IrNode, byArray: Map<string, number>, n: number): vo
   switch (node.kind) {
     case "const":
     case "scalar":
+    case "readState":
       return;
     case "load": {
       const need = node.stride * Math.max(0, n - 1) + node.intercept + 1;
@@ -244,6 +273,7 @@ function buildProbe(ir: IrKernel, n: number, fundamentalBin: number, probeScalar
   const need = new Map<string, number>();
   for (const name of inputParams) need.set(name, n);
   for (const s of ir.stores) collectLoads(s.value, need, n);
+  for (const ss of ir.stateStores ?? []) collectLoads(ss.value, need, n);
 
   const nyquist = n >> 1;
   const inputs: Record<string, number[]> = {};
@@ -396,7 +426,8 @@ function profileOutputs(
  * attached either way). Pure + deterministic — same kernel ⇒ byte-identical verdict.
  */
 export function acousticGate(ir: IrKernel, opts: AcousticGateOptions = {}): AcousticGateResult {
-  const probeLength = opts.probeLength ?? DEFAULT_PROBE_LENGTH;
+  const stateful = isStateful(ir);
+  const probeLength = opts.probeLength ?? (stateful ? DEFAULT_STATEFUL_PROBE_LENGTH : DEFAULT_PROBE_LENGTH);
   if (!isPow2(probeLength)) {
     throw new Error(`acousticGate: probeLength must be a power of two, got ${probeLength}`);
   }
@@ -406,6 +437,7 @@ export function acousticGate(ir: IrKernel, opts: AcousticGateOptions = {}): Acou
   const maxPeak = opts.maxPeak ?? DEFAULT_MAX_PEAK;
   const maxAbsDc = opts.maxAbsDcOffset ?? DEFAULT_MAX_ABS_DC;
   const maxCrest = opts.maxCrestFactor ?? DEFAULT_MAX_CREST;
+  const maxGrowth = opts.maxGrowthRatio ?? DEFAULT_MAX_GROWTH;
 
   const probe = buildProbe(ir, probeLength, fundamentalBin, probeScalar);
   const outputs = evalReference(ir, probe.inputs, probe.scalars, probe.n);
@@ -423,5 +455,30 @@ export function acousticGate(ir: IrKernel, opts: AcousticGateOptions = {}): Acou
   if (profile.rms > SILENCE_EPS && profile.crestFactor > maxCrest) {
     return { ok: false, profile, reason: `crest-out-of-bounds: crest ${profile.crestFactor} > ${maxCrest}` };
   }
+  // Stability net for stateful kernels (Frontier 7 §3): slow divergence the fixed peak
+  // bound can miss over a short window. Free for stateless kernels (not run), so their
+  // verdicts are byte-identical to pre-statefulness.
+  if (stateful) {
+    const growth = growthRatio(ir, outputs);
+    if (growth > maxGrowth) {
+      return { ok: false, profile, reason: `unstable-growth: 2nd/1st-half RMS ratio ${growth} > ${maxGrowth}` };
+    }
+  }
   return { ok: true, profile };
+}
+
+/** Second-half / first-half RMS of the primary output — the slow-divergence net.
+ *  Returns 0 for an empty/silent first half (no growth to measure). */
+function growthRatio(ir: IrKernel, outputs: Record<string, number[]>): number {
+  const primaryName = paramsByRole(ir.signature, "output")[0]?.name;
+  const y = primaryName ? outputs[primaryName] : undefined;
+  if (!y || y.length < 2) return 0;
+  const half = y.length >> 1;
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < half; i++) s1 += y[i]! * y[i]!;
+  for (let i = half; i < y.length; i++) s2 += y[i]! * y[i]!;
+  const rms1 = Math.sqrt(s1 / Math.max(1, half));
+  const rms2 = Math.sqrt(s2 / Math.max(1, y.length - half));
+  return rms1 > SILENCE_EPS ? rms2 / rms1 : 0;
 }

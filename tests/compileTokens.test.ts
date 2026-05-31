@@ -122,6 +122,7 @@ function foldNeg(node: IrNode): IrNode {
     case "const":
     case "scalar":
     case "load":
+    case "readState":
       return node;
     case "unary": {
       const a = foldNeg(node.a);

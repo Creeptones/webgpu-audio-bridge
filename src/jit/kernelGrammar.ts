@@ -44,7 +44,7 @@
  */
 
 import {
-  type IrKernel, type IrNode, type IrStore, type LoopBound,
+  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore, type LoopBound,
   type KernelSignature, type KernelParam, type ParamRole,
   type LaneWidth, type UnaryOp, type BinaryOp,
   UNARY_OPS, BINARY_OPS, kernelKey,
@@ -59,13 +59,20 @@ import {
 export type KernelToken =
   | { readonly t: "width"; readonly width: LaneWidth }
   | { readonly t: "param"; readonly name: string; readonly role: ParamRole }
+  /** state-register declaration (Frontier 7) — in the params phase, beside `param`. */
+  | { readonly t: "state"; readonly name: string; readonly init: number }
   | { readonly t: "bound"; readonly bound: LoopBound }
   | { readonly t: "load"; readonly array: string; readonly stride: number; readonly intercept: number }
+  /** read a state register (Frontier 7) — a body value-pusher, like `scalar`. */
+  | { readonly t: "readState"; readonly name: string }
   | { readonly t: "scalar"; readonly name: string }
   | { readonly t: "const"; readonly value: number }
   | { readonly t: "unary"; readonly op: UnaryOp }
   | { readonly t: "binary"; readonly op: BinaryOp }
-  | { readonly t: "store"; readonly array: string; readonly stride: number; readonly intercept: number };
+  | { readonly t: "store"; readonly array: string; readonly stride: number; readonly intercept: number }
+  /** commit a state register's next value (Frontier 7) — a body terminator, like
+   *  `store` (consumes the one value on the stack); one per register per iteration. */
+  | { readonly t: "writeState"; readonly name: string };
 
 export type TokenKind = KernelToken["t"];
 
@@ -94,15 +101,23 @@ function warnOnce(): void {
 
 // ── IR → tokens ───────────────────────────────────────────────────────────────
 
-/** Serialize an `IrKernel` to its canonical token stream (lossless). */
+/** Serialize an `IrKernel` to its canonical token stream (lossless). Order: width,
+ *  the `param` run (signature order), the `state` decls (Frontier 7), `bound`, then
+ *  the body — each output store's expression + `store`, then each state register's
+ *  next-value expression + `writeState`. */
 export function kernelToTokens(ir: IrKernel): KernelToken[] {
   warnOnce();
   const tokens: KernelToken[] = [{ t: "width", width: ir.width }];
   for (const p of ir.signature.params) tokens.push({ t: "param", name: p.name, role: p.role });
+  for (const d of ir.stateDecls ?? []) tokens.push({ t: "state", name: d.name, init: d.init });
   tokens.push({ t: "bound", bound: ir.bound });
   for (const store of ir.stores) {
     emitNode(store.value, tokens);
     tokens.push({ t: "store", array: store.array, stride: store.stride, intercept: store.intercept });
+  }
+  for (const ss of ir.stateStores ?? []) {
+    emitNode(ss.value, tokens);
+    tokens.push({ t: "writeState", name: ss.name });
   }
   return tokens;
 }
@@ -112,6 +127,7 @@ function emitNode(node: IrNode, out: KernelToken[]): void {
     case "const": out.push({ t: "const", value: node.value }); break;
     case "scalar": out.push({ t: "scalar", name: node.name }); break;
     case "load": out.push({ t: "load", array: node.array, stride: node.stride, intercept: node.intercept }); break;
+    case "readState": out.push({ t: "readState", name: node.name }); break;
     case "unary": emitNode(node.a, out); out.push({ t: "unary", op: node.op }); break;
     case "binary": emitNode(node.a, out); emitNode(node.b, out); out.push({ t: "binary", op: node.op }); break;
   }
@@ -147,10 +163,22 @@ interface GrammarState {
   bound: LoopBound | null;
   stack: IrNode[];
   stores: IrStore[];
+  // ── state registers (Frontier 7) ──────────────────────────────────────────
+  /** Declared register names — a SEPARATE namespace from `names` (signature
+   *  params), so a `scalar`/`load`/`store`/`bound` name can never resolve to a
+   *  register and vice versa (sound: a register is internal memory, not an arg). */
+  stateNames: Set<string>;
+  stateDecls: IrStateDecl[];
+  stateStores: IrStateStore[];
+  /** Registers already written this iteration (at most one `writeState` each). */
+  written: Set<string>;
 }
 
 function initialState(): GrammarState {
-  return { phase: "width", width: null, params: [], names: new Set<string>(), bound: null, stack: [], stores: [] };
+  return {
+    phase: "width", width: null, params: [], names: new Set<string>(), bound: null,
+    stack: [], stores: [], stateNames: new Set<string>(), stateDecls: [], stateStores: [], written: new Set<string>(),
+  };
 }
 
 /** Advance the state by one token. Mutates `s`; returns a `ValidateFailure` (with
@@ -168,10 +196,18 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
     case "params": {
       if (tk.t === "param") {
         if (!IDENT.test(tk.name)) return fail(`invalid param name "${tk.name}"`, at);
-        if (s.names.has(tk.name)) return fail(`duplicate param "${tk.name}"`, at);
+        if (s.names.has(tk.name) || s.stateNames.has(tk.name)) return fail(`duplicate param "${tk.name}"`, at);
         if (!ROLES.has(tk.role)) return fail(`unknown param role "${String(tk.role)}"`, at);
         s.names.add(tk.name);
         s.params.push({ name: tk.name, role: tk.role });
+        return null;
+      }
+      if (tk.t === "state") {
+        if (!IDENT.test(tk.name)) return fail(`invalid state name "${tk.name}"`, at);
+        if (s.names.has(tk.name) || s.stateNames.has(tk.name)) return fail(`duplicate state register "${tk.name}"`, at);
+        if (typeof tk.init !== "number" || !Number.isFinite(tk.init)) return fail(`state "${tk.name}" init must be a finite number`, at);
+        s.stateNames.add(tk.name);
+        s.stateDecls.push({ name: tk.name, init: tk.init });
         return null;
       }
       if (tk.t === "bound") {
@@ -185,12 +221,13 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
         s.phase = "body";
         return null;
       }
-      return fail("expected `bound` token after the param run", at);
+      return fail("expected a `param`, `state`, or `bound` token in the signature phase", at);
     }
     case "body": {
       switch (tk.t) {
         case "width": return fail("unexpected `width` token in body", at);
         case "param": return fail("`param` tokens must precede `bound`", at);
+        case "state": return fail("`state` tokens must precede `bound`", at);
         case "bound": return fail("duplicate `bound` token", at);
         case "const":
           if (typeof tk.value !== "number") return fail("const value must be a number", at);
@@ -200,6 +237,18 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
           if (!s.names.has(tk.name)) return fail(`scalar references undeclared param "${tk.name}"`, at);
           s.stack.push({ kind: "scalar", name: tk.name });
           return null;
+        case "readState":
+          if (!s.stateNames.has(tk.name)) return fail(`readState references undeclared state register "${tk.name}"`, at);
+          s.stack.push({ kind: "readState", name: tk.name });
+          return null;
+        case "writeState": {
+          if (!s.stateNames.has(tk.name)) return fail(`writeState references undeclared state register "${tk.name}"`, at);
+          if (s.written.has(tk.name)) return fail(`state register "${tk.name}" is written more than once per iteration`, at);
+          if (s.stack.length !== 1) return fail(`writeState expects exactly one value on the stack (found ${s.stack.length})`, at);
+          s.stateStores.push({ name: tk.name, value: s.stack.pop()! });
+          s.written.add(tk.name);
+          return null;
+        }
         case "load": {
           const err = checkAffine("load", tk.array, tk.stride, tk.intercept, s.names, at);
           if (err) return err;
@@ -241,7 +290,13 @@ function finalizeGrammar(s: GrammarState): ValidateResult {
   if (s.stack.length !== 0) return fail(`${s.stack.length} unconsumed value(s) at end of stream (missing STORE?)`);
   if (s.stores.length === 0) return fail("kernel has no stores");
   const signature: KernelSignature = { params: s.params, width: s.width! };
-  return { ok: true, ir: { width: s.width!, bound: s.bound!, stores: s.stores, signature } };
+  // State fields are added ONLY when present, so a stateless stream rebuilds the
+  // byte-identical (state-free) IR — preserving the stateless content address.
+  const stateful = s.stateDecls.length > 0 || s.stateStores.length > 0;
+  const ir: IrKernel = stateful
+    ? { width: s.width!, bound: s.bound!, stores: s.stores, stateDecls: s.stateDecls, stateStores: s.stateStores, signature }
+    : { width: s.width!, bound: s.bound!, stores: s.stores, signature };
+  return { ok: true, ir };
 }
 
 /**
@@ -295,16 +350,21 @@ function legalKinds(s: GrammarState): Set<TokenKind> {
       break;
     case "params":
       out.add("param"); // declare another signature parameter
-      out.add("bound"); // …or end the param run and begin the body
+      out.add("state"); // …or declare a state register (Frontier 7)
+      out.add("bound"); // …or end the signature phase and begin the body
       break;
     case "body": {
       const depth = s.stack.length;
       out.add("const"); // value-pushers are always legal (depth → depth+1)
       out.add("scalar");
       out.add("load");
+      out.add("readState"); // a state read is a value-pusher too (Frontier 7)
       if (depth >= 1) out.add("unary");  // pops 1, pushes 1
       if (depth >= 2) out.add("binary"); // pops 2, pushes 1
-      if (depth === 1) out.add("store"); // consumes the one value → starts a new statement
+      if (depth === 1) {
+        out.add("store");      // consumes the one value → starts a new statement
+        out.add("writeState"); // …or commits it to a state register (Frontier 7)
+      }
       break;
     }
   }
@@ -374,10 +434,15 @@ export interface OperandChoices {
   readonly interceptValid?: (n: number) => boolean;
   /** `scalar` token: the declared scalar-role names. */
   readonly scalars?: ReadonlyArray<string>;
-  /** `const` token: a value-validity predicate (finite number). */
+  /** `const` token: a value-validity predicate (finite number). Also the `state`
+   *  token's `init` field validity (a finite number). */
   readonly constValid?: (value: number) => boolean;
   /** `unary`/`binary` token: the legal ops. */
   readonly ops?: ReadonlyArray<UnaryOp | BinaryOp>;
+  /** `readState` token: every declared register; `writeState` token: the registers
+   *  not yet written this iteration (Frontier 7). Empty ⇒ no legal token of that kind
+   *  here (no register declared, or all already written). */
+  readonly stateNames?: ReadonlyArray<string>;
 }
 
 const ALL_WIDTHS: ReadonlyArray<LaneWidth> = ["f32", "f64"];
@@ -413,7 +478,8 @@ export function legalNextOperands(
   if (!legalKinds(s).has(kind)) return {}; // the KIND itself is illegal at this position
   switch (kind) {
     case "width": return { width: ALL_WIDTHS };
-    case "param": return { paramRoles: ALL_ROLES, nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) };
+    case "param": return { paramRoles: ALL_ROLES, nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) && !s.stateNames.has(n) };
+    case "state": return { nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) && !s.stateNames.has(n), constValid: isFiniteNumber };
     case "bound": return { boundParams: namesByRole(s, "length"), boundConstOk: true, boundConstValid: isBoundConst };
     case "load": return { arrays: namesByRole(s, "input"), strideValid: isInteger, interceptValid: isInteger };
     case "store": return { arrays: namesByRole(s, "output"), strideValid: isInteger, interceptValid: isInteger };
@@ -421,6 +487,8 @@ export function legalNextOperands(
     case "const": return { constValid: isFiniteNumber };
     case "unary": return { ops: UNARY_OP_LIST };
     case "binary": return { ops: BINARY_OP_LIST };
+    case "readState": return { stateNames: [...s.stateNames] };
+    case "writeState": return { stateNames: [...s.stateNames].filter((nm) => !s.written.has(nm)) };
   }
 }
 
@@ -464,13 +532,16 @@ function tokenToWord(tk: KernelToken): string {
   switch (tk.t) {
     case "width": return `width:${tk.width}`;
     case "param": return `param:${tk.name}:${tk.role}`;
+    case "state": return `state:${tk.name}:${String(tk.init)}`;
     case "bound": return tk.bound.kind === "param" ? `bound:$${tk.bound.name}` : `bound:#${String(tk.bound.value)}`;
     case "load": return `load:${tk.array}:${String(tk.stride)}:${String(tk.intercept)}`;
+    case "readState": return `readState:${tk.name}`;
     case "scalar": return `scalar:${tk.name}`;
     case "const": return `const:${String(tk.value)}`;
     case "unary": return `unary:${tk.op}`;
     case "binary": return `binary:${tk.op}`;
     case "store": return `store:${tk.array}:${String(tk.stride)}:${String(tk.intercept)}`;
+    case "writeState": return `writeState:${tk.name}`;
   }
 }
 
@@ -500,6 +571,12 @@ function wordToToken(w: string): KernelToken {
       }
       return { t: "param", name, role };
     }
+    case "state": {
+      const name = parts[1];
+      const init = parts[2];
+      if (name === undefined || init === undefined) throw new Error(`parseTokens: bad state token "${w}"`);
+      return { t: "state", name, init: strToNum(init) };
+    }
     case "bound": {
       const arg = parts[1];
       if (arg === undefined || arg.length < 2) throw new Error(`parseTokens: bad bound token "${w}"`);
@@ -520,6 +597,16 @@ function wordToToken(w: string): KernelToken {
       const name = parts[1];
       if (name === undefined) throw new Error(`parseTokens: bad scalar token "${w}"`);
       return { t: "scalar", name };
+    }
+    case "readState": {
+      const name = parts[1];
+      if (name === undefined) throw new Error(`parseTokens: bad readState token "${w}"`);
+      return { t: "readState", name };
+    }
+    case "writeState": {
+      const name = parts[1];
+      if (name === undefined) throw new Error(`parseTokens: bad writeState token "${w}"`);
+      return { t: "writeState", name };
     }
     case "const": {
       const v = parts[1];

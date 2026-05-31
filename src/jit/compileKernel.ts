@@ -25,7 +25,7 @@ import { lowerKernel } from "./lower.js";
 import { JitRejection, type Diagnostic } from "./diagnostics.js";
 import { vectorize, type VectorizedKernelPlan } from "./vectorize.js";
 import { emitScalarModule, emitSimdModule } from "./emitKernelWat.js";
-import { buildCorpus, type CorpusOptions } from "./corpus.js";
+import { buildCorpus, CORPUS_N_VALUES, type CorpusOptions } from "./corpus.js";
 import { runGate, type CompileWat, type GateReport } from "./gate.js";
 import { type IrKernel, type KernelSignature, type LaneWidth } from "./ir.js";
 import { validateTokens, type KernelToken } from "./kernelGrammar.js";
@@ -135,11 +135,27 @@ export function compileKernel(
 export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
   const exportName = opts.exportName ?? "kernel";
 
-  // vectorize — surfaces v1-non-emittable shapes as `unsupported` (→ JS fallback).
+  // vectorize — surfaces v1-non-emittable shapes as `unsupported` (→ JS fallback);
+  // flags a stateful kernel as scalarOnly (supported, scalar-only — Frontier 7).
   const vec = vectorize(ir, exportName);
   if (!vec.ok) return { status: "unsupported", reason: vec.reason };
 
   const scalarWat = emitScalarModule(ir, exportName);
+
+  // ── Frontier 7: the scalar-only (stateful) path ──────────────────────────────
+  // No SIMD candidate (the recurrence is not time-axis vectorizable), so the
+  // deliverable IS the scalar module and the gate proves scalar WASM ≡ evalReference
+  // over a corpus that includes a LONG run (so an IIR transient develops past the
+  // residue rows). The stateless SIMD path below is untouched.
+  if (vec.plan.scalarOnly) {
+    const corpus = buildCorpus(ir.signature, opts.corpus ?? { nValues: [...CORPUS_N_VALUES, 256, 512] });
+    const gate = runGate({ ir, scalarWat, simdWat: scalarWat, corpus, compileWat: opts.compileWat, maxUlpF32: opts.maxUlpF32, scalarOnly: true });
+    if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
+    if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
+    const wasm = opts.compileWat(scalarWat, "scalar");
+    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate };
+  }
+
   const simdWat = emitSimdModule(ir, exportName);
 
   const corpus = buildCorpus(ir.signature, opts.corpus);
