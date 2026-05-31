@@ -40,3 +40,14 @@ export { JitKernelConsumer } from "./JitKernelConsumer.js";
 export type {
   JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult,
 } from "./JitKernelConsumer.js";
+
+// ── one-call constructor + 3-realm wiring (Stage 3) ──────────────────────────
+export {
+  connectJit, runJitCompile, forwardCompileResponse,
+  createJitConsumer, handleJitInstallMessage, jitMemoryPages,
+} from "./connectJit.js";
+export type {
+  ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection,
+  JitWorkletOptions, JitCompileRequest, JitCompileResponse, JitInstallMessage,
+  JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions,
+} from "./connectJit.js";

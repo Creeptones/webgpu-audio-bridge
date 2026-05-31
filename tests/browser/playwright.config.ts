@@ -97,13 +97,27 @@ export default defineConfig({
     },
   ],
 
-  webServer: {
-    command: "node examples/minimal/serve.mjs",
-    cwd: repoRoot,
-    port: 5173,
-    reuseExistingServer: !process.env.CI,
-    timeout: 30_000,
-    stdout: "pipe",
-    stderr: "pipe",
-  },
+  // Two demo servers: the minimal demo (5173, default baseURL) for minimal/e2e
+  // specs, and the jit-vectorize demo (5185) for the Autonomous JIT smoke (which
+  // overrides its own baseURL via `test.use`). Playwright supports an array.
+  webServer: [
+    {
+      command: "node examples/minimal/serve.mjs",
+      cwd: repoRoot,
+      port: 5173,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+    {
+      command: "node examples/jit-vectorize/serve.mjs",
+      cwd: repoRoot,
+      port: 5185,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  ],
 });

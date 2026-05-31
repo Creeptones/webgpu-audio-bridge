@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — The Autonomous JIT (naive JS → WASM SIMD, live)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 880px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #force { background: #7a3df4; } #force:hover:not(:disabled) { background: #9355ff; }
+      #recompile { background: #2f7a55; } #recompile:hover:not(:disabled) { background: #3a9568; }
+      label { display: block; margin: 12px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; } .dim { color: #6b7280; }
+      .wbarwrap { height: 14px; background: #101218; border: 1px solid #21252d; border-radius: 7px; overflow: hidden; margin: 8px 0; }
+      .wbar { height: 100%; width: 0%; background: #2b3550; transition: width 60ms linear; }
+      .wbar.fade { background: linear-gradient(90deg, #7a3df4, #c79bff); }
+      .wbar.done { background: #2f7a55; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+      pre.k { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; overflow-x: auto; color: #c8cdd4; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — The Autonomous JIT</h1>
+    <p>
+      A developer writes a <strong>naive scalar JS</strong> DSP kernel — a cubic waveshaper. From the first quantum
+      the AudioWorklet runs it on the <strong>JS fallback</strong> (audio is immediate). A beat later,
+      <code>connectJit</code> has compiled the SAME function off-thread to <strong>WASM&nbsp;SIMD</strong>, proven it
+      <strong>bit-exact</strong> to the scalar source through the equivalence gate, and shipped it into the worklet —
+      which <strong>silently upgrades mid-playback with zero audible glitch</strong> (the exact-lerp crossfade). The
+      sound never changes; only the per-quantum kernel <em>time</em> drops.
+    </p>
+    <pre class="k">function softClip(out, x, drive, n) {
+  for (let i = 0; i &lt; n; i++) {
+    const t = Math.max(Math.min(x[i] * drive, 1), -1);
+    out[i] = 1.5 * t - 0.5 * t * t * t;       // cubic saturator — auto-vectorized to f32x4
+  }
+}</pre>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="recompile" disabled>Recompile ↻</button>
+    <button id="force" disabled>Force JS</button>
+
+    <h2>Crossfade weight (audio clock — JS → SIMD)</h2>
+    <div class="wbarwrap"><div id="wbar" class="wbar"></div></div>
+
+    <h2>JIT</h2>
+    <div id="hud" class="panel"></div>
+
+    <h2>Controls</h2>
+    <div class="grid">
+      <div>
+        <label for="freq">saw fundamental <span class="val" id="freq-val"></span> Hz</label>
+        <input id="freq" type="range" min="55" max="440" step="1" value="110" />
+      </div>
+      <div>
+        <label for="drive">drive <span class="val" id="drive-val"></span>×</label>
+        <input id="drive" type="range" min="1" max="8" step="0.1" value="3" />
+      </div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>. The compiler runs in a background worker
+      (wabt vendored same-origin); the gate proves the SIMD kernel before it can reach the audio thread; the worklet
+      installs it between quanta and crossfades click-free. The Module-vs-bytes transport is picked at the send
+      boundary. Experimental (<code>webgpu-audio-bridge/experimental</code>).
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -127,3 +127,29 @@ export type {
   JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum,
   JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult,
 } from "../jit/index.js";
+
+// ── The Autonomous JIT — connectJit() one-call constructor (0.9.917, Stage 3) ─
+//
+// Apollo Frontier 5, Stage 3: the `connect()`-style constructor that hides the
+// three-realm dance behind one main-thread call + two tiny realm helpers.
+// `connectJit(spec)` (main) allocates/adopts the shared memory, snapshots
+// `kernel.toString()` (a closure can't cross `postMessage` — the kernel reaches
+// both off-thread realms as a SOURCE STRING), and returns the worklet
+// `processorOptions` + the compile-worker request + the bind/forceJs controls.
+// `runJitCompile(request, { compileWat })` (compile worker) runs `compileKernel`
+// and, on `accepted` ONLY, async-`WebAssembly.compile`s a clone-safe response.
+// `createJitConsumer` + `handleJitInstallMessage` (worklet) reconstruct the JS
+// fallback and route the install. The Module-vs-bytes transport is one swappable
+// strategy decided at the send boundary (`forwardCompileResponse`). Degrades to
+// JS forever on a non-isolated / no-SIMD host (never throws). Still
+// `@experimental` — same surface as `compileKernel` / `JitKernelConsumer`. See
+// docs/jit-vectorize-design.md + the `examples/jit-vectorize/` browser demo.
+export {
+  connectJit, runJitCompile, forwardCompileResponse,
+  createJitConsumer, handleJitInstallMessage, jitMemoryPages,
+} from "../jit/index.js";
+export type {
+  ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection,
+  JitWorkletOptions, JitCompileRequest, JitCompileResponse, JitInstallMessage,
+  JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions,
+} from "../jit/index.js";

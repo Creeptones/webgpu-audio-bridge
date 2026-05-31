@@ -4,6 +4,93 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.917] — 2026-05-30
+
+### Added — Apollo Frontier 5, Stage 3: The Autonomous JIT — `connectJit()` + browser demo
+
+Stages 1a/1b/2 shipped the compiler (`compileKernel`), the click-free live-swap
+runtime (`JitKernelConsumer`), and the characterization bench. Stage 3 is the thing
+a developer actually calls: a `connect()`-style one-call constructor that hides the
+three-realm dance, plus a browser demo proving a naive JS DSP loop silently upgrades
+to WASM SIMD mid-playback with zero audible glitch.
+
+- **`src/jit/connectJit.ts`** — the one-call constructor + the two realm helpers,
+  all wire shapes in one file (mirrors `connectFanIn`'s allocate-once / mount-many
+  split). Exported from `webgpu-audio-bridge/experimental`:
+  - **`connectJit(spec)`** (main thread) — allocates (or adopts) the shared
+    `WebAssembly.Memory`, snapshots `kernel.toString()` (a closure can't
+    `postMessage` — the kernel reaches both off-thread realms as a SOURCE STRING),
+    and returns a handle with the worklet `processorOptions`, the compile-worker
+    request, and `bind` / `requestCompile` / `forceJs` / `dispose`. Never throws on
+    an unsupported host — `handle.jitEnabled` reports the graceful-degrade floor.
+  - **`runJitCompile(request, { compileWat })`** (compile worker) — runs
+    `compileKernel` (parse → vectorize → **gate**) and, on `accepted` ONLY,
+    async-`WebAssembly.compile`s a clone-safe response carrying both a Module and
+    the raw bytes. A rejected/unsupported verdict ships nothing (the gate is the
+    safety boundary, end to end).
+  - **`createJitConsumer(opts)` + `handleJitInstallMessage(consumer, msg)`**
+    (AudioWorklet) — reconstruct the JS fallback from the source string and route
+    the SYNC install (in `port.onmessage`, never `process()`).
+  - **`forwardCompileResponse(port, response, opts?)`** — the SINGLE transport-choice
+    point: **bytes by default**, `transport: "module"` opt-in. `jitMemoryPages()`
+    sizes the working memory.
+- **`examples/jit-vectorize/`** + **`npm run dev:jit-vectorize`** (port 5185) — a
+  six-file demo (mirrors `examples/god-node-hotswap/`) of a cubic waveshaper
+  (`softClip`, bit-exact, 56 gate cases) silently upgrading to SIMD mid-playback.
+  wabt + acorn are **vendored** (`vendor/`) so the compiler runs same-origin under
+  the COOP/COEP isolation headers; the demo server rewrites the library's bare
+  `acorn` specifier to the vendored URL (import maps don't work in module workers).
+- **`tests/connectJit.test.ts`** — 6 Node pins (shape/sizing, runJitCompile
+  accepted-vs-fallback, transport selection, end-to-end bind→compile→install→upgrade
+  bit-exact, graceful degrade over non-shared memory). Registered in `test` +
+  `test:unit`.
+- **`tests/browser/jit-vectorize.spec.ts`** — a cross-engine Playwright smoke (a
+  second `webServer` on 5185) that loads the demo, confirms cross-origin isolation,
+  drives the live idle→fading→complete upgrade, checks the gate report, records the
+  per-engine install transport, and flips "Force JS" back. Runs on chromium /
+  firefox / webkit.
+
+### Why — put all of Stages 1–2 behind one call, and settle the open transport question
+
+The compiler, runtime, and numbers were proven; what was missing was the developer
+ergonomics (one call, not a three-thread protocol) and the **empirical** answer to
+Stage 3's #1 risk: does a `WebAssembly.Module` clone into an AudioWorklet realm? The
+browser investigation settled it — in Chrome a Module posted to a worklet port does
+NOT throw at send but **silently fails to deserialize** (an async `messageerror`),
+so a "try Module, catch the throw" fallback never fires. The robust default for the
+worklet boundary is therefore **bytes** (universally clone-safe, compiled
+synchronously in µs); `transport: "module"` is opt-in for Worker destinations (where
+clone is reliable and a failure throws synchronously). Two more realm-capability
+findings shaped the demo: the experimental barrel transitively imports `acorn` (a
+bare specifier raw browser ESM can't resolve, and import maps aren't available in
+workers → the demo server rewrites it), and `performance` is not guaranteed in
+`AudioWorkletGlobalScope` (the HUD's kernel-time guard degrades to "—"; the rigorous
+numbers are `bench:jit`). See [`docs/jit-vectorize-design.md`](./docs/jit-vectorize-design.md).
+
+### Wire compatibility
+
+**Unchanged.** An experimental-subpath addition + an example + tests + docs. No SAB
+layout, public-API, or type change to the 1.0 core; no new runtime dependency
+(`acorn` stays a compile-time dependency confined to the JIT subtree; `wabt` stays a
+devDependency, vendored for the demo only). `connectJit` and the JIT compiler/runtime
+remain `@experimental` — they may break across patch releases until the JIT promotes.
+
+### Tests
+
+`npm run typecheck` clean; full `npm test` green (now including
+`tests/connectJit.test.ts`); `npm run bench:jit` numbers + budget PASS; the chromium
+Playwright smoke passes locally (firefox/webkit run in CI where those browsers are
+installed). Verified in a real browser: the demo reaches `complete` on the SIMD
+kernel (bytes transport), the gate reports bit-exact (ULP 0), and Force-JS reverts +
+re-enable re-upgrades.
+
+### Documentation
+
+`docs/jit-vectorize-design.md` (the connectJit shape, the source-string wiring, and
+the Module-vs-bytes / `compileWat` / barrel-import / worklet-`performance` findings);
+a README "Experimental — The Autonomous JIT" section; this changelog block; the
+`src/jit/` "What lives where" entry in `CLAUDE.md`.
+
 ## [0.9.916] — 2026-05-30
 
 ### Added — Apollo Frontier 5, Stage 2: The Autonomous JIT — characterization bench

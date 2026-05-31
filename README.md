@@ -2188,6 +2188,42 @@ The hard problem moved with the role flip. MP→SC's danger was producer-side (c
 
 > **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `SpmcRing` may break across PATCH releases until the SP→MC broadcast primitive promotes to the root. Constructing a `SpmcRing` emits a one-shot `console.warn`.
 
+### Experimental — The Autonomous JIT — `connectJit()` (0.9.917)
+
+A developer writes a **naive scalar JS** DSP kernel. The Autonomous JIT compiles it off-thread to **WASM SIMD**, proves the result **bit-exact** to the scalar source through an equivalence gate, and **live-swaps it into a running AudioWorklet click-free** — degrading to the developer's JS on every failure. `connectJit` is the one-call constructor that hides the three-realm dance.
+
+```ts
+import { connectJit } from "webgpu-audio-bridge/experimental";
+
+function softClip(out, x, drive, n) {                 // a naive scalar kernel…
+  for (let i = 0; i < n; i++) {
+    const t = Math.max(Math.min(x[i] * drive, 1), -1);
+    out[i] = 1.5 * t - 0.5 * t * t * t;
+  }
+}
+const SIGNATURE = { width: "f32", params: [
+  { name: "out", role: "output" }, { name: "x", role: "input" },
+  { name: "drive", role: "scalar" }, { name: "n", role: "length" } ] };
+
+// MAIN thread: allocate the shared memory, snapshot kernel.toString(), get payloads.
+const jit = connectJit({ kernel: softClip, signature: SIGNATURE, maxBlock: 128, sampleRate: ctx.sampleRate });
+const node = new AudioWorkletNode(ctx, "my-jit-proc", { processorOptions: jit.processorOptions });
+const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+jit.bind({ worker, workletPort: node.port, callbacks: { onUpgrade, onFallback } });
+jit.requestCompile();    // worklet silently upgrades to SIMD when it lands; jit.forceJs() reverts
+```
+
+Three realms, three entry points (one file): `connectJit(spec)` (main), `runJitCompile(request, { compileWat })` (the background **compile worker** — runs the compiler + the gate, ships only `accepted` kernels), and `createJitConsumer` + `handleJitInstallMessage` (the **AudioWorklet** — reconstructs the JS fallback from the source string and installs the SIMD kernel between quanta). The split mirrors `connectFanIn`. Key facts:
+
+- **The kernel crosses as a SOURCE STRING, not a closure** (a closure can't `postMessage`) — the same source drives the SIMD compile, the gate's third oracle, and the live JS fallback.
+- **The gate is the safety boundary, end to end.** A rejected / unsupported verdict ships nothing; the worklet keeps playing JS (`onFallback`).
+- **Transport: bytes by default, Module opt-in.** A `WebAssembly.Module` can *silently* fail to deserialize into an AudioWorklet realm (an async `messageerror`, not a send-time throw), so `forwardCompileResponse` defaults to the universally-cloneable bytes (compiled synchronously in µs); `transport: "module"` is opt-in for Worker destinations.
+- **Graceful degrade is the floor.** No isolation / no WASM-SIMD+threads ⇒ `jitEnabled` is false, installs are no-ops, audio stays on JS forever. `connectJit` never throws on an unsupported host.
+
+Live demo: `npm run dev:jit-vectorize` (`examples/jit-vectorize/`, port 5185 — a naive cubic waveshaper silently upgrading to SIMD mid-playback with zero audible glitch). Speedups + the swap-glitch / quantum-budget numbers: `npm run bench:jit` (3.8×–9.2×). Design note: [`docs/jit-vectorize-design.md`](./docs/jit-vectorize-design.md).
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectJit` + the JIT compiler/runtime may break across PATCH releases until the JIT promotes to the root. The compilable sub-language is documented by the gate (one counted loop, affine array loads, the `Math.min`/`max`/`abs`/`sqrt`/`floor`/`ceil`/`trunc` whitelist). `compileKernel` requires an injected `compileWat` (WAT→bytes); the zero-runtime-dep core ships no encoder — tests/bench inject wabt, the demo vendors it. A one-shot `console.warn` fires on first compile.
+
 ## What this is, and what it isn't
 
 **This is, and remains, an SAB-first library.** Turbo mode (`Bridge<S>` over `SharedArrayBuffer` + `Atomics`) is the canonical path. The 0.8.x `MessageChannelBridge<S>` is a deliberate explicit second tier with documented worse latency — **not a transparent fallback**. The library will never auto-detect the user's environment and silently pick a transport for them; the choice between `Bridge<S>` and `MessageChannelBridge<S>` is explicit at construction time. See [Two transport tiers](#two-transport-tiers-070) for the framing, [Browser support matrix](#browser-support-matrix) for what works where, and the §FAQ entry "Will the library add a transparent fallback?" (0.7.9) for the long-form answer.
