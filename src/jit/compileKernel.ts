@@ -27,7 +27,8 @@ import { vectorize, type VectorizedKernelPlan } from "./vectorize.js";
 import { emitScalarModule, emitSimdModule } from "./emitKernelWat.js";
 import { buildCorpus, type CorpusOptions } from "./corpus.js";
 import { runGate, type CompileWat, type GateReport } from "./gate.js";
-import { type KernelSignature, type LaneWidth } from "./ir.js";
+import { type IrKernel, type KernelSignature, type LaneWidth } from "./ir.js";
+import { validateTokens, type KernelToken } from "./kernelGrammar.js";
 
 export interface CompileKernelOptions {
   /** Injected WAT→bytes compiler (wabt in tests/build; a binary encoder in the
@@ -40,6 +41,27 @@ export interface CompileKernelOptions {
   /** f32 ULP budget for the gate (default 0 — v1 is bit-exact). */
   readonly maxUlpF32?: number;
 }
+
+/** Options for the IR back-half (`compileIr`) and the token entry (`compileTokens`).
+ *  The width is NOT here — it is carried by the IR (`ir.width` / `ir.signature`),
+ *  already resolved by lowering / token validation. */
+export interface CompileIrOptions {
+  readonly compileWat: CompileWat;
+  readonly exportName?: string;
+  readonly corpus?: CorpusOptions;
+  /** f32 ULP budget for the gate (default 0 — v1 is bit-exact). */
+  readonly maxUlpF32?: number;
+  /** The user's JS source, used ONLY as the gate's THIRD oracle (catches a faulty
+   *  LOWERING — scalar WASM ≠ source). N/A on the IR/token path: there the IR IS
+   *  the spec and SIMD≡scalar is the safety, so leave it undefined. Threaded only
+   *  from the legacy `compileKernel(source)` entry. */
+  readonly jsSource?: string;
+}
+
+/** Options for the token entry (`compileTokens`). Identical to `CompileIrOptions`
+ *  minus `jsSource` (the token path has no separate JS author — the IR is the
+ *  spec). */
+export type CompileTokensOptions = Omit<CompileIrOptions, "jsSource">;
 
 export type CompileResult =
   | {
@@ -79,7 +101,7 @@ export function compileKernel(
   const exportName = opts.exportName ?? "kernel";
 
   // parse + lower/validate — rejection is a value, not an exception.
-  let ir;
+  let ir: IrKernel;
   try {
     const program = parseProgram(source);
     ir = lowerKernel(program, sig);
@@ -88,6 +110,31 @@ export function compileKernel(
     throw err;
   }
 
+  // The user's source is the gate's THIRD oracle on this (JS) path only.
+  return compileIr(ir, {
+    compileWat: opts.compileWat,
+    exportName,
+    corpus: opts.corpus,
+    maxUlpF32: opts.maxUlpF32,
+    jsSource: source,
+  });
+}
+
+/**
+ * The IR back-half of the pipeline (Apollo Frontier 6, Stage 1): vectorize → emit
+ * scalar + SIMD WAT → equivalence gate → accepted SIMD bytes. Shared by the legacy
+ * `compileKernel(source)` front-half (parse → lower) and the token front-half
+ * (`compileTokens` / the kernel grammar). Behavior is IDENTICAL to the pre-Stage-1
+ * inline block — `compileKernel` is now `parse → lower → compileIr`.
+ *
+ * The width + signature ride in `ir` (resolved by lowering or token validation), so
+ * there is no width override here. `opts.jsSource` is the gate's THIRD oracle — pass
+ * it ONLY from `compileKernel(source)`; on the IR/token path the IR is the spec, so
+ * leave it undefined (SIMD≡scalar is the safety).
+ */
+export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
+  const exportName = opts.exportName ?? "kernel";
+
   // vectorize — surfaces v1-non-emittable shapes as `unsupported` (→ JS fallback).
   const vec = vectorize(ir, exportName);
   if (!vec.ok) return { status: "unsupported", reason: vec.reason };
@@ -95,8 +142,8 @@ export function compileKernel(
   const scalarWat = emitScalarModule(ir, exportName);
   const simdWat = emitSimdModule(ir, exportName);
 
-  const corpus = buildCorpus(sig, opts.corpus);
-  const gate = runGate({ ir, scalarWat, simdWat, corpus, compileWat: opts.compileWat, jsSource: source, maxUlpF32: opts.maxUlpF32 });
+  const corpus = buildCorpus(ir.signature, opts.corpus);
+  const gate = runGate({ ir, scalarWat, simdWat, corpus, compileWat: opts.compileWat, jsSource: opts.jsSource, maxUlpF32: opts.maxUlpF32 });
 
   if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
   if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
@@ -104,4 +151,36 @@ export function compileKernel(
   // accepted — produce the deliverable SIMD bytes.
   const wasm = opts.compileWat(simdWat, "simd");
   return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate };
+}
+
+/**
+ * The TOKEN entry (Apollo Frontier 6, Stage 1): a kernel grammar token stream →
+ * `CompileResult`. Runs the SYNTAX gate (`validateTokens`, gate #1 of 3); on
+ * success compiles the validated IR through `compileIr` (gate #2, equivalence).
+ * Rejection is a VALUE, mirroring `compileKernel`.
+ *
+ * A syntax failure is surfaced as `rejected-source` with an `E_TOKENS` diagnostic
+ * — the bridge from the grammar's `{ error, at? }` shape (a token index, no source
+ * line/col) to the compiler's closed `Diagnostic` shape. The token index is folded
+ * into the message (line/col are 0; the token stream has no source location).
+ *
+ * No `jsSource`: the token stream IS the spec, so the gate's SIMD≡scalar check is
+ * the whole safety. The emitted JS fallback (`emitJsKernel`) is a DERIVATIVE of the
+ * IR, not an independent author, so it is not used as the third oracle here.
+ */
+export function compileTokens(
+  tokens: ReadonlyArray<KernelToken>,
+  opts: CompileTokensOptions,
+): CompileResult {
+  const v = validateTokens(tokens);
+  if (!v.ok) {
+    const message = v.at !== undefined ? `${v.error} (at token ${v.at})` : v.error;
+    return { status: "rejected-source", diagnostic: { code: "E_TOKENS", message, line: 0, col: 0 } };
+  }
+  return compileIr(v.ir, {
+    compileWat: opts.compileWat,
+    exportName: opts.exportName,
+    corpus: opts.corpus,
+    maxUlpF32: opts.maxUlpF32,
+  });
 }

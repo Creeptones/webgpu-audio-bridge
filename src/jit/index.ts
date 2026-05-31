@@ -11,8 +11,10 @@
  * may change before promotion, mirroring SpscRing internal@0.6.8 → public@0.6.10.
  */
 
-export { compileKernel } from "./compileKernel.js";
-export type { CompileKernelOptions, CompileResult } from "./compileKernel.js";
+export { compileKernel, compileIr, compileTokens } from "./compileKernel.js";
+export type {
+  CompileKernelOptions, CompileIrOptions, CompileTokensOptions, CompileResult,
+} from "./compileKernel.js";
 
 export type { CompileWat, GateReport, GateStatus, GateMismatch } from "./gate.js";
 export { runGate } from "./gate.js";
@@ -44,6 +46,16 @@ export {
 } from "./kernelGrammar.js";
 export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "./kernelGrammar.js";
 
+// ── Stage-1 compile pipeline: IR→JS emitter + content-addressed cache ────────
+// `emitJsKernel` inverts `lower.ts` (IR → naive scalar JS — the worklet fallback
+// for the token path). `KernelCache.getOrCompile` content-addresses + characterizes
+// (gate-verifies) a token stream, returning a cached kernel instantly on a repeat.
+export { emitJsKernel } from "./emitJsKernel.js";
+export { KernelCache } from "./kernelCache.js";
+export type {
+  CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult,
+} from "./kernelCache.js";
+
 // ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
 export { JitKernelSwap } from "./JitKernelSwap.js";
 export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum } from "./JitKernelSwap.js";
@@ -59,6 +71,7 @@ export {
 } from "./connectJit.js";
 export type {
   ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection,
-  JitWorkletOptions, JitCompileRequest, JitCompileResponse, JitInstallMessage,
-  JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions,
+  JitWorkletOptions, JitCompileRequest, JitCompileRequestBase, JitCompileResponse,
+  JitInstallMessage, JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome,
+  ForwardOptions,
 } from "./connectJit.js";

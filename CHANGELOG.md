@@ -4,6 +4,111 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.919] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 1: the model-free compile pipeline + content-addressed characterized cache
+
+Stage 0 shipped the closed token grammar (codec + syntax validator + content hash).
+Stage 1 turns that grammar into a working **tokens → IR → gate → install → audio**
+pipeline with a **content-addressed characterized cache** — still model-free (a
+hand-authored palette is the SLM stand-in). All additive, experimental-subpath,
+wire-compat unchanged.
+
+- **`compileIr(ir, opts)`** (`src/jit/compileKernel.ts`) — the IR back-half of the
+  compiler (vectorize → emit scalar + SIMD WAT → equivalence gate → accepted SIMD
+  bytes), extracted from `compileKernel` so the JS front-half (`parse → lower`) and
+  the new token front-half share one gate. `compileKernel(source)` is now exactly
+  `parse → lower → compileIr(ir, { jsSource: source })` — **byte-for-byte
+  behavior-preserving** (JitCompiler pin 8 determinism + pin 10 import-graph intact).
+  The width rides in the IR; `jsSource` (the gate's third oracle) is threaded ONLY
+  from the JS path.
+- **`compileTokens(tokens, opts)`** — the token entry: the SYNTAX gate
+  (`validateTokens`, gate #1 of 3) then `compileIr` (gate #2, equivalence). Rejection
+  is a VALUE: a syntax failure is surfaced as `rejected-source` with a new
+  **`E_TOKENS`** diagnostic (added to the closed `DiagnosticCode` enum — the bridge
+  from the grammar's `{ error, at? }` to the compiler's `Diagnostic` shape; the token
+  index rides in the message, line/col are 0). No `jsSource` — the token stream IS
+  the spec, so SIMD≡scalar is the whole safety.
+- **`emitJsKernel(ir)`** (`src/jit/emitJsKernel.ts`) — inverts `lower.ts` (IR → naive
+  scalar JS), the worklet FALLBACK for the token path. Faithfulness is load-bearing
+  (it keeps the hot-swap fade transparent), so it preserves the IR exactly: full
+  parenthesization (the (NR) no-reassociation tree shape), shortest round-trip number
+  formatting, and reserved-word-safe name aliasing (a grammar-valid name like an
+  input array `in` is a JS keyword — both kernels are called POSITIONALLY, so aliasing
+  local names is invisible to the runtime). JS has no negative numeric literal, so
+  `const(-1)` emits as `-1` and re-lowers to `neg(const(1))` — numerically identical;
+  the round-trip pin folds `neg(const c) ↔ const(-c)` and is otherwise exact.
+- **`KernelCache` / `CharacterizedKernel`** (`src/jit/kernelCache.ts`) — the
+  content-addressed characterized-kernel cache. `getOrCompile(tokens, { compileWat })`
+  validates → `kernelHash`es the canonical IR → **hit returns the same object
+  instantly (no recompile)**; a miss gate-verifies via `compileIr`, characterizes
+  (`hash`, canonical `tokens`, `signature`, `gate`, `wasm`, `jsSource`; `acoustic` is
+  RESERVED for Stage 2), and stores. Pure + Node-testable (no I/O / clock / random);
+  rejection is a value and is not cached. This is the exact object a Stage-3 SLM
+  worker calls.
+- **`connectJit({ tokens, signature, … })`** — the token path alongside the existing
+  `{ kernel }`. It synthesizes the worklet fallback via
+  `emitJsKernel(tokensToKernel(tokens))` and ships a discriminated
+  `{ kind: "tokens" }` compile request; `runJitCompile` branches `"tokens"` →
+  `compileTokens`, `"js"`/absent → `compileKernel` (unchanged). `JitCompileRequest`
+  is now a discriminated union over `kind` (the JS arm's `kind` is optional, so the
+  pre-Frontier-6 request shape is still valid). The `{ kernel }` path is 100% intact.
+
+### Why — prove the model-free chain end-to-end before any model
+
+The Frontier-6 bet is that a closed grammar + constrained decoding makes an untrusted
+emitter unable to produce invalid IR, and the equivalence gate makes the accepted
+kernel safe to run. Stage 1 wires the *whole chain* a future small model will drive —
+tokens in, gate-proven click-free audio out — with a deterministic palette in the
+model's seat, so the SLM (Stage 3) swaps only the emitter, never the plumbing. The
+content-addressed cache makes a repeated kernel free (compile is ~1.5 ms per
+`bench:jit`); `emitJsKernel`'s structural faithfulness is what keeps the swap fade
+transparent on the token path (no separate JS author exists there).
+
+### Wire compatibility
+
+**Unchanged.** Experimental-subpath additions only — new symbols under
+`webgpu-audio-bridge/experimental` (`compileIr`, `compileTokens`, `emitJsKernel`,
+`KernelCache`, `CharacterizedKernel`, the option/result types), one additive enum
+member (`E_TOKENS`), and a backward-compatible `JitCompileRequest` discriminant
+(`kind?` defaults to the JS shape). No SAB layout / 1.0-core API / type change, no new
+runtime dependency (the token path stays acorn-free — the JitCompiler import-graph
+guard is intact). `@experimental`: the existing one-shot construction warnings cover
+the surface; these APIs are outside the 1.0 stability contract until they soak +
+promote. Patch-level per the versioning policy.
+
+### Tests
+
+- **`tests/compileTokens.test.ts`** (new, registered in `test` + `test:unit`) — pins
+  1–4 through REAL wabt over a 6-kernel palette (gain, hard-clip with a negative
+  const, cubic soft-clip, ring-mod of two inputs, crossfade mix, abs rectify-scale):
+  (1) every kernel compiles `accepted`, gate bit-exact (worst ULP 0), and the
+  accepted SIMD bytes re-run; (2) an out-of-grammar stream → `rejected-source`
+  `E_TOKENS`; (3) the cache — hit returns the SAME object with `cached:true` and does
+  NOT invoke `compileWat` (compile-count probe), a distinct kernel grows the store, a
+  rejected stream is not cached; (4) the `emitJsKernel` IR→JS→IR round-trip is exact
+  by `kernelKey` (neg-const folded).
+- **`tests/connectJit.test.ts`** — new pin G: `connectJit({ tokens })` synthesizes the
+  JS fallback, ships a `{ kind: "tokens" }` request, and the f64 stream upgrades to
+  SIMD bit-exactly through the same forward → install wiring. Pins A–F unchanged-green
+  (A narrows the now-union request).
+- Full `npm test` green (incl. JitCompiler pin 8 determinism + pin 10 import-graph,
+  connectJit, kernelGrammar, the concurrent stress suites). `npm run typecheck` clean.
+  `npm run bench` push/pull/pullLatest within the ~1.20 µs baseline + 10 µs hard
+  budget (the tight-budget `trajEval (fast)` micro-cell flaked at 1.30 µs vs 1.25 µs
+  — a pre-documented machine-load flake unrelated to grammar/cache work; `trajectory.
+  ts` is untouched). `npm run bench:jit` nominal (compile ~1.5 ms, install ~3.2 µs,
+  glitch ≈0).
+
+### Documentation
+
+- **`docs/frontier6-grammar-design.md`** — the Frontier-6 design note (grammar shape,
+  postfix/constrained-decoding rationale, the characterized-hash message format, the
+  three-gate stack, stateless-now/stateful-palette-later), the analogue of
+  `docs/jit-vectorize-design.md`.
+- **`CLAUDE.md`** "What lives where" — extended the `src/jit/` entry with
+  `kernelGrammar.ts` + `compileIr`/`compileTokens`/`emitJsKernel`/`KernelCache`.
+
 ## [0.9.918] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 0: the canonical kernel grammar (codec + syntax validator + content hash)

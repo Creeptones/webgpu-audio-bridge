@@ -75,7 +75,9 @@ import {
   type KernelSignature, type LaneWidth,
   ELEM_BYTES, signatureWidth, paramsByRole,
 } from "./ir.js";
-import { compileKernel, type CompileResult } from "./compileKernel.js";
+import { compileKernel, compileTokens, type CompileResult } from "./compileKernel.js";
+import { emitJsKernel } from "./emitJsKernel.js";
+import { tokensToKernel, type KernelToken } from "./kernelGrammar.js";
 import { type CompileWat, type GateReport } from "./gate.js";
 import {
   JitKernelConsumer, type JitJsKernel, type JitProcessResult,
@@ -91,13 +93,25 @@ import { hasWasmConsumerSupport, hasWasmThreads } from "../worklet/wasmSimdSuppo
  *  realm. */
 export type ConnectJitKernel = (...args: never[]) => void;
 
-/** The declarative spec passed to `connectJit()` on the main thread. */
+/** The declarative spec passed to `connectJit()` on the main thread. Provide
+ *  EXACTLY ONE source of the kernel: a JS `kernel` function (the Frontier-5 path)
+ *  OR a `tokens` stream (the Frontier-6 kernel-grammar path). */
 export interface ConnectJitSpec {
   /** The developer's naive scalar JS DSP kernel. `connectJit` snapshots
-   *  `kernel.toString()` and ships the SOURCE to both off-thread realms. */
-  readonly kernel: ConnectJitKernel;
+   *  `kernel.toString()` and ships the SOURCE to both off-thread realms. Mutually
+   *  exclusive with `tokens`. */
+  readonly kernel?: ConnectJitKernel;
+  /** A kernel-grammar token stream (Apollo Frontier 6). `connectJit` synthesizes
+   *  the worklet JS fallback via `emitJsKernel(tokensToKernel(tokens))` and ships a
+   *  `{ kind: "tokens" }` compile request; the compile worker runs `compileTokens`
+   *  (the syntax gate + the equivalence gate). Mutually exclusive with `kernel`.
+   *  The stream is self-contained (its `param` tokens carry the signature); the
+   *  `signature` field below MUST be consistent with it (same names + order — the
+   *  consumer calls both kernels positionally in `signature` order). */
+  readonly tokens?: ReadonlyArray<KernelToken>;
   /** The kernel I/O shape (the same `KernelSignature` `compileKernel` takes).
-   *  Plain data — clone-safe; travels in both payloads. */
+   *  Plain data — clone-safe; travels in both payloads. On the token path it must
+   *  match the stream's embedded signature. */
   readonly signature: KernelSignature;
   /** Maximum block size `n` per quantum (sizes every scratch slab). E.g. 128. */
   readonly maxBlock: number;
@@ -135,14 +149,21 @@ export interface JitWorkletOptions {
   readonly exportName: string;
 }
 
-/** The message the main thread posts to the compile worker to start a compile. */
-export interface JitCompileRequest {
+/** Fields common to both compile-request variants. */
+export interface JitCompileRequestBase {
   readonly type: "jit-compile";
-  readonly source: string;
   readonly signature: KernelSignature;
   readonly width?: LaneWidth;
   readonly exportName: string;
 }
+
+/** The message the main thread posts to the compile worker to start a compile. A
+ *  discriminated union over `kind`: the JS-source path (`kind` absent or `"js"` —
+ *  backward-compatible with the pre-Frontier-6 shape) carries `source`; the
+ *  kernel-grammar path (`kind: "tokens"`) carries `tokens`. */
+export type JitCompileRequest =
+  | (JitCompileRequestBase & { readonly kind?: "js"; readonly source: string })
+  | (JitCompileRequestBase & { readonly kind: "tokens"; readonly tokens: ReadonlyArray<KernelToken> });
 
 /** The compile worker's reply (worker → main). On `accepted` it carries BOTH a
  *  compiled `Module` (the preferred transport) and the raw `bytes` (the universal
@@ -268,8 +289,12 @@ function isSharedMemory(memory: WebAssembly.Memory): boolean {
  * `jitEnabled === false`).
  */
 export function connectJit(spec: ConnectJitSpec): JitConnection {
-  if (typeof spec.kernel !== "function") {
-    throw new TypeError("connectJit(): spec.kernel must be a function");
+  const hasKernel = typeof spec.kernel === "function";
+  const hasTokens = Array.isArray(spec.tokens);
+  if (hasKernel === hasTokens) {
+    throw new TypeError(
+      "connectJit(): provide exactly one of { kernel } (a function) or { tokens } (a kernel-grammar stream)",
+    );
   }
   if (!Number.isInteger(spec.maxBlock) || spec.maxBlock <= 0) {
     throw new RangeError(`connectJit(): maxBlock must be a positive integer, got ${spec.maxBlock}`);
@@ -286,7 +311,22 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   const exportName = spec.exportName ?? "kernel";
   const width = spec.width ?? signatureWidth(spec.signature);
   const signature: KernelSignature = spec.width ? { ...spec.signature, width } : spec.signature;
-  const kernelSource = spec.kernel.toString();
+
+  // Resolve the kernel SOURCE (shipped to both off-thread realms) + the compile
+  // request from whichever input was given. On the token path the worklet fallback
+  // is synthesized by inverting the IR (`emitJsKernel`); `tokensToKernel` throws on
+  // a malformed stream — a construction-time programmer error, like a non-function
+  // kernel. The gate, not this, is the equivalence boundary.
+  let kernelSource: string;
+  let compileRequest: JitCompileRequest;
+  if (hasTokens) {
+    const tokens = spec.tokens!;
+    kernelSource = emitJsKernel(tokensToKernel(tokens));
+    compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName };
+  } else {
+    kernelSource = spec.kernel!.toString();
+    compileRequest = { type: "jit-compile", kind: "js", source: kernelSource, signature, width, exportName };
+  }
 
   // Allocate the working memory unless the caller adopts one. Shared when the host
   // is isolated; otherwise a non-shared memory so the JS-only degrade path still
@@ -304,9 +344,6 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   const processorOptions: JitWorkletOptions = {
     memory, kernelSource, signature,
     maxBlock: spec.maxBlock, sampleRate: spec.sampleRate, windowSeconds, baseOffset, exportName,
-  };
-  const compileRequest: JitCompileRequest = {
-    type: "jit-compile", source: kernelSource, signature, width, exportName,
   };
 
   let boundWorker: JitMessageSource | null = null;
@@ -370,11 +407,18 @@ export async function runJitCompile(
   request: JitCompileRequest,
   opts: { compileWat: CompileWat },
 ): Promise<JitCompileResponse> {
-  const result: CompileResult = compileKernel(request.source, request.signature, {
-    compileWat: opts.compileWat,
-    width: request.width,
-    exportName: request.exportName,
-  });
+  // Branch on the request kind: `"tokens"` runs the kernel-grammar pipeline
+  // (`compileTokens` = syntax gate → equivalence gate); the JS path (`"js"`/absent)
+  // is unchanged (`compileKernel`). Either way the verdict is a value and only an
+  // `accepted` result ships. On the token path the width rides in the stream, so no
+  // width override is applied.
+  const result: CompileResult = request.kind === "tokens"
+    ? compileTokens(request.tokens, { compileWat: opts.compileWat, exportName: request.exportName })
+    : compileKernel(request.source, request.signature, {
+        compileWat: opts.compileWat,
+        width: request.width,
+        exportName: request.exportName,
+      });
 
   if (result.status !== "accepted") {
     const detail =

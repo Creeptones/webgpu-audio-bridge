@@ -25,6 +25,10 @@
  *      fired with transport "module").
  *   F  graceful degrade: a NON-shared memory → jitEnabled false → install is a
  *      no-op → output stays pure JS.
+ *   G  the TOKEN path (Apollo Frontier 6): connectJit({ tokens }) synthesizes the
+ *      JS fallback by inverting the IR (emitJsKernel), ships a { kind: "tokens" }
+ *      request, runJitCompile runs compileTokens, and the f64 stream upgrades to
+ *      SIMD bit-exactly through the same forward → install wiring.
  *
  * `tsx` script; `assert`/`assertEq`/`ok` from `_assert.ts`. No framework.
  */
@@ -36,7 +40,11 @@ import {
   createJitConsumer, handleJitInstallMessage, jitMemoryPages,
   type JitCompileResponse, type JitInstallMessage, type JitPostTarget, type JitMessageSource,
 } from "../src/jit/connectJit.js";
-import { type KernelSignature, type LaneWidth } from "../src/jit/ir.js";
+import { kernelToTokens, tokensToKernel, emitJsKernel } from "../src/jit/index.js";
+import {
+  type KernelSignature, type LaneWidth,
+  type IrKernel, type IrNode, type IrStore, type KernelParam, type ParamRole, type LoopBound,
+} from "../src/jit/ir.js";
 import { hasWasmConsumerSupport } from "../src/worklet/wasmSimdSupport.js";
 
 // ── wabt-backed compileWat (identical to the rest of the JIT suite) ──────────
@@ -78,6 +86,24 @@ const REJECTED = {
   src: "function k(out, x, n){ for (let i = 0; i < n; i++) { out[i] = Math.sin(x[i]); } }",
 };
 
+// A TOKEN kernel (Apollo Frontier 6 grammar path): f64 gain out[i] = x[i] * g.
+// f64 so the swap fades exact-lerp bit-exact to the JS fallback at every phase.
+const TOKEN_GAIN = (() => {
+  const P = (name: string, role: ParamRole): KernelParam => ({ name, role });
+  const L = (array: string): IrNode => ({ kind: "load", array, stride: 1, intercept: 0 });
+  const Sc = (name: string): IrNode => ({ kind: "scalar", name });
+  const bound: LoopBound = { kind: "param", name: "n" };
+  const store: IrStore = { array: "out", stride: 1, intercept: 0, value: { kind: "binary", op: "mul", a: L("x"), b: Sc("g") } };
+  const params = [P("n", "length"), P("out", "output"), P("x", "input"), P("g", "scalar")];
+  const ir: IrKernel = { width: "f64", bound, stores: [store], signature: { params, width: "f64" } };
+  return {
+    width: "f64" as LaneWidth,
+    sig: { params, width: "f64" } as KernelSignature,
+    tokens: kernelToTokens(ir),
+    scalars: { g: 0.75 },
+  };
+})();
+
 // ── A fake compile worker: main `postMessage`s a request; it runs runJitCompile
 //    and delivers the response back through `onmessage` on the next microtask
 //    (mirrors the async worker→main hop). ───────────────────────────────────────
@@ -117,8 +143,10 @@ function testShape(): void {
   assertEq(c.processorOptions.baseOffset, 16, "A: default baseOffset 16");
   assertEq(c.processorOptions.exportName, "kernel", "A: default exportName");
   assertEq(c.compileRequest.type, "jit-compile", "A: compileRequest type");
-  assertEq(c.compileRequest.source, kernel.toString(), "A: compileRequest carries source");
-  assertEq(c.compileRequest.width, "f32", "A: compileRequest width from signature");
+  const req = c.compileRequest;
+  assert(req.kind !== "tokens", "A: the { kernel } path produces the js compile-request variant");
+  assertEq(req.source, kernel.toString(), "A: compileRequest carries source");
+  assertEq(req.width, "f32", "A: compileRequest width from signature");
 
   // In an isolated host (Node has SAB + threads) the memory is shared and the JIT
   // is enabled; on a host without SIMD/threads it would be a no-op (jitEnabled false).
@@ -313,12 +341,66 @@ async function testDegrade(): Promise<void> {
   ok("F: graceful degrade over non-shared memory");
 }
 
+// ── G: the TOKEN path end-to-end (Apollo Frontier 6) ──────────────────────────
+async function testTokenEndToEnd(): Promise<void> {
+  // Shape: { tokens } synthesizes the JS fallback by inverting the IR, and the
+  // compile request is the tokens variant.
+  const c = connectJit({ tokens: TOKEN_GAIN.tokens, signature: TOKEN_GAIN.sig, maxBlock: N, sampleRate: SR });
+  assertEq(c.kernelSource, emitJsKernel(tokensToKernel(TOKEN_GAIN.tokens)), "G: kernelSource = emitJsKernel(tokensToKernel(tokens))");
+  assertEq(c.compileRequest.kind, "tokens", "G: compileRequest is the tokens variant");
+  assert(c.compileRequest.kind === "tokens" && c.compileRequest.tokens.length === TOKEN_GAIN.tokens.length, "G: request carries the tokens");
+
+  if (!hasWasmConsumerSupport() || !c.jitEnabled) { ok("G: token path shape OK; e2e skipped (jit not enabled on host)"); return; }
+
+  const worker = new FakeWorker();
+  const port = new FakePort();
+  let upgradeTransport = "";
+  let fellBack = false;
+  c.bind({ worker, workletPort: port, callbacks: { onUpgrade: (t) => { upgradeTransport = t; }, onFallback: () => { fellBack = true; } } });
+  c.requestCompile();
+  await flush();
+
+  assertEq(fellBack, false, "G: a compilable token kernel does not fall back");
+  assertEq(upgradeTransport, "bytes", "G: onUpgrade fired (bytes transport)");
+  assertEq(port.posted.length, 1, "G: one install message reached the port");
+  const installMsg = port.posted[0]!;
+  assertEq((installMsg as JitInstallMessage).type, "jit-install", "G: it's a jit-install");
+
+  // Worklet-side consumer from the SAME processorOptions; install + run quanta.
+  const consumer = createJitConsumer(c.processorOptions);
+  assertEq(consumer.jitEnabled, true, "G: consumer jitEnabled over the shared memory");
+
+  const x = new Float64Array(N);
+  for (let i = 0; i < N; i++) x[i] = Math.sin(0.019 * i + 0.3);
+  const g = TOKEN_GAIN.scalars.g;
+  const jsRef = new Float64Array(N);
+  for (let i = 0; i < N; i++) jsRef[i] = x[i]! * g; // f64 exact
+
+  const QUANTA = 12;
+  let sawSimdComplete = false;
+  for (let q = 0; q < QUANTA; q++) {
+    if (q === 1) {
+      const outcome = handleJitInstallMessage(consumer, installMsg);
+      assertEq(outcome.installed, true, "G: install armed the swap");
+    }
+    const out = new Float64Array(N);
+    const baseNs = (q * N / SR) * 1e9;
+    const r = consumer.process({ x }, TOKEN_GAIN.scalars, { out }, N, baseNs);
+    for (let i = 0; i < N; i++) assertEq(out[i]!, jsRef[i]!, `G: q${q} sample ${i} bit-exact to JS gain reference`);
+    if (r.phase === "complete" && r.ranSimd) sawSimdComplete = true;
+  }
+  assert(sawSimdComplete, "G: the swap reached complete on the SIMD kernel");
+  c.dispose();
+  ok("G: token path bind → compileTokens → forward → install → bit-exact SIMD upgrade");
+}
+
 async function main(): Promise<void> {
   testShape();
   await testRunCompile();
   await testTransport();
   await testEndToEnd();
   await testDegrade();
+  await testTokenEndToEnd();
   console.log("\nconnectJit: all pins passed.");
 }
 

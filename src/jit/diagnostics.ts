@@ -7,9 +7,11 @@
  * program outside the sub-language is REJECTED, never silently mis-compiled
  * (the silent-mis-compile guard the Stage-0 probe's SCENARIO C pins).
  *
- * The codes mirror `docs/frontier5-jit-semantics.md` §3 one-for-one. Each is
- * exercised by a pin in `tests/JitCompiler.test.ts` and by the in-CI fuzzer's
- * reject half (`tests/JitCompiler.interleaving.test.ts`).
+ * The Frontier-5 codes mirror `docs/frontier5-jit-semantics.md` §3 one-for-one.
+ * Each is exercised by a pin in `tests/JitCompiler.test.ts` and by the in-CI
+ * fuzzer's reject half (`tests/JitCompiler.interleaving.test.ts`). The Frontier-6
+ * addition `E_TOKENS` (the kernel-grammar syntax-gate bridge) is pinned in
+ * `tests/compileTokens.test.ts`.
  */
 
 export type DiagnosticCode =
@@ -26,7 +28,8 @@ export type DiagnosticCode =
   | "E_NONFINITE_LITERAL" // NaN / Infinity / non-finite literal baked into the source
   | "E_SHAPE"             // not one counted for(let i=0;i<bound;i++){…}; signature/body mismatch
   | "E_TRANSCENDENTAL"    // Math.sin/cos/tan/exp/log/pow/atan2/… — no SIMD intrinsic, no exact lowering
-  | "E_PARSE";            // acorn failed to parse the source as JavaScript
+  | "E_PARSE"             // acorn failed to parse the source as JavaScript
+  | "E_TOKENS";           // kernel-grammar token stream failed the SYNTAX gate (validateTokens); Frontier 6 Stage 1
 
 /** A precise, machine-stable rejection. `line`/`col` are 1-based acorn locations
  *  (0 when the offending construct has no source location, e.g. a signature

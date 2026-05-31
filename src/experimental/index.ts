@@ -150,8 +150,9 @@ export {
 } from "../jit/index.js";
 export type {
   ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection,
-  JitWorkletOptions, JitCompileRequest, JitCompileResponse, JitInstallMessage,
-  JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions,
+  JitWorkletOptions, JitCompileRequest, JitCompileRequestBase, JitCompileResponse,
+  JitInstallMessage, JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome,
+  ForwardOptions,
 } from "../jit/index.js";
 
 // ── The kernel grammar (0.9.918, Apollo Frontier 6, Stage 0) ─────────────────
@@ -169,3 +170,21 @@ export {
   kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens,
 } from "../jit/index.js";
 export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/index.js";
+
+// ── The kernel grammar — Stage 1: compile pipeline + characterized cache ──────
+//
+// Apollo Frontier 6, Stage 1: tokens → IR → gate → install → audio, model-free.
+// `compileIr` is the IR back-half of the compiler (shared by the JS + token
+// front-halves); `compileTokens` runs the syntax gate (`validateTokens`) then
+// `compileIr` (a syntax failure surfaces as a `rejected-source` E_TOKENS
+// diagnostic). `emitJsKernel` inverts `lower.ts` (IR → naive scalar JS — the
+// worklet fallback for the token path, tree-shape + number faithful). `KernelCache`
+// content-addresses + characterizes (gate-verifies) a token stream by `kernelHash`,
+// so a repeated kernel returns instantly without recompiling — the exact object a
+// Stage-3 SLM worker calls. All additive + `@experimental`. See
+// docs/frontier6-grammar-design.md.
+export { compileIr, compileTokens, emitJsKernel, KernelCache } from "../jit/index.js";
+export type {
+  CompileIrOptions, CompileTokensOptions,
+  CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult,
+} from "../jit/index.js";
