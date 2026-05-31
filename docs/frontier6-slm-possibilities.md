@@ -1,6 +1,6 @@
 # Apollo Frontier 6 — what the Stage-3b SLM makes possible (beyond NL→hash)
 
-> Status note (2026-05-31, v0.9.923): a design exploration, not shipped code. Grounded
+> Status note (2026-05-31, v0.9.924): a design exploration, not shipped code. Grounded
 > in the model-free primitives that ARE shipped: the grammar + `legalNextTokens` mask
 > (Stage 3a), the three-gate stack, the `AcousticProfile` fingerprint + `evalReference`,
 > the content-addressed `KernelCache`, and the click-free SIMD→SIMD morph. Every claim is
@@ -23,8 +23,9 @@ NL intent → a *region* of the grammar, not a point. A rules file maps intents
 `legalNextTokens(prefix).kinds` and emits whole kernel *families* over a fixed signature
 (streams are self-contained — `param` tokens carry the I/O contract). The non-drift
 guarantee (mask = exactly what `validateTokens` won't reject, one shared `GrammarState`
-step machine) means the model **cannot** emit malformed IR. Becomes fully airtight once
-`legalNextOperands` (C1.5 / 0.9.924) masks operand choices too, not just kinds.
+step machine) means the model **cannot** emit malformed IR. Now fully airtight: `legalNextOperands` (C1.5 / 0.9.924,
+DONE) masks operand choices too, not just kinds — a decoder composing both masks cannot
+emit any token the validator would reject.
 
 ## 2. Search / retrieval / reuse — [enabled-now]
 
@@ -85,8 +86,8 @@ exact stack.
 
 ## 7. Highest-leverage next primitives (most unlock, least effort)
 
-1. **`legalNextOperands(prefix, kind)`** (C1.5 / 0.9.924, recommended next) — closes the
-   no-invalid-*token* gap; underpins all of §1–§5. Medium effort, same `GrammarState`.
+1. ~~**`legalNextOperands(prefix, kind)`** (C1.5 / 0.9.924)~~ — **DONE.** Closed the
+   no-invalid-*token* gap; underpins all of §1–§5. The next four are now the leaders.
 2. **Fingerprint-distance helper + NN query** — turns the existing profile into real
    "sounds-like" search + steering (§2, §3). Low effort.
 3. **Negative cache** (memoize gate rejections) — kills the demo's reroll waste; faster

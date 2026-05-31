@@ -332,6 +332,98 @@ export function legalNextTokens(prefix: ReadonlyArray<KernelToken>): LegalNextRe
   return { kinds: legalKinds(s), done: isAccepting(s) };
 }
 
+// ── the OPERAND mask (Stage 3a+) ────────────────────────────────────────────────
+//
+// `legalNextTokens` masks the token KIND; this masks the operand CHOICES of a given
+// kind, closing the last gap C1 left. Given a (valid) prefix and a chosen `kind`,
+// `legalNextOperands` returns the legal value-sets for that kind's operand fields:
+// enumerable fields (`width`, `param` role, `bound`/`load`/`store`/`scalar` names,
+// `unary`/`binary` op) as explicit arrays, unbounded fields (`const` value, affine
+// `stride`/`intercept`, `bound` const, the `param` name) as validity predicates the
+// decoder samples-then-checks. A decoder that masks its KIND logits with
+// `legalNextTokens` AND fills the operand from `legalNextOperands` *literally cannot*
+// emit any token `validateTokens` would reject — operand included.
+//
+// ROLE-PARTITIONED (a deliberate tightening of the validator). `validateTokens`
+// admits a `load`/`store`/`scalar`/`bound:$name` referencing ANY declared param;
+// `legalNextOperands` returns only the role-correct names (load ⊂ inputs, store ⊂
+// outputs, scalar ⊂ scalars, bound-param ⊂ lengths). This is STRICTLY SOUND — a
+// role-correct name is a declared name, so every choice still validates — and it is
+// the semantically-meaningful set an emitter actually wants (you don't load from an
+// output or take a trip count from an input array). The corpus authors role-correct
+// kernels, so the operand-soundness pin holds.
+
+/** The legal operand choices for one token kind at a prefix position. Only the
+ *  fields relevant to `kind` are populated; the rest are absent. Enumerable fields
+ *  are arrays (possibly empty ⇒ no legal token of that kind here, even if the KIND
+ *  mask admits it); unbounded fields are validity predicates. */
+export interface OperandChoices {
+  /** `width` token: the two lane widths. */
+  readonly width?: ReadonlyArray<LaneWidth>;
+  /** `param` token: the legal roles + a name-freshness predicate (fresh IDENT). */
+  readonly paramRoles?: ReadonlyArray<ParamRole>;
+  readonly nameIsFresh?: (name: string) => boolean;
+  /** `bound` token: declared length-param names usable as a trip count, plus the
+   *  const-bound option (a non-negative integer per `boundConstValid`). */
+  readonly boundParams?: ReadonlyArray<string>;
+  readonly boundConstOk?: boolean;
+  readonly boundConstValid?: (value: number) => boolean;
+  /** `load`/`store` token: the role-correct array names + affine-coefficient predicates. */
+  readonly arrays?: ReadonlyArray<string>;
+  readonly strideValid?: (n: number) => boolean;
+  readonly interceptValid?: (n: number) => boolean;
+  /** `scalar` token: the declared scalar-role names. */
+  readonly scalars?: ReadonlyArray<string>;
+  /** `const` token: a value-validity predicate (finite number). */
+  readonly constValid?: (value: number) => boolean;
+  /** `unary`/`binary` token: the legal ops. */
+  readonly ops?: ReadonlyArray<UnaryOp | BinaryOp>;
+}
+
+const ALL_WIDTHS: ReadonlyArray<LaneWidth> = ["f32", "f64"];
+const ALL_ROLES: ReadonlyArray<ParamRole> = ["input", "output", "scalar", "length"];
+const UNARY_OP_LIST = [...UNARY_OPS] as ReadonlyArray<UnaryOp>;
+const BINARY_OP_LIST = [...BINARY_OPS] as ReadonlyArray<BinaryOp>;
+const isInteger = (n: number): boolean => Number.isInteger(n);
+const isFiniteNumber = (n: number): boolean => Number.isFinite(n);
+const isBoundConst = (v: number): boolean => Number.isInteger(v) && v >= 0;
+
+/** The declared names of a given role, in declaration order. */
+function namesByRole(s: GrammarState, role: ParamRole): string[] {
+  const out: string[] = [];
+  for (const p of s.params) if (p.role === role) out.push(p.name);
+  return out;
+}
+
+/**
+ * The operand mask: the legal operand choices for `kind` at the end of `prefix`.
+ * Pure + value-returning (never throws). Returns an empty `OperandChoices` (`{}`) if
+ * the prefix is invalid OR `kind` is not itself legal here (i.e. not in
+ * `legalNextTokens(prefix).kinds`) — so a decoder can compose the two masks freely.
+ */
+export function legalNextOperands(
+  prefix: ReadonlyArray<KernelToken>,
+  kind: TokenKind,
+): OperandChoices {
+  warnOnce();
+  const s = initialState();
+  for (let i = 0; i < prefix.length; i++) {
+    if (stepGrammar(s, prefix[i]!, i)) return {}; // invalid prefix → no legal operands
+  }
+  if (!legalKinds(s).has(kind)) return {}; // the KIND itself is illegal at this position
+  switch (kind) {
+    case "width": return { width: ALL_WIDTHS };
+    case "param": return { paramRoles: ALL_ROLES, nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) };
+    case "bound": return { boundParams: namesByRole(s, "length"), boundConstOk: true, boundConstValid: isBoundConst };
+    case "load": return { arrays: namesByRole(s, "input"), strideValid: isInteger, interceptValid: isInteger };
+    case "store": return { arrays: namesByRole(s, "output"), strideValid: isInteger, interceptValid: isInteger };
+    case "scalar": return { scalars: namesByRole(s, "scalar") };
+    case "const": return { constValid: isFiniteNumber };
+    case "unary": return { ops: UNARY_OP_LIST };
+    case "binary": return { ops: BINARY_OP_LIST };
+  }
+}
+
 function checkAffine(
   what: "load" | "store", array: string, stride: number, intercept: number,
   names: ReadonlySet<string>, at: number,

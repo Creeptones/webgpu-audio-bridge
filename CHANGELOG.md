@@ -4,6 +4,75 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.924] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 3a+: `legalNextOperands` (the operand mask)
+
+The completion of the model-free safety story the Stage-3a kind-mask
+(`legalNextTokens`, 0.9.922) began. `legalNextTokens` masks which token **KINDS** may
+come next; `legalNextOperands` masks which operand **VALUES** each kind may carry — so
+a constrained decoder composing the two cannot emit *any* token `validateTokens` would
+reject, operand included. Library + tests + docs only.
+
+- **`legalNextOperands(prefix, kind) → OperandChoices`** (`src/jit/kernelGrammar.ts`),
+  derived from the SAME `GrammarState` step machine `validateTokens`/`legalNextTokens`
+  fold over (the non-drift guarantee extends to operands). For the chosen `kind` it
+  returns the legal value-set of each operand field — **enumerable** fields as arrays
+  (`width` → the two widths; `param` role → the four roles; `unary`/`binary` → the six
+  ops each; `load`/`store`/`scalar`/`bound` names → the declared params), **unbounded**
+  fields as validity predicates (`const` → finite; affine `stride`/`intercept` →
+  integer; `bound` const → non-negative integer; the `param` name → a fresh-IDENT
+  predicate). Pure + value-returning; returns `{}` when the prefix is invalid OR `kind`
+  is not itself legal here, so the two masks compose freely.
+- **Role-partitioned (a deliberate tightening).** `validateTokens` admits a
+  `load`/`store`/`scalar`/`bound:$name` referencing ANY declared param;
+  `legalNextOperands` returns only the role-correct names (load ⊂ inputs, store ⊂
+  outputs, scalar ⊂ scalars, bound-param ⊂ lengths). Strictly **sound** — a role-correct
+  name is a declared name, so every choice still validates — and it is the
+  semantically-meaningful set an emitter actually wants. This yields a genuine
+  refinement over the kind mask: with no input param declared the kind mask still
+  admits `load` (value-pushers are always structurally legal), but the operand mask's
+  `arrays` is empty — there is no legal `load` token.
+- **Exports:** `legalNextOperands` + `OperandChoices` from `src/jit/index.ts` →
+  `webgpu-audio-bridge/experimental`.
+
+### Why — close the last "the emitter still picks operands" gap
+
+The kind mask proved an emitter constrained to it cannot produce a structurally-invalid
+*stream*, but it still relied on the emitter to fill operands from the declared names (a
+wrong array name / fractional stride was caught only after the fact by `validateTokens`).
+The operand mask removes that reliance: the Stage-3b SLM becomes a pure, fully-guarded
+emitter swap with **zero** ways to produce a rejected token — it reads array/scalar
+names back out of the mask rather than carrying any grammar knowledge of its own.
+
+### Wire compatibility
+
+**Unchanged.** Additive function + type on the experimental subpath. No SAB layout, no
+wire-format, no change to any existing signature (`legalNextTokens`/`validateTokens` are
+byte-for-byte unchanged). Patch-level.
+
+### Tests
+
+- **`tests/legalNextOperands.test.ts`** (5 pins, registered in `test` + `test:unit`):
+  (1) operand soundness over the Stage-0 corpus (every prefix's actual token admitted);
+  (2) the per-kind operand sets exactly — roles/widths/ops enumerations, the
+  role-partitioned names, the freshness + numeric predicates, the empty-set refinement,
+  illegal-kind/invalid-prefix → `{}`; (3) **no-invalid-TOKEN** — the strengthened
+  mask-driven emitter fills BODY operands ONLY from `legalNextOperands` (reading the
+  array/scalar names back out of the mask, hardcoding nothing), over 1000 seeds all
+  validate (652 distinct shapes); (4) broad operand soundness over 1000 random valid
+  kernels; (5) parity + barrel identity (`legalNextTokens`/`validateTokens` unchanged,
+  the `kernelHash(gain)` regression pin intact).
+- `npm run typecheck` clean; full `npm test` green; `npm run bench` push/pull/pullLatest
+  at **1.20 µs** (within the ~1.20 µs baseline + 10 µs hard budget) — `kernelGrammar.ts`
+  is not in the bench path, so bench is structurally unaffected.
+
+### Documentation
+
+- This CHANGELOG block + `docs/frontier6-grammar-design.md` (the operand-mask section) +
+  the `CLAUDE.md` `src/jit/` entry + `docs/frontier6-stage3b-handoff.md` (the next-patch
+  note).
+
 ## [0.9.923] — 2026-05-31
 
 ### Added — Apollo Frontier 6: the generative-kernels browser demo (model-free music)

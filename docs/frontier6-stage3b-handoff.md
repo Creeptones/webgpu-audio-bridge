@@ -1,8 +1,8 @@
 # Apollo Frontier 6 — post-mask handoff: the Stage-3 endgame (the SLM behind the mask)
 
-**As of:** 2026-05-31 · version **0.9.923** (Frontier 6 **Stage 3a — `legalNextTokens`, the constrained-decoder mask — shipped** at 0.9.922, commit `4e540d8`; **0.9.923 shipped `examples/kernel-generative/`**, the model-free generative demo) · branch `main`, pushed to `origin/main` · next patch **0.9.924**.
+**As of:** 2026-05-31 · version **0.9.924** (Frontier 6 **Stage 3a — `legalNextTokens`, the kind mask — shipped** at 0.9.922, commit `4e540d8`; **0.9.923 shipped `examples/kernel-generative/`**, the model-free generative demo; **0.9.924 shipped `legalNextOperands`, the OPERAND mask — Stage 3a+, C1.5 below — DONE**) · branch `main` · next patch **0.9.925**.
 
-> **Note:** the recommended next deliverable below (C1.5, `legalNextOperands`) is now **0.9.924** — 0.9.923 was spent on the generative browser demo (a showcase of the shipped mask + gates, no library change).
+> **Note:** C1.5 (`legalNextOperands`) is now **DONE at 0.9.924** — the model-free safety stack is COMPLETE (both the kind mask and the operand mask are shipped + proven). The plan section below is kept as the as-built record. **Next**: either **C2** (the Stage-3b SLM — the endgame, wants a design note first) or one of the LOW-EFFORT quick-wins from `docs/frontier6-slm-possibilities.md` (fingerprint-distance helper / negative cache / offline corpus index) as `0.9.925+`.
 
 **Supersedes** `docs/frontier6-stage3-handoff.md` (its recommended "direction C1" is now DONE). You can delete that file once you've read this one.
 
@@ -44,16 +44,18 @@ With Stage 3a done, **every model-free piece of Frontier 6 is now shipped**: the
 | | Direction | Size | Risk | Status / value |
 |---|-----------|------|------|--------|
 | ~~C1~~ | ~~Stage 3a — `legalNextTokens` (the kind mask)~~ | medium | low | **DONE (0.9.922)** |
-| **C1.5** | **Stage 3a+ — the OPERAND mask (`legalNextOperands`)** | medium | low | **recommended next** — finishes the model-free safety story: mask not just KINDS but the legal operand *choices*, so even an operand can't be invalid |
-| C2 | Stage 3b — the SLM behind the mask | large | high | the model; the true endgame. Plugs in behind C1 (+ C1.5); changes only the emitter |
+| ~~C1.5~~ | ~~Stage 3a+ — the OPERAND mask (`legalNextOperands`)~~ | medium | low | **DONE (0.9.924)** — both masks shipped; the model-free safety stack is COMPLETE |
+| **C2** | **Stage 3b — the SLM behind the mask** | large | high | the model; the true endgame. Plugs in behind C1 + C1.5 (both done); changes only the emitter. **Recommended next** (wants a design note first) |
 | D | Frontier-3 `connectFanOut()` (Stage 4.3) | medium | med | the un-built broadcast topology constructor over `SpmcRing` |
 | E | Promotions (rings + JIT/grammar/acoustic/mask subtree) → 1.0 core | small each | low | each its own deliberate patch (mirrors SpscRing internal@0.6.8 → public@0.6.10) |
 
-**Recommendation:** do **C1.5** (`legalNextOperands`) next as `0.9.924`. It is the natural completion of the model-free de-risking that C1 began: C1 proved an emitter constrained to the *kind* mask cannot produce a structurally-invalid stream, but it still relies on the emitter to fill operands from the declared names. C1.5 closes that last gap — given a prefix and a chosen kind, return the legal operand *choices* (which array names by role, which scalar names, the legal width values, the legal `bound` forms) — so a constrained decoder literally cannot emit *any* invalid token, operand included. It is medium-size, low-risk (derives from the same `GrammarState` + the role partitions already in `paramsByRole`), and it makes the Stage-3b model a pure, fully-guarded emitter swap. If you'd rather jump straight to the model, C2 is fine too — C1.5 can also be folded into the decoder's sampling loop later — but doing it first means the SLM has zero ways to produce a rejected token.
+**Recommendation:** with C1.5 now **DONE (0.9.924)**, the model-free safety stack is complete — both the kind mask and the operand mask are shipped and proven. The next deliverable is **C2** (the Stage-3b SLM, the true endgame), which now plugs in behind a fully-guarded boundary: a decoder composing `legalNextTokens` (KIND) + `legalNextOperands` (operand) literally cannot emit a token `validateTokens` would reject. C2 is large + high-risk and **wants its own design note first** (model choice, where it runs, the constrained-decoding integration). If you'd rather land a few low-effort, high-leverage primitives before the model, `docs/frontier6-slm-possibilities.md` §7 lists three (fingerprint-distance helper / negative cache / offline corpus index) — each a small extension of shipped primitives, slottable as `0.9.925+`.
 
 ---
 
-## C1.5. Stage 3a+ — `legalNextOperands(prefix, kind)` — concrete plan
+## C1.5. Stage 3a+ — `legalNextOperands(prefix, kind)` — as-built (DONE @ 0.9.924)
+
+> **Shipped at 0.9.924.** This section is retained as the as-built record. What landed matches the plan below, with one decision resolved: the bound-param set is **role-partitioned to `length`** (the "tighten" option — sound, since a length param is a declared param, and corpus-complete). The result type is `OperandChoices` (a flat object; only the chosen kind's fields are populated). Empty operand sets (e.g. `load` with no input declared) are a genuine refinement over the kind mask. Proven by `tests/legalNextOperands.test.ts` (5 pins).
 
 **The gap C1 left:** `legalNextTokens` masks the token *kind*; the operand fields (`width` value, `param` name+role, `bound` form, `load`/`store` array+stride+intercept, `scalar` name, `const` value) are still the emitter's responsibility, and a wrong operand is rejected only after the fact by `validateTokens`. For a fully-guarded decoder the operand choices must be masked too.
 
@@ -126,20 +128,20 @@ The true goal: a big LLM reads a rules file once → emits a kernel *family* + a
 
 ## Process notes
 
-- **Versioning:** next is **0.9.924** (recommended: `legalNextOperands`). Three-digit patch space (`0.9.900 → … → 0.9.999`). Additive + experimental-subpath ⇒ **wire-compat unchanged** ⇒ patch. Default to patch; let the user promote.
+- **Versioning:** next is **0.9.925** (recommended: a C2 design note, or a quick-win from the SLM-possibilities memo). Three-digit patch space (`0.9.900 → … → 0.9.999`). Additive + experimental-subpath ⇒ **wire-compat unchanged** ⇒ patch. Default to patch; let the user promote. `0.9.924` (`legalNextOperands`) shipped as a patch under exactly this rule.
 - **Gates before any version-bumping commit (mandatory):** `npm run typecheck`; full `npm run test`; `npm run bench` (push/pull/pullLatest within ~1.20 µs baseline + 10 µs hard budget — mind the documented `trajEval` flake); plus `npm run bench:jit` for any JIT-touching change. Register new tests in `package.json` `test` + `test:unit`.
 - **Commit:** one release-grade commit (subject = `0.9.92x — …`; body = what/why/wire-compat). Mirror the CHANGELOG block shape (`Added` / `Why` / `Wire compatibility` / `Tests` / `Documentation`). Trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. **Local commit OK; push only on the user's explicit OK** (this session pushed `0.9.922` after explicit OK).
-- **Docs to update when C1.5 lands:** the CHANGELOG `[0.9.924]` block; extend `docs/frontier6-grammar-design.md` (the operand-mask section); the `CLAUDE.md` `src/jit/` entry; `LLM_BUNDLE.md` via `npm run llm-bundle` (gitignored artifact).
+- **Docs updated when C1.5 landed (0.9.924, done):** the CHANGELOG `[0.9.924]` block; `docs/frontier6-grammar-design.md` (the operand-mask section); the `CLAUDE.md` `src/jit/` entry; this handoff. `LLM_BUNDLE.md` is a gitignored artifact — regenerate via `npm run llm-bundle` as needed.
 - **Auto-memory rule:** end any building-task response with a single-line commit message in a triple-backtick fenced block (no language tag).
 
 ---
 
 ## Quick-start checklist for the next session
 
-1. Read this file + `docs/frontier6-grammar-design.md`; skim `kernelGrammar.ts` (`stepGrammar`/`legalNextTokens`), `tests/legalNextTokens.test.ts`, `ir.ts`, `kernelCache.ts`.
-2. Decide direction (recommended: **C1.5**, `legalNextOperands`, as `0.9.924`).
-3. **If C1.5:** add `legalNextOperands(prefix, kind)` deriving operand choices from the `GrammarState` role partitions; prove operand soundness + the no-invalid-token property (the pin-3 emitter filling operands ONLY from the mask, carrying zero grammar knowledge); export through the barrels; `tests/legalNextOperands.test.ts`.
-4. **If C2:** write a design note first (model choice, where it runs, the constrained-decoding integration), then build the emitter behind the unchanged mask + gates.
+1. Read this file + `docs/frontier6-grammar-design.md` + `docs/frontier6-slm-possibilities.md`; skim `kernelGrammar.ts` (`stepGrammar`/`legalNextTokens`/`legalNextOperands`), `tests/legalNextOperands.test.ts`, `ir.ts`, `kernelCache.ts`.
+2. Decide direction. The model-free safety stack (both masks + the three gates) is COMPLETE, so the live options are **C2** (the SLM — the endgame), a **quick-win** from the SLM-possibilities memo §7, or **D** (`connectFanOut`, a Frontier-3 sidetrack).
+3. **If C2 (recommended):** write a design note first (model choice, where it runs, the constrained-decoding integration), then build the emitter behind the unchanged masks + gates — it consumes `legalNextTokens` (KIND) + `legalNextOperands` (operand) + `KernelCache.getOrCompile`.
+4. **If a quick-win:** pick one of fingerprint-distance helper / negative cache / offline corpus index (each a small extension of shipped primitives; see the memo).
 5. **If D:** build `connectFanOut()` over `SpmcRing` (the broadcast topology constructor — sibling of `connectFanIn`).
-6. Gates → bump to `0.9.924` → CHANGELOG block → local commit → ask before pushing.
+6. Gates → bump to `0.9.925` → CHANGELOG block → local commit → ask before pushing.
 7. Update the deferred docs (design note / CLAUDE.md / LLM bundle) when the API stabilizes.

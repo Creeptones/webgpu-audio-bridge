@@ -81,10 +81,34 @@ of kinds the validator will not reject at that position. The mask is the operand
 arity function (value-pushers always; `unary` at depth ≥ 1; `binary` at depth ≥ 2;
 `store` at depth == 1; `{width}` then `{param, bound}` in the header). v1 masks KINDS;
 a wrong OPERAND (an undeclared name, a fractional stride) can still be rejected — that
-is a v2 operand-mask, and the reason the emitter fills operands from the declared names.
-The no-invalid-stream property (a mask-respecting emitter can only produce streams
-`validateTokens` accepts) is proven model-free by `tests/legalNextTokens.test.ts`. The
-SLM (Stage 3b) plugs in behind this mask and swaps **only** the emitter.
+is the **operand-mask** (Stage 3a+, below), and the reason v1's emitter fills operands
+from the declared names. The no-invalid-stream property (a mask-respecting emitter can
+only produce streams `validateTokens` accepts) is proven model-free by
+`tests/legalNextTokens.test.ts`. The SLM (Stage 3b) plugs in behind this mask and swaps
+**only** the emitter.
+
+**Stage 3a+ (`0.9.924`) closes the operand gap: `legalNextOperands`.** Where
+`legalNextTokens(prefix)` masks the token KIND, `legalNextOperands(prefix, kind) →
+OperandChoices` masks the operand VALUES of that kind — derived from the SAME
+`GrammarState`, so the non-drift guarantee extends to operands. For the chosen `kind`
+it returns each operand field's legal set: **enumerable** fields as arrays (`width` →
+the two widths; `param` role → the four roles; `unary`/`binary` → the six ops each;
+`load`/`store`/`scalar`/`bound` names → the declared params), **unbounded** fields as
+validity predicates (`const` → finite; affine `stride`/`intercept` → integer; `bound`
+const → non-negative integer; the `param` name → a fresh-IDENT predicate). It is
+**role-partitioned** — a deliberate tightening of `validateTokens` (which admits a
+`load`/`store`/`scalar`/`bound:$name` referencing ANY declared param) to only the
+role-correct names (load ⊂ inputs, store ⊂ outputs, scalar ⊂ scalars, bound-param ⊂
+lengths). This is strictly SOUND (a role-correct name is a declared name, so every
+choice still validates) and is the semantically-meaningful set an emitter actually
+wants. It yields a genuine refinement over the kind mask: with no input declared the
+kind mask still admits `load` (value-pushers are always structurally legal) but the
+operand mask's `arrays` is empty — there is no legal `load` token. Composed, the two
+masks make a decoder unable to emit *any* token `validateTokens` would reject — operand
+included; the no-invalid-TOKEN property (an emitter filling BODY operands ONLY from
+`legalNextOperands`, carrying zero grammar knowledge of its own, still produces only
+valid streams) is proven model-free by `tests/legalNextOperands.test.ts`. The Stage-3b
+SLM becomes a pure, fully-guarded emitter swap.
 
 ## Self-contained streams
 

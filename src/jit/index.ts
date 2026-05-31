@@ -42,10 +42,11 @@ export { parseProgram } from "./parse.js";
 // Pure data — depends only on the IR types + `kernelKey`, never on the
 // parser/vectorizer/emitter/gate. See kernelGrammar.ts.
 export {
-  kernelToTokens, tokensToKernel, validateTokens, legalNextTokens, kernelHash, tokensToString, parseTokens,
+  kernelToTokens, tokensToKernel, validateTokens, legalNextTokens, legalNextOperands,
+  kernelHash, tokensToString, parseTokens,
 } from "./kernelGrammar.js";
 export type {
-  KernelToken, TokenKind, ValidateResult, ValidateFailure, LegalNextResult,
+  KernelToken, TokenKind, ValidateResult, ValidateFailure, LegalNextResult, OperandChoices,
 } from "./kernelGrammar.js";
 
 // ── Stage-1 compile pipeline: IR→JS emitter + content-addressed cache ────────
