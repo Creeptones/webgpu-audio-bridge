@@ -52,8 +52,18 @@ const isoOk = () => typeof crossOriginIsolated !== "undefined" && crossOriginIso
 const SPARK = "▁▂▃▄▅▆▇█";
 function sparkline(b) {
   if (!b || !b.length) return "—";
-  const max = b.reduce((m, v) => Math.max(m, v), 0) || 1;
-  return b.map((v) => SPARK[Math.min(7, Math.round((v / max) * 7))]).join("");
+  // Max-pool to ≤16 cells (default fingerprintBands is 64) so the bar stays compact.
+  const CELLS = 16;
+  let cells = b;
+  if (b.length > CELLS) {
+    cells = new Array(CELLS).fill(0);
+    for (let i = 0; i < b.length; i++) {
+      const c = Math.min(CELLS - 1, Math.floor((i * CELLS) / b.length));
+      cells[c] = Math.max(cells[c], b[i]);
+    }
+  }
+  const max = cells.reduce((m, v) => Math.max(m, v), 0) || 1;
+  return cells.map((v) => SPARK[Math.min(7, Math.round((v / max) * 7))]).join("");
 }
 const fmtUs = (us) => (!us ? "—" : us < 1 ? `${(us * 1000).toFixed(0)} ns` : `${us.toFixed(2)} µs`);
 
@@ -228,7 +238,7 @@ function render() {
     lines.push(`<span class="k">current</span> <span class="v">#${k.gen.hash} <span class="dim">(seed ${k.gen.seed})</span></span>`);
     if (a) {
       lines.push(`<span class="k">acoustic (gate #3)</span> <span class="v ok">peak ${a.peak.toFixed(3)} · rms ${a.rms.toFixed(3)} · crest ${a.crestFactor.toFixed(2)} · centroid ${a.spectralCentroid.toFixed(3)}</span>`);
-      lines.push(`<span class="k">fingerprint</span> <span class="v">${sparkline(a.magnitude)} <span class="dim">(16-band spectrum · ${k.cur.why})</span></span>`);
+      lines.push(`<span class="k">fingerprint</span> <span class="v">${sparkline(a.magnitude)} <span class="dim">(${a.magnitude.length}-band spectrum · ${k.cur.why})</span></span>`);
     }
     if (k.m.gate) lines.push(`<span class="k">equivalence (gate #2)</span> <span class="v ok">${k.m.gate.status} — worst f32 ULP ${k.m.gate.worstUlpF32}, ${k.m.gate.comparisons} comparisons</span>`);
   } else {

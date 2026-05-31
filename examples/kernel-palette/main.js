@@ -77,8 +77,19 @@ function fmtUs(us) {
 const SPARK = "▁▂▃▄▅▆▇█";
 function sparkline(bands) {
   if (!bands || bands.length === 0) return "—";
-  const max = bands.reduce((m, v) => Math.max(m, v), 0) || 1;
-  return bands.map((v) => SPARK[Math.min(SPARK.length - 1, Math.round((v / max) * (SPARK.length - 1)))]).join("");
+  // Max-pool to ≤16 display cells so the bar stays compact regardless of the
+  // fingerprint resolution (the default fingerprintBands is 64).
+  const CELLS = 16;
+  let cells = bands;
+  if (bands.length > CELLS) {
+    cells = new Array(CELLS).fill(0);
+    for (let i = 0; i < bands.length; i++) {
+      const c = Math.min(CELLS - 1, Math.floor((i * CELLS) / bands.length));
+      cells[c] = Math.max(cells[c], bands[i]);
+    }
+  }
+  const max = cells.reduce((m, v) => Math.max(m, v), 0) || 1;
+  return cells.map((v) => SPARK[Math.min(SPARK.length - 1, Math.round((v / max) * (SPARK.length - 1)))]).join("");
 }
 
 function render() {
@@ -115,7 +126,7 @@ function render() {
       lines.push(
         `<span class="k">acoustic (gate #3)</span> <span class="v ok">SANE — peak ${a.peak.toFixed(3)} · rms ${a.rms.toFixed(3)} · crest ${a.crestFactor.toFixed(2)} · dc ${a.dcOffset.toFixed(3)} · centroid ${a.spectralCentroid.toFixed(3)}</span>`,
       );
-      lines.push(`<span class="k">fingerprint</span> <span class="v">${sparkline(a.magnitude)} <span class="dim">(16-band L1-normalized spectrum)</span></span>`);
+      lines.push(`<span class="k">fingerprint</span> <span class="v">${sparkline(a.magnitude)} <span class="dim">(${a.magnitude.length}-band L1-normalized spectrum)</span></span>`);
     }
   } else {
     lines.push(`<span class="k">cache</span> <span class="v dim">pick a kernel — it compiles + gate-verifies; re-pick it for a cache hit</span>`);

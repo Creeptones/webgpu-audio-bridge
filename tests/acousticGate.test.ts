@@ -116,12 +116,12 @@ async function main(): Promise<void> {
     assert(Number.isFinite(r.profile.peak) && r.profile.peak >= 0, `${name}: finite peak`);
     assert(Number.isFinite(r.profile.rms) && r.profile.rms >= 0, `${name}: finite rms`);
     assert(Number.isFinite(r.profile.spectralCentroid), `${name}: finite centroid`);
-    assertEq(r.profile.magnitude.length, 16, `${name}: 16-band fingerprint`);
+    assertEq(r.profile.magnitude.length, 64, `${name}: 64-band fingerprint`);
     const sum = r.profile.magnitude.reduce((a, b) => a + b, 0);
     assert(Math.abs(sum - 1) < 1e-9, `${name}: fingerprint L1-normalized (sum ${sum})`);
   }
   // gain (g=0.5, full-scale sine in): peak 0.5, rms 0.5/√2, dc≈0, crest≈√2, centroid at
-  // bin 8/512, and ALL energy in band 0 (bin 8 → floor(7*16/512)=0).
+  // bin 8/512, and ALL energy in band 0 (bin 8 → floor(7*64/512)=0).
   {
     const gain = PALETTE.find((p) => p.name === "gain")!.ir;
     const r = acousticGate(gain);
@@ -204,7 +204,7 @@ async function main(): Promise<void> {
     // The characterized kernel carries the gate-#3 profile.
     assert(r1.kernel.acoustic !== undefined, "cache: acoustic profile attached");
     assert(r1.kernel.acoustic.finite, "cache: attached profile finite");
-    assertEq(r1.kernel.acoustic.magnitude.length, 16, "cache: attached fingerprint width");
+    assertEq(r1.kernel.acoustic.magnitude.length, 64, "cache: attached fingerprint width");
     // It equals a standalone gate run on the same IR (the cache ran the same gate).
     const standalone = acousticGate(PALETTE.find((p) => p.name === "gain")!.ir);
     assert(standalone.ok, "cache: standalone gate ok");

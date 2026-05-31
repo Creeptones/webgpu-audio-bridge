@@ -70,6 +70,16 @@ export type {
   AcousticProfile, AcousticGateOptions, AcousticGateResult,
 } from "./acousticGate.js";
 
+// ── fingerprint queries over the acoustic embedding (quick-win #2) ────────────
+// "Sounds-like" math over `AcousticProfile.magnitude` (the L1-normalized,
+// amplitude-invariant band vector): L2 distance, nearest-neighbour, dedup-by-sound,
+// and brightness ordering along `spectralCentroid`. Pure (no wasm). See fingerprint.ts.
+export {
+  fingerprintDistance, nearestByFingerprint, dedupByFingerprint,
+  sortByBrightness, brighterThan, darkerThan,
+} from "./fingerprint.js";
+export type { FingerprintLike, FingerprintMatch } from "./fingerprint.js";
+
 // ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
 export { JitKernelSwap } from "./JitKernelSwap.js";
 export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum } from "./JitKernelSwap.js";

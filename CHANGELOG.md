@@ -4,6 +4,92 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.926] — 2026-05-31
+
+### Added — Apollo Frontier 6 quick-win #2: fingerprint-distance helpers ("sounds-like" queries)
+
+Gate #3 already attaches an `AcousticProfile` to every characterized kernel; its
+`magnitude` field is a small, L1-normalized, **amplitude-invariant** band vector — a
+genuine "sounds-like" embedding. This turns that embedding into the obvious queries.
+Pure vector math (no wasm); library + tests only.
+
+- **`src/jit/fingerprint.ts`** — a self-contained module of pure helpers over the
+  minimal `FingerprintLike` shape (`{ magnitude, spectralCentroid? }`), which every
+  `AcousticProfile` (and so every `CharacterizedKernel.acoustic`) satisfies:
+  - **`fingerprintDistance(a, b)`** — Euclidean (L2) distance over the magnitude
+    vectors; a proper metric (identity / symmetry / triangle). Throws on a band-count
+    mismatch (comparing different resolutions is a programming error).
+  - **`nearestByFingerprint(target, candidates)`** — the nearest-sounding candidate
+    (`{ item, index, distance }`), ties → lowest index, `undefined` for an empty list.
+  - **`dedupByFingerprint(items, ε = 0)`** — greedy, order-preserving collapse of items
+    within `ε` of a kept representative; folds "same sound, different spelling"
+    duplicates a generative emitter produces.
+  - **`sortByBrightness` / `brighterThan` / `darkerThan`** — move along the
+    `spectralCentroid` axis (a 1-D dark→bright timbre coordinate).
+- **Exports:** the six functions + `FingerprintLike` / `FingerprintMatch` from
+  `src/jit/index.ts` → `webgpu-audio-bridge/experimental`.
+- **Soundness note (important):** `fingerprintDistance === 0` means a and b sound
+  identical *on the probe* — it is NOT a proof they compute the same function (the
+  embedding is amplitude-invariant and reads a single full-scale sine; a hard-clipper
+  and a linear gain match on a non-clipping probe yet differ once a signal clips). Use
+  these helpers to **cull** redundant generative candidates and to **search by timbre** —
+  never to substitute one kernel for another in a signal path. The sound behavioral
+  identity remains the structural content address (`kernelHash` / `kernelKey`).
+
+### Changed — `acousticGate` default `fingerprintBands` 16 → 64
+
+The attached fingerprint's default resolution moves from 16 to **64 bands** so the
+embedding actually discriminates harmonic content out of the box. At 16 bands the low
+harmonics of a typical low-fundamental probe bucket into a single band, so `cubic`
+(a 3rd-harmonic distortion) aliased `gain` (a pure level change) in `magnitude` — making
+dedup/NN over the *default* profile over-merge genuinely-distinct kernels. 64 bands
+separates a fundamental (bin 8 → band 0) from its 3rd harmonic (bin 24 → band 2) while
+staying a tiny vector. The sanity gate (finite / peak / dc / crest) and `spectralCentroid`
+are band-count-independent, so the verdict for every previously-accepted kernel is
+unchanged — only the attached `magnitude` vector is finer. `fingerprintBands` remains a
+per-call override.
+
+### Why — make the acoustic embedding queryable
+
+The fingerprint was computed and attached but never *used* beyond the sane-bounds gate.
+These helpers are the dedup-by-sound + timbre-search the generative demo and the future
+Stage-3b SLM want (cull audibly-redundant rerolls; "give me something brighter"). They
+also seed quick-win #3 (the offline corpus index clusters by exactly this distance).
+
+### Wire compatibility
+
+**Unchanged.** A new pure module + six additive functions + two types, all on the
+experimental subpath. No SAB layout, no wire-format, no change to any existing
+signature (`acousticGate` / `AcousticProfile` untouched). Patch-level.
+
+### Tests
+
+- **`tests/fingerprint.test.ts`** (4 pins, registered in `test` + `test:unit`):
+  (1) `fingerprintDistance` is a proper metric (identity / symmetry / triangle on hand
+  vectors + the L2 value + a mismatch throws); (2) **amplitude-invariance** — `gain`
+  (level 0.5) and `hardclip` (level 1.0) share a fingerprint *exactly*, so dedup
+  collapses them (and `constscale`) while genuinely-distinct spectra are all kept;
+  (3) `nearestByFingerprint` finds the **timbre** neighbour — a cubic-soft variant's
+  nearest is the cubic softclip (its harmonic sibling), not the pure-fundamental gain;
+  self → 0, empty → `undefined`; (4) brightness — `sortByBrightness` orders dark→bright,
+  `brighterThan`/`darkerThan` step one item along the centroid axis, no-brighter →
+  `undefined`, a missing centroid throws. Profiles come from `acousticGate` (no wasm) at
+  the new default 64 bands — fine enough that the toy kernels' low harmonics separate, so
+  the dedup/NN pins run on the real attached embedding. `acousticGate.test.ts`'s
+  fingerprint-width pins updated 16 → 64.
+- `npm run typecheck` clean; full `npm test` green; `npm run bench` push/pull/pullLatest
+  at 1.20 µs (within baseline + 10 µs hard budget) — neither `fingerprint.ts` nor
+  `acousticGate.ts` is in the bench path.
+
+### Documentation
+
+- This CHANGELOG block + the `fingerprint.ts` file header (incl. the soundness note) +
+  the `acousticGate.ts` `fingerprintBands` doc + the `CLAUDE.md` `src/jit/` entry +
+  `docs/frontier6-grammar-design.md` (64-band default) + `docs/frontier6-quickwins-handoff.md`
+  (quick-win #2 marked shipped, next session pointed at #3). Both kernel demos
+  (`kernel-palette`, `kernel-generative`) max-pool the sparkline to ≤16 cells and label
+  the band count dynamically (so the 64-band fingerprint renders compactly + accurately).
+
 ## [0.9.925] — 2026-05-31
 
 ### Added — Apollo Frontier 6 quick-win #1: the negative cache (memoized rejections)

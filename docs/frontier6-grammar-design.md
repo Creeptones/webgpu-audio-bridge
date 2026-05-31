@@ -265,7 +265,7 @@ IR ──acousticGate(ir)──▶ { ok, profile } | { ok:false, profile, reason
     safety: a NaN/Inf anywhere rejects);
   - `rms` / `peak` / `dcOffset` / `crestFactor` — level statistics;
   - `spectralCentroid` — normalized [0,1] of Nyquist (a timbre coordinate);
-  - `magnitude` — a 16-band L1-normalized magnitude fingerprint over the AC spectrum.
+  - `magnitude` — a 64-band (default) L1-normalized magnitude fingerprint over the AC spectrum.
     L1-normalization makes it **amplitude-invariant** (a gain change leaves it
     unchanged), so it is a "sounds-like" shape vector — the basis for dedup-by-sound /
     similarity search and the Stage-3 model's features.

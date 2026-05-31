@@ -94,7 +94,10 @@ export interface AcousticGateOptions {
    *  mid-value (the kernel body, not the runtime scalar, is what gate #3 judges —
    *  the scalar is a runtime input, not part of the content address). Default 0.5. */
   readonly probeScalar?: number;
-  /** Number of bands in the magnitude fingerprint. Default 16. */
+  /** Number of bands in the magnitude fingerprint. Default 64 — fine enough to
+   *  separate a fundamental from its low harmonics (so dedup/NN over the fingerprint
+   *  discriminate genuinely-distinct distortions; a coarser split buckets them
+   *  together). The sanity gate + `spectralCentroid` are band-count-independent. */
   readonly fingerprintBands?: number;
   /** Reject if the primary peak exceeds this (runaway magnitude). Default 1e3. */
   readonly maxPeak?: number;
@@ -114,7 +117,7 @@ export type AcousticGateResult =
 const DEFAULT_PROBE_LENGTH = 1024;
 const DEFAULT_FUNDAMENTAL_BIN = 8;
 const DEFAULT_PROBE_SCALAR = 0.5;
-const DEFAULT_BANDS = 16;
+const DEFAULT_BANDS = 64;
 const DEFAULT_MAX_PEAK = 1e3;
 const DEFAULT_MAX_ABS_DC = 1e3;
 const DEFAULT_MAX_CREST = 1e4;
