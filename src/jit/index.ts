@@ -32,3 +32,11 @@ export type { CorpusOptions, CorpusCase } from "./corpus.js";
 export { vectorize } from "./vectorize.js";
 export { lowerKernel, validate } from "./lower.js";
 export { parseProgram } from "./parse.js";
+
+// ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
+export { JitKernelSwap } from "./JitKernelSwap.js";
+export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum } from "./JitKernelSwap.js";
+export { JitKernelConsumer } from "./JitKernelConsumer.js";
+export type {
+  JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult,
+} from "./JitKernelConsumer.js";

@@ -107,3 +107,23 @@ export type {
   KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore,
   Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase,
 } from "../jit/index.js";
+
+// ── The Autonomous JIT — live-swap runtime (0.9.914, Stage 1b) ───────────────
+//
+// Apollo Frontier 5, Stage 1b: the audio-thread runtime that gets a gate-PASSED
+// SIMD kernel into the live AudioWorklet click-free. `JitKernelSwap` is the pure,
+// Node-testable dual-kernel swap state machine (the `HotSwapConsumer` sibling);
+// `JitKernelConsumer` is the worklet-side executor — it holds the developer's
+// permanent JS fallback + the compiled SIMD `Instance`, instantiates the Module
+// SYNCHRONOUSLY between quanta, runs both kernels into disjoint scratch slabs
+// during the fade, and AMPLITUDE-crossfades them (the two kernels are ULP-
+// correlated, so a hard switch could click near cancellation — the Stage-1a
+// stress finding). It degrades to the JS kernel on EVERY failure (no shared
+// memory, instantiation throw, missing export, non-finite output). Still
+// `@experimental` — same surface as `compileKernel`. The `connectJit()` one-call
+// constructor + browser demo is Stage 3. See docs/frontier5-stage1b-runtime-handoff.md.
+export { JitKernelSwap, JitKernelConsumer } from "../jit/index.js";
+export type {
+  JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum,
+  JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult,
+} from "../jit/index.js";

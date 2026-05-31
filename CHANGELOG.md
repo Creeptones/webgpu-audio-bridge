@@ -4,6 +4,102 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.914] — 2026-05-30
+
+### Added — Apollo Frontier 5, Stage 1b: The Autonomous JIT — the live-swap runtime
+
+Stage 1a shipped the compiler (`compileKernel` proves a vectorized WASM kernel
+bit-exact/within-ULP to its scalar reference, returns it as `accepted`). Stage 1b
+is the runtime that gets such a kernel onto the **live audio thread without a
+click**, degrading to the developer's JS kernel on every failure. Two new files
+under `src/jit/`, **internal-first + `@experimental`** (exported from the
+`webgpu-audio-bridge/experimental` subpath, NOT the 1.0 core).
+
+- **`src/jit/JitKernelSwap.ts`** — the PURE dual-kernel swap state machine (the
+  `HotSwapConsumer` sibling, with the two BRIDGES replaced by two KERNELS — the JS
+  fallback and the SIMD kernel). `idle → priming → fading → complete`, driven by
+  `crossfadeWeight` (C² quintic default). Carries HotSwap's one critical timing
+  law: the window clock anchors to the **first `beginQuantum` after `armSwap`**,
+  not to the arm call (which runs in the worklet's `port.onmessage`, between
+  quanta, where the audio clock is stale) — so the weight starts at exactly 0 with
+  vanishing derivatives (no click at fade onset). No DOM/WASM/audio — fully
+  Node-testable. Surface: `armSwap` / `beginQuantum` / `weightAt` (pure,
+  per-sample) / `phase` / `reset` / `windowStartNs` / `isSwapping`.
+- **`src/jit/JitKernelConsumer.ts`** — the worklet-side executor. Holds the
+  developer's permanent JS fallback closure + (when verified) a SIMD
+  `WebAssembly.Instance`. `installCompiledKernel(module)` does a **synchronous**
+  `new WebAssembly.Instance(module, { env: { memory } })` (microseconds — the
+  expensive parse/validate/codegen already happened off-thread) and arms the swap;
+  it MUST be called from `port.onmessage`, never `process()`. During a fade
+  `process()` runs BOTH kernels into **pairwise-disjoint scratch slabs** (one input
+  slab per input array + a generation-A + a generation-B output slab — the kernel
+  ABI takes `outPtr` as a param precisely so each generation owns its slab) and
+  **amplitude-crossfades** them per sample (the rare correct linear-blend case: the
+  JS and SIMD kernels are ULP-correlated, so amplitude has no power notch — a hard
+  switch could step the signal and click near cancellation, the Stage-1a stress
+  finding). The constructor runs an explicit disjointness assertion; `describeLayout()`
+  exposes the layout. **The bytes-clone fallback** (`installCompiledKernelFromBytes`)
+  covers the case where a `WebAssembly.Module` cannot be cloned into the worklet
+  realm. **Failure envelope** (output equals the pure-JS-kernel stream in every
+  case): no shared memory → JIT disabled; `new Instance` throws → caught, not armed;
+  missing `kernel` export → not armed; a non-finite incoming value DURING a fade →
+  abort, drop the SIMD instance(s), snap back to the JS fallback.
+- **`tests/JitKernelSwap.test.ts`** — 6 state-machine pins mirroring
+  `Bridge.hotswap.test.ts`: weight starts at exactly 0 at the anchor, C^k schedule
+  monotone 0→1 with endpoints exact, completion at weight 1 with `justCompleted`
+  firing exactly once, re-arm-after-complete + reset, and the guards.
+- **`tests/JitKernelConsumer.test.ts`** — 9 Node "real-audio" pins driving a real
+  `compileKernel` (through wabt) into the consumer over a fake shared
+  `WebAssembly.Memory`: disjoint+sized+in-bounds layout (too-small memory throws);
+  pre-install idle == the pure JS stream; JIT-disabled on non-shared memory; a full
+  **f64 swap** — seams (w=0, w=1) bit-exact, in-fade samples within the blend's own
+  ≤ULP rounding, max stream step ≤ the reference's (no click), both generation slabs
+  finite+intact through the fade; an **f32 cancelling kernel** (x²−y²) — the blend is
+  a finite convex combination of the JS and SIMD streams, exactly JS at idle and
+  exactly SIMD at complete; install failures (bad import / missing export) stay on
+  JS; **poison injection** (a non-finite incoming kernel) aborts to JS and never
+  reaches the output; the bytes-clone fallback path; and SIMD→SIMD re-upgrade with
+  superseded-instance retirement.
+
+### Why — get the proven kernel onto the audio thread, click-free + fail-safe
+
+The compiler is only useful once a verified kernel can replace the JS one mid-
+playback without an audible seam. The crossfade-not-hard-switch decision is forced
+by the Stage-1a measurement (the f32 SIMD deliverable diverges from naive JS by up
+to ~2677 ULP near cancellation — inaudible in magnitude but a step that can click);
+amplitude mode is correct precisely because the two kernels are ULP-correlated. The
+gate stays the safety boundary: the consumer arms ONLY a kernel that arrived as a
+gate-PASSED Module, and degrades to the JS fallback on every other path — so the
+audio stream is, in the worst case, exactly what the developer's JS would have
+produced.
+
+### Wire compatibility
+
+**Unchanged.** A runtime/compile-time subsystem only — no SAB layout change, no
+change to `Bridge` or the SPSC/MP→SC/SP→MC rings or their `.tla` models, no new
+runtime dependency (the consumer uses only `WebAssembly` + the existing
+`wasmSimdSupport` probes; `acorn` stays confined to the compiler's `parse.ts` and
+absent from the core import graph). The `experimental` subpath gains the
+`JitKernelSwap` / `JitKernelConsumer` surface; the root entry point is untouched
+and remains zero-runtime-dep.
+
+### Tests
+
+`npm run typecheck` clean. Full suite green, now including the two new
+`JitKernel*` suites. `npm run bench`: push/pull/pullLatest within the documented
+baseline + the 10 µs hard budget (the pre-existing `trajEval (fast)` characterization
+cell can exceed its tight 1.25 µs budget under load on this machine — unrelated to
+this patch; `trajectory.ts`/`bench/Bridge.bench.ts` untouched).
+
+### Documentation
+
+This CHANGELOG entry. The `connectJit()` one-call constructor, the
+`examples/jit-vectorize/` browser demo + Playwright smoke (the empirical
+Module-clone-into-worklet check), the `bench/jit.bench.ts` characterization, the
+`docs/jit-vectorize-design.md` note, and the README "Experimental — The Autonomous
+JIT" section are Stages 2–3 (0.9.915 / 0.9.916). See
+`docs/frontier5-stage1b-runtime-handoff.md`.
+
 ## [0.9.913] — 2026-05-30
 
 ### Added — Apollo Frontier 5, Stage 1a: The Autonomous JIT — the production vectorizing compiler
