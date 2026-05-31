@@ -4,6 +4,79 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.916] — 2026-05-30
+
+### Added — Apollo Frontier 5, Stage 2: The Autonomous JIT — characterization bench
+
+Stage 1a (0.9.913) shipped the compiler (`compileKernel` proves a vectorized WASM
+kernel bit-exact/within-ULP to its scalar reference) and Stage 1b (0.9.914 + the
+0.9.915 exact-lerp upgrade) shipped the click-free live-swap runtime
+(`JitKernelConsumer`). Both are proven by the test suite. Stage 2 turns "we believe
+the SIMD kernel is faster and the fade fits the quantum" into **measured numbers +
+one load-bearing budget gate** — a standalone microbenchmark that adds NO product
+code (no `src/` changes).
+
+- **`bench/jit.bench.ts`** + **`npm run bench:jit`** — a `tsx` characterization bench
+  mirroring `bench/eval-simd.bench.ts` (the same `percentile`/`mean`/`fmt`/`time`
+  batch-to-beat-the-tick harness, the wabt-injected `compileWat` from
+  `tests/JitCompiler.test.ts`, and an early `hasWasmConsumerSupport()` bail so it's a
+  no-op on a host without SIMD/threads). Four representative kernels spanning the
+  cost range (`identity` f32 memory floor, `taylor o2` f64 integrate, `hard-clip` f32
+  min/max chain, `diffsq` x²−y² f32 cancellation), all benched at the N=128 audio
+  quantum. Only `accepted` (gate-passed) wasm is ever measured. Four cells:
+  1. **Throughput** — the developer's scalar JS closure vs the JIT-SIMD `Instance`,
+     median + speedup. Measured **3.8×–9.2×** here (identity 5.5×, taylor 3.8×,
+     hard-clip 4.7×, diffsq 9.2×).
+  2. **Off-thread compile vs sync install** — `compileKernel` end-to-end
+     (~1.5–3.9 ms, the background-worker cost), `WebAssembly.compile` (~40 µs), and
+     the SYNC `new WebAssembly.Instance` (**~4 µs** — the audio-thread
+     `port.onmessage` install, confirmed microseconds so it never blocks a quantum).
+  3. **Measured swap glitch** — drives a `JitKernelConsumer` through a full
+     idle→fade→complete swap and reports `max|blend−ref|` against the pure-JS stream:
+     **exactly 0** for the f64 + non-cancelling-f32 kernels (the 0.9.915 exact-lerp
+     transparency property, *reported* not re-proven) and a tiny **~2e-7** residual
+     for the f32 cancelling `diffsq` (the ULP gap the crossfade smooths). Excess
+     sample-to-sample step ≈0 everywhere (no click).
+  4. **THE load-bearing budget check** — during a fade the consumer runs BOTH kernels
+     every quantum, so the worst-case per-quantum cost is ≈ JS + SIMD ≤ 2×JS. Asserts
+     `2×(slowest JS kernel median, N=128) < quantumBudgetMs` (128/48000 ≈ 2.667 ms)
+     and prints PASS/FAIL. Measured 2×JS ≈ **0.001 ms (~0.04% of the quantum)** —
+     PASS with vast headroom. The documented mitigation if it ever fails (shorten the
+     fade window / hard-switch at the exact-lerp-safe seam, flag a smaller default
+     `windowSeconds` for `connectJit`) is printed rather than silently capping.
+
+### Why — measure the win + gate the fade, before the one-call API lands
+
+The compiler and runtime are settled and pinned; what was missing was the
+*characterization*: real speedup numbers, proof the install is cheap enough for
+`port.onmessage`, the measured (near-zero) swap glitch, and — load-bearing — a gate
+that the doubled fade-quantum cost fits the audio budget. Stage 2 supplies all four
+as one reproducible bench so Stage 3's `connectJit` defaults (the fade window in
+particular) rest on measured headroom, not belief.
+
+### Wire compatibility
+
+**Unchanged.** A standalone bench + a `package.json` script + this changelog block.
+No `src/` changes, no SAB layout, API surface, or type changes; no new dependency
+(wabt is already a devDependency).
+
+### Tests
+
+`npm run typecheck` clean. Full `npm test` green (the JIT compiler/runtime suites
+unchanged). `npm run bench` push/pull/pullLatest within baseline + the 10 µs hard
+budget. The new `npm run bench:jit` produces the numbers above and the Cell-4 budget
+assertion PASSes (exit 0). The two pre-existing unrelated quirks (`Bridge.properties`
+~1-ULP smoother-monotonicity flake; `bench`'s tight `trajEval (fast)` cell under
+load) are not Frontier 5 — `trajectory.ts` is untouched.
+
+### Documentation
+
+`bench/jit.bench.ts` carries a self-contained header documenting all four cells, the
+N=128/48 kHz budget definition, the methodology (eval-only, batched, seedless
+deterministic inputs, `accepted`-only), and the note that the cross-thread
+Module-clone-into-a-worklet transport check is Stage 3's Playwright smoke (a worklet
+realm ≠ a worker realm).
+
 ## [0.9.915] — 2026-05-30
 
 ### Changed — exact-lerp amplitude crossfade: bit-exact fade transparency
