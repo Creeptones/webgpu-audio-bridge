@@ -4,6 +4,91 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.912] — 2026-05-30
+
+### Added — Apollo Frontier 5, Stage 0: The Autonomous JIT — semantics + vectorization-correctness proof + probe
+
+Opens a **new frontier** (orthogonal to Frontier 3's remaining DAG work): an
+in-browser micro-compiler that auto-vectorizes a developer's naive scalar
+JavaScript DSP loop into WASM SIMD (`f32x4` / `f64x2`), **proves it equivalent to
+the source**, and hot-swaps it into the live audio path click-free. Stage 0 ships
+**no production code** — like the ring frontiers' Stage 0, it settles correctness
+first: the compilable sub-language, the written proof that the scalar→SIMD lowering
+is equivalence-preserving, and a runnable probe that proves it AND exhibits the
+unsound variants' concrete failures. The JIT hazard is *program-transform semantic
+equivalence* (not memory ordering), so the Stage-0 artifacts are an operational
+semantics + a vectorization-correctness proof + a differential/metamorphic probe
+(rather than a TLA+ model + interleaving probe) — same discipline, different hazard.
+
+- **`docs/frontier5-jit-handoff.md`** — the kickoff memo. The candidate-generator-
+  +-equivalence-gate thesis (the gate is the load-bearing safety, so an untrusted
+  generator — e.g. a future SLM — is safe behind it); the locked decisions
+  (deterministic core; `acorn` parser quarantined out of the zero-dep core; both
+  lanes, `f32x4` default; purely additive — no ring/`Bridge` wire change; the audio
+  thread never compiles/blocks; every failure path falls back to the JS kernel);
+  and the Stage 0→3 sub-arc (0.9.912→0.9.916).
+- **`docs/frontier5-jit-semantics.md`** — the exact compilable sub-language: one
+  counted independent `for` loop, affine stride-{1,2} loads/stores, `+ − × ÷`,
+  unary `−`, and the exactly-reproducible `Math.*` whitelist
+  (`min/max/abs/sqrt/floor/ceil/trunc/fround`). Everything else is **rejected** with
+  a node-specific `E_*` diagnostic (branches, loop-carry, transcendentals, mixed
+  width, bad stride, …) — never silently mis-compiled. The denotation is left-to-
+  right IEEE-754, **no fusion, no reassociation**; the explicit `Math.fround` is the
+  one width-coercion boundary, which keeps the f32 lowering bit-exact for v1.
+- **`docs/frontier5-vectorization-correctness-proof.md`** — the theorem (lane-wise
+  equivalence: bit-exact f64, within-budget — and for v1, bit-exact — f32) with six
+  lemmas (per-sample independence; op-by-op lane homomorphism; gather/scatter is a
+  pure permutation; the f64 no-FMA/non-reassociation hinge; f32 rounding-only budget;
+  the loop-tail partition/conservation) and the **Stage-0 finding**: the
+  "fuse `a·b+c` into an FMA / reassociate" lowering is unsound for the bit-exact
+  promise (rounds once where the source rounds twice). Decision: ship the
+  structure-preserving lowering; any future fusing lane re-enters behind the gate at
+  a declared budget.
+- **`bench/jit-probe.mjs`** — throwaway, dependency-free (`node bench/jit-probe.mjs`),
+  the runnable half of the proof and the executable spec for Stage 1a's in-CI fuzzer.
+  A tiny self-contained IR + two separate evaluators (`evalScalar` ground truth;
+  `runSimdModel` W-lane gather → lane-wise op → scatter + scalar epilogue).
+  **SCENARIO A**: 350 enumerated programs (f64+f32) × an IEEE-edge + seeded-random
+  corpus across every `n mod W` residue — **85,400 index comparisons bit-exact**,
+  max f32 ULP = 0, four metamorphic relations hold. **SCENARIO B**: the FMA candidate
+  diverges on the crafted witness (`a=b=1+ε`, `c=−(a·b)`: scalar→0, fused→2⁻¹⁰⁴) and
+  on 1460/16000 random samples — finding confirmed. **SCENARIO C**: every out-of-
+  subset program rejected with the expected `E_*` (13 distinct diagnostics) and no
+  false rejection. **SCENARIO D**: every deliberately-wrong candidate (negate, drop-
+  addend, wrong-deinterleave) caught by the differential check. `RESULT: ALL GREEN`.
+- **`package.json`** — `bench:jit-probe` script.
+
+### Why — settle correctness before generating a single line of WASM
+
+A miscompiled DSP kernel is the audio-domain analogue of a torn read: it can sound
+*almost* right and corrupt only on edge inputs. The ring frontiers proved that
+modeling-and-proving-first pays (Stage 0 found unsound *published* designs before any
+production code). The JIT has its own trap — the FMA/reassociation tear — and the
+probe finds it in exhaustive search, not in the field. The equivalence gate that
+enforces the proof's invariants is what makes the whole feature safe: no generated
+kernel reaches the audio thread until it is proven equivalent, which is precisely why
+an untrusted candidate generator can be added later behind the same gate.
+
+### Wire compatibility
+
+**Unchanged.** Stage 0 ships only docs + a throwaway probe — no `src/`, no exports,
+no SAB layout. The frozen SPSC protocol and the experimental MP→SC / SP→MC formats
+and their `.tla` models are untouched. The core `Bridge` remains zero-runtime-dep
+(the planned `acorn` parser dependency lands in Stage 1a, quarantined to the JIT
+subsystem and provably absent from the core import graph).
+
+### Tests
+
+`npm run typecheck` clean. Full suite green (unchanged — Stage 0 adds no `src/` or
+test files). The Stage-0 proof is the probe: `node bench/jit-probe.mjs` →
+`RESULT: ALL GREEN ✓` (the in-CI fuzzer that supersedes it lands at Stage 1a).
+
+### Documentation
+
+Three new `docs/frontier5-*.md` notes (handoff, semantics, correctness proof). The
+README "Roadmap" / experimental section gains the Frontier 5 arc when the primitive
+ships at Stage 1a.
+
 ## [0.9.911] — 2026-05-30
 
 ### Added — Apollo Frontier 3, Stage 4.1: the `SpmcRing` primitive (wait-free SP→MC broadcast fan-out)

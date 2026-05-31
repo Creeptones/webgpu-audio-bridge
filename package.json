@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.9.911",
+  "version": "0.9.912",
   "description": "Reference bridge architecture for browser audio. Provides schema-driven lock-free lanes for WebGPU macro state, realtime input events, and additive GPU residual blocks into AudioWorklets.",
   "type": "module",
   "main": "./dist/index.js",
@@ -51,6 +51,7 @@
     "bench:eval-simd": "npm run build:wasm && tsx bench/eval-simd.bench.ts",
     "bench:kalman-simd": "npm run build:wasm && tsx bench/kalman-simd.bench.ts",
     "bench:mpmc": "tsx bench/mpmc.bench.ts",
+    "bench:jit-probe": "node bench/jit-probe.mjs",
     "bench:decode-path-comparator": "node bench/decode-path-comparator/serve.mjs",
     "bench:graceful-degradation": "tsx bench/graceful-degradation.bench.ts",
     "bench:e2e": "node bench/e2e-latency/serve.mjs",
