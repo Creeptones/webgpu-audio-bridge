@@ -31,6 +31,12 @@ The first deliverable of Stage 3 — the **model-free half**. The whole language
 
 ---
 
+## What also shipped (0.9.923 — the generative demo) + the SLM-scope memo
+
+**0.9.923 — `examples/kernel-generative/`** (`npm run dev:kernel-generative`, port 5187, commit `2b1e7e2`, pushed). A model-free generative demo: a seeded LCG (the SLM stand-in) walks `legalNextTokens` → random VALID streams → the worker's `KernelCache.getOrCompile` (the three gates) → a `curate()` acoustic filter → gate-verified SIMD bytes morph into the AudioWorklet click-free (SIMD→SIMD crossfade). Modes: Roll 🎲 / Keep ★ / Build bank ×6 / Evolve ▶ (cycle the bank a kernel-per-bar + an LFO on `g`). Source = a built-in arpeggio (in0) + a rhythmic pluck (in1). Verified headless by **`examples/kernel-generative/selftest.mjs`** (`npm run build && node examples/kernel-generative/selftest.mjs`): over 300 rolls — 0 invalid streams, 0 syntax-rejects, ~64% musical after curation, the equivalence gate catching the unsafe ~10%, the content-addressed cache deduping (204 distinct ≤ 268 accepts). It is the clearest demonstration of the bet: the *most untrusted emitter imaginable* (random) can only produce safe, sane, click-free audio. The SLM (C2) just replaces the LCG with something that picks *good* kernels.
+
+**Design memo — `docs/frontier6-slm-possibilities.md`** (written this session): what the SLM unlocks BEYOND naive "NL → content hash", grounded in the shipped primitives, each capability tagged `[enabled-now]` / `[needs-new-infra]` / `[speculative]`. Headline: the SLM is a *discovery layer*; the genuinely-new capability is an **untrusted, tiny, realtime-safe model on the audio thread** (impossible without the mask + gates). It surfaces three LOW-EFFORT quick-wins that compound C1.5 — a **fingerprint-distance helper** (the `AcousticProfile.magnitude` 16-band L1-normalized vector is an amplitude-invariant "sounds-like" embedding → dedup-by-sound + "brighter/darker" search), a **negative cache** (memoize gate rejections — kills the demo's reroll waste), and an **offline corpus index** (`evalReference` is pure JS, so batch-score + cluster kernels by fingerprint with zero wasm). Consider slotting these as `0.9.925+` after C1.5.
+
 ## The fork (the model-free stack is COMPLETE; the model is the endgame)
 
 With Stage 3a done, **every model-free piece of Frontier 6 is now shipped**: the grammar/codec/hash (Stage 0), the compile pipeline + content-addressed cache (Stage 1), the acoustic gate (Stage 2), and the constrained-decoder mask (Stage 3a). What remains is the model itself — plus one optional model-free tightening and the usual sidetracks.
@@ -43,7 +49,7 @@ With Stage 3a done, **every model-free piece of Frontier 6 is now shipped**: the
 | D | Frontier-3 `connectFanOut()` (Stage 4.3) | medium | med | the un-built broadcast topology constructor over `SpmcRing` |
 | E | Promotions (rings + JIT/grammar/acoustic/mask subtree) → 1.0 core | small each | low | each its own deliberate patch (mirrors SpscRing internal@0.6.8 → public@0.6.10) |
 
-**Recommendation:** do **C1.5** (`legalNextOperands`) next as `0.9.923`. It is the natural completion of the model-free de-risking that C1 began: C1 proved an emitter constrained to the *kind* mask cannot produce a structurally-invalid stream, but it still relies on the emitter to fill operands from the declared names. C1.5 closes that last gap — given a prefix and a chosen kind, return the legal operand *choices* (which array names by role, which scalar names, the legal width values, the legal `bound` forms) — so a constrained decoder literally cannot emit *any* invalid token, operand included. It is medium-size, low-risk (derives from the same `GrammarState` + the role partitions already in `paramsByRole`), and it makes the Stage-3b model a pure, fully-guarded emitter swap. If you'd rather jump straight to the model, C2 is fine too — C1.5 can also be folded into the decoder's sampling loop later — but doing it first means the SLM has zero ways to produce a rejected token.
+**Recommendation:** do **C1.5** (`legalNextOperands`) next as `0.9.924`. It is the natural completion of the model-free de-risking that C1 began: C1 proved an emitter constrained to the *kind* mask cannot produce a structurally-invalid stream, but it still relies on the emitter to fill operands from the declared names. C1.5 closes that last gap — given a prefix and a chosen kind, return the legal operand *choices* (which array names by role, which scalar names, the legal width values, the legal `bound` forms) — so a constrained decoder literally cannot emit *any* invalid token, operand included. It is medium-size, low-risk (derives from the same `GrammarState` + the role partitions already in `paramsByRole`), and it makes the Stage-3b model a pure, fully-guarded emitter swap. If you'd rather jump straight to the model, C2 is fine too — C1.5 can also be folded into the decoder's sampling loop later — but doing it first means the SLM has zero ways to produce a rejected token.
 
 ---
 
@@ -85,7 +91,7 @@ You'll need to expose the role partition from the state (the `params` array is a
 2. **No-invalid-token property (the real win):** extend the pin-3 mock emitter so it fills operands ONLY from `legalNextOperands` (no hand-picked `"in0"`/`"out"` policy) — over N seeds every produced stream still passes `validateTokens`, now with the emitter carrying ZERO grammar knowledge of its own.
 3. **Parity:** `legalNextTokens` + `validateTokens` unchanged (Stage-0 pins + the hash pin green).
 
-**Version:** `0.9.923`, patch-level (additive fn + types; wire-compat unchanged).
+**Version:** `0.9.924`, patch-level (additive fn + types; wire-compat unchanged).
 
 ---
 
@@ -120,10 +126,10 @@ The true goal: a big LLM reads a rules file once → emits a kernel *family* + a
 
 ## Process notes
 
-- **Versioning:** next is **0.9.923** (recommended: `legalNextOperands`). Three-digit patch space (`0.9.900 → … → 0.9.999`). Additive + experimental-subpath ⇒ **wire-compat unchanged** ⇒ patch. Default to patch; let the user promote.
+- **Versioning:** next is **0.9.924** (recommended: `legalNextOperands`). Three-digit patch space (`0.9.900 → … → 0.9.999`). Additive + experimental-subpath ⇒ **wire-compat unchanged** ⇒ patch. Default to patch; let the user promote.
 - **Gates before any version-bumping commit (mandatory):** `npm run typecheck`; full `npm run test`; `npm run bench` (push/pull/pullLatest within ~1.20 µs baseline + 10 µs hard budget — mind the documented `trajEval` flake); plus `npm run bench:jit` for any JIT-touching change. Register new tests in `package.json` `test` + `test:unit`.
 - **Commit:** one release-grade commit (subject = `0.9.92x — …`; body = what/why/wire-compat). Mirror the CHANGELOG block shape (`Added` / `Why` / `Wire compatibility` / `Tests` / `Documentation`). Trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. **Local commit OK; push only on the user's explicit OK** (this session pushed `0.9.922` after explicit OK).
-- **Docs to update when C1.5 lands:** the CHANGELOG `[0.9.923]` block; extend `docs/frontier6-grammar-design.md` (the operand-mask section); the `CLAUDE.md` `src/jit/` entry; `LLM_BUNDLE.md` via `npm run llm-bundle` (gitignored artifact).
+- **Docs to update when C1.5 lands:** the CHANGELOG `[0.9.924]` block; extend `docs/frontier6-grammar-design.md` (the operand-mask section); the `CLAUDE.md` `src/jit/` entry; `LLM_BUNDLE.md` via `npm run llm-bundle` (gitignored artifact).
 - **Auto-memory rule:** end any building-task response with a single-line commit message in a triple-backtick fenced block (no language tag).
 
 ---
@@ -131,9 +137,9 @@ The true goal: a big LLM reads a rules file once → emits a kernel *family* + a
 ## Quick-start checklist for the next session
 
 1. Read this file + `docs/frontier6-grammar-design.md`; skim `kernelGrammar.ts` (`stepGrammar`/`legalNextTokens`), `tests/legalNextTokens.test.ts`, `ir.ts`, `kernelCache.ts`.
-2. Decide direction (recommended: **C1.5**, `legalNextOperands`, as `0.9.923`).
+2. Decide direction (recommended: **C1.5**, `legalNextOperands`, as `0.9.924`).
 3. **If C1.5:** add `legalNextOperands(prefix, kind)` deriving operand choices from the `GrammarState` role partitions; prove operand soundness + the no-invalid-token property (the pin-3 emitter filling operands ONLY from the mask, carrying zero grammar knowledge); export through the barrels; `tests/legalNextOperands.test.ts`.
 4. **If C2:** write a design note first (model choice, where it runs, the constrained-decoding integration), then build the emitter behind the unchanged mask + gates.
 5. **If D:** build `connectFanOut()` over `SpmcRing` (the broadcast topology constructor — sibling of `connectFanIn`).
-6. Gates → bump to `0.9.923` → CHANGELOG block → local commit → ask before pushing.
+6. Gates → bump to `0.9.924` → CHANGELOG block → local commit → ask before pushing.
 7. Update the deferred docs (design note / CLAUDE.md / LLM bundle) when the API stabilizes.
