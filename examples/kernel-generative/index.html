@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — Generative Kernels (model-free: mask → gates → live audio)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 900px; }
+      h1 { font-size: 18px; margin: 0 0 12px; color: #fff; }
+      h2 { font-size: 12px; margin: 22px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 16px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin: 0 8px 8px 0; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #roll { background: #c08a2a; } #roll:hover:not(:disabled) { background: #e0a338; }
+      #keep { background: #2f7a55; } #keep:hover:not(:disabled) { background: #3a9568; }
+      #evolve { background: #7a3df4; } #evolve:hover:not(:disabled) { background: #9355ff; }
+      label { display: block; margin: 10px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; font: inherit; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; } .dim { color: #6b7280; }
+      .wbarwrap { height: 14px; background: #101218; border: 1px solid #21252d; border-radius: 7px; overflow: hidden; margin: 8px 0; }
+      .wbar { height: 100%; width: 0%; background: #2b3550; transition: width 60ms linear; }
+      .wbar.fade { background: linear-gradient(90deg, #7a3df4, #c79bff); }
+      .wbar.done { background: #2f7a55; }
+      pre.k { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; overflow-x: auto; color: #c8cdd4; white-space: pre-wrap; word-break: break-all; }
+      #bank .bankrow { padding: 3px 0; font-size: 12px; }
+      #bank .bankrow.on { color: #c79bff; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — Generative Kernels</h1>
+    <p>
+      <strong>Model-free music.</strong> A seeded generator walks the Stage-3a constrained-decoder mask
+      (<code>legalNextTokens</code>) to emit random <strong>valid</strong> kernel-grammar token streams — standing in for
+      the future SLM. Each stream runs the <strong>three gates</strong> (syntax → equivalence → acoustic) in a background
+      worker; only <strong>gate-verified, acoustically-curated</strong> kernels reach your ears, morphing into a running
+      AudioWorklet <strong>click-free</strong>. No model — just the mask + the gates, which are exactly the safety
+      contract the model will plug behind. The source is a built-in arpeggio (in0) + a rhythmic pluck (in1); each kernel
+      shapes them.
+    </p>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="roll" disabled>Roll 🎲</button>
+    <button id="keep" disabled>Keep ★</button>
+    <button id="build" disabled>Build bank ×6</button>
+    <button id="evolve" disabled>Evolve ▶</button>
+
+    <h2>Crossfade weight (audio clock — kernel morph)</h2>
+    <div class="wbarwrap"><div id="wbar" class="wbar"></div></div>
+
+    <h2>Current kernel (self-contained token stream)</h2>
+    <pre class="k" id="tokens">(press Start, then Roll 🎲)</pre>
+
+    <h2>Mask · gates · curation</h2>
+    <div id="hud" class="panel"></div>
+
+    <h2>Bank</h2>
+    <div id="bank" class="panel"></div>
+
+    <h2>Controls</h2>
+    <div class="grid">
+      <div>
+        <label for="tempo">tempo <span class="val" id="tempo-val"></span> BPM</label>
+        <input id="tempo" type="range" min="60" max="180" step="1" value="104" />
+        <label for="level">input level <span class="val" id="level-val"></span>×</label>
+        <input id="level" type="range" min="0.3" max="2" step="0.01" value="1.25" />
+      </div>
+      <div>
+        <label for="gain">scalar g (center) <span class="val" id="gain-val"></span></label>
+        <input id="gain" type="range" min="0" max="3" step="0.01" value="1.2" />
+        <label for="lfo">evolve LFO depth (on g) <span class="val" id="lfo-val"></span></label>
+        <input id="lfo" type="range" min="0" max="1.5" step="0.01" value="0.7" />
+      </div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Needs <code>crossOriginIsolated === true</code> (served by <code>serve.mjs</code>). The generator is
+      <code>legalNextTokens</code> + a seeded LCG — proven by <code>tests/legalNextTokens.test.ts</code> to be unable to
+      emit an invalid stream; the worker's <code>KernelCache.getOrCompile</code> runs all three gates before any kernel is
+      audible. Experimental (<code>webgpu-audio-bridge/experimental</code>). Sibling demos:
+      <code>npm run dev:kernel-palette</code> · <code>npm run dev:jit-vectorize</code>.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

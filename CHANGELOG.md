@@ -4,6 +4,65 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.923] — 2026-05-31
+
+### Added — Apollo Frontier 6: the generative-kernels browser demo (model-free music)
+
+A browser demo that makes the model-free language→music pipeline audible **without a
+model**: a seeded generator stands in for the future SLM, and the Stage-3a mask + the
+three gates are exactly the safety contract it plugs behind. Demo + headless self-test
+only — no library/wire change.
+
+- **`examples/kernel-generative/`** (`npm run dev:kernel-generative`, port 5187). A
+  seeded LCG walks `legalNextTokens` to emit random **valid** kernel-grammar token
+  streams (the no-invalid-stream property in `tests/legalNextTokens.test.ts` made
+  flesh — it *cannot* emit a malformed stream); a background worker `getOrCompile`s
+  each through the three gates (syntax → equivalence → acoustic); a `curate()` filter
+  keeps the audibly-interesting ones; the gate-verified SIMD bytes **morph** into a
+  running AudioWorklet click-free. Because every generated kernel shares one signature,
+  the graph is built once over a bootstrap kernel and successive kernels install over
+  it (the consumer crossfades SIMD→SIMD — a click-free morph between kernels).
+  - **Roll 🎲** (generate → auto-reroll past gate/curation rejects → install a keeper),
+    **Keep ★**, **Build bank ×6**, **Evolve ▶** (cycle the bank a kernel-per-bar with an
+    LFO sweeping the scalar `g` → an evolving generative texture). Source is a built-in
+    arpeggio (in0) + a rhythmic pluck (in1) the kernels shape.
+  - The HUD surfaces the live mask→gate→curation story: the current token stream, the
+    acoustic fingerprint (peak/rms/crest/centroid + a 16-band sparkline), the
+    equivalence-gate report, and session stats (rolled / gated-or-curated-out / cached).
+- Sibling of `examples/kernel-palette/` (the fixed-palette Stage-1 demo); reuses the
+  COOP/COEP + bare-`acorn`-rewrite `serve.mjs` and the vendored wabt/acorn.
+
+### Why — make the model-free safety story tangible (and de-risk the SLM)
+
+The mask + the three gates are the whole bet: an *untrusted* emitter, constrained to
+the mask and filtered by the gates, can only ever produce safe, sane, click-free audio.
+A random LCG is the most untrusted emitter imaginable, so a demo where it generates
+gate-proven, live-morphing kernels is the most direct evidence that the Stage-3b model
+will be a pure emitter-swap behind an unchanged, already-proven boundary.
+
+### Wire compatibility
+
+**Unchanged.** A new example + a `dev:` script + a standalone self-test. No `src/`
+change, no SAB layout, no wire-format, no public-API change. Patch-level (mirrors the
+`0.9.920` palette demo).
+
+### Tests
+
+- **`examples/kernel-generative/selftest.mjs`** — a headless verification of the whole
+  generative pipeline through real wabt (`npm run build && node
+  examples/kernel-generative/selftest.mjs`): runs the EXACT browser generator through
+  the EXACT gate stack and asserts (1) **0 invalid streams** (the generator only ever
+  picks masked kinds), (2) **0 syntax-rejects** (the mask never drifts from the
+  validator), (3) no compile throws, (4) a healthy fraction is musical (≈64% over 300
+  rolls), (5) the content-addressed cache dedupes (distinct ≤ accepts; the gap is free
+  hits). Gate/acoustic rejections are expected — the safety net doing its job.
+- The full `npm run typecheck` / `npm test` / `npm run bench` gates are unaffected (no
+  `src/` change) and remain green.
+
+### Documentation
+
+- This CHANGELOG block + `docs/frontier6-stage3b-handoff.md` (the next-patch note).
+
 ## [0.9.922] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 3a: `legalNextTokens` (the constrained-decoder mask)
