@@ -17,7 +17,7 @@ a maintainer owes. No new compiler invariants — pure integration + judgement. 
 `kernelHash(gain) === "72b5c2e5a7a5f117"` pin holds.
 
 - **A playable poly-synth demo (`examples/poly-synth/`, `npm run dev:poly-synth`, port
-  5187).** The first STATEFUL browser demo (the Frontier-5/6 demos were stateless). A fixed
+  5188).** The first STATEFUL browser demo (the Frontier-5/6 demos were stateless). A fixed
   batch of `V = 8` voices over ONE token kernel — a per-voice **one-pole lowpass** (a state
   register) + a **feedback comb** (a delay-line ring buffer), so the register, delay, AND
   voice axes are all exercised at once. An on-screen / computer-key keyboard (A S D F G H J K)

@@ -1,7 +1,8 @@
 // Tiny static server with the COOP/COEP headers SharedArrayBuffer requires.
 //
 // Mirror of examples/kernel-palette/serve.mjs; serves examples/poly-synth/ on port
-// 5187 (5185 = dev:jit-vectorize, 5186 = dev:kernel-palette). The cross-origin
+// 5188 (5185 = dev:jit-vectorize, 5186 = dev:kernel-palette, 5187 =
+// dev:kernel-generative). The cross-origin
 // isolation headers are mandatory (shared WebAssembly.Memory) and let the vendored
 // wabt load same-origin under require-corp.
 //
@@ -21,7 +22,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = resolve(__dirname, "..", "..");
 const DEMO_DIR = __dirname;
-const PORT = Number(process.env.PORT ?? 5187);
+const PORT = Number(process.env.PORT ?? 5188);
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
