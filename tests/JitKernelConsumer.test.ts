@@ -12,9 +12,12 @@
  *   B  pre-install idle = exactly the pure JS-kernel stream.
  *   C  JIT disabled (non-shared memory) → install is a no-op; output is pure JS.
  *   D  install → priming → fading → complete; the WHOLE f64 stream is BIT-EXACT
- *      to the JS reference (gate guarantees f64 SIMD≡JS, so every phase — incl.
- *      the blend — is exact; a corrupted/overlapping slab would break this), and
- *      both generation slabs hold their kernel's finite output during a fade.
+ *      to the JS reference. The gate proves f64 SIMD≡JS bit-exact, and the
+ *      EXACT-LERP amplitude blend `a + w·(b−a)` is exactly `a` for every w when
+ *      a==b (b−a==0), so EVERY phase — including each fading sample — is exact (a
+ *      `(1−w)a+wb` blend would drift ≤1 ULP; a corrupted/overlapping slab would
+ *      diverge grossly). Both generation slabs hold their kernel's finite output
+ *      during the fade.
  *   E  an f32 CANCELLING kernel (x²−y², the ~ULP-gap case): the blended stream is
  *      a true convex combination of the JS and SIMD streams at every sample
  *      (finite, bounded, no discontinuity), exactly JS at idle and exactly SIMD
@@ -58,12 +61,6 @@ function typed(width: LaneWidth): Float32ArrayConstructor | Float64ArrayConstruc
 }
 function roundW(width: LaneWidth): (v: number) => number {
   return width === "f32" ? Math.fround : (v: number) => v;
-}
-// During a fade the blend `(1−w)·a + w·b` rounds: even with a==b (the f64 case,
-// since the gate proves f64 SIMD≡JS bit-exact) the result differs from `a` by the
-// blend's OWN rounding (≤ ~2 ULP) — inaudible. The seams (w=0, w=1) ARE exact.
-function closeF64(a: number, b: number): boolean {
-  return Math.abs(a - b) <= 16 * Number.EPSILON * Math.max(1, Math.abs(b));
 }
 
 function sharedMemory(pages: number): WebAssembly.Memory {
@@ -244,7 +241,6 @@ function testF64Swap(): void {
   const stream = new Float64Array(total);
   const refStream = new Float64Array(total);
   for (let k = 0; k < total; k++) refStream[k] = g * xAll[k]!;
-  const phaseOf: string[] = [];
   let sawFading = false; let sawComplete = false; let installedAt = -1;
   let checkedSlabs = false;
   for (let q = 0; q < QUANTA; q++) {
@@ -254,7 +250,6 @@ function testF64Swap(): void {
     const out = new Float64Array(N);
     const baseNs = (q * N / SR) * 1e9;
     const r = c.process({ x }, { g }, { out }, N, baseNs);
-    phaseOf[q] = r.phase;
     if (r.phase === "fading") {
       sawFading = true;
       // The two generation slabs each hold THEIR kernel's finite output (disjoint,
@@ -279,30 +274,23 @@ function testF64Swap(): void {
   assert(sawComplete, "swap reached complete");
   assert(c.isUpgraded(), "consumer is upgraded (SIMD is the steady kernel)");
 
-  // SEAMS exact, fade within the blend's own rounding. At idle/priming (w=0) the
-  // output is exactly the JS kernel; at complete (w=1) exactly the SIMD kernel
-  // (== JS for f64). Those exact endpoints are what make the fade onset + the
-  // hand-off to the steady SIMD click-free. In-fade samples differ from the
-  // reference only by the blend's ≤ULP rounding.
-  for (let q = 0; q < QUANTA; q++) {
-    const seamExact = phaseOf[q] !== "fading";
-    for (let i = 0; i < N; i++) {
-      const k = q * N + i;
-      if (seamExact) assertEq(stream[k]!, refStream[k]!, `f64 seam (${phaseOf[q]}) exact at k=${k}`);
-      else assert(closeF64(stream[k]!, refStream[k]!), `f64 fade within ULP at k=${k}: ${stream[k]} vs ${refStream[k]}`);
-    }
-  }
-
-  // No click: the blended stream is no less smooth than the reference. Its max
-  // sample-to-sample step must not exceed the reference's by more than the
-  // blend's rounding (a hard switch / corruption would spike this).
+  // EXACT-LERP TRANSPARENCY: the gate proves f64 SIMD≡JS bit-exact, and the
+  // amplitude blend is `a + w·(b−a)` (b−a == 0 when they agree → exactly `a` for
+  // every w), so the WHOLE stream — idle, EVERY fading sample, and complete — is
+  // BIT-EXACT to the pure JS reference. `(1−w)·a + w·b` would drift ≤1 ULP in the
+  // fade; an overlapping/corrupted slab would diverge grossly. This is a formal
+  // transparency proof, not "imperceptibly close".
+  for (let k = 0; k < total; k++)
+    assertEq(stream[k]!, refStream[k]!, `f64 stream[${k}] BIT-EXACT to JS (exact-lerp transparency)`);
+  // Bit-exact ⇒ trivially click-free: the blended stream's steps equal the
+  // reference's exactly.
   let maxRefStep = 0; let maxBlendStep = 0;
   for (let k = 1; k < total; k++) {
     maxRefStep = Math.max(maxRefStep, Math.abs(refStream[k]! - refStream[k - 1]!));
     maxBlendStep = Math.max(maxBlendStep, Math.abs(stream[k]! - stream[k - 1]!));
   }
-  assert(maxBlendStep <= maxRefStep + 1e-9, `blended stream is click-free (maxStep ${maxBlendStep} ≤ ref ${maxRefStep} + ε)`);
-  ok("consumer f64 swap: seams exact, fade ≤ULP, no discontinuity; slabs disjoint+intact");
+  assertEq(maxBlendStep, maxRefStep, "blended stream steps == reference steps (bit-exact ⇒ no discontinuity)");
+  ok("consumer f64 swap (priming→fading→complete) is BIT-EXACT to JS throughout; slabs disjoint+intact");
 }
 
 // ─── Pin E: f32 cancelling kernel — blend is a finite convex combo of JS/SIMD ─
@@ -428,7 +416,7 @@ function testBytesFallbackInstall(): void {
     const out = new Float64Array(N);
     const r = c.process({ x }, { g }, { out }, N, (q * N / SR) * 1e9);
     const ref = jsReference(GAIN_JS, GAIN_SIG, "f64", { x }, { g }, N).out!;
-    for (let i = 0; i < N; i++) assert(closeF64(out[i]!, ref[i]!), `bytes-fallback f64 within ULP q=${q} i=${i}`);
+    for (let i = 0; i < N; i++) assertEq(out[i]!, ref[i]!, `bytes-fallback f64 bit-exact q=${q} i=${i}`);
     if (r.phase === "complete") completed = true;
   }
   assert(completed, "bytes-fallback swap completes");
@@ -446,7 +434,7 @@ function testReUpgrade(): void {
   // First upgrade JS→SIMD.
   assert(c.installCompiledKernel(moduleFromBytes(compileGain())), "first install");
   let q = 0;
-  const step = () => { const out = new Float64Array(N); const r = c.process({ x }, { g }, { out }, N, (q * N / SR) * 1e9); q++; for (let i = 0; i < N; i++) assert(closeF64(out[i]!, ref[i]!), `re-upgrade within ULP q=${q} i=${i}`); return r; };
+  const step = () => { const out = new Float64Array(N); const r = c.process({ x }, { g }, { out }, N, (q * N / SR) * 1e9); q++; for (let i = 0; i < N; i++) assertEq(out[i]!, ref[i]!, `re-upgrade bit-exact q=${q} i=${i}`); return r; };
   let r = step();
   while (r.phase !== "complete" && q < 10) r = step();
   assert(c.isUpgraded(), "upgraded after first swap");

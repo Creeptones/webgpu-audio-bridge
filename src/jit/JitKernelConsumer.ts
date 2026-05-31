@@ -513,8 +513,12 @@ export class JitKernelConsumer {
   }
 
   /** Per-sample AMPLITUDE crossfade A→B into `outs` (the per-sample form of
-   *  `crossfadeInto(a, b, w, out, { mode: "amplitude" })` — the two kernels are
-   *  ULP-correlated, so amplitude has no power notch). */
+   *  `crossfadeInto(a, b, w, out, { mode: "amplitude" })`). Uses the EXACT-LERP
+   *  form `a + w·(b−a)`, NOT `(1−w)·a + w·b`: when the JS and SIMD kernels agree
+   *  bit-for-bit (the f64 case the gate proves, and the f32 no-cancellation
+   *  case), `b−a` is exactly 0 and the output is bit-exactly `a` for every `w` —
+   *  so the entire fade is acoustically transparent, not merely ≤1 ULP close. No
+   *  power notch (the two kernels are ULP-correlated). */
   private blendAtoBintoOuts(outs: Record<string, WritableBuffer>, n: number, baseNs: number, sr: number): void {
     const nsPerSample = 1e9 / sr;
     for (const name of this.outputNames) {
@@ -523,7 +527,7 @@ export class JitKernelConsumer {
       const dst = outs[name]!;
       for (let i = 0; i < n; i++) {
         const w = this.swap.weightAt(baseNs + i * nsPerSample);
-        dst[i] = (1 - w) * a[i]! + w * b[i]!;
+        dst[i] = a[i]! + w * (b[i]! - a[i]!);
       }
     }
   }

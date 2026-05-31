@@ -31,10 +31,11 @@
  *
  * ─── Two blend modes ───────────────────────────────────────────────────────
  *
- *   - "amplitude"  : `out = (1−w)·a + w·b`. Correct when A and B are strongly
- *     correlated (a PARAMETER hot-swap: same schema, near-identical state →
- *     same signal reconstructed twice). A linear blend of correlated signals
- *     preserves amplitude with no power notch.
+ *   - "amplitude"  : `out = a + w·(b−a)` (the exact-lerp form of `(1−w)·a + w·b`;
+ *     see below). Correct when A and B are strongly correlated (a PARAMETER hot-
+ *     swap: same schema, near-identical state → same signal reconstructed twice).
+ *     A linear blend of correlated signals preserves amplitude with no power
+ *     notch.
  *   - "equal-power": `out = cos(½πw)·a + sin(½πw)·b`. Correct when A and B are
  *     UNCORRELATED (a SCHEMA / emitter hot-swap: a genuinely different sound).
  *     A linear blend of uncorrelated signals dips ≈ −3 dB mid-fade (the power
@@ -134,8 +135,22 @@ type WritableBuffer = { length: number; [i: number]: number };
  * Blend two evaluated signal buffers `a → b` under weight `w ∈ [0, 1]` into
  * `out`, in place and allocation-free.
  *
- *   "amplitude"  : `out[i] = (1−w)·a[i] + w·b[i]`
+ *   "amplitude"  : `out[i] = a[i] + w·(b[i] − a[i])`   (exact-lerp; see below)
  *   "equal-power": `out[i] = cos(½πw)·a[i] + sin(½πw)·b[i]`
+ *
+ * ─── Why amplitude uses `a + w·(b−a)` and not `(1−w)·a + w·b` ────────────────
+ *
+ * The two are algebraically equal but NOT equal in IEEE-754. The mathematically
+ * important property for a live hot-swap is `lerp(a, a, w) == a` — when the two
+ * signals AGREE bit-for-bit (e.g. a JIT'd SIMD kernel that the equivalence gate
+ * proved bit-exact to its scalar/JS reference), the blended output must be
+ * exactly that shared value at EVERY `w`, so the fade is acoustically
+ * transparent rather than merely ≤1 ULP close. `(1−w)·a + w·b` fails this: even
+ * with `a==b` it rounds `1−w`, both products, and the sum, drifting ≤1 ULP. The
+ * exact-lerp form `a + w·(b−a)` evaluates `b−a` to exactly 0 (IEEE-754
+ * guarantees `x−x == 0`), then `w·0 == 0`, then `a+0 == a` — bit-exact, with no
+ * `if (a===b)` branch. (This is precisely why C++20 added `std::lerp` with this
+ * formulation.) `w=0` is naturally exact; `w=1` is snapped to exactly `b`.
  *
  * `w` is a single already-resolved weight applied to the whole buffer (compute
  * it with `crossfadeWeight(order)(s)`); to fade a quantum sample-accurately,
@@ -161,14 +176,13 @@ export function crossfadeInto(
     throw new Error(`crossfadeInto: w must be finite, got ${w}`);
   }
   const mode = opts?.mode ?? "amplitude";
-  // Resolve the two gains once; the inner loop is then a flat MAC per element
-  // regardless of mode (no per-sample branch on `mode`).
-  let ga: number;
-  let gb: number;
   if (mode === "equal-power") {
-    // Snap the exact endpoints: `cos(½π·1)` is 6.12e-17, not 0, so without
-    // this the completed swap (w=1) would leave a femto-ghost of `a`. A
-    // hot-swap must retire `a` EXACTLY at w=1 (and emit pure `a` at w=0).
+    // Resolve the two gains once; the inner loop is a flat MAC per element. Snap
+    // the exact endpoints: `cos(½π·1)` is 6.12e-17, not 0, so without this the
+    // completed swap (w=1) would leave a femto-ghost of `a`. A hot-swap must
+    // retire `a` EXACTLY at w=1 (and emit pure `a` at w=0).
+    let ga: number;
+    let gb: number;
     if (w === 0) {
       ga = 1; gb = 0;
     } else if (w === 1) {
@@ -178,11 +192,18 @@ export function crossfadeInto(
       ga = Math.cos(theta);
       gb = Math.sin(theta);
     }
+    for (let i = 0; i < n; i++) {
+      out[i] = ga * a[i]! + gb * b[i]!;
+    }
   } else {
-    gb = w;
-    ga = 1 - w;
-  }
-  for (let i = 0; i < n; i++) {
-    out[i] = ga * a[i]! + gb * b[i]!;
+    // amplitude — the EXACT-LERP form `a + w·(b−a)` (see header). Bit-exact to
+    // `a` (==`b`) when the two signals agree, for every `w`. `w=0` is naturally
+    // exact (`w·(b−a)` is exactly 0 → `a+0 == a`); `w=1` is snapped to exactly
+    // `b` (the algebraic form `a+(b−a)` is not guaranteed to round back to `b`).
+    if (w === 1) {
+      for (let i = 0; i < n; i++) out[i] = b[i]!;
+    } else {
+      for (let i = 0; i < n; i++) out[i] = a[i]! + w * (b[i]! - a[i]!);
+    }
   }
 }

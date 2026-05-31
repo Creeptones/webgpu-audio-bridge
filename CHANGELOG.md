@@ -4,6 +4,63 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.915] — 2026-05-30
+
+### Changed — exact-lerp amplitude crossfade: bit-exact fade transparency
+
+The amplitude crossfade now uses the **exact-lerp** formulation `out = a + w·(b−a)`
+instead of `(1−w)·a + w·b`. The two are algebraically equal but NOT equal in
+IEEE-754: the load-bearing property for a hot-swap is `lerp(a, a, w) == a`. When
+the two blended signals AGREE bit-for-bit — which the JIT's equivalence gate
+**proves** for the f64 SIMD-vs-JS kernel pair, and which also holds for any f32
+kernel without cancellation — the fade output must be exactly that shared value at
+every `w`, not merely ≤1 ULP close. `(1−w)·a + w·b` fails this (it rounds `1−w`,
+both products, and the sum, drifting ≤1 ULP through the fade); `a + w·(b−a)`
+evaluates `b−a` to exactly `0` (IEEE-754 guarantees `x−x == 0`), `w·0` to `0`, and
+`a+0` to `a` — bit-exact, with no `if (a===b)` branch. (This is exactly why C++20
+added `std::lerp` with this formulation.)
+
+- **`src/crossfade.ts`** — `crossfadeInto`'s `"amplitude"` branch rewritten to the
+  exact-lerp form. `w=0` is naturally exact (`w·(b−a)` is exactly 0 → `a`); `w=1`
+  is snapped to exactly `b` (the algebraic `a+(b−a)` is not guaranteed to round
+  back to `b`), preserving the documented `w=0→a` / `w=1→b` endpoint contract. The
+  `"equal-power"` branch is unchanged. Header + method docs explain the choice.
+- **`src/jit/JitKernelConsumer.ts`** — the per-sample fade blend
+  (`blendAtoBintoOuts`) switched to the same exact-lerp form. Consequence: when the
+  JIT-compiled SIMD kernel is bit-exact to the JS fallback (every f64 kernel, by
+  the gate; f32 kernels away from cancellation), the **entire** live swap — idle,
+  every fading sample, and complete — emits a stream BIT-IDENTICAL to the
+  developer's JS kernel. The swap is now *formally* acoustically transparent, not
+  just imperceptibly close, so a JIT upgrade / fallback / mid-quantum hot-swap is
+  provably structurally flawless.
+
+### Why — elevate the JIT from "imperceptibly close" to "formally transparent"
+
+Stage 1b (0.9.914) measured the f64 fade as seam-exact but ≤1 ULP off mid-fade —
+the blend's own rounding, inaudible but not *provably* nothing. The exact-lerp
+rearrangement closes that gap for free: it is the same lerp mathematically, the
+same cost, but it bypasses floating-point rounding entirely wherever the two
+signals agree. That turns the gate's bit-exactness guarantee into an end-to-end
+transparency guarantee that survives the crossfade — the property a downstream
+user wants when an unverified-looking JIT swap happens under their audio.
+
+### Wire compatibility
+
+**Unchanged.** Pure numeric-formulation refinement of an existing blend — no SAB
+layout, API surface, or type changes; no new dependency. The `"equal-power"` mode
+and all endpoint contracts are bit-identical to before.
+
+### Tests
+
+`npm run typecheck` clean. `tests/Bridge.crossfade.test.ts` green (endpoint
+exactness, the `w=0.5` midpoint, the −3 dB amplitude notch, and the C^k seam-
+continuity pins all hold under the new formulation). `tests/JitKernelConsumer.test.ts`
+**Pin D reverted to assert the f64 swap is BIT-EXACT to JS throughout** (idle +
+every fading sample + complete), with the no-discontinuity step-bound now an exact
+equality; Pins H (bytes fallback) and I (re-upgrade) likewise bit-exact. Full suite
+green; `npm run bench` push/pull/pullLatest within baseline + the 10 µs hard budget
+(the pre-existing `trajEval (fast)` quirk unrelated; `trajectory.ts` untouched).
+
 ## [0.9.914] — 2026-05-30
 
 ### Added — Apollo Frontier 5, Stage 1b: The Autonomous JIT — the live-swap runtime
