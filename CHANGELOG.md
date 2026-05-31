@@ -4,6 +4,94 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.913] — 2026-05-30
+
+### Added — Apollo Frontier 5, Stage 1a: The Autonomous JIT — the production vectorizing compiler
+
+The first production code of Frontier 5: a deterministic JS→WASM-SIMD micro-
+compiler that turns a developer's naive scalar DSP loop into vectorized WASM and
+returns it **only after proving it equivalent to the source**. Implements exactly
+the sub-language + lowering Stage 0 (0.9.912) specified, proved, and probed.
+**Internal-first + `@experimental`** — exported from the
+`webgpu-audio-bridge/experimental` subpath, NOT the 1.0 core; a one-shot
+construction warning fires (mirrors `MpmcRing`/`SpmcRing`). The live hot-swap
+runtime (`JitKernelConsumer` / `connectJit`) is Stage 1b.
+
+- **`src/jit/`** — the pipeline (`compileKernel(source, signature, { compileWat })`):
+  - **`parse.ts`** — the ONLY file importing `acorn` (the new compile-time-only
+    dependency). Quarantined: `src/jit/` is reachable only from the experimental
+    subpath / a background worker, never from `src/index.ts`.
+  - **`lower.ts`** — ESTree → typed IR, validating the sub-language as it walks;
+    the FIRST out-of-subset construct throws the precise `E_*` diagnostic (no
+    silent mis-compile). SSA temps are inlined, making loop-carry structurally
+    impossible.
+  - **`ir.ts` / `vectorize.ts` / `emitKernelWat.ts`** — typed expression-tree IR;
+    a plan that gates v1 emittability (contiguous stride-1 loads/stores — a valid
+    stride-2 program surfaces as `unsupported` → JS fallback, deferred to a
+    follow-up); and the WAT emitter (mirrors `emitWasmDecoder`: folded `i32.const`
+    offsets, `(import "env" "memory" … shared)`, a GENERATED banner). Two modules
+    from the SAME op-tree — a single-lane scalar reference and a packed
+    `f{32x4,64x2}` SIMD candidate with a scalar epilogue for the `n%W` tail.
+    **Never emits a fused / `relaxed_*` opcode** (the (NF) invariant — the FMA
+    finding).
+  - **`gate.ts`** — THE load-bearing safety: compiles both modules via an
+    **injected** `compileWat` (the module imports no compiler), runs them over the
+    fuzz corpus, and accepts ONLY if the SIMD candidate equals the scalar
+    reference **bit-exact (f64) / within-ULP (f32)**, with the user's JS as a
+    third oracle (finite inputs). Returns a **discriminated union** —
+    `compileKernel` never throws on a user program; the caller swaps only on
+    `accepted`, else keeps the JS kernel.
+  - **`corpus.ts`** — deterministic IEEE-edge + seeded-random inputs sweeping
+    every `n%W` residue (no `Math.random`/`Date.now`).
+- **`tests/JitCompiler.interleaving.test.ts`** — the in-CI successor to
+  `bench/jit-probe.mjs`, driving the REAL pipeline: **128 enumerated programs
+  (f64+f32) all gate-ACCEPTED across 104,960 comparisons (worst f32 ULP 0)**; the
+  reject half pins 12 out-of-subset programs to their exact `E_*`; three
+  deliberately-wrong candidates (op-flip / mul→div / wrong-const) all caught.
+- **`tests/JitCompiler.test.ts`** — 10 numbered API pins through real wabt:
+  identity / Taylor o2 (f64 bit-exact, f32 worst-ULP 0) / a curated kernel
+  library / loop-tail residues / one pin per `E_*` rejection / the gate rejecting
+  a corrupted candidate / **determinism (same source ⇒ byte-identical WAT + wasm)**
+  / stride-2 ⇒ `unsupported` / the **import-graph guard** (the core reaches 30
+  files, none import `acorn`; `parse.ts` does).
+- **`tests/JitCompiler.stress.test.ts`** — audio-block-scale soak: 4 kernels ×
+  1000×128-sample random blocks, SIMD ≡ scalar **bit-exact**; f64 deliverable
+  bit-exact vs naive JS; **f32 deliverable up to ~2677 ULP from naive JS near
+  cancellation** (the f64-intermediate-vs-f32 gap — empirical justification for
+  the Stage-1b crossfade-not-hard-switch decision) + a 50-recompile determinism
+  soak (byte-identical).
+
+### Why — implement the proven design, pin it three ways
+
+Stage 0 proved the lowering equivalence-preserving and found the FMA tear; Stage
+1a builds exactly that and pins it the way the ring primitives were — an in-CI
+program-space fuzzer driving the real emitter (with the negative reject + wrong-
+candidate pins that make the gate load-bearing), numbered API pins, and an audio-
+scale stress soak. The gate is the whole safety story: a generated kernel reaches
+the audio thread only after it is proven equivalent, which is exactly why an
+untrusted candidate generator (a future SLM) can later plug in behind it unchanged.
+
+### Wire compatibility
+
+**Unchanged.** A new compile-time subsystem only — no SAB layout, no change to
+`Bridge` or the SPSC/MP→SC/SP→MC rings or their `.tla` models. New dependency
+`acorn` is compile-time-only and **provably absent from the core import graph**
+(pinned). The `experimental` subpath gains the JIT surface; the root entry point
+is untouched and remains zero-runtime-dep.
+
+### Tests
+
+`npm run typecheck` clean. Full suite green, now including the three new
+`JitCompiler.*` suites. `npm run bench`: push/pull/pullLatest within the
+documented baseline + the 10 µs hard budget (the `trajEval (fast)` characterization
+cell exceeds its tight 1.25 µs budget under load on this machine — pre-existing
+and unrelated; `trajectory.ts`/`bench/Bridge.bench.ts` are untouched by this patch).
+
+### Documentation
+
+The `experimental` barrel documents the JIT surface. README + a
+`docs/jit-vectorize-design.md` design note land with the Stage-3 public API.
+
 ## [0.9.912] — 2026-05-30
 
 ### Added — Apollo Frontier 5, Stage 0: The Autonomous JIT — semantics + vectorization-correctness proof + probe

@@ -85,3 +85,25 @@ export type {
 // docs/frontier3-stage4.1-spmc-primitive-handoff.md.
 export { SpmcRing, SPMC_HEADER_BYTES } from "../SpmcRing.js";
 export type { SpmcRingOptions } from "../SpmcRing.js";
+
+// ── The Autonomous JIT — compileKernel (0.9.913) ────────────────────────────
+//
+// Apollo Frontier 5, Stage 1a: the in-browser JS→WASM-SIMD micro-compiler.
+// `compileKernel(source, signature, { compileWat })` parses a developer's naive
+// scalar JS DSP loop, auto-vectorizes it to WASM SIMD (f32x4 / f64x2), and
+// returns the SIMD bytes ONLY after the equivalence gate proves them bit-exact
+// (f64) / within-ULP (f32) to a scalar reference compiled from the same IR — so
+// a generated kernel can never reach the audio thread unless it is proven
+// equivalent. Internal-first + `@experimental`: the API and the compilable
+// sub-language are OUTSIDE the 1.0 stability contract until they soak + promote;
+// a one-shot construction warning fires. `acorn` (the JS parser) is a
+// compile-time dependency confined to this subtree — the zero-runtime-dep core
+// (the root entry point) never reaches it. The live hot-swap runtime
+// (`JitKernelConsumer` / `connectJit`) is Stage 1b. See docs/frontier5-jit-handoff.md.
+export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/index.js";
+export { emitScalarModule, emitSimdModule, paramLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
+export type {
+  CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch,
+  KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore,
+  Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase,
+} from "../jit/index.js";
