@@ -80,6 +80,16 @@ export {
 } from "./fingerprint.js";
 export type { FingerprintLike, FingerprintMatch } from "./fingerprint.js";
 
+// ── offline corpus index (quick-win #3) ──────────────────────────────────────
+// Batch-characterize kernels → cluster by fingerprint → export prototypes (a vetted
+// seed set). Build/worker-time tooling, pure (no wasm). See corpusIndex.ts.
+export {
+  characterizeCorpus, clusterByFingerprint, buildCorpusIndex, corpusPrototypes,
+} from "./corpusIndex.js";
+export type {
+  CorpusEntry, CorpusRejection, CorpusCluster, CorpusIndex, BuildCorpusIndexOptions,
+} from "./corpusIndex.js";
+
 // ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
 export { JitKernelSwap } from "./JitKernelSwap.js";
 export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum } from "./JitKernelSwap.js";

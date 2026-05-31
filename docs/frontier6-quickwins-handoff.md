@@ -1,6 +1,8 @@
 # Apollo Frontier 6 — quick-wins handoff (the model-free stack is complete; the SLM is deferred)
 
-**As of:** 2026-05-31 · version **0.9.926** (quick-win #2 — the **fingerprint helpers** + the default `fingerprintBands` 16→64 bump — shipped at 0.9.926; quick-win #1 the **negative cache** at 0.9.925) · branch `main` · next patch **0.9.927**.
+**As of:** 2026-05-31 · version **0.9.927** (quick-win #3 — the **offline corpus index** — shipped at 0.9.927; #2 fingerprint helpers + the 16→64 band bump at 0.9.926; #1 negative cache at 0.9.925) · branch `main` · next patch **0.9.928**.
+
+> **All three model-free quick-wins are DONE.** #1 negative cache (0.9.925), #2 fingerprint helpers + 64-band default (0.9.926), #3 offline corpus index (0.9.927). **Next session: pick direction D (`connectFanOut()` over `SpmcRing`) or E (promote a soaked `@experimental` surface toward the 1.0 core)** — both detailed in "Alternative directions" below. The Stage-3b SLM (C2) stays deferred (resume from `docs/frontier6-stage3b-handoff.md`).
 
 > **Quick-win #1 (negative cache) is DONE (0.9.925).** `KernelCache` now memoizes rejections (two memos: syntax→stream-text key, body→`kernelHash`), every `GetOrCompileResult` carries a `cached` flag, `RejectVerdict`/`rejectedSize` are new surface, `clear()` wipes both stores. Proven by `tests/kernelCache.negativeCache.test.ts` (4 pins incl. a compile-count probe).
 
@@ -44,11 +46,9 @@ Done. `KernelCache` memoizes rejections via two memos (syntax→stream-text key,
 
 Done. `src/jit/fingerprint.ts` — `fingerprintDistance` / `nearestByFingerprint` / `dedupByFingerprint` / `sortByBrightness` / `brighterThan` / `darkerThan` over the (now 64-band) amplitude-invariant `AcousticProfile.magnitude`. Pure, metric, proven by `tests/fingerprint.test.ts`. **Soundness caveat baked into the file header:** distance is a "sounds-like" prior on one probe, never an equivalence proof — `kernelHash` stays the sound identity.
 
-### 3. Offline corpus index *(recommended next)*
+### 3. Offline corpus index ✅ SHIPPED (0.9.927)
 
-Batch `evalReference` (pure JS, **zero wasm**) over many kernels → cluster by fingerprint → export prototypes. A vetted seed set for the eventual SLM; builds on #2's distance metric.
-
-- A script/helper that walks a set of token streams (or random-generated valid kernels via the mask), characterizes each, clusters by fingerprint distance, and emits representative prototypes. Pure offline tooling — keep it out of the runtime hot path.
+Done. `src/jit/corpusIndex.ts` — `characterizeCorpus` / `clusterByFingerprint` (leader clustering + medoid prototype) / `buildCorpusIndex` / `corpusPrototypes`, generic over the item type. Pure offline tooling (no wasm), builds on #2's `fingerprintDistance`. Proven by `tests/corpusIndex.test.ts` (4 pins). Captures gate rejections + `toKernel` throws as values (never throws). **The three model-free quick-wins are complete.**
 
 ## Alternative directions (if not Frontier 6)
 
@@ -62,7 +62,8 @@ Batch `evalReference` (pure JS, **zero wasm**) over many kernels → cluster by 
 - `src/jit/kernelGrammar.ts` — `legalNextTokens` + `legalNextOperands` + the shared `GrammarState`/`stepGrammar` machine. **One machine, now three readings** (validate / kind-mask / operand-mask) — never fork the grammar logic; change `stepGrammar`/`legalKinds` once and all three move together. That non-drift is the entire safety argument.
 - `src/jit/kernelCache.ts` — `KernelCache.getOrCompile`, the three-gate orchestration (syntax → equivalence → acoustic, attaching the `AcousticProfile`). **Where the negative cache (quick-win #1) slots.**
 - `src/jit/acousticGate.ts` — `acousticGate` + `evalReference` (the reusable pure-JS, width-rounded IR interpreter — bit-identical to scalar WASM for f32, **no wasm needed**) + `AcousticProfile` (the 64-band-default L1-normalized `magnitude` fingerprint).
-- `src/jit/fingerprint.ts` — the shipped quick-win #2 helpers (`fingerprintDistance`/`nearestByFingerprint`/`dedupByFingerprint`/`sortByBrightness`/`brighterThan`/`darkerThan`). **Quick-win #3 (offline corpus index) builds on `fingerprintDistance` here.**
+- `src/jit/fingerprint.ts` — the shipped quick-win #2 helpers (`fingerprintDistance`/`nearestByFingerprint`/`dedupByFingerprint`/`sortByBrightness`/`brighterThan`/`darkerThan`).
+- `src/jit/corpusIndex.ts` — the shipped quick-win #3 offline index (`characterizeCorpus`/`clusterByFingerprint`/`buildCorpusIndex`/`corpusPrototypes`). Built on `fingerprintDistance`; pure offline tooling.
 - `src/SpmcRing.ts` + `src/connectFanIn.ts` — the pieces for direction D.
 - `docs/frontier6-slm-possibilities.md` — the design memo (quick-wins = §7).
 - `docs/frontier6-grammar-design.md` — the shipped design note (operand-mask section at the end of the constrained-decoder discussion).

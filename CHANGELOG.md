@@ -4,6 +4,73 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.927] — 2026-05-31
+
+### Added — Apollo Frontier 6 quick-win #3: the offline corpus index
+
+Batch-characterize many kernels → cluster by fingerprint → export one representative
+prototype per cluster: a vetted, deduplicated seed set for the eventual Stage-3b model
+(and a ready-made palette for a human). The natural consumer of quick-win #2's
+`fingerprintDistance`. Pure, deterministic, **offline** tooling (no wasm); library +
+tests only.
+
+- **`src/jit/corpusIndex.ts`** — generic over the indexed item type `T` (a token
+  stream, an IR, an id, …):
+  - **`characterizeCorpus(items, toKernel, acoustic?)`** — map each item to its IR and
+    run gate #3; returns `{ entries, rejected }`. A `toKernel` throw (e.g. an invalid
+    token stream) or a gate rejection (non-finite / runaway) becomes a `CorpusRejection`
+    with its reason — nothing is thrown.
+  - **`clusterByFingerprint(entries, radius)`** — leader clustering: admit each entry to
+    the first cluster whose seed is within `radius`, else open a new one; then re-choose
+    each cluster's `prototype` as its **medoid** (the most central sound) and report the
+    realized `radius`. `radius = 0` is exact dedup-by-sound.
+  - **`buildCorpusIndex(items, toKernel, { radius?, acoustic? })`** — one call →
+    `{ entries, clusters, rejected }`.
+  - **`corpusPrototypes(index)`** — the cluster medoids, the prototype seed set.
+- **Exports:** the four functions + `CorpusEntry` / `CorpusRejection` / `CorpusCluster` /
+  `CorpusIndex` / `BuildCorpusIndexOptions` from `src/jit/index.ts` →
+  `webgpu-audio-bridge/experimental`.
+- **Soundness (inherited):** clustering groups kernels that *sound* alike on the probe —
+  a prototype is a representative SOUND, not a canonical implementation. The behavioral
+  identity stays `kernelHash`; use the index to seed/curate, never to substitute.
+
+### Why — turn the fingerprint into a curated vocabulary
+
+The fingerprint distance (quick-win #2) gives a "sounds-like" metric; the corpus index
+is what you build *with* it. Batch-scoring kernels offline (gate #3 is pure JS, zero
+wasm) → clustering → prototypes is the §4 "free deterministic reward/filter" loop from
+`docs/frontier6-slm-possibilities.md`: a small model can be distilled against, or a human
+can browse, the de-duplicated prototype set rather than a flood of audibly-redundant
+candidates. Completes the three model-free quick-wins.
+
+### Wire compatibility
+
+**Unchanged.** A new pure module + four functions + five types on the experimental
+subpath. No SAB layout, no wire-format, no change to any existing signature. Patch-level.
+
+### Tests
+
+- **`tests/corpusIndex.test.ts`** (4 pins, registered in `test` + `test:unit`):
+  (1) `characterizeCorpus` splits accepted entries (carrying the gate-#3 profile) from a
+  blowup rejection (`peak-out-of-bounds`) and a `toKernel`-throw rejection — no throw;
+  (2) `clusterByFingerprint(0)` groups only byte-identical sounds (gain ≡ hardclip ≡
+  constscale collapse; distinct spectra stay singleton; medoid prototype, radius 0);
+  (3) `clusterByFingerprint(0.08)` folds the two cubic-soft variants (distance 0.04) into
+  one cluster while keeping them apart from gain (0.10/0.14) and ringmod (0.57), realized
+  radius = medoid→member max, negative radius throws; (4) `buildCorpusIndex` +
+  `corpusPrototypes` yield one medoid per cluster (each a real member, mutually distinct),
+  and the index is byte-deterministic across runs.
+- `npm run typecheck` clean; full `npm test` green; `npm run bench` push/pull/pullLatest
+  at 1.20 µs (within baseline + 10 µs hard budget) — `corpusIndex.ts` is offline tooling,
+  not in the bench path.
+
+### Documentation
+
+- This CHANGELOG block + the `corpusIndex.ts` file header (offline + soundness notes) +
+  the `CLAUDE.md` `src/jit/` entry + `docs/frontier6-quickwins-handoff.md` (quick-win #3
+  marked shipped — all three model-free quick-wins now done; next session pointed at
+  direction D / E).
+
 ## [0.9.926] — 2026-05-31
 
 ### Added — Apollo Frontier 6 quick-win #2: fingerprint-distance helpers ("sounds-like" queries)
