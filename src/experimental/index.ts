@@ -153,3 +153,19 @@ export type {
   JitWorkletOptions, JitCompileRequest, JitCompileResponse, JitInstallMessage,
   JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions,
 } from "../jit/index.js";
+
+// ── The kernel grammar (0.9.918, Apollo Frontier 6, Stage 0) ─────────────────
+//
+// Language→music begins here: a small, CLOSED token grammar that IS the JIT IR
+// serialized (postfix/RPN), with a lossless bidirectional codec, a value-returning
+// SYNTAX validator (gate #1 of the three-gate stack: syntax → equivalence →
+// acoustic), a copy-pasteable flat text form, and a deterministic content hash.
+// Pure data — no parser/compiler/gate, no model, no wabt. `kernelHash` is a
+// content-address / cache key (FNV-1a-64 over the canonical `kernelKey`), NOT a
+// security boundary — the equivalence gate is the boundary. `@experimental`: the
+// grammar + codec + hash are outside the 1.0 stability contract until they soak +
+// promote. See docs/frontier6-stage0-1-grammar-handoff.md.
+export {
+  kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens,
+} from "../jit/index.js";
+export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/index.js";

@@ -19,6 +19,7 @@ export { runGate } from "./gate.js";
 
 export type {
   KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore,
+  LoopBound, UnaryOp, BinaryOp,
 } from "./ir.js";
 
 export type { Diagnostic, DiagnosticCode } from "./diagnostics.js";
@@ -32,6 +33,16 @@ export type { CorpusOptions, CorpusCase } from "./corpus.js";
 export { vectorize } from "./vectorize.js";
 export { lowerKernel, validate } from "./lower.js";
 export { parseProgram } from "./parse.js";
+
+// ── Stage-0 kernel grammar (Apollo Frontier 6) ───────────────────────────────
+// The token serialization of the IR: a closed postfix grammar, a lossless codec,
+// the syntax validator (gate #1 of 3), the flat text form, and the content hash.
+// Pure data — depends only on the IR types + `kernelKey`, never on the
+// parser/vectorizer/emitter/gate. See kernelGrammar.ts.
+export {
+  kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens,
+} from "./kernelGrammar.js";
+export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "./kernelGrammar.js";
 
 // ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
 export { JitKernelSwap } from "./JitKernelSwap.js";

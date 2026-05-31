@@ -4,6 +4,93 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.918] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 0: the canonical kernel grammar (codec + syntax validator + content hash)
+
+Frontier 5 made a naive scalar JS kernel into gate-proven WASM SIMD. Frontier 6
+turns the JIT into a *language→music* engine: a small, **closed** token grammar a
+future small language model emits under constrained decoding, each kernel
+content-addressed, gate-verified, and characterized. Stage 0 is the **model-free
+foundation** — the grammar, the lossless codec, the syntax validator, and the
+content hash — built and pinned *before any model* so a Stage-3 decoder swaps only
+the emitter, never the whole chain.
+
+- **`src/jit/kernelGrammar.ts`** — a postfix (RPN) token serialization of the JIT
+  IR (`src/jit/ir.ts`'s `IrKernel`). Pure data: it depends only on the IR *types*
+  and the canonical `kernelKey`, never on the parser/vectorizer/emitter/gate (the
+  token path is acorn-free). Exported from `webgpu-audio-bridge/experimental`:
+  - **`kernelToTokens(ir)` / `tokensToKernel(tokens)`** — the lossless codec. The
+    `IrNode` expression tree serializes to postfix (`const`/`scalar`/`load` push;
+    `unary` pops 1, `binary` pops 2; `store` pops the one expression value) — the
+    push/pop shape a constrained decoder wants. Streams are **self-contained**: the
+    `width`, the signature (`param` tokens), and the loop `bound` ride along, so no
+    external signature argument is needed (a strict superset of the handoff sketch).
+  - **`validateTokens(tokens)`** — **gate #1 of 3** (syntax → equivalence →
+    acoustic). The syntax layer: a single leading `width`, a well-formed `param`
+    run, a `bound` resolving to a declared param or a non-negative integer, correct
+    operand-stack arity, known ops, integer affine strides, exactly one value on
+    the stack at each `store`, declared-name resolution, and an empty stack at the
+    end. **Rejection is a VALUE** (`{ ok: false, error, at? }`), mirroring
+    `compileKernel`. This is the spec a Stage-3 decoder enforces — built now.
+  - **`tokensToString(tokens)` / `parseTokens(text)`** — a copy-pasteable one-line
+    flat text form (colon-joined fields, space-separated tokens).
+  - **`kernelHash(ir | tokens)`** — a deterministic content address: FNV-1a-64 (16
+    hex chars) over the canonical `kernelKey`, synchronous + zero-dependency (no
+    `node:crypto`), AudioWorklet-realm safe. It is **NOT a security boundary** — the
+    equivalence gate is. Because `kernelKey` is over the kernel BODY, two kernels
+    with the same computation but a different calling convention hash equal (the
+    intended identity).
+- The grammar is **isomorphic to the IR**, not to the narrower v1-emittable subset:
+  it round-trips arbitrary integer strides (e.g. the stride-2 deinterleave that is
+  *valid in the language* though `vectorize.ts` surfaces it as `unsupported`). It
+  is stateless — no recurrence is designed into the grammar (the stateful-palette
+  division is a later stage).
+
+### Why — build the closed grammar + codec + hash before any model
+
+The whole Frontier-6 bet is that a closed grammar + constrained decoding makes an
+*untrusted emitter* unable to produce invalid IR, and the equivalence gate makes
+the *accepted* kernel safe to run. Stage 0 de-risks the parts unique to that bet —
+the serialization, the syntax validator, and the content-address — as pure,
+exhaustively-tested data, so the Stage-1 compile plumbing and the eventual SLM
+emitter plug into a settled foundation. No model, no compile, no wabt: the codec is
+provably lossless and the hash provably deterministic on their own.
+
+### Wire compatibility
+
+**Unchanged.** An experimental-subpath addition only — new symbols under
+`webgpu-audio-bridge/experimental`, no SAB layout / public-API / type change to the
+1.0 core, no new runtime dependency (the grammar is zero-dep; it never imports
+`acorn`, preserved by the JitCompiler import-graph guard). `@experimental`: a
+one-shot construction warning fires; the grammar/codec/hash are outside the 1.0
+stability contract until they soak + promote (mirrors SpscRing internal@0.6.8 →
+public@0.6.10). Patch-level per the versioning policy.
+
+### Tests
+
+- **`tests/kernelGrammar.test.ts`** — pins A–G over an 11-kernel hand-authored
+  corpus (gain, mix2, affine, hard-clip, abs, cubic soft-clip, f64 sqrt, stereo
+  two-store, const-bound copy, stride-2 deinterleave, an op-sweep covering every
+  unary + binary op): (A) codec round-trip by `kernelKey`; (B) flat-form round-trip;
+  (C) validator accepts + rebuilds every corpus kernel; (D) validator rejects — as
+  a value — arity underflow, unknown unary/binary op, two-values-before-STORE,
+  fractional stride, undeclared name, trailing operand, no-leading-width, empty
+  stream, bad bound; (E) hash determinism, ir≡tokens parity, equal-key⇒equal-hash
+  (signature ignored), corpus distinctness (no collisions), 16-hex shape, a
+  regression pin; (F) barrel re-export identity; (G) `tokensToKernel` throws on an
+  invalid stream. Registered in `test` + `test:unit`. Gates green: `npm run
+  typecheck`; `tsx tests/kernelGrammar.test.ts`; `tsx tests/JitCompiler.test.ts`
+  (10/10, import-graph guard intact); `tsx tests/connectJit.test.ts` (6/6);
+  `npm run bench` (push/pull/pullLatest within ~1.20 µs baseline).
+
+### Documentation
+
+The Stage-0/1 plan lives in `docs/frontier6-stage0-1-grammar-handoff.md`. The
+`docs/frontier6-grammar-design.md` design note and the `CLAUDE.md` "What lives
+where" entry are deferred to the end of Stage 1 (per the handoff), once the
+`compileIr`/`compileTokens`/cache API stabilizes alongside the grammar.
+
 ## [0.9.917] — 2026-05-30
 
 ### Added — Apollo Frontier 5, Stage 3: The Autonomous JIT — `connectJit()` + browser demo
