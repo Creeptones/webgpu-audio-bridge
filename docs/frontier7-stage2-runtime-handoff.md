@@ -109,3 +109,19 @@ Add a browser smoke (extend `examples/kernel-palette/` or a new `examples/state-
 - **Stage 4 — SIMD across voices.** A voice-batched calling convention packs `W` independent instances per `v128`; the SIMD emitter re-engages along the *voice* axis; the gate proves SIMD-voices ≡ scalar-per-voice. The polyphony payoff. Large.
 - **Stage 5 — surface + demo.** A live-tweakable filter/echo browser demo, the `connectJit` token path exercised for stateful kernels end-to-end, docs + README + the experimental-promotion note. Medium.
 - **Deferred: `lower.ts` JS authoring** (a `let s = <literal>;` before the loop ⇒ a register; `s = expr;` ⇒ its `writeState`) — the real-JS-is-sequential vs IR-is-simultaneous reconciliation (enforce the single-write-at-end class where the two coincide). Independent of Stages 2–4.
+
+---
+
+## 8. Shipped postscript (0.9.930)
+
+Stage 2 shipped as **0.9.930**, additive and `@experimental`. What actually landed vs the plan above:
+
+- **`stateDecls` source of truth** — went with "add `stateDecls` to the *accepted `CompileResult`*" (§3.1's simplest option): both `compileIr` accepted returns now carry `ir.stateDecls ?? []`. `runJitCompile` forwards it on the `jit-result` response → `forwardCompileResponse` onto the `jit-install` message (both transports) → `handleJitInstallMessage` → the consumer's install methods. `connectJit` derives it from `tokensToKernel(tokens)` on the token path (JS-source path stays stateless) into `JitWorkletOptions` → `createJitConsumer`.
+- **Per-install AND construction (a hybrid, not pure §3.1(a))** — the recommendation was "per-install only", but the JS fallback (current-A) is itself a stateful kernel that runs at idle *before any install*, so its state shape MUST be known at construction. So: `JitKernelConsumerOptions.stateDecls` fixes the consumer's `stateful` flag + layout + the JS-fallback / slab-A seed at construction; the install message's `stateDecls` seeds the incoming slab-B. v1 `connectJit` derives both from the same kernel so they always match; a stateful kernel installed onto a stateless consumer (or one exceeding the reserved registers) is refused (`install* → false`).
+- **Fixed-max reservation** — `MAX_STATE_REGISTERS = 64` (exported from `JitKernelConsumer.ts`), per §3.2's recommended option, so `describeLayout()` + the disjointness assertion + `jitMemoryPages` stay construction-time and the page budget is predictable. `stateA`/`stateB` regions are reserved only when stateful (stateless layout byte-identical).
+- **Promotion is a copy, not a reference swap** — §3.6 said "swap the slab references"; the static prebuilt arg arrays (which bake the slab offsets) made a tiny ≤64-element `slab-B → slab-A` copy at promotion strictly simpler and equally continuous. Documented inline.
+- **One bug fixed beyond the plan** — the existing non-finite-abort path re-ran the current kernel (`runJsFallbackA`) *after* `runCurrentA` had already run it; for a STATEFUL kernel that **double-advances** the registers. The abort now projects the already-computed current-A output (`copyAtoOuts`) instead of re-running — bit-identical for a stateless kernel (the re-run was idempotent), correct for a stateful one. Pin 4 guards it.
+- **Tests** — `tests/stateKernelConsumer.test.ts`, 5 pins, registered in `test` + `test:unit`. All green; `npm run typecheck` clean; `npm run bench` 1.30 µs; `npm run bench:jit` swap/install cells unchanged. The `Bridge.properties` + `Bridge.observability` flakes fired once each under load and passed on isolated re-run (documented in §5.3 — neither touches the JIT).
+- **Demo deferred** — no `examples/state-filter/` yet (Stage 5 per §4).
+
+**Stage 3 (delay lines — `z⁻N` ring buffers) is now the next frontier** (§7).

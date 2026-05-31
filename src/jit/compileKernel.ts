@@ -27,7 +27,7 @@ import { vectorize, type VectorizedKernelPlan } from "./vectorize.js";
 import { emitScalarModule, emitSimdModule } from "./emitKernelWat.js";
 import { buildCorpus, CORPUS_N_VALUES, type CorpusOptions } from "./corpus.js";
 import { runGate, type CompileWat, type GateReport } from "./gate.js";
-import { type IrKernel, type KernelSignature, type LaneWidth } from "./ir.js";
+import { type IrKernel, type IrStateDecl, type KernelSignature, type LaneWidth } from "./ir.js";
 import { validateTokens, type KernelToken } from "./kernelGrammar.js";
 
 export interface CompileKernelOptions {
@@ -72,6 +72,11 @@ export type CompileResult =
       readonly plan: VectorizedKernelPlan;
       readonly exportName: string;
       readonly gate: GateReport;
+      /** The kernel's declared state registers (Apollo Frontier 7), declaration
+       *  order. Empty for a stateless kernel. The Stage-2 runtime needs these to
+       *  allocate + seed the per-generation state slab — they cannot be derived
+       *  from the `KernelSignature` (state registers are NOT signature params). */
+      readonly stateDecls: ReadonlyArray<IrStateDecl>;
     }
   | { readonly status: "rejected-source"; readonly diagnostic: Diagnostic }
   | { readonly status: "rejected-gate"; readonly gate: GateReport }
@@ -153,7 +158,7 @@ export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
     if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
     if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
     const wasm = opts.compileWat(scalarWat, "scalar");
-    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate };
+    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [] };
   }
 
   const simdWat = emitSimdModule(ir, exportName);
@@ -166,7 +171,7 @@ export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
 
   // accepted — produce the deliverable SIMD bytes.
   const wasm = opts.compileWat(simdWat, "simd");
-  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate };
+  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [] };
 }
 
 /**

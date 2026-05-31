@@ -4,6 +4,94 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.930] — 2026-05-31
+
+### Added — Apollo Frontier 7, Stage 2: the persistent-state runtime
+
+Stage 1 made a stateful kernel **compile** (a one-pole / biquad / IIR → gate-verified
+scalar WASM, proven `scalar-WASM ≡ evalReference`). Stage 2 makes it **run** — click-free,
+across `process()` quanta, in the live `JitKernelConsumer`. The compiler already emitted a
+kernel that takes a `$__state` base-pointer arg, but the worklet runtime didn't yet
+allocate, seed, persist, or thread a state slab — so a filter would reset its `z⁻¹` every
+128 samples (a click per quantum). Stage 2 closes that, and it is **purely additive**: the
+stateless runtime path stays bit-for-bit identical (the frontier gate).
+
+- **`stateDecls` threaded to the consumer.** State registers are NOT signature params, so
+  the consumer (built from a `KernelSignature`) cannot derive them — they now ride the
+  whole wiring: the **`accepted` `CompileResult`** carries `stateDecls`; `runJitCompile`
+  forwards them on the **`jit-result`** response; `forwardCompileResponse` puts them on the
+  **`jit-install`** message (both `module` and `bytes` transports); `handleJitInstallMessage`
+  applies them at install; and `connectJit` derives them from the validated IR on the token
+  path (the JS-source path is stateless — `lower.ts` authoring is a deferred follow-up) and
+  embeds them in `JitWorkletOptions` → `createJitConsumer`.
+- **Per-generation state slabs (the §3.6 correction).** During a hot-swap, kernel A
+  (current) and kernel B (incoming) are **different recurrences**, so each keeps its OWN
+  state slab — a shared slab would let B read A's filter memory mid-fade and corrupt its
+  recurrence. The consumer reserves two disjoint fixed-max (`MAX_STATE_REGISTERS = 64`)
+  slabs, threads slab-A's offset into the current-generation args and slab-B's into the
+  incoming args (after arrays, before scalars — matching `paramLayout`), and threads the
+  trailing typed-array state view into each generation's JS-fallback args. The
+  amplitude-blend (`blendAtoBintoOuts`) is **unchanged** — each generation fills its own
+  output slab from its own state, so the existing output crossfade Just Works.
+- **Seed once, persist forever.** Slabs are seeded to the declared `init`s exactly once,
+  at install (off the audio thread, in `port.onmessage`), never re-seeded mid-stream —
+  persistence then follows automatically from the kernel's load-at-entry / store-at-exit
+  ABI over a byte range the consumer never zeroes. A freshly-installed kernel starts cold
+  (the rising crossfade gain masks the short settling transient). On **promotion** B's
+  accrued state is copied into the current slab (continuity, not a re-seed). On a
+  **non-finite abort** the consumer snaps to current-A, whose slab is live — and the abort
+  path no longer re-runs the current kernel (which would **double-advance** a stateful
+  register); it projects the already-computed current-A output instead (bit-identical to
+  the prior behavior for a stateless kernel, where the re-run was idempotent).
+- **`jitMemoryPages(signature, maxBlock, baseOffset, stateRegisters?)`** gains the optional
+  `stateRegisters` arg and reserves the same fixed-max window the consumer does when it is
+  positive; `0` (the default) reserves nothing, so a **stateless signature's page count is
+  byte-identical to pre-Stage-2**.
+- **Bumpless transfer is flagged, not built (deferred).** For a swap that changes only a
+  coefficient on the same topology (predicate: identical ordered `(name, init)`
+  `stateDecls`), seeding B's slab from A's at the swap instant would remove the cold
+  transient. v1 ships cold-start + crossfade (correct + sufficient); the predicate is noted
+  as a one-line TODO in `JitKernelConsumer`.
+
+### Why
+
+A filter that audibly works requires its state to *survive* the quantum boundary; without
+Stage 2 the Stage-1 compiler produced a correct kernel that the runtime then sabotaged by
+resetting every 128 samples. The independent-state-per-generation design is the load-bearing
+insight: it keeps the elegant stateless output-blend untouched while making two live
+recurrences coexist through a fade, and it degrades exactly like the stateless path on every
+failure (the audio keeps playing the developer's JS).
+
+### Wire compatibility
+
+No SAB wire-format change. `stateDecls` (a plain `{name, init}[]`, structured-clone-safe) is
+**added** to `CompileResult` (`accepted`), `JitCompileResponse` (`accepted`), `JitInstallMessage`
+(`jit-install`), and `JitWorkletOptions`; `jitMemoryPages` gains a trailing optional arg. All
+additive — a stateless kernel produces byte-identical messages, layout, page count, and
+output to 0.9.929. Still `@experimental` (the JIT subtree is outside the 1.0 contract).
+
+### Tests
+
+- **`tests/stateKernelConsumer.test.ts`** (new, 5 pins; registered in `test` + `test:unit`):
+  ① JS-fallback persistence across quanta (8×128 ≡ one 1024 run); ② click-free swap with
+  disjoint, independent per-generation state slabs (warm-A vs cold-B); ③ promotion continuity
+  — a full f64 stateful swap is BIT-EXACT to `evalReference` including the post-promotion tail
+  (no re-seed); ④ a non-finite incoming aborts to the live JS state with no double-advance
+  (whole stream ≡ `evalReference`); ⑤ stateless-path-untouched (no state slab, layout + page
+  count + output byte-identical, `stateDecls: []` ≡ omitting it).
+- Full suite green (the pre-existing `Bridge.properties` fast-check fp wobble and the
+  `Bridge.observability` 60 Hz cadence timing test each flaked once under load and passed on
+  isolated re-run — neither touches the JIT). `npm run typecheck` clean; `npm run bench`
+  push/pull/pullLatest median 1.30 µs (< 10 µs hard budget); `npm run bench:jit` swap-glitch +
+  install-cost cells unchanged (stateless).
+
+### Documentation
+
+`JitKernelConsumer` header documents the per-generation state-slab design (§3.6) + the
+bumpless-transfer TODO. `CLAUDE.md` `src/jit/` entry updated to mark Stage 2 shipped
+(Stage 3 — delay lines / `z⁻N` ring buffers — next). The Stage-2 handoff
+(`docs/frontier7-stage2-runtime-handoff.md`) gets a shipped postscript.
+
 ## [0.9.929] — 2026-05-31
 
 ### Added — Apollo Frontier 7, Stage 1: stateful kernels (the recurrence compiler)
