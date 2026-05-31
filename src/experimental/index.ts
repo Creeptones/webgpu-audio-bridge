@@ -171,6 +171,19 @@ export {
 } from "../jit/index.js";
 export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/index.js";
 
+// ── The kernel grammar — Stage 3a: the constrained-decoder mask (0.9.922) ─────
+//
+// `legalNextTokens(prefix)` is the forward-direction sibling of `validateTokens`:
+// the set of token KINDS that may legally come next, plus a `done` flag (is the
+// prefix already a complete, valid kernel?). It shares ONE step machine with
+// `validateTokens`, so the mask a Stage-3 decoder applies to its logits can never
+// drift from the syntax gate — an emitter constrained to the mask cannot produce a
+// structurally-invalid stream (the model-free safety contract the SLM plugs behind).
+// v1 masks KINDS; a wrong OPERAND can still be rejected (a v2 operand-mask). All
+// additive + `@experimental`. See docs/frontier6-grammar-design.md.
+export { legalNextTokens } from "../jit/index.js";
+export type { LegalNextResult } from "../jit/index.js";
+
 // ── The kernel grammar — Stage 1: compile pipeline + characterized cache ──────
 //
 // Apollo Frontier 6, Stage 1: tokens → IR → gate → install → audio, model-free.

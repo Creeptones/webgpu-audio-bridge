@@ -123,6 +123,127 @@ function fail(error: string, at?: number): ValidateFailure {
   return at === undefined ? { ok: false, error } : { ok: false, error, at };
 }
 
+// ── the grammar step machine (shared by validateTokens + legalNextTokens) ───────
+//
+// `validateTokens` and `legalNextTokens` are two readings of ONE walk: validate
+// folds the step over a whole stream then checks the final state; legalNextTokens
+// folds over a prefix and asks which token KINDS the next step would accept. Sharing
+// a single `stepGrammar` is what guarantees the Stage-3 decoder's mask can NEVER
+// drift from the validator — the mask is, by construction, exactly the set of kinds
+// the validator will not reject.
+
+/** The three sequential phases of a token stream: the leading `width`, the
+ *  contiguous `param` run (the signature), then the postfix body. */
+type GrammarPhase = "width" | "params" | "body";
+
+/** The full structural + IR-building state of a partial walk. `stack`/`stores` are
+ *  the operand stack + accumulated stores the validator builds; the mask only reads
+ *  `phase` + `stack.length` + `stores.length` + the declared `names`. */
+interface GrammarState {
+  phase: GrammarPhase;
+  width: LaneWidth | null;
+  params: KernelParam[];
+  names: Set<string>;
+  bound: LoopBound | null;
+  stack: IrNode[];
+  stores: IrStore[];
+}
+
+function initialState(): GrammarState {
+  return { phase: "width", width: null, params: [], names: new Set<string>(), bound: null, stack: [], stores: [] };
+}
+
+/** Advance the state by one token. Mutates `s`; returns a `ValidateFailure` (with
+ *  the same message + `at` index the original `validateTokens` produced) if the
+ *  token is illegal at this position, or `null` on success. */
+function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFailure | null {
+  switch (s.phase) {
+    case "width": {
+      if (tk.t !== "width") return fail("first token must be `width`", at);
+      if (tk.width !== "f32" && tk.width !== "f64") return fail(`unknown width "${String(tk.width)}"`, at);
+      s.width = tk.width;
+      s.phase = "params";
+      return null;
+    }
+    case "params": {
+      if (tk.t === "param") {
+        if (!IDENT.test(tk.name)) return fail(`invalid param name "${tk.name}"`, at);
+        if (s.names.has(tk.name)) return fail(`duplicate param "${tk.name}"`, at);
+        if (!ROLES.has(tk.role)) return fail(`unknown param role "${String(tk.role)}"`, at);
+        s.names.add(tk.name);
+        s.params.push({ name: tk.name, role: tk.role });
+        return null;
+      }
+      if (tk.t === "bound") {
+        const bound = tk.bound;
+        if (bound.kind === "param") {
+          if (!s.names.has(bound.name)) return fail(`bound references undeclared param "${bound.name}"`, at);
+        } else if (!Number.isInteger(bound.value) || bound.value < 0) {
+          return fail(`bound constant must be a non-negative integer (got ${bound.value})`, at);
+        }
+        s.bound = bound;
+        s.phase = "body";
+        return null;
+      }
+      return fail("expected `bound` token after the param run", at);
+    }
+    case "body": {
+      switch (tk.t) {
+        case "width": return fail("unexpected `width` token in body", at);
+        case "param": return fail("`param` tokens must precede `bound`", at);
+        case "bound": return fail("duplicate `bound` token", at);
+        case "const":
+          if (typeof tk.value !== "number") return fail("const value must be a number", at);
+          s.stack.push({ kind: "const", value: tk.value });
+          return null;
+        case "scalar":
+          if (!s.names.has(tk.name)) return fail(`scalar references undeclared param "${tk.name}"`, at);
+          s.stack.push({ kind: "scalar", name: tk.name });
+          return null;
+        case "load": {
+          const err = checkAffine("load", tk.array, tk.stride, tk.intercept, s.names, at);
+          if (err) return err;
+          s.stack.push({ kind: "load", array: tk.array, stride: tk.stride, intercept: tk.intercept });
+          return null;
+        }
+        case "unary": {
+          if (!UNARY_OPS.has(tk.op)) return fail(`unknown unary op "${String(tk.op)}"`, at);
+          const a = s.stack.pop();
+          if (a === undefined) return fail(`unary "${tk.op}" underflows the operand stack`, at);
+          s.stack.push({ kind: "unary", op: tk.op, a });
+          return null;
+        }
+        case "binary": {
+          if (!BINARY_OPS.has(tk.op)) return fail(`unknown binary op "${String(tk.op)}"`, at);
+          const b = s.stack.pop();
+          const a = s.stack.pop();
+          if (a === undefined || b === undefined) return fail(`binary "${tk.op}" underflows the operand stack`, at);
+          s.stack.push({ kind: "binary", op: tk.op, a, b });
+          return null;
+        }
+        case "store": {
+          const err = checkAffine("store", tk.array, tk.stride, tk.intercept, s.names, at);
+          if (err) return err;
+          if (s.stack.length !== 1) return fail(`STORE expects exactly one value on the stack (found ${s.stack.length})`, at);
+          s.stores.push({ array: tk.array, stride: tk.stride, intercept: tk.intercept, value: s.stack.pop()! });
+          return null;
+        }
+      }
+    }
+  }
+}
+
+/** Close the walk: turn the final state into the accepted `IrKernel`, or the
+ *  end-of-stream failure (empty / missing bound / unconsumed operand / no store). */
+function finalizeGrammar(s: GrammarState): ValidateResult {
+  if (s.phase === "width") return fail("empty token stream");
+  if (s.phase === "params") return fail("missing `bound` token");
+  if (s.stack.length !== 0) return fail(`${s.stack.length} unconsumed value(s) at end of stream (missing STORE?)`);
+  if (s.stores.length === 0) return fail("kernel has no stores");
+  const signature: KernelSignature = { params: s.params, width: s.width! };
+  return { ok: true, ir: { width: s.width!, bound: s.bound!, stores: s.stores, signature } };
+}
+
 /**
  * The syntax gate: validate a token stream and, on success, build the `IrKernel`.
  * Never throws — rejection is a value. Checks (in order): a single leading
@@ -130,97 +251,85 @@ function fail(error: string, at?: number): ValidateFailure {
  * one `bound` resolving to a declared param or a non-negative integer constant;
  * a postfix body with correct stack arity, known ops, integer affine strides, and
  * exactly one value on the stack at each `store`; every referenced name declared;
- * an empty stack and ≥1 store at the end.
+ * an empty stack and ≥1 store at the end. A fold of `stepGrammar` + `finalizeGrammar`.
  */
 export function validateTokens(tokens: ReadonlyArray<KernelToken>): ValidateResult {
   warnOnce();
-  if (tokens.length === 0) return fail("empty token stream");
-
-  // 1) width — must be the first token, exactly once.
-  const first = tokens[0]!;
-  if (first.t !== "width") return fail("first token must be `width`", 0);
-  if (first.width !== "f32" && first.width !== "f64") return fail(`unknown width "${String(first.width)}"`, 0);
-  const width: LaneWidth = first.width;
-
-  // 2) params — a contiguous run declaring the signature.
-  let i = 1;
-  const params: KernelParam[] = [];
-  const names = new Set<string>();
-  for (; i < tokens.length; i++) {
-    const tk = tokens[i]!;
-    if (tk.t !== "param") break;
-    if (!IDENT.test(tk.name)) return fail(`invalid param name "${tk.name}"`, i);
-    if (names.has(tk.name)) return fail(`duplicate param "${tk.name}"`, i);
-    if (!ROLES.has(tk.role)) return fail(`unknown param role "${String(tk.role)}"`, i);
-    names.add(tk.name);
-    params.push({ name: tk.name, role: tk.role });
+  const s = initialState();
+  for (let i = 0; i < tokens.length; i++) {
+    const err = stepGrammar(s, tokens[i]!, i);
+    if (err) return err;
   }
+  return finalizeGrammar(s);
+}
 
-  // 3) bound.
-  if (i >= tokens.length) return fail("missing `bound` token");
-  const boundTok = tokens[i]!;
-  if (boundTok.t !== "bound") return fail("expected `bound` token after the param run", i);
-  const bound = boundTok.bound;
-  if (bound.kind === "param") {
-    if (!names.has(bound.name)) return fail(`bound references undeclared param "${bound.name}"`, i);
-  } else if (!Number.isInteger(bound.value) || bound.value < 0) {
-    return fail(`bound constant must be a non-negative integer (got ${bound.value})`, i);
-  }
-  i++;
+// ── the constrained-decoder mask (Stage 3a) ─────────────────────────────────────
+//
+// `legalNextTokens(prefix)` is the forward-direction sibling of `validateTokens`:
+// it answers "given this valid prefix, which token KINDS may legally come next, and
+// is the stream a complete kernel here?". The set is a finite function of the
+// operand-stack depth + the declaration phase, so a Stage-3 decoder that masks its
+// logits to this set *cannot* emit a structurally-invalid stream (stack underflow,
+// dangling operand, store with the wrong arity, param-after-bound). v1 masks KINDS;
+// a wrong OPERAND (an undeclared array name, a fractional stride) can still be
+// rejected by `validateTokens` — that is the operand-mask's job (a v2), and the
+// reason the emitter is responsible for filling operands from the declared names.
 
-  // 4) body — postfix with an operand stack; one value per STORE.
-  const stack: IrNode[] = [];
-  const stores: IrStore[] = [];
-  for (; i < tokens.length; i++) {
-    const tk = tokens[i]!;
-    switch (tk.t) {
-      case "width": return fail("unexpected `width` token in body", i);
-      case "param": return fail("`param` tokens must precede `bound`", i);
-      case "bound": return fail("duplicate `bound` token", i);
-      case "const":
-        if (typeof tk.value !== "number") return fail("const value must be a number", i);
-        stack.push({ kind: "const", value: tk.value });
-        break;
-      case "scalar":
-        if (!names.has(tk.name)) return fail(`scalar references undeclared param "${tk.name}"`, i);
-        stack.push({ kind: "scalar", name: tk.name });
-        break;
-      case "load": {
-        const err = checkAffine("load", tk.array, tk.stride, tk.intercept, names, i);
-        if (err) return err;
-        stack.push({ kind: "load", array: tk.array, stride: tk.stride, intercept: tk.intercept });
-        break;
-      }
-      case "unary": {
-        if (!UNARY_OPS.has(tk.op)) return fail(`unknown unary op "${String(tk.op)}"`, i);
-        const a = stack.pop();
-        if (a === undefined) return fail(`unary "${tk.op}" underflows the operand stack`, i);
-        stack.push({ kind: "unary", op: tk.op, a });
-        break;
-      }
-      case "binary": {
-        if (!BINARY_OPS.has(tk.op)) return fail(`unknown binary op "${String(tk.op)}"`, i);
-        const b = stack.pop();
-        const a = stack.pop();
-        if (a === undefined || b === undefined) return fail(`binary "${tk.op}" underflows the operand stack`, i);
-        stack.push({ kind: "binary", op: tk.op, a, b });
-        break;
-      }
-      case "store": {
-        const err = checkAffine("store", tk.array, tk.stride, tk.intercept, names, i);
-        if (err) return err;
-        if (stack.length !== 1) return fail(`STORE expects exactly one value on the stack (found ${stack.length})`, i);
-        stores.push({ array: tk.array, stride: tk.stride, intercept: tk.intercept, value: stack.pop()! });
-        break;
-      }
+/** The result of `legalNextTokens`: the legal next-token KIND set + whether the
+ *  prefix is already a complete, valid kernel (so the decoder may stop here). */
+export interface LegalNextResult {
+  /** The token kinds that `validateTokens` will not reject as the next step. Empty
+   *  iff the prefix is itself invalid (no legal continuation exists). */
+  readonly kinds: ReadonlySet<TokenKind>;
+  /** True iff stopping here yields a complete, valid kernel (body phase, empty
+   *  operand stack, ≥1 store emitted) — i.e. `validateTokens(prefix).ok`. */
+  readonly done: boolean;
+}
+
+/** The legal next-token kinds for a (valid) state — the pure mask function. */
+function legalKinds(s: GrammarState): Set<TokenKind> {
+  const out = new Set<TokenKind>();
+  switch (s.phase) {
+    case "width":
+      out.add("width");
+      break;
+    case "params":
+      out.add("param"); // declare another signature parameter
+      out.add("bound"); // …or end the param run and begin the body
+      break;
+    case "body": {
+      const depth = s.stack.length;
+      out.add("const"); // value-pushers are always legal (depth → depth+1)
+      out.add("scalar");
+      out.add("load");
+      if (depth >= 1) out.add("unary");  // pops 1, pushes 1
+      if (depth >= 2) out.add("binary"); // pops 2, pushes 1
+      if (depth === 1) out.add("store"); // consumes the one value → starts a new statement
+      break;
     }
   }
+  return out;
+}
 
-  if (stack.length !== 0) return fail(`${stack.length} unconsumed value(s) at end of stream (missing STORE?)`);
-  if (stores.length === 0) return fail("kernel has no stores");
+/** Whether the state is an accepting state — exactly `validateTokens(prefix).ok`. */
+function isAccepting(s: GrammarState): boolean {
+  return s.phase === "body" && s.stack.length === 0 && s.stores.length >= 1;
+}
 
-  const signature: KernelSignature = { params, width };
-  return { ok: true, ir: { width, bound, stores, signature } };
+/**
+ * The constrained-decoder mask: the legal next-token KIND set for a token-stream
+ * prefix, plus a `done` flag. Folds `stepGrammar` over the prefix, then reads the
+ * mask off the final state. Pure + value-returning (never throws). An invalid
+ * prefix returns an empty `kinds` set with `done: false` (there is no legal
+ * continuation of a malformed stream).
+ */
+export function legalNextTokens(prefix: ReadonlyArray<KernelToken>): LegalNextResult {
+  warnOnce();
+  const s = initialState();
+  for (let i = 0; i < prefix.length; i++) {
+    if (stepGrammar(s, prefix[i]!, i)) return { kinds: new Set<TokenKind>(), done: false };
+  }
+  return { kinds: legalKinds(s), done: isAccepting(s) };
 }
 
 function checkAffine(

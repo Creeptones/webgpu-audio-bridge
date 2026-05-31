@@ -1,9 +1,10 @@
 # Apollo Frontier 6 — the kernel grammar + the model-free compile pipeline (design note)
 
 > Status: Stage 0 (`0.9.918`) + Stage 1 (`0.9.919`) + Stage 2 (`0.9.921`, the
-> acoustic gate) shipped. Model-free. The Stage-3 small language model (SLM) is
-> future. This note is the analogue of `docs/jit-vectorize-design.md` for Frontier 6
-> — it records *why* the grammar is shaped the way it is and what the model-free
+> acoustic gate) + Stage 3a (`0.9.922`, `legalNextTokens` — the constrained-decoder
+> mask) shipped. Model-free. The Stage-3b small language model (SLM) behind the mask
+> is future. This note is the analogue of `docs/jit-vectorize-design.md` for Frontier
+> 6 — it records *why* the grammar is shaped the way it is and what the model-free
 > plumbing locks in before any model.
 
 ## The bet
@@ -68,6 +69,22 @@ legal next-token set is a function of the current operand-stack depth:
 Stage-3 decoder will consult to mask logits, written and tested now, used later. An
 emitter that respects the mask literally cannot produce a stack underflow, a dangling
 operand, or a store with the wrong arity.
+
+**Stage 3a (`0.9.922`) ships the forward reading of that spec: `legalNextTokens`.**
+`validateTokens` and `legalNextTokens(prefix) → { kinds, done }` are two readings of
+ONE grammar step machine (`stepGrammar`): validate folds the step over a whole stream
+and checks the final state; `legalNextTokens` folds over a prefix and reads the legal
+next-token KIND set (plus `done === validateTokens(prefix).ok`) off the final state.
+Sharing one machine is the load-bearing property — the mask a decoder applies to its
+logits *cannot drift* from the validator, because it is by construction exactly the set
+of kinds the validator will not reject at that position. The mask is the operand-stack
+arity function (value-pushers always; `unary` at depth ≥ 1; `binary` at depth ≥ 2;
+`store` at depth == 1; `{width}` then `{param, bound}` in the header). v1 masks KINDS;
+a wrong OPERAND (an undeclared name, a fractional stride) can still be rejected — that
+is a v2 operand-mask, and the reason the emitter fills operands from the declared names.
+The no-invalid-stream property (a mask-respecting emitter can only produce streams
+`validateTokens` accepts) is proven model-free by `tests/legalNextTokens.test.ts`. The
+SLM (Stage 3b) plugs in behind this mask and swaps **only** the emitter.
 
 ## Self-contained streams
 

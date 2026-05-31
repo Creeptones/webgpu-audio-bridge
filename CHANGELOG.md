@@ -4,6 +4,79 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.922] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 3a: `legalNextTokens` (the constrained-decoder mask)
+
+The first deliverable of Stage 3 — the model-free half. The whole language→music bet
+rests on one property that is independent of any model: *a closed grammar + constrained
+decoding makes an untrusted emitter unable to produce invalid IR*. `legalNextTokens` is
+that mask — the forward-direction sibling of the Stage-0 syntax gate (`validateTokens`),
+built and exhaustively tested **before** any model so the Stage-3 SLM plugs in behind a
+proven boundary and changes only the emitter. All additive, experimental-subpath,
+wire-compat unchanged.
+
+- **`src/jit/kernelGrammar.ts`** — `validateTokens` is refactored into a single reusable
+  **grammar step machine** (`GrammarState` + `stepGrammar` + `finalizeGrammar`), a
+  behavior-preserving change (every Stage-0 pin A–G stays green, the
+  `kernelHash(gain) === "72b5c2e5a7a5f117"` regression pin intact). `validateTokens` is
+  now a fold of `stepGrammar` + a final-state check.
+- **`legalNextTokens(prefix) → { kinds, done }`** is the forward reading of that SAME
+  machine: it folds `stepGrammar` over a prefix and reads the legal next-token KIND set
+  off the final state, plus a `done` flag (`done === validateTokens(prefix).ok`). Sharing
+  one step machine is what guarantees the decoder's mask can **never drift** from the
+  validator — the mask is, by construction, exactly the set of kinds the validator will
+  not reject.
+  - The mask is the operand-stack arity function: in the body, value-pushers
+    (`const`/`scalar`/`load`) are always legal; `unary` at depth ≥ 1; `binary` at
+    depth ≥ 2; `store` at depth == 1. In the header: `{width}` at the start, then
+    `{param, bound}` through the declaration run.
+  - **v1 masks KINDS.** A wrong OPERAND (an undeclared array, a fractional stride) can
+    still be rejected by `validateTokens` — that is a v2 operand-mask's job, and the
+    reason the emitter remains responsible for filling operands from the declared names.
+  - Pure + value-returning (never throws). An invalid prefix returns an empty `kinds`
+    set with `done: false`.
+- **Exports:** `legalNextTokens` + `LegalNextResult` from `src/jit/index.ts` →
+  `webgpu-audio-bridge/experimental`.
+
+### Why — de-risk the decoder before the model
+
+`legalNextTokens` is the function a Stage-3 constrained decoder will consult to mask its
+logits. Building + proving it model-free now means the SLM (Stage 3b) is a pure
+emitter-swap behind an already-proven safety contract: a decoder that can only choose
+kinds the mask offers literally cannot emit a stack underflow, a dangling operand, a
+store with the wrong arity, or a param-after-bound. The remaining failure classes are
+caught downstream by the equivalence (#2) and acoustic (#3) gates.
+
+### Wire compatibility
+
+**Unchanged.** A new function + type on the experimental subpath and an internal,
+behavior-preserving refactor of `validateTokens`. No SAB layout, no wire-format, no
+public 1.0-core change. Patch-level per the versioning policy.
+
+### Tests
+
+- **`tests/legalNextTokens.test.ts`** (5 pins, registered in `test` + `test:unit`):
+  (1) **exact-mask completeness** — for every prefix of every corpus kernel the actual
+  next token's kind is in the mask, and `done === validateTokens(prefix).ok` at every
+  prefix (incl. the mid-stream store boundary of a multi-store kernel); (2) the **depth
+  rules** exactly, positive and negative, across width/params/body × depth 0..3 +
+  post-store; (3) **no-invalid-stream** — a seeded mock emitter that picks ONLY masked
+  kinds (filling operands from the declared signature) and stops at `done` produces, over
+  1000 seeds, ONLY streams `validateTokens` accepts (the untrusted-model safety
+  contract); (4) **random-kernel completeness** — 1000 randomly-generated valid kernels,
+  the mask contains every token at every prefix; (5) invalid-prefix → empty mask, barrel
+  identity, and refactor parity (the corpus still validates + the gain hash pin holds).
+- Parity guard: the Stage-0 `tests/kernelGrammar.test.ts` pins A–G and
+  `tests/compileTokens.test.ts` / `tests/acousticGate.test.ts` remain green after the
+  step-machine refactor.
+
+### Documentation
+
+- `docs/frontier6-grammar-design.md` — extended the "Why postfix" section with the
+  `legalNextTokens` ↔ constrained-decoder contract.
+- `CLAUDE.md` `src/jit/` entry + this CHANGELOG block.
+
 ## [0.9.921] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 2: the acoustic gate (gate #3)
