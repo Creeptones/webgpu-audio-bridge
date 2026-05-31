@@ -4,6 +4,87 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.928] — 2026-05-31
+
+### Added — Apollo Frontier 3, Stage 4.3: `connectFanOut()` (the SP→MC broadcast topology)
+
+The `connect()`-style topology constructor over the wait-free `SpmcRing` broadcast ring
+(one producer → N consumers, every consumer sees every frame through its own cursor) —
+the direct sibling of `connectFanIn()`. Gives the broadcast edge the same
+**allocate-once / mount-many** ergonomics across realms. Library + tests + docs only.
+
+- **`src/connectFanOut.ts`** — `connectFanOut(spec) → FanOutTopology` allocates +
+  `initLayout`s the shared SAB once (fixed `consumerCount` → a frozen, clone-safe
+  `FanOutHandle`); `mountFanOut(handle, { role, consumerIndex? })` reconstructs a
+  `SpmcRing` on each peer via the **bare ctor** (no re-init). Both the free function and
+  `topology.mount()` are provided (symmetric).
+- **Three load-bearing differences from `connectFanIn`** (the broadcast direction):
+  - **`consumerCount` fixed at allocation** (the inverse of fan-in's `producerCount`) —
+    it sizes `SpmcRing`'s per-consumer lane region (max 64).
+  - **Each consumer mounts a distinct `consumerIndex` ∈ [0, consumerCount)**; the
+    producer mounts unbound and MUST NOT pass one. This is genuinely new vs fan-in
+    (where producers were symmetric and `role` was advisory) — `mountFanOut` enforces it.
+  - **No reserved slack.** The Policy-P1 producer laps freely and never reads consumer
+    cursors, so capacity is simply the **lap window**: a consumer lagging more than
+    `capacity` frames drops the oldest (counted via `SpmcRing.dropped(c)`). So
+    `usableDepth === capacity` and `reservedSlack === 0` on `FanOutSizing` (kept for
+    shape-parity with `FanInSizing`).
+- **Turbo-ONLY**, exactly like `connectFanIn`: a non-isolated environment throws
+  `ConnectUnsupportedError('isolation-required')` — no MessageChannel fallback (zero-copy
+  SAB broadcast has no serialized analogue worth degrading to). Deploy COOP/COEP.
+- **Self-contained** — `connect.ts` is NEVER opened (a tiny local layout-match validator
+  is duplicated), so the "SPSC `connect()` untouched + bit-exact" frontier gate stays
+  structurally trivial. Sizing reuses connect()'s `LatencyHint`/`LatencyBudget` heuristic
+  (minus the slack/floor terms).
+- **Exports:** `connectFanOut` / `mountFanOut` + `ConnectFanOutSpec` / `FanOutHandle` /
+  `FanOutTopology` / `FanOutSizing` / `FanOutRole` / `MountFanOutOptions` from
+  `src/experimental/index.ts` → `webgpu-audio-bridge/experimental`, NOT the root (until
+  `SpmcRing` promotes).
+
+### Why — finish the broadcast edge's ergonomics
+
+`SpmcRing` (0.9.911) shipped the proven broadcast primitive but left the cross-realm
+wiring to the caller. `connectFanOut()` is that wiring — allocate once, hand each of the
+producer + N consumers a clone-safe handle, mount. It completes the fan-out direction the
+way `connectFanIn()` completed fan-in, and is the last "Stage 4.x" item for the SP→MC
+edge before the rings promote toward the 1.0 core.
+
+### Wire compatibility
+
+**Unchanged.** A new pure-wiring module over the already-shipped `SpmcRing` SAB layout +
+seven additive exports on the experimental subpath. No new SAB layout, no wire-format
+change, no new formal model needed (`connectFanOut` is pure wiring over the
+already-proven Stage-4.0 protocol; like `connectFanIn` it adds no TLA). Patch-level.
+
+### Tests
+
+- **`tests/connectFanOut.test.ts`** (10 single-thread pins, registered in `test` +
+  `test:unit`): handle shape (`kind:'spmc'`, `reservedSlack 0`, `usableDepth === capacity`,
+  SAB sized to `SpmcRing.byteLength`); Turbo-only env gate + `consumerCount` validation
+  (0 / non-integer / > 64); sizing (no slack, capacity pow2, override floored to 2); the
+  allocate-once / mount-many **broadcast** bit-exact round-trip (1 producer + 3 consumers,
+  every consumer sees every frame across every `FieldKind`, `tornGuarded 0`); drop-oldest
+  for a lagging consumer counted while a kept-up consumer drops nothing; `initLayout` not
+  re-called by a late mount; layout-skew guard; LatencyBudget block sizing; topology.mount
+  symmetry; and the **consumerIndex contract** (a consumer needs an in-range index; a
+  producer must not pass one; two consumers with distinct indices each receive the full
+  broadcast).
+- **`tests/connectFanOut.concurrent.test.ts`** (registered in `test` + `test:concurrent`):
+  the real `worker_threads` broadcast stress THROUGH the wiring — `connectFanOut` allocates
+  + the producer mounts via `topo.mount`; 3 inline-eval consumer workers each attach over
+  `handle.sab` and verify **3 × 1 000 000 frames bit-exact** (`delivered === COUNT`,
+  `dropped === 0`, `tornGuarded === 0`), asserting the topology sized the SAB to exactly
+  the `SpmcRing` layout. Reuses `tests/_mpmcStress.ts`.
+- `npm run typecheck` clean; full `npm test` green; `npm run bench` push/pull/pullLatest at
+  1.20 µs (within baseline + 10 µs hard budget) — `connectFanOut` is wiring, not in the
+  bench path.
+
+### Documentation
+
+- This CHANGELOG block + the `connectFanOut.ts` file header + the `CLAUDE.md` (new
+  `src/connectFanOut.ts` bullet) + `docs/frontier6-quickwins-handoff.md` (direction D
+  marked shipped; next session pointed at E — the experimental-surface promotions).
+
 ## [0.9.927] — 2026-05-31
 
 ### Added — Apollo Frontier 6 quick-win #3: the offline corpus index

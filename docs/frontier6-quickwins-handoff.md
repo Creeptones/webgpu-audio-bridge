@@ -1,8 +1,8 @@
 # Apollo Frontier 6 — quick-wins handoff (the model-free stack is complete; the SLM is deferred)
 
-**As of:** 2026-05-31 · version **0.9.927** (quick-win #3 — the **offline corpus index** — shipped at 0.9.927; #2 fingerprint helpers + the 16→64 band bump at 0.9.926; #1 negative cache at 0.9.925) · branch `main` · next patch **0.9.928**.
+**As of:** 2026-05-31 · version **0.9.928** (direction D — `connectFanOut()` over `SpmcRing` — shipped at 0.9.928; all three model-free quick-wins shipped at 0.9.925–0.9.927) · branch `main` · next patch **0.9.929**.
 
-> **All three model-free quick-wins are DONE.** #1 negative cache (0.9.925), #2 fingerprint helpers + 64-band default (0.9.926), #3 offline corpus index (0.9.927). **Next session: pick direction D (`connectFanOut()` over `SpmcRing`) or E (promote a soaked `@experimental` surface toward the 1.0 core)** — both detailed in "Alternative directions" below. The Stage-3b SLM (C2) stays deferred (resume from `docs/frontier6-stage3b-handoff.md`).
+> **All three model-free quick-wins + direction D are DONE.** #1 negative cache (0.9.925), #2 fingerprint helpers + 64-band default (0.9.926), #3 offline corpus index (0.9.927); **D — `connectFanOut()` the SP→MC broadcast topology constructor over `SpmcRing` (0.9.928)**: `src/connectFanOut.ts` + `tests/connectFanOut.test.ts` (10 pins) + `tests/connectFanOut.concurrent.test.ts` (3×1 M broadcast stress through the wiring). **Next session: direction E** — promote a soaked `@experimental` surface toward the 1.0 core (detailed in "Alternative directions" below). The Stage-3b SLM (C2) stays deferred (resume from `docs/frontier6-stage3b-handoff.md`).
 
 > **Quick-win #1 (negative cache) is DONE (0.9.925).** `KernelCache` now memoizes rejections (two memos: syntax→stream-text key, body→`kernelHash`), every `GetOrCompileResult` carries a `cached` flag, `RejectVerdict`/`rejectedSize` are new surface, `clear()` wipes both stores. Proven by `tests/kernelCache.negativeCache.test.ts` (4 pins incl. a compile-count probe).
 
@@ -52,7 +52,7 @@ Done. `src/jit/corpusIndex.ts` — `characterizeCorpus` / `clusterByFingerprint`
 
 ## Alternative directions (if not Frontier 6)
 
-- **D — `connectFanOut()`** over `SpmcRing` (Frontier-3, Stage 4.3): the broadcast topology constructor, direct sibling of `src/connectFanIn.ts` (copy that pattern — shared SAB alloc + `initLayout` once → handle; `mountFanOut(handle, {role, consumerIndex})` reconstructs via the bare ctor). Turbo-only, like `connectFanIn`. Medium size. Tests mirror `tests/connectFanIn.*` (single-thread pins + a cross-thread stress reusing the SpmcRing harness).
+- **D — `connectFanOut()`** over `SpmcRing` (Frontier-3, Stage 4.3): ✅ **SHIPPED (0.9.928).** `src/connectFanOut.ts` — `connectFanOut`/`mountFanOut`, the broadcast topology constructor (allocate-once/mount-many, Turbo-only, `consumerCount` fixed, per-consumer `consumerIndex`, no-slack lap-window sizing). Proven by `tests/connectFanOut.test.ts` (10 pins) + `tests/connectFanOut.concurrent.test.ts` (3×1 M-frame broadcast stress through the wiring). Browser demo (`examples/spmc-fan-out/`) deferred to a later patch.
 - **E — promotions** of the soaked `@experimental` surfaces (rings `MpmcRing`/`SpmcRing`/`connectFanIn`, and the JIT/grammar/acoustic/mask subtree) toward the 1.0 core. Each its own deliberate patch (mirrors `SpscRing` internal@0.6.8 → public@0.6.10): drop the one-shot warning, export from `src/index.ts`, add a promotion note. Low-risk, high-signal toward 1.0.
 
 ---

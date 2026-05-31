@@ -86,6 +86,26 @@ export type {
 export { SpmcRing, SPMC_HEADER_BYTES } from "../SpmcRing.js";
 export type { SpmcRingOptions } from "../SpmcRing.js";
 
+// ── connectFanOut/mountFanOut (0.9.928) ─────────────────────────────────────
+//
+// Apollo Frontier 3, Stage 4.3: the `connect()`-style SP→MC broadcast topology
+// constructor over `SpmcRing` — the direct sibling of `connectFanIn`. Allocate +
+// `initLayout` the shared SAB ONCE → a clone-safe handle; the producer + each of
+// N consumers `mountFanOut` a `SpmcRing` over it (a consumer with its
+// `consumerIndex`, the producer unbound). Turbo-ONLY: a non-isolated environment
+// throws `ConnectUnsupportedError('isolation-required')` (no MessageChannel
+// fallback). Capacity is the lap window (no reserved slack). `@experimental`
+// until `SpmcRing` promotes.
+export { connectFanOut, mountFanOut } from "../connectFanOut.js";
+export type {
+  ConnectFanOutSpec,
+  FanOutHandle,
+  FanOutTopology,
+  FanOutSizing,
+  FanOutRole,
+  MountFanOutOptions,
+} from "../connectFanOut.js";
+
 // ── The Autonomous JIT — compileKernel (0.9.913) ────────────────────────────
 //
 // Apollo Frontier 5, Stage 1a: the in-browser JS→WASM-SIMD micro-compiler.
