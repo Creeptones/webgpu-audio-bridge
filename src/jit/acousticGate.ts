@@ -137,6 +137,11 @@ const SILENCE_EPS = 1e-12;
 function isPow2(n: number): boolean {
   return Number.isInteger(n) && n > 0 && (n & (n - 1)) === 0;
 }
+function nextPow2(n: number): number {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
 
 // ── the IR reference interpreter ────────────────────────────────────────────────
 //
@@ -201,6 +206,16 @@ export function evalReference(
   const states: Record<string, number> = {};
   for (const d of stateDecls) states[d.name] = round(d.init);
 
+  // Delay-line ring buffers (Frontier 7, Stage 3) — a width-rounded ring + an integer
+  // write cursor per buffer, mirroring the emitter EXACTLY. `readDelay(b, d)` reads
+  // `ring[(w−d+L) mod L]`; at iteration end `ring[w] = value` then `w = (w+1) mod L`.
+  // Cursors advance for EVERY declared buffer each iteration (read "d ago" semantics).
+  const stateBuffers = ir.stateBuffers ?? [];
+  const stateBufferStores = ir.stateBufferStores ?? [];
+  const rings: Record<string, number[]> = {};
+  const cursors: Record<string, number> = {};
+  for (const b of stateBuffers) { rings[b.name] = new Array<number>(b.length).fill(0); cursors[b.name] = 0; }
+
   const evalNode = (node: IrNode, i: number): number => {
     switch (node.kind) {
       case "const": return round(node.value);
@@ -211,6 +226,13 @@ export function evalReference(
         return round((src && idx >= 0 && idx < src.length ? src[idx]! : 0));
       }
       case "readState": return round(states[node.name] ?? 0);
+      case "readDelay": {
+        const ring = rings[node.buffer];
+        if (!ring) return round(0);
+        const L = ring.length;
+        const idx = (((cursors[node.buffer]! - node.delay) % L) + L) % L;
+        return round(ring[idx]!);
+      }
       case "unary": return round(applyUnary(node.op, evalNode(node.a, i)));
       case "binary": return round(applyBinary(node.op, evalNode(node.a, i), evalNode(node.b, i)));
     }
@@ -220,14 +242,22 @@ export function evalReference(
     for (const s of ir.stores) {
       outputs[s.array]![s.stride * i + s.intercept] = round(evalNode(s.value, i));
     }
-    // Compute every register's next value from the PRE-commit state, then commit all —
-    // order-independent (simultaneous), so the two passes can never observe a partial
-    // update.
+    // Compute every register's + buffer's next value from the PRE-commit state, then
+    // commit all — order-independent (simultaneous), so the passes can never observe a
+    // partial update. Buffer writes go to ring[w]; reads use w−d (d≥1) so never alias w.
+    let next: Record<string, number> | null = null;
     if (stateStores.length > 0) {
-      const next: Record<string, number> = {};
+      next = {};
       for (const ss of stateStores) next[ss.name] = round(evalNode(ss.value, i));
-      for (const k in next) states[k] = next[k]!;
     }
+    let bufNext: Record<string, number> | null = null;
+    if (stateBufferStores.length > 0) {
+      bufNext = {};
+      for (const bs of stateBufferStores) bufNext[bs.buffer] = round(evalNode(bs.value, i));
+    }
+    if (next) for (const k in next) states[k] = next[k]!;
+    if (bufNext) for (const bs of stateBufferStores) rings[bs.buffer]![cursors[bs.buffer]!] = bufNext[bs.buffer]!;
+    for (const b of stateBuffers) cursors[b.name] = (cursors[b.name]! + 1) % b.length;
   }
   return outputs;
 }
@@ -239,6 +269,7 @@ function collectLoads(node: IrNode, byArray: Map<string, number>, n: number): vo
     case "const":
     case "scalar":
     case "readState":
+    case "readDelay":
       return;
     case "load": {
       const need = node.stride * Math.max(0, n - 1) + node.intercept + 1;
@@ -274,6 +305,7 @@ function buildProbe(ir: IrKernel, n: number, fundamentalBin: number, probeScalar
   for (const name of inputParams) need.set(name, n);
   for (const s of ir.stores) collectLoads(s.value, need, n);
   for (const ss of ir.stateStores ?? []) collectLoads(ss.value, need, n);
+  for (const bs of ir.stateBufferStores ?? []) collectLoads(bs.value, need, n);
 
   const nyquist = n >> 1;
   const inputs: Record<string, number[]> = {};
@@ -427,7 +459,13 @@ function profileOutputs(
  */
 export function acousticGate(ir: IrKernel, opts: AcousticGateOptions = {}): AcousticGateResult {
   const stateful = isStateful(ir);
-  const probeLength = opts.probeLength ?? (stateful ? DEFAULT_STATEFUL_PROBE_LENGTH : DEFAULT_PROBE_LENGTH);
+  // A delay-line kernel must probe LONGER than its longest delay so the feedback loop
+  // closes (and any instability has room to develop) — `max(4096, nextPow2(L·8))`.
+  const longestDelay = Math.max(0, ...(ir.stateBuffers ?? []).map((b) => b.length));
+  const statefulProbe = longestDelay > 0
+    ? Math.max(DEFAULT_STATEFUL_PROBE_LENGTH, nextPow2(longestDelay * 8))
+    : DEFAULT_STATEFUL_PROBE_LENGTH;
+  const probeLength = opts.probeLength ?? (stateful ? statefulProbe : DEFAULT_PROBE_LENGTH);
   if (!isPow2(probeLength)) {
     throw new Error(`acousticGate: probeLength must be a power of two, got ${probeLength}`);
   }

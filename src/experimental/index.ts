@@ -122,9 +122,11 @@ export type {
 // (`JitKernelConsumer` / `connectJit`) is Stage 1b. See docs/frontier5-jit-handoff.md.
 export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/index.js";
 export { emitScalarModule, emitSimdModule, paramLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
+export { isStateful, stateLayout } from "../jit/index.js";
 export type {
   CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch,
   KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore,
+  IrStateDecl, IrStateStore, IrStateBufferDecl, IrStateBufferStore, StateLayout,
   Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase,
 } from "../jit/index.js";
 

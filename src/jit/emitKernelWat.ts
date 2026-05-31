@@ -24,18 +24,26 @@
 
 import {
   type IrKernel, type IrNode, type IrStore, type LaneWidth, type UnaryOp, type BinaryOp,
-  ELEM_BYTES, LANES, lengthParamName, kernelKey, isStateful,
+  ELEM_BYTES, LANES, lengthParamName, kernelKey, isStateful, stateLayout,
 } from "./ir.js";
 
 /** WASM local name for a state register's current (pre-commit) value. */
 function stLocal(name: string): string { return `$__st_${name}`; }
 /** WASM local name for a state register's next (to-commit) value. */
 function nextLocal(name: string): string { return `$__next_${name}`; }
-/** Byte offset of register `name` within the `$state` slab (declaration order). */
+/** WASM i32 local holding a delay buffer's live write cursor (Stage 3). */
+function curLocal(name: string): string { return `$__cur_${name}`; }
+/** Byte offset of register `name` within the `$state` slab (via `stateLayout`,
+ *  the single source of truth — registers occupy the slab prefix). */
 function stateOffset(ir: IrKernel, name: string): number {
-  const decls = ir.stateDecls ?? [];
-  const k = decls.findIndex((d) => d.name === name);
-  return (k < 0 ? 0 : k) * ELEM_BYTES[ir.width];
+  const r = stateLayout(ir).regs.find((x) => x.name === name);
+  return (r ? r.offset : 0) * ELEM_BYTES[ir.width];
+}
+/** The slab descriptor for a delay buffer (ring start + cursor element offsets). */
+function bufferInfo(ir: IrKernel, name: string): { byteBase: number; cursorByte: number; length: number } {
+  const eb = ELEM_BYTES[ir.width];
+  const b = stateLayout(ir).buffers.find((x) => x.name === name)!;
+  return { byteBase: b.offset * eb, cursorByte: b.cursorOffset * eb, length: b.length };
 }
 
 export interface WasmParam {
@@ -83,6 +91,7 @@ function emitScalar(node: IrNode, ir: IrKernel): string {
     case "scalar": return `(local.get $${node.name})`;
     case "load": return `(${t}.load ${addr(node.array, node.stride, node.intercept, ir)})`;
     case "readState": return `(local.get ${stLocal(node.name)})`;
+    case "readDelay": return `(${t}.load ${delayReadAddr(node.buffer, node.delay, ir)})`;
     case "unary": return `(${t}.${unaryOp(node.op)} ${emitScalar(node.a, ir)})`;
     case "binary": return `(${t}.${node.op} ${emitScalar(node.a, ir)} ${emitScalar(node.b, ir)})`;
   }
@@ -99,6 +108,7 @@ function emitVector(node: IrNode, ir: IrKernel): string {
     // A stateful kernel is scalar-only (vectorize → scalarOnly), so emitSimdModule is
     // never called for one; this arm is unreachable and guards the (NR) invariant.
     case "readState": throw new Error("emitVector: readState has no SIMD lowering (stateful kernels are scalar-only)");
+    case "readDelay": throw new Error("emitVector: readDelay has no SIMD lowering (delay-line kernels are scalar-only)");
     case "unary": return `(${v}.${unaryOp(node.op)} ${emitVector(node.a, ir)})`;
     case "binary": return `(${v}.${node.op} ${emitVector(node.a, ir)} ${emitVector(node.b, ir)})`;
   }
@@ -117,6 +127,26 @@ function addr(name: string, stride: number, intercept: number, ir: IrKernel): st
     : `(i32.add (local.get $i) (i32.const ${intercept}))`;
   void stride;
   return `(i32.add (local.get $${name}) (i32.mul ${elem} (i32.const ${eb})))`;
+}
+
+/** Byte address of `buffer[(w − delay + L) mod L]` in the state slab, where `w` is the
+ *  buffer's live cursor i32 local. `(w − delay + L)` is in `[0, 2L)`, so `i32.rem_u`
+ *  by `L` lands non-negative in `[0, L)`. (delay ≥ 1, so this never aliases slot `w`.) */
+function delayReadAddr(buffer: string, delay: number, ir: IrKernel): string {
+  const eb = ELEM_BYTES[ir.width];
+  const { byteBase, length } = bufferInfo(ir, buffer);
+  const w = curLocal(buffer);
+  const ring = `(i32.rem_u (i32.add (i32.sub (local.get ${w}) (i32.const ${delay})) (i32.const ${length})) (i32.const ${length}))`;
+  return `(i32.add (local.get $__state) (i32.add (i32.const ${byteBase}) (i32.mul ${ring} (i32.const ${eb}))))`;
+}
+
+/** Byte address of the slot the buffer's cursor `w` currently points at (the
+ *  `writeDelay` target — written AFTER all reads, before the cursor advances). */
+function delayWriteAddr(buffer: string, ir: IrKernel): string {
+  const eb = ELEM_BYTES[ir.width];
+  const { byteBase } = bufferInfo(ir, buffer);
+  const w = curLocal(buffer);
+  return `(i32.add (local.get $__state) (i32.add (i32.const ${byteBase}) (i32.mul (local.get ${w}) (i32.const ${eb}))))`;
 }
 
 function storeScalar(s: IrStore, ir: IrKernel): string {
@@ -154,29 +184,55 @@ export function emitScalarModule(ir: IrKernel, exportName = "kernel"): string {
   const t = ir.width;
   const decls = ir.stateDecls ?? [];
   const stateStores = ir.stateStores ?? [];
+  const buffers = ir.stateBuffers ?? [];
+  const bufferStores = ir.stateBufferStores ?? [];
+  const cvt = ir.width === "f32" ? "f32" : "f64"; // i32.trunc_<cvt>_s / <cvt>.convert_i32_s
 
-  // Per-register locals: $__st_* (current) + $__next_* (to-commit, only if written).
+  // Per-register locals: $__st_* (current) + $__next_* (to-commit, only if written);
+  // per-buffer: a single i32 cursor local $__cur_* (Stage 3 — a buffer needs NO
+  // deferral temp: it writes directly to buf[w] after the reads, then w advances).
   const written = new Set(stateStores.map((ss) => ss.name));
-  const stateLocals = decls
-    .map((d) => `    (local ${stLocal(d.name)} ${t})` + (written.has(d.name) ? `\n    (local ${nextLocal(d.name)} ${t})` : ""))
-    .join("\n");
-  // Preamble: load each register from the slab into its $__st_* local.
-  const statePreamble = decls
-    .map((d) => `    (local.set ${stLocal(d.name)} (${t}.load (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)}))))`)
-    .join("\n");
-  // In-loop body: output stores, then compute every next-value, then commit them all.
+  const regLocals = decls
+    .map((d) => `    (local ${stLocal(d.name)} ${t})` + (written.has(d.name) ? `\n    (local ${nextLocal(d.name)} ${t})` : ""));
+  const cursorLocals = buffers.map((b) => `    (local ${curLocal(b.name)} i32)`);
+  const stateLocals = [...regLocals, ...cursorLocals].join("\n");
+
+  // Preamble: load each register into its $__st_* local; truncate each buffer's
+  // (float-in-slab) cursor into its $__cur_* i32 local.
+  const regPreamble = decls
+    .map((d) => `    (local.set ${stLocal(d.name)} (${t}.load (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)}))))`);
+  const cursorPreamble = buffers.map((b) => {
+    const { cursorByte } = bufferInfo(ir, b.name);
+    return `    (local.set ${curLocal(b.name)} (i32.trunc_${cvt}_s (${t}.load (i32.add (local.get $__state) (i32.const ${cursorByte})))))`;
+  });
+  const statePreamble = [...regPreamble, ...cursorPreamble].join("\n");
+
+  // In-loop body (SIMULTANEOUS — all reads see pre-iteration state):
+  //   1 output stores · 2 register next-values · 3 buffer writes (direct to buf[w],
+  //   reading pre-commit registers + w−d slots) · 4 commit registers · 5 advance cursors.
   const outStores = ir.stores.map((s) => "        " + storeScalar(s, ir)).join("\n");
   const computeNext = stateStores
     .map((ss) => `        (local.set ${nextLocal(ss.name)} ${emitScalar(ss.value, ir)})`)
     .join("\n");
+  const bufferWrites = bufferStores
+    .map((bs) => `        (${t}.store ${delayWriteAddr(bs.buffer, ir)} ${emitScalar(bs.value, ir)})`)
+    .join("\n");
   const commitNext = stateStores
     .map((ss) => `        (local.set ${stLocal(ss.name)} (local.get ${nextLocal(ss.name)}))`)
     .join("\n");
-  const loopBody = [outStores, computeNext, commitNext].filter((x) => x.length > 0).join("\n");
-  // Epilogue: store each register local back to the slab.
-  const stateEpilogue = decls
-    .map((d) => `    (${t}.store (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)})) (local.get ${stLocal(d.name)}))`)
+  const advanceCursors = buffers
+    .map((b) => `        (local.set ${curLocal(b.name)} (i32.rem_u (i32.add (local.get ${curLocal(b.name)}) (i32.const 1)) (i32.const ${b.length})))`)
     .join("\n");
+  const loopBody = [outStores, computeNext, bufferWrites, commitNext, advanceCursors].filter((x) => x.length > 0).join("\n");
+
+  // Epilogue: store registers back, and each cursor back as a width-typed float.
+  const regEpilogue = decls
+    .map((d) => `    (${t}.store (i32.add (local.get $__state) (i32.const ${stateOffset(ir, d.name)})) (local.get ${stLocal(d.name)}))`);
+  const cursorEpilogue = buffers.map((b) => {
+    const { cursorByte } = bufferInfo(ir, b.name);
+    return `    (${t}.store (i32.add (local.get $__state) (i32.const ${cursorByte})) (${cvt}.convert_i32_s (local.get ${curLocal(b.name)})))`;
+  });
+  const stateEpilogue = [...regEpilogue, ...cursorEpilogue].join("\n");
 
   const localDecls = stateLocals.length > 0 ? `\n${stateLocals}` : "";
   const preamble = statePreamble.length > 0 ? `\n${statePreamble}` : "";

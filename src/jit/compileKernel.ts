@@ -27,7 +27,7 @@ import { vectorize, type VectorizedKernelPlan } from "./vectorize.js";
 import { emitScalarModule, emitSimdModule } from "./emitKernelWat.js";
 import { buildCorpus, CORPUS_N_VALUES, type CorpusOptions } from "./corpus.js";
 import { runGate, type CompileWat, type GateReport } from "./gate.js";
-import { type IrKernel, type IrStateDecl, type KernelSignature, type LaneWidth } from "./ir.js";
+import { type IrKernel, type IrStateDecl, type IrStateBufferDecl, type KernelSignature, type LaneWidth } from "./ir.js";
 import { validateTokens, type KernelToken } from "./kernelGrammar.js";
 
 export interface CompileKernelOptions {
@@ -77,6 +77,11 @@ export type CompileResult =
        *  allocate + seed the per-generation state slab — they cannot be derived
        *  from the `KernelSignature` (state registers are NOT signature params). */
       readonly stateDecls: ReadonlyArray<IrStateDecl>;
+      /** The kernel's declared delay-line ring buffers (Apollo Frontier 7, Stage 3),
+       *  declaration order. Empty for a kernel with no delay lines. The runtime needs
+       *  these (with `stateDecls`) to size + seed the per-generation state slab; like
+       *  registers, they are NOT derivable from the `KernelSignature`. */
+      readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
     }
   | { readonly status: "rejected-source"; readonly diagnostic: Diagnostic }
   | { readonly status: "rejected-gate"; readonly gate: GateReport }
@@ -153,12 +158,16 @@ export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
   // over a corpus that includes a LONG run (so an IIR transient develops past the
   // residue rows). The stateless SIMD path below is untouched.
   if (vec.plan.scalarOnly) {
-    const corpus = buildCorpus(ir.signature, opts.corpus ?? { nValues: [...CORPUS_N_VALUES, 256, 512] });
+    // The long-run corpus must exceed the longest delay so the ring WRAPS (a too-short
+    // run never re-reads a wrapped slot — a ring-addressing / off-by-one bug would hide).
+    const maxBuf = Math.max(0, ...(ir.stateBuffers ?? []).map((b) => b.length));
+    const longRun = maxBuf > 0 ? [256, 512, maxBuf * 2 + 17] : [256, 512];
+    const corpus = buildCorpus(ir.signature, opts.corpus ?? { nValues: [...CORPUS_N_VALUES, ...longRun] });
     const gate = runGate({ ir, scalarWat, simdWat: scalarWat, corpus, compileWat: opts.compileWat, maxUlpF32: opts.maxUlpF32, scalarOnly: true });
     if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
     if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
     const wasm = opts.compileWat(scalarWat, "scalar");
-    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [] };
+    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [], stateBuffers: ir.stateBuffers ?? [] };
   }
 
   const simdWat = emitSimdModule(ir, exportName);
@@ -171,7 +180,7 @@ export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
 
   // accepted — produce the deliverable SIMD bytes.
   const wasm = opts.compileWat(simdWat, "simd");
-  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [] };
+  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [], stateBuffers: ir.stateBuffers ?? [] };
 }
 
 /**

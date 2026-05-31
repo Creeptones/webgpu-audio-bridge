@@ -124,33 +124,34 @@ function main(): void {
   const ld: KernelToken = { t: "load", array: "in", stride: 1, intercept: 0 };
   const stTok: KernelToken = { t: "store", array: "out", stride: 1, intercept: 0 };
 
-  // The signature phase also offers `state` (a register decl, Frontier 7); the body
-  // always offers `readState` (a value-pusher) and, at depth 1, `writeState` (a
-  // store-like terminator). The KIND mask is broad; the OPERAND mask narrows the
-  // register name to the declared set (empty here ⇒ no register, like `load` with no
-  // inputs — see legalNextOperands.test.ts) — so the composition stays sound.
+  // The signature phase also offers `state` (a register decl, Frontier 7) + `stateBuffer`
+  // (a delay-line decl, Stage 3); the body always offers `readState`/`readDelay` (value-
+  // pushers) and, at depth 1, `writeState`/`writeDelay` (store-like terminators). The KIND
+  // mask is broad; the OPERAND mask narrows the register/buffer name to the declared set
+  // (empty here ⇒ none, like `load` with no inputs — see legalNextOperands.test.ts) — so
+  // the composition stays sound.
   // width phase
-  assert(setEq(legalNextTokens([HDR[0]!]).kinds, ["param", "state", "bound"]), "2 after width → {param, state, bound}");
+  assert(setEq(legalNextTokens([HDR[0]!]).kinds, ["param", "state", "stateBuffer", "bound"]), "2 after width → {param, state, stateBuffer, bound}");
   // params phase (mid-run)
-  assert(setEq(legalNextTokens([HDR[0]!, HDR[1]!]).kinds, ["param", "state", "bound"]), "2 mid-param-run → {param, state, bound}");
+  assert(setEq(legalNextTokens([HDR[0]!, HDR[1]!]).kinds, ["param", "state", "stateBuffer", "bound"]), "2 mid-param-run → {param, state, stateBuffer, bound}");
   // body, depth 0 (just after bound): value-pushers only, NOT unary/binary/store
   {
     const r = legalNextTokens([...HDR, BND]);
-    assert(setEq(r.kinds, ["const", "scalar", "load", "readState"]), `2 body depth0 → {const,scalar,load,readState} (got {${[...r.kinds].join(",")}})`);
+    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "readDelay"]), `2 body depth0 → {const,scalar,load,readState,readDelay} (got {${[...r.kinds].join(",")}})`);
     assert(!r.done, "2 body depth0 with no store is not done");
   }
-  // body, depth 1: + unary + store + writeState, NOT binary
+  // body, depth 1: + unary + store + writeState + writeDelay, NOT binary
   {
     const r = legalNextTokens([...HDR, BND, ld]);
-    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "unary", "store", "writeState"]), `2 body depth1 (got {${[...r.kinds].join(",")}})`);
+    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "readDelay", "unary", "store", "writeState", "writeDelay"]), `2 body depth1 (got {${[...r.kinds].join(",")}})`);
     assert(!r.kinds.has("binary"), "2 body depth1 excludes binary");
     assert(!r.done, "2 body depth1 is not done");
   }
-  // body, depth 2: + binary, NOT store/writeState
+  // body, depth 2: + binary, NOT store/writeState/writeDelay
   {
     const r = legalNextTokens([...HDR, BND, ld, ld]);
-    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "unary", "binary"]), `2 body depth2 (got {${[...r.kinds].join(",")}})`);
-    assert(!r.kinds.has("store") && !r.kinds.has("writeState"), "2 body depth2 excludes store/writeState (arity ≠ 1)");
+    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "readDelay", "unary", "binary"]), `2 body depth2 (got {${[...r.kinds].join(",")}})`);
+    assert(!r.kinds.has("store") && !r.kinds.has("writeState") && !r.kinds.has("writeDelay"), "2 body depth2 excludes store/writeState/writeDelay (arity ≠ 1)");
   }
   // body, depth 3: still binary, still no store
   {
@@ -160,7 +161,7 @@ function main(): void {
   // after a store: depth 0 again AND done (one store emitted)
   {
     const r = legalNextTokens([...HDR, BND, ld, stTok]);
-    assert(setEq(r.kinds, ["const", "scalar", "load", "readState"]), `2 post-store depth0 (got {${[...r.kinds].join(",")}})`);
+    assert(setEq(r.kinds, ["const", "scalar", "load", "readState", "readDelay"]), `2 post-store depth0 (got {${[...r.kinds].join(",")}})`);
     assert(r.done, "2 post-store with ≥1 store IS done");
   }
   ok(`2 depth rules exact (width/params/body × depth 0..3 + post-store done)`);

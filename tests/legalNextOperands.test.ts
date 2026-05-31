@@ -99,6 +99,9 @@ function admits(choices: OperandChoices, tk: KernelToken): boolean {
     case "state": return !!choices.nameIsFresh?.(tk.name) && !!choices.constValid?.(tk.init);
     case "readState": return !!choices.stateNames?.includes(tk.name);
     case "writeState": return !!choices.stateNames?.includes(tk.name);
+    case "stateBuffer": return !!choices.nameIsFresh?.(tk.name) && !!choices.lengthValid?.(tk.length);
+    case "readDelay": return !!choices.buffers?.includes(tk.buffer) && !!choices.delayValid?.(tk.buffer, tk.delay);
+    case "writeDelay": return !!choices.buffers?.includes(tk.buffer);
   }
 }
 

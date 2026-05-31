@@ -42,7 +42,10 @@
  * `@experimental` — exported from `webgpu-audio-bridge/experimental`.
  */
 
-import { type IrKernel, type IrNode, type IrStore, type UnaryOp, type BinaryOp, isStateful } from "./ir.js";
+import {
+  type IrKernel, type IrNode, type IrStore, type UnaryOp, type BinaryOp, type StateLayout,
+  isStateful, stateLayout,
+} from "./ir.js";
 
 /** ECMAScript reserved words that cannot be used as a binding name in strict-mode
  *  (module) source — the names this emitter must alias away. */
@@ -72,6 +75,11 @@ interface NameContext {
   readonly stateParam: string | null;
   /** Frontier 7: state register name → its cur/next JS locals. */
   readonly stateLocals: ReadonlyMap<string, StateLocal>;
+  /** Frontier 7, Stage 3: delay-buffer name → its live write-cursor JS local. */
+  readonly bufferCursors: ReadonlyMap<string, string>;
+  /** Frontier 7, Stage 3: the slab layout (ring + cursor element offsets), shared
+   *  with the emitter + `evalReference` so the three fallbacks index identically. */
+  readonly layout: StateLayout;
 }
 
 /** Build the original→safe name map + the loop variable + the state locals,
@@ -105,12 +113,16 @@ function buildNameContext(ir: IrKernel): NameContext {
   };
   // The loop variable: a fresh name that collides with nothing above.
   const loopVar = fresh("__i");
-  // Frontier 7: the trailing state-slab param + per-register cur/next locals.
+  // Frontier 7: the trailing state-slab param + per-register cur/next locals + (Stage 3)
+  // per-buffer write-cursor locals. The slab is present for ANY loop-carried state.
   const decls = ir.stateDecls ?? [];
-  const stateParam = decls.length > 0 ? fresh("__state") : null;
+  const buffers = ir.stateBuffers ?? [];
+  const stateParam = isStateful(ir) ? fresh("__state") : null;
   const stateLocals = new Map<string, StateLocal>();
   decls.forEach((d, k) => stateLocals.set(d.name, { cur: fresh(`__st_${k}`), next: fresh(`__next_${k}`) }));
-  return { map, loopVar, stateParam, stateLocals };
+  const bufferCursors = new Map<string, string>();
+  buffers.forEach((b, k) => bufferCursors.set(b.name, fresh(`__cur_${k}`)));
+  return { map, loopVar, stateParam, stateLocals, bufferCursors, layout: stateLayout(ir) };
 }
 
 function safe(name: string, ctx: NameContext): string {
@@ -159,6 +171,12 @@ function emitExpr(node: IrNode, ctx: NameContext): string {
     case "scalar": return safe(node.name, ctx);
     case "load": return `${safe(node.array, ctx)}[${indexExpr(node.stride, node.intercept, ctx)}]`;
     case "readState": return ctx.stateLocals.get(node.name)!.cur;
+    case "readDelay": {
+      const cur = ctx.bufferCursors.get(node.buffer)!;
+      const info = ctx.layout.buffers.find((b) => b.name === node.buffer)!;
+      const ring = `((${cur} - ${node.delay} + ${info.length}) % ${info.length})`;
+      return `${ctx.stateParam}[${slabIndex(info.offset, ring)}]`;
+    }
     case "unary": return unaryJs(node.op, emitExpr(node.a, ctx));
     case "binary": return binaryJs(node.op, emitExpr(node.a, ctx), emitExpr(node.b, ctx));
   }
@@ -166,6 +184,11 @@ function emitExpr(node: IrNode, ctx: NameContext): string {
 
 function emitStore(store: IrStore, ctx: NameContext): string {
   return `${safe(store.array, ctx)}[${indexExpr(store.stride, store.intercept, ctx)}] = ${emitExpr(store.value, ctx)};`;
+}
+
+/** Slab element index `base + ring` (folding the `base === 0` register-less case). */
+function slabIndex(base: number, ring: string): string {
+  return base === 0 ? ring : `${base} + ${ring}`;
 }
 
 /**
@@ -194,21 +217,49 @@ export function emitJsKernel(ir: IrKernel, functionName = "kernel"): string {
   // ── Frontier 7: the stateful fallback ──────────────────────────────────────
   // The state slab is a trailing typed-array param the caller keeps across quanta
   // (persistent, click-free — the Stage-2 convention). SIMULTANEOUS semantics: load
-  // each register from the slab into a `cur` local; read `cur` everywhere this
-  // iteration; compute each register's `next` from the pre-commit `cur`s; commit all
-  // at the END of the iteration; store the `cur`s back to the slab after the loop.
-  // This realizes the exact same loop as the scalar WASM + `evalReference`, so the
-  // fallback is numerically faithful (gated behaviorally by tests/stateKernel.test.ts).
+  // each register into a `cur` local + each buffer's (float-in-slab) cursor into an int
+  // local; read pre-iteration state everywhere; compute each register's `next` + each
+  // buffer's write value from the pre-commit state; commit registers + write buf[w]
+  // directly (Stage 3: no deferral temp — reads use w−d, d≥1, never alias w); advance
+  // every cursor at the END of the iteration; store registers + cursors back after the
+  // loop. The exact same loop as the scalar WASM + `evalReference`, so the fallback is
+  // numerically faithful (gated by tests/stateKernel.test.ts + tests/delayKernel.test.ts).
   const decls = ir.stateDecls ?? [];
   const stateStores = ir.stateStores ?? [];
+  const buffers = ir.stateBuffers ?? [];
+  const bufferStores = ir.stateBufferStores ?? [];
   const params = ir.signature.params.map((p) => safe(p.name, ctx)).concat(ctx.stateParam!).join(", ");
   const slab = ctx.stateParam!;
-  const preamble = decls.map((d, k) => `  let ${ctx.stateLocals.get(d.name)!.cur} = ${slab}[${k}];`).join("\n");
-  const outStores = ir.stores.map((s) => `    ${emitStore(s, ctx)}`).join("\n");
-  const computeNext = stateStores.map((ss) => `    let ${ctx.stateLocals.get(ss.name)!.next} = ${emitExpr(ss.value, ctx)};`).join("\n");
-  const commit = stateStores.map((ss) => { const l = ctx.stateLocals.get(ss.name)!; return `    ${l.cur} = ${l.next};`; }).join("\n");
-  const loopBody = [outStores, computeNext, commit].filter((x) => x.length > 0).join("\n");
-  const epilogue = decls.map((d, k) => `  ${slab}[${k}] = ${ctx.stateLocals.get(d.name)!.cur};`).join("\n");
+  const regOff = (name: string): number => ctx.layout.regs.find((r) => r.name === name)!.offset;
+
+  const regPreamble = decls.map((d) => `  let ${ctx.stateLocals.get(d.name)!.cur} = ${slab}[${regOff(d.name)}];`);
+  // `| 0` truncates the float-in-slab cursor to a small non-negative int (exact).
+  const cursorPreamble = buffers.map((b) => {
+    const info = ctx.layout.buffers.find((x) => x.name === b.name)!;
+    return `  let ${ctx.bufferCursors.get(b.name)!} = ${slab}[${info.cursorOffset}] | 0;`;
+  });
+  const preamble = [...regPreamble, ...cursorPreamble].join("\n");
+
+  const outStores = ir.stores.map((s) => `    ${emitStore(s, ctx)}`);
+  const computeNext = stateStores.map((ss) => `    let ${ctx.stateLocals.get(ss.name)!.next} = ${emitExpr(ss.value, ctx)};`);
+  const bufferWrites = bufferStores.map((bs) => {
+    const info = ctx.layout.buffers.find((x) => x.name === bs.buffer)!;
+    return `    ${slab}[${slabIndex(info.offset, ctx.bufferCursors.get(bs.buffer)!)}] = ${emitExpr(bs.value, ctx)};`;
+  });
+  const commit = stateStores.map((ss) => { const l = ctx.stateLocals.get(ss.name)!; return `    ${l.cur} = ${l.next};`; });
+  const advance = buffers.map((b) => {
+    const cur = ctx.bufferCursors.get(b.name)!;
+    return `    ${cur} = (${cur} + 1) % ${b.length};`;
+  });
+  const loopBody = [...outStores, ...computeNext, ...bufferWrites, ...commit, ...advance].join("\n");
+
+  const regEpilogue = decls.map((d) => `  ${slab}[${regOff(d.name)}] = ${ctx.stateLocals.get(d.name)!.cur};`);
+  const cursorEpilogue = buffers.map((b) => {
+    const info = ctx.layout.buffers.find((x) => x.name === b.name)!;
+    return `  ${slab}[${info.cursorOffset}] = ${ctx.bufferCursors.get(b.name)!};`;
+  });
+  const epilogue = [...regEpilogue, ...cursorEpilogue].join("\n");
+
   return (
     `function ${functionName}(${params}) {\n` +
     `${preamble}\n` +

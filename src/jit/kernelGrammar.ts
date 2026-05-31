@@ -44,7 +44,8 @@
  */
 
 import {
-  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore, type LoopBound,
+  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore,
+  type IrStateBufferDecl, type IrStateBufferStore, type LoopBound,
   type KernelSignature, type KernelParam, type ParamRole,
   type LaneWidth, type UnaryOp, type BinaryOp,
   UNARY_OPS, BINARY_OPS, kernelKey,
@@ -61,10 +62,15 @@ export type KernelToken =
   | { readonly t: "param"; readonly name: string; readonly role: ParamRole }
   /** state-register declaration (Frontier 7) — in the params phase, beside `param`. */
   | { readonly t: "state"; readonly name: string; readonly init: number }
+  /** delay-line buffer declaration (Frontier 7, Stage 3) — in the params phase. */
+  | { readonly t: "stateBuffer"; readonly name: string; readonly length: number }
   | { readonly t: "bound"; readonly bound: LoopBound }
   | { readonly t: "load"; readonly array: string; readonly stride: number; readonly intercept: number }
   /** read a state register (Frontier 7) — a body value-pusher, like `scalar`. */
   | { readonly t: "readState"; readonly name: string }
+  /** read a delay-line buffer at a fixed integer offset (Frontier 7, Stage 3) — a
+   *  body value-pusher, like `load`; the buffer must be declared + `1 ≤ delay ≤ length`. */
+  | { readonly t: "readDelay"; readonly buffer: string; readonly delay: number }
   | { readonly t: "scalar"; readonly name: string }
   | { readonly t: "const"; readonly value: number }
   | { readonly t: "unary"; readonly op: UnaryOp }
@@ -72,7 +78,10 @@ export type KernelToken =
   | { readonly t: "store"; readonly array: string; readonly stride: number; readonly intercept: number }
   /** commit a state register's next value (Frontier 7) — a body terminator, like
    *  `store` (consumes the one value on the stack); one per register per iteration. */
-  | { readonly t: "writeState"; readonly name: string };
+  | { readonly t: "writeState"; readonly name: string }
+  /** schedule a value into a delay-line buffer (Frontier 7, Stage 3) — a body
+   *  terminator, like `writeState`; one per buffer per iteration. */
+  | { readonly t: "writeDelay"; readonly buffer: string };
 
 export type TokenKind = KernelToken["t"];
 
@@ -110,6 +119,7 @@ export function kernelToTokens(ir: IrKernel): KernelToken[] {
   const tokens: KernelToken[] = [{ t: "width", width: ir.width }];
   for (const p of ir.signature.params) tokens.push({ t: "param", name: p.name, role: p.role });
   for (const d of ir.stateDecls ?? []) tokens.push({ t: "state", name: d.name, init: d.init });
+  for (const b of ir.stateBuffers ?? []) tokens.push({ t: "stateBuffer", name: b.name, length: b.length });
   tokens.push({ t: "bound", bound: ir.bound });
   for (const store of ir.stores) {
     emitNode(store.value, tokens);
@@ -118,6 +128,10 @@ export function kernelToTokens(ir: IrKernel): KernelToken[] {
   for (const ss of ir.stateStores ?? []) {
     emitNode(ss.value, tokens);
     tokens.push({ t: "writeState", name: ss.name });
+  }
+  for (const bs of ir.stateBufferStores ?? []) {
+    emitNode(bs.value, tokens);
+    tokens.push({ t: "writeDelay", buffer: bs.buffer });
   }
   return tokens;
 }
@@ -128,6 +142,7 @@ function emitNode(node: IrNode, out: KernelToken[]): void {
     case "scalar": out.push({ t: "scalar", name: node.name }); break;
     case "load": out.push({ t: "load", array: node.array, stride: node.stride, intercept: node.intercept }); break;
     case "readState": out.push({ t: "readState", name: node.name }); break;
+    case "readDelay": out.push({ t: "readDelay", buffer: node.buffer, delay: node.delay }); break;
     case "unary": emitNode(node.a, out); out.push({ t: "unary", op: node.op }); break;
     case "binary": emitNode(node.a, out); emitNode(node.b, out); out.push({ t: "binary", op: node.op }); break;
   }
@@ -137,6 +152,12 @@ function emitNode(node: IrNode, out: KernelToken[]): void {
 
 function fail(error: string, at?: number): ValidateFailure {
   return at === undefined ? { ok: false, error } : { ok: false, error, at };
+}
+
+/** True iff `name` is already declared in ANY of the three namespaces (signature
+ *  params, state registers, delay buffers) — names are globally unique. */
+function taken(s: GrammarState, name: string): boolean {
+  return s.names.has(name) || s.stateNames.has(name) || s.bufferNames.has(name);
 }
 
 // ── the grammar step machine (shared by validateTokens + legalNextTokens) ───────
@@ -172,12 +193,21 @@ interface GrammarState {
   stateStores: IrStateStore[];
   /** Registers already written this iteration (at most one `writeState` each). */
   written: Set<string>;
+  // ── delay-line ring buffers (Frontier 7, Stage 3) ──────────────────────────
+  /** Declared buffer names — a THIRD namespace (beside signature params + state
+   *  registers), so a buffer name never collides with an array/scalar/register. */
+  bufferNames: Set<string>;
+  stateBuffers: IrStateBufferDecl[];
+  stateBufferStores: IrStateBufferStore[];
+  /** Buffers already written this iteration (at most one `writeDelay` each). */
+  bufWritten: Set<string>;
 }
 
 function initialState(): GrammarState {
   return {
     phase: "width", width: null, params: [], names: new Set<string>(), bound: null,
     stack: [], stores: [], stateNames: new Set<string>(), stateDecls: [], stateStores: [], written: new Set<string>(),
+    bufferNames: new Set<string>(), stateBuffers: [], stateBufferStores: [], bufWritten: new Set<string>(),
   };
 }
 
@@ -196,7 +226,7 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
     case "params": {
       if (tk.t === "param") {
         if (!IDENT.test(tk.name)) return fail(`invalid param name "${tk.name}"`, at);
-        if (s.names.has(tk.name) || s.stateNames.has(tk.name)) return fail(`duplicate param "${tk.name}"`, at);
+        if (taken(s, tk.name)) return fail(`duplicate param "${tk.name}"`, at);
         if (!ROLES.has(tk.role)) return fail(`unknown param role "${String(tk.role)}"`, at);
         s.names.add(tk.name);
         s.params.push({ name: tk.name, role: tk.role });
@@ -204,10 +234,18 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
       }
       if (tk.t === "state") {
         if (!IDENT.test(tk.name)) return fail(`invalid state name "${tk.name}"`, at);
-        if (s.names.has(tk.name) || s.stateNames.has(tk.name)) return fail(`duplicate state register "${tk.name}"`, at);
+        if (taken(s, tk.name)) return fail(`duplicate state register "${tk.name}"`, at);
         if (typeof tk.init !== "number" || !Number.isFinite(tk.init)) return fail(`state "${tk.name}" init must be a finite number`, at);
         s.stateNames.add(tk.name);
         s.stateDecls.push({ name: tk.name, init: tk.init });
+        return null;
+      }
+      if (tk.t === "stateBuffer") {
+        if (!IDENT.test(tk.name)) return fail(`invalid state buffer name "${tk.name}"`, at);
+        if (taken(s, tk.name)) return fail(`duplicate state buffer "${tk.name}"`, at);
+        if (!Number.isInteger(tk.length) || tk.length < 1) return fail(`state buffer "${tk.name}" length must be a positive integer (got ${tk.length})`, at);
+        s.bufferNames.add(tk.name);
+        s.stateBuffers.push({ name: tk.name, length: tk.length });
         return null;
       }
       if (tk.t === "bound") {
@@ -221,13 +259,14 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
         s.phase = "body";
         return null;
       }
-      return fail("expected a `param`, `state`, or `bound` token in the signature phase", at);
+      return fail("expected a `param`, `state`, `stateBuffer`, or `bound` token in the signature phase", at);
     }
     case "body": {
       switch (tk.t) {
         case "width": return fail("unexpected `width` token in body", at);
         case "param": return fail("`param` tokens must precede `bound`", at);
         case "state": return fail("`state` tokens must precede `bound`", at);
+        case "stateBuffer": return fail("`stateBuffer` tokens must precede `bound`", at);
         case "bound": return fail("duplicate `bound` token", at);
         case "const":
           if (typeof tk.value !== "number") return fail("const value must be a number", at);
@@ -241,12 +280,29 @@ function stepGrammar(s: GrammarState, tk: KernelToken, at: number): ValidateFail
           if (!s.stateNames.has(tk.name)) return fail(`readState references undeclared state register "${tk.name}"`, at);
           s.stack.push({ kind: "readState", name: tk.name });
           return null;
+        case "readDelay": {
+          const buf = s.stateBuffers.find((b) => b.name === tk.buffer);
+          if (!buf) return fail(`readDelay references undeclared state buffer "${tk.buffer}"`, at);
+          if (!Number.isInteger(tk.delay) || tk.delay < 1 || tk.delay > buf.length) {
+            return fail(`readDelay delay must be an integer in [1, ${buf.length}] (got ${tk.delay})`, at);
+          }
+          s.stack.push({ kind: "readDelay", buffer: tk.buffer, delay: tk.delay });
+          return null;
+        }
         case "writeState": {
           if (!s.stateNames.has(tk.name)) return fail(`writeState references undeclared state register "${tk.name}"`, at);
           if (s.written.has(tk.name)) return fail(`state register "${tk.name}" is written more than once per iteration`, at);
           if (s.stack.length !== 1) return fail(`writeState expects exactly one value on the stack (found ${s.stack.length})`, at);
           s.stateStores.push({ name: tk.name, value: s.stack.pop()! });
           s.written.add(tk.name);
+          return null;
+        }
+        case "writeDelay": {
+          if (!s.bufferNames.has(tk.buffer)) return fail(`writeDelay references undeclared state buffer "${tk.buffer}"`, at);
+          if (s.bufWritten.has(tk.buffer)) return fail(`state buffer "${tk.buffer}" is written more than once per iteration`, at);
+          if (s.stack.length !== 1) return fail(`writeDelay expects exactly one value on the stack (found ${s.stack.length})`, at);
+          s.stateBufferStores.push({ buffer: tk.buffer, value: s.stack.pop()! });
+          s.bufWritten.add(tk.buffer);
           return null;
         }
         case "load": {
@@ -291,12 +347,16 @@ function finalizeGrammar(s: GrammarState): ValidateResult {
   if (s.stores.length === 0) return fail("kernel has no stores");
   const signature: KernelSignature = { params: s.params, width: s.width! };
   // State fields are added ONLY when present, so a stateless stream rebuilds the
-  // byte-identical (state-free) IR — preserving the stateless content address.
-  const stateful = s.stateDecls.length > 0 || s.stateStores.length > 0;
-  const ir: IrKernel = stateful
-    ? { width: s.width!, bound: s.bound!, stores: s.stores, stateDecls: s.stateDecls, stateStores: s.stateStores, signature }
-    : { width: s.width!, bound: s.bound!, stores: s.stores, signature };
-  return { ok: true, ir };
+  // byte-identical (state-free) IR, and a registers-only stream omits the buffer
+  // fields — preserving both content addresses.
+  const ir: IrKernel = { width: s.width!, bound: s.bound!, stores: s.stores, signature };
+  const withState = (s.stateDecls.length > 0 || s.stateStores.length > 0)
+    ? { ...ir, stateDecls: s.stateDecls, stateStores: s.stateStores }
+    : ir;
+  const withBuffers = (s.stateBuffers.length > 0 || s.stateBufferStores.length > 0)
+    ? { ...withState, stateBuffers: s.stateBuffers, stateBufferStores: s.stateBufferStores }
+    : withState;
+  return { ok: true, ir: withBuffers };
 }
 
 /**
@@ -351,6 +411,7 @@ function legalKinds(s: GrammarState): Set<TokenKind> {
     case "params":
       out.add("param"); // declare another signature parameter
       out.add("state"); // …or declare a state register (Frontier 7)
+      out.add("stateBuffer"); // …or declare a delay-line buffer (Frontier 7, Stage 3)
       out.add("bound"); // …or end the signature phase and begin the body
       break;
     case "body": {
@@ -359,11 +420,13 @@ function legalKinds(s: GrammarState): Set<TokenKind> {
       out.add("scalar");
       out.add("load");
       out.add("readState"); // a state read is a value-pusher too (Frontier 7)
+      out.add("readDelay"); // …as is a delay-line read (Frontier 7, Stage 3)
       if (depth >= 1) out.add("unary");  // pops 1, pushes 1
       if (depth >= 2) out.add("binary"); // pops 2, pushes 1
       if (depth === 1) {
         out.add("store");      // consumes the one value → starts a new statement
         out.add("writeState"); // …or commits it to a state register (Frontier 7)
+        out.add("writeDelay"); // …or schedules it into a delay buffer (Frontier 7, Stage 3)
       }
       break;
     }
@@ -443,6 +506,15 @@ export interface OperandChoices {
    *  not yet written this iteration (Frontier 7). Empty ⇒ no legal token of that kind
    *  here (no register declared, or all already written). */
   readonly stateNames?: ReadonlyArray<string>;
+  /** `readDelay` token: every declared delay buffer; `writeDelay` token: the buffers
+   *  not yet written this iteration (Frontier 7, Stage 3). Empty ⇒ no legal token. */
+  readonly buffers?: ReadonlyArray<string>;
+  /** `readDelay` token: validity of the (buffer, delay) pair — integer in
+   *  `[1, lengthOf(buffer)]`. Takes the buffer name because the bound is per-buffer. */
+  readonly delayValid?: (buffer: string, delay: number) => boolean;
+  /** `stateBuffer` token: validity of the declared ring length (a positive integer).
+   *  (The buffer NAME freshness rides on `nameIsFresh`, shared with `param`/`state`.) */
+  readonly lengthValid?: (n: number) => boolean;
 }
 
 const ALL_WIDTHS: ReadonlyArray<LaneWidth> = ["f32", "f64"];
@@ -452,6 +524,7 @@ const BINARY_OP_LIST = [...BINARY_OPS] as ReadonlyArray<BinaryOp>;
 const isInteger = (n: number): boolean => Number.isInteger(n);
 const isFiniteNumber = (n: number): boolean => Number.isFinite(n);
 const isBoundConst = (v: number): boolean => Number.isInteger(v) && v >= 0;
+const isBufferLength = (v: number): boolean => Number.isInteger(v) && v >= 1;
 
 /** The declared names of a given role, in declaration order. */
 function namesByRole(s: GrammarState, role: ParamRole): string[] {
@@ -478,8 +551,9 @@ export function legalNextOperands(
   if (!legalKinds(s).has(kind)) return {}; // the KIND itself is illegal at this position
   switch (kind) {
     case "width": return { width: ALL_WIDTHS };
-    case "param": return { paramRoles: ALL_ROLES, nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) && !s.stateNames.has(n) };
-    case "state": return { nameIsFresh: (n) => IDENT.test(n) && !s.names.has(n) && !s.stateNames.has(n), constValid: isFiniteNumber };
+    case "param": return { paramRoles: ALL_ROLES, nameIsFresh: (n) => IDENT.test(n) && !taken(s, n) };
+    case "state": return { nameIsFresh: (n) => IDENT.test(n) && !taken(s, n), constValid: isFiniteNumber };
+    case "stateBuffer": return { nameIsFresh: (n) => IDENT.test(n) && !taken(s, n), lengthValid: isBufferLength };
     case "bound": return { boundParams: namesByRole(s, "length"), boundConstOk: true, boundConstValid: isBoundConst };
     case "load": return { arrays: namesByRole(s, "input"), strideValid: isInteger, interceptValid: isInteger };
     case "store": return { arrays: namesByRole(s, "output"), strideValid: isInteger, interceptValid: isInteger };
@@ -489,6 +563,14 @@ export function legalNextOperands(
     case "binary": return { ops: BINARY_OP_LIST };
     case "readState": return { stateNames: [...s.stateNames] };
     case "writeState": return { stateNames: [...s.stateNames].filter((nm) => !s.written.has(nm)) };
+    case "readDelay": {
+      const lenOf = (b: string): number => s.stateBuffers.find((x) => x.name === b)?.length ?? 0;
+      return {
+        buffers: s.stateBuffers.map((b) => b.name),
+        delayValid: (b, d) => Number.isInteger(d) && d >= 1 && d <= lenOf(b),
+      };
+    }
+    case "writeDelay": return { buffers: s.stateBuffers.map((b) => b.name).filter((nm) => !s.bufWritten.has(nm)) };
   }
 }
 
@@ -533,15 +615,18 @@ function tokenToWord(tk: KernelToken): string {
     case "width": return `width:${tk.width}`;
     case "param": return `param:${tk.name}:${tk.role}`;
     case "state": return `state:${tk.name}:${String(tk.init)}`;
+    case "stateBuffer": return `stateBuffer:${tk.name}:${String(tk.length)}`;
     case "bound": return tk.bound.kind === "param" ? `bound:$${tk.bound.name}` : `bound:#${String(tk.bound.value)}`;
     case "load": return `load:${tk.array}:${String(tk.stride)}:${String(tk.intercept)}`;
     case "readState": return `readState:${tk.name}`;
+    case "readDelay": return `readDelay:${tk.buffer}:${String(tk.delay)}`;
     case "scalar": return `scalar:${tk.name}`;
     case "const": return `const:${String(tk.value)}`;
     case "unary": return `unary:${tk.op}`;
     case "binary": return `binary:${tk.op}`;
     case "store": return `store:${tk.array}:${String(tk.stride)}:${String(tk.intercept)}`;
     case "writeState": return `writeState:${tk.name}`;
+    case "writeDelay": return `writeDelay:${tk.buffer}`;
   }
 }
 
@@ -577,6 +662,12 @@ function wordToToken(w: string): KernelToken {
       if (name === undefined || init === undefined) throw new Error(`parseTokens: bad state token "${w}"`);
       return { t: "state", name, init: strToNum(init) };
     }
+    case "stateBuffer": {
+      const name = parts[1];
+      const length = parts[2];
+      if (name === undefined || length === undefined) throw new Error(`parseTokens: bad stateBuffer token "${w}"`);
+      return { t: "stateBuffer", name, length: strToNum(length) };
+    }
     case "bound": {
       const arg = parts[1];
       if (arg === undefined || arg.length < 2) throw new Error(`parseTokens: bad bound token "${w}"`);
@@ -603,10 +694,21 @@ function wordToToken(w: string): KernelToken {
       if (name === undefined) throw new Error(`parseTokens: bad readState token "${w}"`);
       return { t: "readState", name };
     }
+    case "readDelay": {
+      const buffer = parts[1];
+      const delay = parts[2];
+      if (buffer === undefined || delay === undefined) throw new Error(`parseTokens: bad readDelay token "${w}"`);
+      return { t: "readDelay", buffer, delay: strToNum(delay) };
+    }
     case "writeState": {
       const name = parts[1];
       if (name === undefined) throw new Error(`parseTokens: bad writeState token "${w}"`);
       return { t: "writeState", name };
+    }
+    case "writeDelay": {
+      const buffer = parts[1];
+      if (buffer === undefined) throw new Error(`parseTokens: bad writeDelay token "${w}"`);
+      return { t: "writeDelay", buffer };
     }
     case "const": {
       const v = parts[1];

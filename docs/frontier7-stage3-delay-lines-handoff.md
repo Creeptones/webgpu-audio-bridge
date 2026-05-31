@@ -293,4 +293,41 @@ Register `tests/delayKernel.test.ts` in `package.json` **both** `test` and `test
 - **Deferred follow-ups:** fractional / modulated delay (§1); `lower.ts` JS authoring (a `let s = …`
   ⇒ register, an array-indexed delay ⇒ a buffer) — the real-JS-is-sequential vs IR-is-simultaneous
   reconciliation; per-buffer non-zero init (wavetables). All independent of Stages 4–5.
+
+---
+
+## Shipped postscript (0.9.931)
+
+Stage 3 shipped at **0.9.931** as designed, with two reasoned deviations noted below.
+
+**What landed:** the full stack delta — `IrStateBufferDecl` / `readDelay` IR node /
+`IrStateBufferStore` + optional `stateBuffers` / `stateBufferStores` on `IrKernel`
+(`isStateful` + `kernelKey`'s `dbuf{…}` segment fold preserving the `kernelHash(gain)` AND
+every registers-only hash); the grammar's `stateBuffer` / `readDelay` / `writeDelay` tokens
+through the single `stepGrammar` machine (KIND + OPERAND masks move in lockstep) + codec;
+the scalar emitter's modulo ring addressing + float-in-slab cursor (SIMD emitter untouched);
+`evalReference`'s ring interpreter + the wrap-exceeding equivalence corpus + the lengthened
+acoustic stability probe; `emitJsKernel`'s ring fallback; and the runtime generalization of
+the consumer + wiring + `jitMemoryPages` from register count to total slab elements.
+
+**Deviation 1 — `stateLayout` lives in `ir.ts`, not `emitKernelWat.ts` (§3.2).** The
+single-source-of-truth descriptor was placed in `ir.ts` (which all five consumers already
+import) rather than `emitKernelWat.ts`, so `emitJsKernel` need not cross-import the WAT
+emitter. The non-drift principle (one function read by emitter / `evalReference` / gate /
+`emitJsKernel` / consumer) is exactly as recommended; only the file home moved.
+
+**Deviation 2 — the reservation floor (§4).** The handoff said "replace the fixed-max
+`MAX_STATE_REGISTERS` reservation with exact per-kernel sizing." Taken literally that would
+shrink a registers-only kernel's slab (1 reg → 16 bytes vs Stage 2's 512), breaking the §6
+gotcha-4 frontier gate ("registers-only stays the Stage-2 path, bit-for-bit"). The shipped
+form reconciles both: `reserved = max(MAX_STATE_REGISTERS, stateLayout.elements)` — a
+registers-only / stateless kernel (elements ≤ 64) keeps the byte-identical Stage-2
+reservation, while a delay line wider than 64 sizes its slab exactly. `jitMemoryPages`'s
+4th arg follows the same floor. Seed/copy use the live `stateLayout.elements`, so the
+over-reservation for a tiny-buffer kernel is harmless.
+
+**Tests:** `tests/delayKernel.test.ts` (5 pins) + `tests/stateKernelConsumer.test.ts` pin 6
+(cross-quantum persistence) + the `legalNextTokens` / `legalNextOperands` pin-2 mask updates.
+Full suite green, typecheck clean, `bench` push/pull/pullLatest 1.30 µs, `bench:jit`
+unchanged (delay lines are scalar-only). **Stage 4 — SIMD across voices — is next.**
 ```

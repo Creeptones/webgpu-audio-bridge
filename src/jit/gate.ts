@@ -20,7 +20,7 @@
  * browser worker it is wabt or a direct binary encoder.
  */
 
-import { type IrKernel, type LaneWidth, ELEM_BYTES, signatureWidth, isStateful } from "./ir.js";
+import { type IrKernel, type LaneWidth, ELEM_BYTES, signatureWidth, isStateful, stateLayout } from "./ir.js";
 import { type CorpusCase } from "./corpus.js";
 import { evalReference } from "./acousticGate.js";
 import { hasWasmSimd } from "../worklet/wasmSimdSupport.js";
@@ -118,24 +118,28 @@ function planLayout(ir: IrKernel, corpus: ReadonlyArray<CorpusCase>): Layout {
       cursor += slot;
     }
   }
-  // The state slab (Frontier 7): one element per declared register, after the arrays.
+  // The state slab (Frontier 7): registers + delay-buffer rings + cursors, sized by
+  // the single-source-of-truth `stateLayout`, after the arrays.
   let stateOffset = -1;
-  const decls = ir.stateDecls ?? [];
-  if (decls.length > 0) {
+  const slab = stateLayout(ir);
+  if (slab.elements > 0) {
     stateOffset = cursor;
-    cursor += align16(decls.length * eb);
+    cursor += align16(slab.elements * eb);
   }
   const pages = Math.max(1, Math.ceil(cursor / 65536));
   return { offsets, maxN, pages, stateOffset };
 }
 function align16(n: number): number { return (n + 15) & ~15; }
 
-/** Seed the state slab with the declared inits (cold start), matching `evalReference`. */
+/** Seed the state slab to the COLD start (matching `evalReference`): zero the whole
+ *  region (buffer rings + cursors → 0), then write each register's declared init. Run
+ *  per corpus case so the slab never carries the previous case's evolved state. */
 function seedState(memory: WebAssembly.Memory, layout: Layout, ir: IrKernel, TA: Float32ArrayConstructor | Float64ArrayConstructor): void {
-  const decls = ir.stateDecls ?? [];
-  if (layout.stateOffset < 0 || decls.length === 0) return;
-  const view = new TA(memory.buffer, layout.stateOffset, decls.length);
-  for (let k = 0; k < decls.length; k++) view[k] = decls[k]!.init;
+  const slab = stateLayout(ir);
+  if (layout.stateOffset < 0 || slab.elements === 0) return;
+  const view = new TA(memory.buffer, layout.stateOffset, slab.elements);
+  view.fill(0);
+  for (const r of slab.regs) view[r.offset] = r.init;
 }
 
 function instantiate(bytes: Uint8Array, memory: WebAssembly.Memory): WebAssembly.Instance {

@@ -63,6 +63,10 @@ export function vectorize(ir: IrKernel, exportName = "kernel"): VectorizeResult 
     const bad = firstNonContiguousLoad(ss.value);
     if (bad) return { ok: false, reason: `stride-${bad}-not-emitted` };
   }
+  for (const bs of ir.stateBufferStores ?? []) {
+    const bad = firstNonContiguousLoad(bs.value);
+    if (bad) return { ok: false, reason: `stride-${bad}-not-emitted` };
+  }
 
   // Collect arrays/scalars in signature order (deterministic).
   const arrays: PlanArrayRef[] = [];

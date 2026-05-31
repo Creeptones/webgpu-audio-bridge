@@ -39,6 +39,9 @@ export type IrNode =
   | { readonly kind: "load"; readonly array: string; readonly stride: number; readonly intercept: number }
   /** read a single-sample state register's value at iteration start (Frontier 7). */
   | { readonly kind: "readState"; readonly name: string }
+  /** read a delay-line ring buffer at a fixed integer offset `delay` (≥1) — the
+   *  sample written `delay` iterations ago (Frontier 7, Stage 3). */
+  | { readonly kind: "readDelay"; readonly buffer: string; readonly delay: number }
   | { readonly kind: "unary"; readonly op: UnaryOp; readonly a: IrNode }
   | { readonly kind: "binary"; readonly op: BinaryOp; readonly a: IrNode; readonly b: IrNode };
 
@@ -72,6 +75,30 @@ export interface IrStateStore {
   readonly value: IrNode;
 }
 
+// ── delay-line ring buffers (Apollo Frontier 7, Stage 3) ─────────────────────
+//
+// A `z⁻N` ring buffer: `length` f32/f64 slots + an implicit write cursor `w`, all
+// 0-init in v1. `readDelay(buf, d)` (1 ≤ d ≤ length) reads `buf[(w−d+L) mod L]` —
+// the sample written `d` iterations ago; `writeDelay` (≤1 per buffer per iteration)
+// schedules a value into slot `w`. Because every read uses `d ≥ 1`, no read in an
+// iteration ever touches the slot about to be written, so — unlike a single-sample
+// register — a buffer needs NO deferral temp: it writes directly to `buf[w]` (after
+// the reads), then `w` advances at iteration end. Simultaneity (the locked §2.2
+// semantics) falls out for free. A `z⁻¹` register IS a length-1 buffer read at
+// delay 1; v1 keeps registers + buffers as separate constructs for back-compat.
+
+/** A declared delay-line ring buffer (`length` slots, all 0-init in v1). */
+export interface IrStateBufferDecl {
+  readonly name: string;
+  readonly length: number;
+}
+
+/** A buffer's scheduled write (one per buffer per iteration max). */
+export interface IrStateBufferStore {
+  readonly buffer: string;
+  readonly value: IrNode;
+}
+
 export type LoopBound =
   | { readonly kind: "param"; readonly name: string } // trip count = a `length` param
   | { readonly kind: "const"; readonly value: number }; // compile-time trip count
@@ -86,12 +113,66 @@ export interface IrKernel {
   readonly stateDecls?: ReadonlyArray<IrStateDecl>;
   /** Per-iteration register commits (Frontier 7). Absent/empty ⇒ stateless. */
   readonly stateStores?: ReadonlyArray<IrStateStore>;
+  /** Declared delay-line ring buffers (Frontier 7, Stage 3). Absent/empty ⇒ no
+   *  delay lines. Like `stateDecls`, the content address folds these in ONLY when
+   *  present, so a stateless / registers-only kernel's hash is byte-identical. */
+  readonly stateBuffers?: ReadonlyArray<IrStateBufferDecl>;
+  /** Per-iteration buffer writes (Frontier 7, Stage 3). Absent/empty ⇒ no writes. */
+  readonly stateBufferStores?: ReadonlyArray<IrStateBufferStore>;
   readonly signature: KernelSignature;
 }
 
-/** True iff the kernel carries state registers (⇒ scalar-only, not time-axis SIMD). */
+/** True iff the kernel carries loop-carried state — registers OR delay buffers
+ *  (⇒ scalar-only, not time-axis SIMD: the recurrence wall). */
 export function isStateful(k: IrKernel): boolean {
-  return (k.stateDecls?.length ?? 0) > 0 || (k.stateStores?.length ?? 0) > 0;
+  return (
+    (k.stateDecls?.length ?? 0) > 0 || (k.stateStores?.length ?? 0) > 0 ||
+    (k.stateBuffers?.length ?? 0) > 0 || (k.stateBufferStores?.length ?? 0) > 0
+  );
+}
+
+// ── the single state-layout descriptor (the non-drift source of truth) ───────
+//
+// The slab layout (which element holds which register / which buffer ring / which
+// cursor) is needed by the emitter, `evalReference`, and the Stage-2 consumer. Three
+// ad-hoc copies WOULD drift (the same risk the single `stepGrammar` machine avoids on
+// the grammar side), so ALL THREE read this one function. Layout order (declaration
+// order): registers first (one slot each), then per buffer its `length` ring slots
+// followed by ONE cursor slot. Offsets are ELEMENT indices (multiply by
+// `ELEM_BYTES[width]` for byte offsets). The cursor lives IN the slab as a width-typed
+// float (homogeneous slab ⇒ trivial to seed/copy; small integers are exact in f32 ≤
+// 2²⁴ / f64 ≤ 2⁵³, far above any buffer length), truncated to an i32 in the loop.
+
+export interface StateLayout {
+  /** Total element (f-word) count in one generation's slab. */
+  readonly elements: number;
+  /** Registers, in declaration order — element offset + cold-start init. */
+  readonly regs: ReadonlyArray<{ readonly name: string; readonly offset: number; readonly init: number }>;
+  /** Delay buffers, in declaration order — the ring start offset, its length, and
+   *  the element offset of the (float) write cursor that follows the ring. */
+  readonly buffers: ReadonlyArray<{
+    readonly name: string; readonly offset: number; readonly length: number; readonly cursorOffset: number;
+  }>;
+}
+
+/** Compute the (single source of truth) slab layout for a kernel's loop-carried
+ *  state. Accepts any `{ stateDecls?, stateBuffers? }` shape (an `IrKernel`, or the
+ *  consumer's decls+buffers), so every consumer reads the SAME offsets. */
+export function stateLayout(ir: {
+  readonly stateDecls?: ReadonlyArray<IrStateDecl>;
+  readonly stateBuffers?: ReadonlyArray<IrStateBufferDecl>;
+}): StateLayout {
+  const decls = ir.stateDecls ?? [];
+  const bufs = ir.stateBuffers ?? [];
+  const regs = decls.map((d, k) => ({ name: d.name, offset: k, init: d.init }));
+  let cursor = decls.length;
+  const buffers = bufs.map((b) => {
+    const offset = cursor;
+    const cursorOffset = offset + b.length;
+    cursor = cursorOffset + 1;
+    return { name: b.name, offset, length: b.length, cursorOffset };
+  });
+  return { elements: cursor, regs, buffers };
 }
 
 // ── KernelSignature — the declared I/O shape ────────────────────────────────
@@ -133,6 +214,7 @@ export function nodeKey(n: IrNode): string {
     case "scalar": return `$${n.name}`;
     case "load": return `${n.array}[${n.stride}i+${n.intercept}]`;
     case "readState": return `@${n.name}`;
+    case "readDelay": return `@${n.buffer}[~${n.delay}]`;
     case "unary": return `${n.op}(${nodeKey(n.a)})`;
     case "binary": return `${n.op}(${nodeKey(n.a)},${nodeKey(n.b)})`;
   }
@@ -140,12 +222,24 @@ export function nodeKey(n: IrNode): string {
 export function kernelKey(k: IrKernel): string {
   const b = k.bound.kind === "param" ? `n=${k.bound.name}` : `n=${k.bound.value}`;
   const base = `${k.width}|${b}|` + k.stores.map((s) => `${s.array}[${s.stride}i+${s.intercept}]=${nodeKey(s.value)}`).join(";");
-  // State segment appended ONLY when present, so a stateless kernel's key (and
-  // therefore its hash) is byte-identical to pre-statefulness.
+  // State segments appended ONLY when present, so a stateless kernel's key (and
+  // therefore its hash) is byte-identical to pre-statefulness, AND a registers-only
+  // kernel's key is byte-identical to pre-Stage-3 (the `dbuf` segment is skipped).
   const decls = k.stateDecls ?? [];
   const stores = k.stateStores ?? [];
-  if (decls.length === 0 && stores.length === 0) return base;
-  const dseg = decls.map((d) => `${d.name}=${d.init}`).join(",");
-  const sseg = stores.map((s) => `${s.name}:=${nodeKey(s.value)}`).join(";");
-  return `${base}|state{${dseg}}{${sseg}}`;
+  const bufs = k.stateBuffers ?? [];
+  const bufStores = k.stateBufferStores ?? [];
+  if (decls.length === 0 && stores.length === 0 && bufs.length === 0 && bufStores.length === 0) return base;
+  let key = base;
+  if (decls.length > 0 || stores.length > 0) {
+    const dseg = decls.map((d) => `${d.name}=${d.init}`).join(",");
+    const sseg = stores.map((s) => `${s.name}:=${nodeKey(s.value)}`).join(";");
+    key += `|state{${dseg}}{${sseg}}`;
+  }
+  if (bufs.length > 0 || bufStores.length > 0) {
+    const bseg = bufs.map((b) => `${b.name}:${b.length}`).join(",");
+    const bstoreseg = bufStores.map((s) => `${s.buffer}<=${nodeKey(s.value)}`).join(";");
+    key += `|dbuf{${bseg}}{${bstoreseg}}`;
+  }
+  return key;
 }

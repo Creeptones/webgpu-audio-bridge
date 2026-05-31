@@ -4,6 +4,105 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.931] — 2026-05-31
+
+### Added — Apollo Frontier 7, Stage 3: delay lines (`z⁻N` ring buffers)
+
+Stage 1 lifted the stateless ceiling to single-sample registers (`z⁻¹`); Stage 2 made
+them run click-free across quanta. **Stage 3 widens state from one sample per register to
+`L` samples per addressable ring buffer + a write cursor** — the time-domain effects
+family: echo / delay, feedforward + feedback comb filters, the Schroeder reverb
+primitives, Karplus-Strong. v1 is **fixed integer delays** (`z⁻N`, `N` a compile-time
+const ≥ 1); fractional / modulated delay (chorus, flanger) is a flagged follow-up. Purely
+additive — the stateless AND registers-only paths stay byte-for-byte identical (the
+frontier gate).
+
+- **The IR gains delay lines.** `IrStateBufferDecl { name, length }`, a `readDelay`
+  `IrNode` variant (`buffer` + a fixed integer `delay`), `IrStateBufferStore`, and optional
+  `stateBuffers` / `stateBufferStores` on `IrKernel`. `isStateful` folds them in; `kernelKey`
+  appends a `dbuf{…}` segment **only when present**, so the `kernelHash(gain)` stateless pin
+  (`72b5c2e5a7a5f117`) AND every registers-only hash are byte-identical.
+- **The simpler-than-registers insight.** Because every `readDelay(buf, d)` uses `d ≥ 1`, no
+  read in an iteration ever touches the slot about to be written, so a buffer writes
+  **directly to `buf[w]`** with no `$__next_*` deferral temp (unlike a register), then the
+  cursor advances at iteration end — and the SIMULTANEOUS semantics still fall out for free.
+- **One `stateLayout(ir)` descriptor — the non-drift source of truth.** The slab layout
+  (registers first, then per buffer its ring + a float write cursor; element offsets) is read
+  by the emitter, `evalReference`, the gate, `emitJsKernel`, AND the consumer — never
+  recomputed ad-hoc (the same discipline the single `stepGrammar` machine uses on the grammar
+  side). The cursor lives in the slab as a width-typed float (homogeneous slab ⇒ trivial
+  seed/copy), truncated to an i32 in the loop.
+- **The grammar moves in lockstep.** `stateBuffer` / `readDelay` / `writeDelay` tokens extend
+  the SINGLE `stepGrammar` machine, so `validateTokens`, `legalNextTokens` (the KIND mask),
+  and `legalNextOperands` (the OPERAND mask) all gain delay-line support together — the KIND
+  mask offers them broadly, the OPERAND mask role-partitions buffer names to the declared set
+  and bounds the delay to `[1, length]` (non-drift preserved). Codec words `stateBuffer:NAME:LEN`
+  / `readDelay:NAME:DELAY` / `writeDelay:NAME`; buffer names are a THIRD namespace (beside
+  signature params + registers).
+- **Emitter, gate, reference all agree.** `emitScalarModule` emits modulo ring addressing
+  (`i32.rem_u` with a pre-add of `L`) + a float-in-slab cursor; the SIMD emitter is untouched
+  (delay lines are `scalarOnly`, with an unreachable-guard `throw` on `readDelay`).
+  `evalReference` maintains a JS ring + cursor per buffer, mirroring the emitter exactly (the
+  spec the scalar WASM is gated against). The equivalence corpus runs long enough to **wrap
+  the ring** (`maxBuffer·2 + 17`), and the acoustic stability probe lengthens to
+  `max(4096, nextPow2(longestDelay·8))` so a feedback comb's instability has room to develop
+  (the free stability gate catches a loop gain ≥ 1 as `peak-out-of-bounds` / `unstable-growth`).
+  `emitJsKernel` emits a faithful ring fallback over the trailing state slab.
+- **Runtime generalized from register count to total slab elements.** `stateBuffers` is
+  threaded the whole wiring alongside `stateDecls` (the `accepted` `CompileResult`,
+  `runJitCompile`'s `jit-result`, `forwardCompileResponse`'s `jit-install` for both transports,
+  `handleJitInstallMessage`, `connectJit` → `JitWorkletOptions` → `createJitConsumer`). The
+  consumer reserves each per-generation slab at `max(MAX_STATE_REGISTERS, stateLayout.elements)`
+  — so a delay line wider than 64 sizes its slab EXACTLY while a registers-only kernel keeps
+  the byte-identical Stage-2 reservation. Seeding zeroes the live region then writes register
+  inits (rings + cursors → 0); the promotion copy moves the WHOLE slab. `jitMemoryPages`'s 4th
+  arg generalizes from `stateRegisters` to `stateElements`.
+
+### Why
+
+Echo, comb filters, and short reverbs are the most-requested DSP a stateless or
+register-only JIT cannot express — they need an addressable history, not a single tap. The
+`d ≥ 1` insight makes the addition *smaller* than the Stage-1 registers (no deferral temp),
+and routing every slab-offset read through one `stateLayout` keeps the five consumers from
+ever drifting — the same load-bearing non-drift property the grammar already enjoys.
+
+### Wire compatibility
+
+No SAB wire-format change. `stateBuffers` (a plain `{name, length}[]`, structured-clone-safe)
+is **added** to `CompileResult` (`accepted`), `JitCompileResponse` (`accepted`),
+`JitInstallMessage` (`jit-install`), `JitWorkletOptions`, and the consumer options;
+`jitMemoryPages`'s trailing arg is reinterpreted as total slab elements (a registers-only or
+stateless call is byte-identical). All additive — a stateless / registers-only kernel
+produces byte-identical IR, hashes, messages, layout, page count, and output to 0.9.930.
+Still `@experimental` (the JIT subtree is outside the 1.0 contract until it soaks + promotes).
+
+### Tests
+
+- **`tests/delayKernel.test.ts`** (new, 5 pins; registered in `test` + `test:unit`):
+  ① a pure delay `out[i] = x[i−N]` is gate-bit-exact + reproduces the delayed copy over a run
+  that WRAPS the ring; ② a feedback comb is accepted + gate-verified when stable and
+  `rejected-acoustic` (not cached) when unstable (`const 1.05`); ③ a damped feedback comb
+  (a `z⁻¹` register AND a delay buffer) compiles + gate-verifies, proving the combined slab
+  layout; ④ a delay kernel round-trips through the codec and the JS fallback ≡ `evalReference`
+  ≡ scalar WASM (f64); ⑥ stateless + registers-only paths untouched (the `kernelHash(gain)`
+  pin, a registers-only one-pole still bit-exact, the delay slab counted in `jitMemoryPages`).
+- **`tests/stateKernelConsumer.test.ts`** gains pin ⑥: a gate-verified feedback comb whose
+  delay `D = 40` ≫ the 16-sample quantum runs across 64 quanta; the concatenated output is
+  BIT-EXACT to one big `evalReference` run — i.e. the ring + cursor persist across `process()`
+  boundaries and the promotion.
+- `tests/legalNextTokens.test.ts` + `tests/legalNextOperands.test.ts` pin 2 updated for the
+  grown KIND/OPERAND masks (the registers-only + stateless emitters still produce only valid
+  streams). Full suite green; `npm run typecheck` clean; `npm run bench` push/pull/pullLatest
+  median 1.30 µs (< 10 µs hard budget); `npm run bench:jit` SIMD/install/fade cells unchanged
+  (delay lines are scalar-only; the SIMD path is untouched).
+
+### Documentation
+
+`CLAUDE.md` `src/jit/` entry updated to mark Stage 3 shipped (Stage 4 — SIMD across voices —
+next). The Stage-3 handoff (`docs/frontier7-stage3-delay-lines-handoff.md`) gets a shipped
+postscript. New IR types + `stateLayout` exported from `src/jit/index.ts` + the experimental
+subpath.
+
 ## [0.9.930] — 2026-05-31
 
 ### Added — Apollo Frontier 7, Stage 2: the persistent-state runtime

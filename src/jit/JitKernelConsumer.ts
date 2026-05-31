@@ -97,18 +97,21 @@
  */
 
 import {
-  type KernelSignature, type LaneWidth, type IrStateDecl,
-  ELEM_BYTES, signatureWidth,
+  type KernelSignature, type LaneWidth, type IrStateDecl, type IrStateBufferDecl, type StateLayout,
+  ELEM_BYTES, signatureWidth, stateLayout,
 } from "./ir.js";
 import { JitKernelSwap, type JitKernelSwapOptions, type JitSwapPhase } from "./JitKernelSwap.js";
 import { hasWasmConsumerSupport } from "../worklet/wasmSimdSupport.js";
 
-/** Maximum state registers a single stateful generation can carry (sizes the
- *  reserved per-generation state slab). Matches the `SpmcRing` consumer cap
- *  precedent. A kernel declaring more registers than this is not installable
- *  (`installCompiledKernel*` returns false). The reservation is FIXED so the
- *  layout, the disjointness assertion, and `jitMemoryPages` stay independent of
- *  the live register count (which is only known when a kernel is installed). */
+/** The FLOOR of the per-generation state-slab reservation, in slab elements
+ *  (f-words). Stage 2 reserved exactly this many for any stateful kernel; Stage 3
+ *  generalizes the reservation to `max(MAX_STATE_REGISTERS, stateLayout.elements)` so
+ *  a delay line wider than 64 (an echo, a reverb) sizes its slab EXACTLY while a
+ *  stateless / registers-only kernel keeps the byte-identical Stage-2 reservation (the
+ *  frontier gate: elements ≤ 64 ⇒ the floor wins ⇒ unchanged). An incoming kernel
+ *  whose slab needs more than what was reserved at construction is not installable
+ *  (`installCompiledKernel*` returns false; in v1 `connectJit` derives both from the
+ *  same IR, so they always match). */
 export const MAX_STATE_REGISTERS = 64;
 
 /** The developer's naive scalar kernel, called with the SAME positional argument
@@ -148,6 +151,12 @@ export interface JitKernelConsumerOptions extends JitKernelSwapOptions {
    *  rides on the install message and must match it (v1: `connectJit` derives
    *  both from the same kernel, so they always do). */
   readonly stateDecls?: ReadonlyArray<IrStateDecl>;
+  /** The kernel's declared delay-line ring buffers (Apollo Frontier 7, Stage 3),
+   *  declaration order. Absent/empty ⇒ no delay lines. With `stateDecls` these size +
+   *  seed the per-generation state slab (registers, then per buffer its ring + a write
+   *  cursor — see `stateLayout`). The construction kernel's buffers fix the reserved
+   *  slab size; an incoming kernel's buffers ride on the install message. */
+  readonly stateBuffers?: ReadonlyArray<IrStateBufferDecl>;
 }
 
 /** One memory region in the consumer's layout (for the disjointness test). */
@@ -215,8 +224,13 @@ export class JitKernelConsumer {
   private readonly stateful: boolean;
   private stateOffA = 0;
   private stateOffB = 0;
-  private _stateDeclsA: ReadonlyArray<IrStateDecl> = [];
-  private _stateDeclsB: ReadonlyArray<IrStateDecl> = [];
+  /** Slab elements reserved per generation = max(MAX_STATE_REGISTERS, ctor elements). */
+  private readonly reservedElements: number;
+  /** The live state layout of each generation (current-A / incoming-B). The slab base
+   *  pointer is all the WASM needs; these drive seeding (reg inits) + the promotion
+   *  copy size. A's is the construction layout until a promotion; B's is set on install. */
+  private _layoutA: StateLayout = { elements: 0, regs: [], buffers: [] };
+  private _layoutB: StateLayout = { elements: 0, regs: [], buffers: [] };
   private _stateViewA: TypedArray | null = null;
   private _stateViewB: TypedArray | null = null;
   private _jsStateSlot = -1; // trailing state-slab arg index in _jsArgsA/_jsArgsB
@@ -269,13 +283,14 @@ export class JitKernelConsumer {
     this.swap = new JitKernelSwap({ continuity: opts.continuity, windowSeconds: this.defaultWindowSeconds });
 
     // ── statefulness (Frontier 7) — fixed at construction (the JS fallback shape) ─
-    const ctorDecls = opts.stateDecls ?? [];
-    if (ctorDecls.length > MAX_STATE_REGISTERS) {
-      throw new Error(`JitKernelConsumer: ${ctorDecls.length} state registers exceeds the max of ${MAX_STATE_REGISTERS}`);
-    }
-    this.stateful = ctorDecls.length > 0;
-    this._stateDeclsA = ctorDecls.slice();
-    this._stateDeclsB = ctorDecls.slice();
+    // The construction kernel's registers + delay buffers fix the per-generation slab
+    // layout (and so the reserved size). Registers-only ⇒ elements ≤ 64 ⇒ the floor
+    // wins ⇒ byte-identical to Stage 2; a delay line wider than 64 grows the slab.
+    const ctorLayout = stateLayout({ stateDecls: opts.stateDecls ?? [], stateBuffers: opts.stateBuffers ?? [] });
+    this.stateful = ctorLayout.elements > 0;
+    this.reservedElements = this.stateful ? Math.max(MAX_STATE_REGISTERS, ctorLayout.elements) : 0;
+    this._layoutA = ctorLayout;
+    this._layoutB = ctorLayout;
 
     // ── classify params + lay out the disjoint slabs ──────────────────────────
     for (const p of this.signature.params) {
@@ -306,7 +321,7 @@ export class JitKernelConsumer {
     // reserved for a stateful kernel, so a stateless layout is byte-identical to
     // pre-Stage-2 (the frontier gate).
     if (this.stateful) {
-      const stateSlot = align16(MAX_STATE_REGISTERS * this.elemBytes);
+      const stateSlot = align16(this.reservedElements * this.elemBytes);
       this.stateOffA = cursor;
       this.regions.push({ label: "stateA", offset: cursor, bytes: stateSlot });
       cursor += stateSlot;
@@ -368,19 +383,21 @@ export class JitKernelConsumer {
     this.jitEnabled = hasWasmConsumerSupport() && isShared(this.memory);
     this.refreshViews();
 
-    // Seed both generations cold (the declared inits) — exactly once, off the
-    // audio thread. Persistence across quanta then follows from never re-seeding.
+    // Seed both generations cold — exactly once, off the audio thread. Persistence
+    // across quanta then follows from never re-seeding.
     if (this.stateful) {
-      this.seedSlab(this._stateViewA!, this._stateDeclsA);
-      this.seedSlab(this._stateViewB!, this._stateDeclsB);
+      this.seedSlab(this._stateViewA!, this._layoutA);
+      this.seedSlab(this._stateViewB!, this._layoutB);
     }
   }
 
-  /** Seed a state slab's live prefix to the declared cold-start `init`s (the
-   *  typed array rounds each to width on store, matching the WASM/JS kernels). */
-  private seedSlab(view: TypedArray, decls: ReadonlyArray<IrStateDecl>): void {
-    const len = Math.min(decls.length, view.length);
-    for (let k = 0; k < len; k++) view[k] = decls[k]!.init;
+  /** Seed a state slab to the COLD start: zero the live region (buffer rings +
+   *  cursors → 0), then write each register's declared `init`. Matches `evalReference`
+   *  + the gate's `seedState` (the typed array rounds each to width on store). */
+  private seedSlab(view: TypedArray, layout: StateLayout): void {
+    const len = Math.min(layout.elements, view.length);
+    for (let k = 0; k < len; k++) view[k] = 0;
+    for (const r of layout.regs) if (r.offset < view.length) view[r.offset] = r.init;
   }
 
   /** Current swap phase. */
@@ -420,7 +437,7 @@ export class JitKernelConsumer {
    * instantiation threw, missing export) — in which case the current kernel keeps
    * running unchanged. Never throws.
    */
-  installCompiledKernel(module: WebAssembly.Module, stateDecls?: ReadonlyArray<IrStateDecl>): boolean {
+  installCompiledKernel(module: WebAssembly.Module, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>): boolean {
     if (!this.jitEnabled) return false;
     let inst: WebAssembly.Instance;
     try {
@@ -428,7 +445,7 @@ export class JitKernelConsumer {
     } catch {
       return false; // `new Instance` threw → do NOT arm; current kernel stays.
     }
-    return this.armInstance(inst, stateDecls);
+    return this.armInstance(inst, stateDecls, stateBuffers);
   }
 
   /**
@@ -439,7 +456,7 @@ export class JitKernelConsumer {
    * instantiating a pre-compiled Module — still microseconds for a kernel-sized
    * module, but keep it in `port.onmessage`, never in `process()`.
    */
-  installCompiledKernelFromBytes(bytes: Uint8Array, stateDecls?: ReadonlyArray<IrStateDecl>): boolean {
+  installCompiledKernelFromBytes(bytes: Uint8Array, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>): boolean {
     if (!this.jitEnabled) return false;
     let inst: WebAssembly.Instance;
     try {
@@ -452,20 +469,26 @@ export class JitKernelConsumer {
     } catch {
       return false;
     }
-    return this.armInstance(inst, stateDecls);
+    return this.armInstance(inst, stateDecls, stateBuffers);
   }
 
-  private armInstance(inst: WebAssembly.Instance, stateDecls?: ReadonlyArray<IrStateDecl>): boolean {
+  private armInstance(
+    inst: WebAssembly.Instance,
+    stateDecls?: ReadonlyArray<IrStateDecl>,
+    stateBuffers?: ReadonlyArray<IrStateBufferDecl>,
+  ): boolean {
     const fn = inst.exports[this.exportName];
     if (typeof fn !== "function") return false; // not a valid kernel module
-    // State-shape compatibility: a stateless consumer reserved no slab, so it
-    // cannot host a stateful kernel; a stateful consumer cannot host a kernel with
-    // more registers than it reserved. Either ⇒ refuse the arm (current stays). In
-    // v1 `connectJit` derives the JS fallback + the SIMD kernel from the same
+    // State-shape compatibility: a stateless consumer reserved no slab, so it cannot
+    // host a stateful kernel; a stateful consumer cannot host a kernel whose slab needs
+    // more elements than it reserved at construction. Either ⇒ refuse the arm (current
+    // stays). In v1 `connectJit` derives the JS fallback + the SIMD kernel from the same
     // source, so the shapes always match and neither guard fires.
-    const incomingDecls = stateDecls ?? (this.stateful ? this._stateDeclsA : []);
-    if (incomingDecls.length > 0 && !this.stateful) return false;
-    if (incomingDecls.length > MAX_STATE_REGISTERS) return false;
+    const incomingLayout = (stateDecls || stateBuffers)
+      ? stateLayout({ stateDecls: stateDecls ?? [], stateBuffers: stateBuffers ?? [] })
+      : this._layoutA;
+    if (incomingLayout.elements > 0 && !this.stateful) return false;
+    if (incomingLayout.elements > this.reservedElements) return false;
     // Replace any in-flight incoming: abandon it, snap the swap, re-arm fresh.
     if (this.swap.isSwapping()) {
       this.swap.reset();
@@ -476,8 +499,8 @@ export class JitKernelConsumer {
     // NEVER copied from slab-A; §3.6). A freshly-installed kernel starts cold; the
     // rising crossfade gain masks the short settling transient.
     if (this.stateful) {
-      this._stateDeclsB = incomingDecls;
-      this.seedSlab(this._stateViewB!, incomingDecls);
+      this._layoutB = incomingLayout;
+      this.seedSlab(this._stateViewB!, incomingLayout);
     }
     this._incoming = inst;
     this._incomingKernelFn = fn as (...a: number[]) => void;
@@ -605,15 +628,15 @@ export class JitKernelConsumer {
       this._incomingKernelFn = null;
       // Promotion (§3.6): B's slab BECOMES the current slab. The incoming kernel
       // ran into slab-B all through the fade, so slab-B holds its live recurrence
-      // state; current now runs via slab-A, so copy B's state across (a tiny
-      // ≤MAX-register copy) — continuity, NOT a re-seed. The retiring instance
-      // does not run again, so overwriting slab-A is safe.
+      // state; current now runs via slab-A, so copy B's WHOLE slab across (registers +
+      // buffer rings + cursors) — continuity, NOT a re-seed. The retiring instance does
+      // not run again, so overwriting slab-A is safe.
       if (this.stateful) {
-        const len = Math.min(this._stateDeclsB.length, MAX_STATE_REGISTERS);
+        const len = Math.min(this._layoutB.elements, this.reservedElements);
         const a = this._stateViewA!;
         const b = this._stateViewB!;
         for (let k = 0; k < len; k++) a[k] = b[k]!;
-        this._stateDeclsA = this._stateDeclsB;
+        this._layoutA = this._layoutB;
       }
     }
     this.runCurrentA();
@@ -705,11 +728,12 @@ export class JitKernelConsumer {
       this._outViewsA[name] = new this.TA(buf, this.outOffA[name]!, this.maxBlock);
       this._outViewsB[name] = new this.TA(buf, this.outOffB[name]!, this.maxBlock);
     }
-    // The two per-generation state slabs (a fixed-max window each). The trailing
+    // The two per-generation state slabs (each `reservedElements` wide — the floor is
+    // MAX_STATE_REGISTERS, so registers-only is byte-identical to Stage 2). The trailing
     // JS state-slab arg points at the matching generation's view.
     if (this.stateful) {
-      this._stateViewA = new this.TA(buf, this.stateOffA, MAX_STATE_REGISTERS);
-      this._stateViewB = new this.TA(buf, this.stateOffB, MAX_STATE_REGISTERS);
+      this._stateViewA = new this.TA(buf, this.stateOffA, this.reservedElements);
+      this._stateViewB = new this.TA(buf, this.stateOffB, this.reservedElements);
       this._jsArgsA[this._jsStateSlot] = this._stateViewA;
       this._jsArgsB[this._jsStateSlot] = this._stateViewB;
     }

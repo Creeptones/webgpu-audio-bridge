@@ -72,8 +72,8 @@
  */
 
 import {
-  type KernelSignature, type LaneWidth, type IrStateDecl,
-  ELEM_BYTES, signatureWidth, paramsByRole,
+  type KernelSignature, type LaneWidth, type IrStateDecl, type IrStateBufferDecl,
+  ELEM_BYTES, signatureWidth, paramsByRole, stateLayout,
 } from "./ir.js";
 import { compileKernel, compileTokens, type CompileResult } from "./compileKernel.js";
 import { emitJsKernel } from "./emitJsKernel.js";
@@ -152,6 +152,10 @@ export interface JitWorkletOptions {
    *  per-generation state slabs + seeds the JS-fallback / current-A generation.
    *  Clone-safe plain data ({name,init}[]). */
   readonly stateDecls: ReadonlyArray<IrStateDecl>;
+  /** The kernel's declared delay-line ring buffers (Apollo Frontier 7, Stage 3),
+   *  declaration order. Empty for a kernel with no delay lines. With `stateDecls` these
+   *  size + seed the per-generation state slab. Clone-safe plain data ({name,length}[]). */
+  readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
 }
 
 /** Fields common to both compile-request variants. */
@@ -186,6 +190,10 @@ export type JitCompileResponse =
        *  stateless kernel. The worklet needs these to seed the incoming
        *  generation's state slab — they are NOT derivable from the signature. */
       readonly stateDecls: ReadonlyArray<IrStateDecl>;
+      /** The compiled kernel's delay-line ring buffers (Frontier 7, Stage 3). Empty
+       *  when it has no delay lines. With `stateDecls`, sizes + seeds the incoming
+       *  generation's state slab; not derivable from the signature. */
+      readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
     }
   | {
       readonly type: "jit-result";
@@ -196,8 +204,8 @@ export type JitCompileResponse =
 
 /** Install / control messages the main thread posts to the worklet port. */
 export type JitInstallMessage =
-  | { readonly type: "jit-install"; readonly transport: "module"; readonly module: WebAssembly.Module; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl> }
-  | { readonly type: "jit-install"; readonly transport: "bytes"; readonly bytes: Uint8Array; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl> }
+  | { readonly type: "jit-install"; readonly transport: "module"; readonly module: WebAssembly.Module; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl> }
+  | { readonly type: "jit-install"; readonly transport: "bytes"; readonly bytes: Uint8Array; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl> }
   | { readonly type: "jit-fallback"; readonly verdict: string; readonly detail: string }
   | { readonly type: "jit-force-js" };
 
@@ -270,17 +278,21 @@ function align16(n: number): number { return (n + 15) & ~15; }
 
 /** Pages of 64 KiB the consumer layout needs for this signature + maxBlock +
  *  baseOffset (input slab per input array, two output generations per output, plus
- *  — for a stateful kernel — two fixed-max per-generation state slabs). The
- *  `stateRegisters` arg (Frontier 7) is the kernel's declared register count; 0 (the
- *  default) reserves NO state region, so a stateless signature's page count is
- *  byte-identical to pre-Stage-2 (the frontier gate). Any positive count reserves
- *  the SAME fixed-max window the consumer does (so the budgets always agree). */
-export function jitMemoryPages(signature: KernelSignature, maxBlock: number, baseOffset = 16, stateRegisters = 0): number {
+ *  — for a stateful kernel — two per-generation state slabs). The `stateElements` arg
+ *  (Frontier 7, Stage 3 — generalized from Stage 2's `stateRegisters`) is the kernel's
+ *  TOTAL slab element count (`stateLayout(ir).elements`: registers + every buffer's
+ *  ring + cursor). 0 (the default) reserves NO state region, so a stateless signature's
+ *  page count is byte-identical to pre-Stage-2 (the frontier gate). Any positive count
+ *  reserves `max(MAX_STATE_REGISTERS, stateElements)` per generation (the same floor +
+ *  exact-sizing the consumer uses), so the budgets always agree — and a registers-only
+ *  kernel (elements ≤ 64) stays byte-identical to Stage 2. */
+export function jitMemoryPages(signature: KernelSignature, maxBlock: number, baseOffset = 16, stateElements = 0): number {
   const width = signatureWidth(signature);
   const slot = align16(maxBlock * ELEM_BYTES[width]);
   const nIn = paramsByRole(signature, "input").length;
   const nOut = paramsByRole(signature, "output").length;
-  const stateBytes = stateRegisters > 0 ? 2 * align16(MAX_STATE_REGISTERS * ELEM_BYTES[width]) : 0;
+  const reserved = stateElements > 0 ? Math.max(MAX_STATE_REGISTERS, stateElements) : 0;
+  const stateBytes = reserved > 0 ? 2 * align16(reserved * ELEM_BYTES[width]) : 0;
   const regionEnd = baseOffset + (nIn + 2 * nOut) * slot + stateBytes;
   return Math.max(1, Math.ceil(regionEnd / 65536));
 }
@@ -340,10 +352,12 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   // the JS-source path `lower.ts` statefulness is a deferred follow-up, so a
   // `kernel`-function kernel is always stateless here.
   let stateDecls: ReadonlyArray<IrStateDecl> = [];
+  let stateBuffers: ReadonlyArray<IrStateBufferDecl> = [];
   if (hasTokens) {
     const tokens = spec.tokens!;
     const ir = tokensToKernel(tokens);
     stateDecls = ir.stateDecls ?? [];
+    stateBuffers = ir.stateBuffers ?? [];
     kernelSource = emitJsKernel(ir);
     compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName };
   } else {
@@ -356,7 +370,7 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   // has somewhere to run (jitEnabled will be false and installs become no-ops).
   let memory = spec.memory;
   if (!memory) {
-    const pages = jitMemoryPages(signature, spec.maxBlock, baseOffset, stateDecls.length);
+    const pages = jitMemoryPages(signature, spec.maxBlock, baseOffset, stateLayout({ stateDecls, stateBuffers }).elements);
     memory = canAllocateShared()
       ? new WebAssembly.Memory({ initial: pages, maximum: 16384, shared: true })
       : new WebAssembly.Memory({ initial: pages });
@@ -366,7 +380,7 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
 
   const processorOptions: JitWorkletOptions = {
     memory, kernelSource, signature,
-    maxBlock: spec.maxBlock, sampleRate: spec.sampleRate, windowSeconds, baseOffset, exportName, stateDecls,
+    maxBlock: spec.maxBlock, sampleRate: spec.sampleRate, windowSeconds, baseOffset, exportName, stateDecls, stateBuffers,
   };
 
   let boundWorker: JitMessageSource | null = null;
@@ -462,7 +476,7 @@ export async function runJitCompile(
   return {
     type: "jit-result", status: "accepted",
     module, bytes: result.wasm, exportName: result.exportName, gate: result.gate,
-    stateDecls: result.stateDecls,
+    stateDecls: result.stateDecls, stateBuffers: result.stateBuffers,
   };
 }
 
@@ -511,14 +525,14 @@ export function forwardCompileResponse(
   }
   if (opts.transport === "module" && response.module) {
     try {
-      port.postMessage({ type: "jit-install", transport: "module", module: response.module, exportName: response.exportName, stateDecls: response.stateDecls } satisfies JitInstallMessage);
+      port.postMessage({ type: "jit-install", transport: "module", module: response.module, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers } satisfies JitInstallMessage);
       return "module";
     } catch {
       // DataCloneError: a WebAssembly.Module would not clone into this realm.
       // Fall through to the bytes transport (always clone-safe).
     }
   }
-  port.postMessage({ type: "jit-install", transport: "bytes", bytes: response.bytes, exportName: response.exportName, stateDecls: response.stateDecls } satisfies JitInstallMessage);
+  port.postMessage({ type: "jit-install", transport: "bytes", bytes: response.bytes, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers } satisfies JitInstallMessage);
   return "bytes";
 }
 
@@ -545,6 +559,7 @@ export function createJitConsumer(options: JitWorkletOptions): JitKernelConsumer
     baseOffset: options.baseOffset,
     exportName: options.exportName,
     stateDecls: options.stateDecls,
+    stateBuffers: options.stateBuffers,
   });
 }
 
@@ -568,8 +583,8 @@ export function handleJitInstallMessage(consumer: JitKernelConsumer, message: un
   if (!msg || typeof msg !== "object" || !("type" in msg)) return { installed: false, transport: "none" };
   switch (msg.type) {
     case "jit-install":
-      if (msg.transport === "module") return { installed: consumer.installCompiledKernel(msg.module, msg.stateDecls), transport: "module" };
-      return { installed: consumer.installCompiledKernelFromBytes(msg.bytes, msg.stateDecls), transport: "bytes" };
+      if (msg.transport === "module") return { installed: consumer.installCompiledKernel(msg.module, msg.stateDecls, msg.stateBuffers), transport: "module" };
+      return { installed: consumer.installCompiledKernelFromBytes(msg.bytes, msg.stateDecls, msg.stateBuffers), transport: "bytes" };
     case "jit-force-js":
       consumer.revertToFallback();
       return { installed: false, transport: "none" };

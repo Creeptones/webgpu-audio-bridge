@@ -21,9 +21,10 @@ export { runGate } from "./gate.js";
 
 export type {
   KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore,
-  IrStateDecl, IrStateStore, LoopBound, UnaryOp, BinaryOp,
+  IrStateDecl, IrStateStore, IrStateBufferDecl, IrStateBufferStore, StateLayout,
+  LoopBound, UnaryOp, BinaryOp,
 } from "./ir.js";
-export { isStateful } from "./ir.js";
+export { isStateful, stateLayout } from "./ir.js";
 
 export type { Diagnostic, DiagnosticCode } from "./diagnostics.js";
 

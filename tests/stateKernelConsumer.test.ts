@@ -27,6 +27,10 @@
  *  5  stateless-path-untouched frontier pin: a stateless consumer has no state slab,
  *     its layout + page count are byte-identical to pre-Stage-2, and `stateDecls: []`
  *     is identical to omitting it.
+ *  6  cross-quantum DELAY persistence (Stage 3): a gate-verified feedback comb whose
+ *     delay D ≫ the quantum runs across many small quanta; the concatenated output is
+ *     BIT-EXACT to one big evalReference run — i.e. the ring + cursor persist in the
+ *     slab across process() boundaries (and across the promotion).
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -38,6 +42,7 @@ import {
 import { JitKernelConsumer, MAX_STATE_REGISTERS, type JitMemoryRegion } from "../src/jit/JitKernelConsumer.js";
 import {
   type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore,
+  type IrStateBufferDecl, type IrStateBufferStore,
   type LoopBound, type KernelParam, type ParamRole, type BinaryOp,
 } from "../src/jit/ir.js";
 
@@ -60,11 +65,14 @@ const C = (value: number): IrNode => ({ kind: "const", value });
 const S = (name: string): IrNode => ({ kind: "scalar", name });
 const L = (array: string, stride = 1, intercept = 0): IrNode => ({ kind: "load", array, stride, intercept });
 const RS = (name: string): IrNode => ({ kind: "readState", name });
+const RD = (buffer: string, delay: number): IrNode => ({ kind: "readDelay", buffer, delay });
 const Bn = (op: BinaryOp, a: IrNode, b: IrNode): IrNode => ({ kind: "binary", op, a, b });
 const ST = (array: string, value: IrNode, stride = 1, intercept = 0): IrStore => ({ array, stride, intercept, value });
 const P = (name: string, role: ParamRole): KernelParam => ({ name, role });
 const SD = (name: string, init = 0): IrStateDecl => ({ name, init });
 const SW = (name: string, value: IrNode): IrStateStore => ({ name, value });
+const SB = (name: string, length: number): IrStateBufferDecl => ({ name, length });
+const WD = (buffer: string, value: IrNode): IrStateBufferStore => ({ buffer, value });
 const pb = (name: string): LoopBound => ({ kind: "param", name });
 
 function K(
@@ -85,6 +93,20 @@ const onePole = K("f64",
 // stateless gain (f64) — the "stateless path untouched" witness.
 const gain = K("f64", [P("n", "length"), P("out", "output"), P("x", "input"), P("g", "scalar")], pb("n"),
   [ST("out", Bn("mul", L("x"), S("g")))]);
+
+// feedback comb / echo (f64, Stage 3): out[i] = x[i] + 0.5·out[i−D]; writeDelay(buf, out).
+// f64 so the gate's scalar WASM, evalReference, and emitJsKernel all agree BIT-EXACT.
+// D = 40 ≫ the small quantum the persistence pin uses, so the delay tap reaches back
+// ACROSS quantum boundaries (the ring + cursor MUST persist or the stream diverges).
+const COMB_D = 40;
+const combExpr = Bn("add", L("x"), Bn("mul", C(0.5), RD("d", COMB_D)));
+const comb: IrKernel = {
+  width: "f64", bound: pb("n"),
+  signature: { params: [P("n", "length"), P("out", "output"), P("x", "input")], width: "f64" },
+  stores: [ST("out", combExpr)],
+  stateBuffers: [SB("d", COMB_D)],
+  stateBufferStores: [WD("d", combExpr)],
+};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 function sharedMemory(pages: number): WebAssembly.Memory {
@@ -113,6 +135,13 @@ function compileOnePole(): { wasm: Uint8Array; stateDecls: ReadonlyArray<IrState
   assert(r.status === "accepted", `one-pole must accept (got ${r.status})`);
   assertEq(r.stateDecls.length, 1, "one-pole exposes 1 state decl on the accepted result");
   return { wasm: r.wasm, stateDecls: r.stateDecls };
+}
+function compileComb(): { wasm: Uint8Array; stateDecls: ReadonlyArray<IrStateDecl>; stateBuffers: ReadonlyArray<IrStateBufferDecl> } {
+  const r = compileIr(comb, { compileWat });
+  assert(r.status === "accepted", `comb must accept (got ${r.status})`);
+  assertEq(r.stateBuffers.length, 1, "comb exposes 1 delay buffer on the accepted result");
+  assertEq(r.stateBuffers[0]!.length, COMB_D, "comb buffer length surfaced");
+  return { wasm: r.wasm, stateDecls: r.stateDecls, stateBuffers: r.stateBuffers };
 }
 
 // A poison module matching the stateful one-pole f64 ABI [n, out, x, __state, c] that
@@ -351,13 +380,60 @@ function testStatelessUntouched(): void {
   ok("5 stateless path untouched: no state slab, layout + page count unchanged, output bit-exact");
 }
 
+// ─── Pin 6: cross-quantum DELAY persistence (Stage 3 runtime headline) ────────
+
+function testDelayPersistenceAcrossQuanta(): void {
+  // A small quantum Q ≪ the delay D, so the feedback tap reaches back ACROSS quantum
+  // boundaries — the ring + cursor MUST persist in the slab or the stream diverges.
+  const Q = 16;
+  const mem = sharedMemory(8);
+  const { wasm, stateDecls, stateBuffers } = compileComb();
+  const c = new JitKernelConsumer({
+    memory: mem, signature: comb.signature, jsKernel: reconstituteJs(comb),
+    maxBlock: Q, sampleRate: SR, windowSeconds: 0.01, stateDecls, stateBuffers,
+  });
+  // The layout reserves the delay slab (MAX-floor still wins for D=40 ⇒ exact 64-window).
+  const { regions } = c.describeLayout();
+  assert(regions.some((r) => r.label === "stateA") && regions.some((r) => r.label === "stateB"), "delay consumer reserves stateA/stateB slabs");
+
+  // Install before the first quantum: A (JS) + B (SIMD) start cold + stay f64 lockstep,
+  // so the whole swap stream is exactly the cold-started comb reference.
+  assert(c.installCompiledKernel(moduleFromBytes(wasm), stateDecls, stateBuffers), "comb install arms");
+  assertEq(c.phase(), "priming", "primed");
+
+  const QUANTA = 64; const total = QUANTA * Q; // 1024 samples ≫ both D=40 and the fade window
+  const x = sine(total, 7);
+  const ref = evalReference(comb, { x: Array.from(x) }, {}, total)["out"]!;
+
+  const stream = new Float64Array(total);
+  let sawComplete = false; let completeAt = -1;
+  for (let q = 0; q < QUANTA; q++) {
+    const xq = x.subarray(q * Q, q * Q + Q);
+    const out = new Float64Array(Q);
+    const r = c.process({ x: xq }, {}, { out }, Q, (q * Q / SR) * 1e9);
+    if (r.phase === "complete" && completeAt < 0) completeAt = q;
+    if (r.phase === "complete") sawComplete = true;
+    stream.set(out, q * Q);
+  }
+  assert(sawComplete, "comb swap reached complete");
+  assert(c.isUpgraded(), "upgraded to the SIMD comb");
+  // BIT-EXACT to one big evalReference run — including every fading + post-promotion
+  // sample. If the ring/cursor reset per quantum (or the promotion re-seeded), the
+  // delayed tap would restart each block and diverge after the first D=40 samples.
+  assertEq(maxAbsDiff(stream, ref), 0, "cross-quantum delay stream is BIT-EXACT to evalReference (ring + cursor persist)");
+  // and the recurrence is real (the comb colours the signal, not a passthrough).
+  assert(maxAbsDiff(Array.from(stream), Array.from(x)) > 0.05, "the comb is real (output ≠ input passthrough)");
+  ok("6 cross-quantum delay persistence: ring + cursor survive process() boundaries (≡ evalReference)");
+}
+
 async function main(): Promise<void> {
   testJsFallbackPersistence();
   testIndependentStateSwap();
   testPromotionContinuity();
   testAbortToLiveJsState();
   testStatelessUntouched();
-  console.log("\nAll stateKernelConsumer (Frontier 7, Stage 2) pins passed.");
+  testDelayPersistenceAcrossQuanta();
+  console.log("\nAll stateKernelConsumer (Frontier 7, Stage 2 + Stage 3) pins passed.");
 }
 
 await main();
