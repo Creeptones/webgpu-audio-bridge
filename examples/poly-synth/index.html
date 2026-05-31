@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — Poly-Synth (stateful kernel, SIMD across voices)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 880px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #force { background: #7a3df4; } #force:hover:not(:disabled) { background: #9355ff; }
+      label { display: block; margin: 12px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; font: inherit; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; } .dim { color: #6b7280; }
+      .wbarwrap { height: 14px; background: #101218; border: 1px solid #21252d; border-radius: 7px; overflow: hidden; margin: 8px 0; }
+      .wbar { height: 100%; width: 0%; background: #2b3550; transition: width 60ms linear; }
+      .wbar.fade { background: linear-gradient(90deg, #7a3df4, #c79bff); }
+      .wbar.done { background: #2f7a55; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+      pre.k { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; overflow-x: auto; color: #c8cdd4; }
+      #keys { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+      .pkey { flex: 1 1 0; min-width: 64px; display: flex; flex-direction: column; align-items: center; gap: 4px; background: #181b22; border: 1px solid #2a2f3a; padding: 18px 8px; user-select: none; touch-action: none; }
+      .pkey:hover:not(:disabled) { background: #1f2430; }
+      .pkey.down { background: linear-gradient(180deg, #7a3df4, #4385ff); color: #fff; border-color: #9355ff; }
+      .pkey .note { font-size: 14px; color: #e7eaee; }
+      .pkey .kk { font-size: 10px; color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — Poly-Synth</h1>
+    <p>
+      Apollo Frontier 7 lifts the JIT's stateless ceiling: a kernel can carry single-sample state
+      (<strong>z⁻¹</strong> registers, biquads) and <strong>delay-line ring buffers</strong> — but a loop-carried
+      recurrence is un-vectorizable along <em>time</em>. <strong>Stage 4 re-engages SIMD along the VOICE axis</strong>:
+      polyphony gives <code>V&nbsp;=&nbsp;8</code> independent voices, each running the SAME stateful kernel with its OWN
+      state + per-voice scalars; pack <code>W&nbsp;=&nbsp;4</code> voices per <code>v128</code> (lane = voice) and one
+      time loop advances all four recurrences lane-parallel. Each voice here is a saw oscillator → a
+      <strong>one-pole lowpass</strong> (a state register, per-voice cutoff) → a <strong>feedback comb</strong> (a delay
+      ring, shared decay). Audio starts on the developer's JS fallback; the gate-verified <strong>voice-SIMD</strong>
+      bytes fade in click-free — and the gate proved every lane <strong>bit-exact</strong> to an independent scalar voice
+      before they could reach the audio thread.
+    </p>
+
+    <h2>The kernel (one self-contained token stream, compiled for 8 voices)</h2>
+    <pre class="k" id="tokens"></pre>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="force" disabled>Force JS</button>
+
+    <h2>Keyboard — play A S D F G H J K (or click)</h2>
+    <div id="keys"></div>
+
+    <h2>Crossfade weight (audio clock — JS → voice-SIMD)</h2>
+    <div class="wbarwrap"><div id="wbar" class="wbar"></div></div>
+
+    <h2>Voice batch · gate · upgrade</h2>
+    <div id="hud" class="panel"></div>
+
+    <h2>Controls</h2>
+    <div class="grid">
+      <div>
+        <label for="tone">tone (per-voice cutoff) <span class="val" id="tone-val"></span></label>
+        <input id="tone" type="range" min="0.2" max="0.95" step="0.01" value="0.7" />
+      </div>
+      <div>
+        <label for="fb">comb feedback (fb) <span class="val" id="fb-val"></span></label>
+        <input id="fb" type="range" min="0" max="0.75" step="0.01" value="0.4" />
+      </div>
+      <div>
+        <label for="level">drive <span class="val" id="level-val"></span>×</label>
+        <input id="level" type="range" min="0.2" max="1.5" step="0.01" value="1.0" />
+      </div>
+    </div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>. The voice-SIMD compile runs in a background
+      worker (<code>runJitCompile</code> → <code>compileTokens</code> with <code>voices: 8</code> + vendored wabt); the
+      voice-equivalence gate proves every lane bit-exact to an independent scalar voice before the bytes can reach the
+      audio thread; the worklet installs them between quanta and crossfades click-free, keeping each voice's lane-packed
+      state across the swap. Experimental (<code>webgpu-audio-bridge/experimental</code>). Sibling demos:
+      <code>npm run dev:kernel-palette</code> (token path + cache), <code>npm run dev:jit-vectorize</code> (JS-path
+      compile). The tone slider is a per-voice cutoff ARRAY; comb feedback is a broadcast scalar.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -4,6 +4,84 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.933] — 2026-05-31
+
+### Added — Apollo Frontier 7, Stage 5: consolidation (poly-synth demo + token-path coverage + promotion verdict)
+
+Stages 1–4 built the stateful-kernel machinery — a kernel compiles (Stage 1), runs
+click-free across quanta (Stage 2), carries delay-line ring buffers (Stage 3), and
+re-engages SIMD along the voice axis for polyphony (Stage 4), all gate-proven bit-exact and
+`@experimental`. Stage 5 is the *consolidation* stage: the part a user sees and the decision
+a maintainer owes. No new compiler invariants — pure integration + judgement. The
+`voices === 1` / stateless **frontier gate** stays byte-identical and the
+`kernelHash(gain) === "72b5c2e5a7a5f117"` pin holds.
+
+- **A playable poly-synth demo (`examples/poly-synth/`, `npm run dev:poly-synth`, port
+  5187).** The first STATEFUL browser demo (the Frontier-5/6 demos were stateless). A fixed
+  batch of `V = 8` voices over ONE token kernel — a per-voice **one-pole lowpass** (a state
+  register) + a **feedback comb** (a delay-line ring buffer), so the register, delay, AND
+  voice axes are all exercised at once. An on-screen / computer-key keyboard (A S D F G H J K)
+  gates one voice per key (the trivial fixed mapping; dynamic allocation/stealing is the
+  deferred synth layer); the worklet generates one saw oscillator per voice into a
+  voice-interleaved input slab `x[i·V + v]`, passes a **per-voice cutoff array** (`c`) + a
+  **broadcast** comb-feedback scalar (`fb`), runs the voice-batched consumer, and down-mixes
+  to mono. The wiring is exactly the shipped surface — `connectJit({ tokens, signature,
+  voices })` → a compile worker calling `runJitCompile` → `createJitConsumer` +
+  `handleJitInstallMessage` — with `jit.bind()` auto-forwarding the gate-verified voice-SIMD
+  bytes; they fade in over the JS fallback click-free. Reuses the COOP/COEP +
+  bare-`acorn`-rewrite `serve.mjs` and the vendored wabt/acorn.
+- **`bench/jit.bench.ts` Cell 5 — voice-batch speedup (the payoff number).** Measures the
+  SAME stateful one-pole run `scalar-per-voice` (V scalar module calls) vs `voice-batched`
+  (V/W v128 calls); the work ratio is the lane count `W`. Measured: **3.94× (f32, W=4) /
+  2.02× (f64, W=2)** — 98–101 % of the ideal `W×`. The recurrence wall took SIMD from the
+  time axis; polyphony hands it back along voices.
+
+### Why
+
+The voice-SIMD machinery was proven in Node across Stages 1–4 but had never been made
+audible or exercised end-to-end through the browser wiring. The demo closes that — and
+forces the maintainer decision the `@experimental` warning has deferred since Frontier 5:
+is the subtree ready to promote into the 1.0 core? The decision note (below) records the
+verdict (keep soaking) and the one viable shape if we promote (token-path-only — the
+JS-source path can't, see Wire compatibility).
+
+### Wire compatibility
+
+Fully wire-compatible. Stage 5 adds a demo, one test pin, one bench cell, and docs — no
+source-of-truth change, no SAB-layout or frame-format change, no public-API break. The
+`voices === 1` + stateless paths are byte-identical to 0.9.932.
+
+### Tests
+
+- New **`tests/connectJit.test.ts` pin H** (voice token path e2e): `connectJit({ tokens,
+  signature, voices: W })` over a STATEFUL f64 one-pole threads the voice count through the
+  whole wiring — the compile request, the `jit-result`, the forwarded `jit-install`
+  (carrying `voices` + `stateDecls`), and the worklet install guard — and the voice-batched
+  consumer upgrades to voice-SIMD **bit-exact per lane** vs an independent per-voice
+  `evalReference` run (each voice's lane-packed state persisting across quanta + the
+  promotion). Closes the "the whole `connectJit` wiring carries `voices`" claim with a test,
+  not just the unit-level `stateKernelConsumer` pin 7.
+- Full suite green (`npm run typecheck` clean; all suites pass; `npm run bench` push/pull/
+  pullLatest within baseline; `npm run bench:jit` Cells 1–5 pass).
+
+### Documentation
+
+- New design note **`docs/frontier-promotion-decision.md`** — the deliberate promotion
+  verdict for the whole Frontier 6/7 subtree. **Verdict: keep soaking, promote nothing.**
+  Spells out the hard blocker (the JS-source path transitively imports `acorn` via
+  `parse.ts`, and the zero-runtime-dep core guard — `JitCompiler.test.ts` pin 10 — pins that
+  the root never reaches it, so only the **acorn-free token path** could promote into the
+  core), the `kernelHash` freeze a promotion implies, and the token-path-only promotion plan
+  (mirroring `SpscRing` internal@0.6.8 → public@0.6.10) for when the trigger is met (a real
+  consumer + the `lower.ts` statefulness question resolved/scoped).
+- README: a Frontier-7 subsection under the JIT section mirroring this entry (the `voices`
+  knob, the voice-interleaved I/O + per-voice-scalar convention, the bit-exact-per-lane gate,
+  the Cell-5 speedup, the poly-synth demo link).
+- CHANGELOG (this entry) + the Stage-5 handoff (`docs/frontier7-stage5-demo-promotion-handoff.md`).
+- Deferred follow-ups unchanged (flagged, not built): dynamic voice allocation / note-on-off
+  / stealing; `V % W ≠ 0` masked tails; fractional / modulated delay; `lower.ts` stateful JS
+  authoring; per-buffer non-zero init (wavetables); a cross-voice fan-in / reverb bus.
+
 ## [0.9.932] — 2026-05-31
 
 ### Added — Apollo Frontier 7, Stage 4: SIMD across voices (the polyphony payoff)

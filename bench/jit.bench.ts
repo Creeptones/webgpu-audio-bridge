@@ -60,10 +60,14 @@
 import { hrtime } from "node:process";
 import wabtInit from "wabt";
 import {
-  compileKernel,
+  compileKernel, compileIr,
   type KernelSignature, type LaneWidth, type CompileResult,
 } from "../src/jit/index.js";
-import { ELEM_BYTES } from "../src/jit/ir.js";
+import {
+  ELEM_BYTES, LANES, stateLayout,
+  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore,
+  type LoopBound, type KernelParam, type ParamRole, type BinaryOp,
+} from "../src/jit/ir.js";
 import { JitKernelConsumer } from "../src/jit/JitKernelConsumer.js";
 import { hasWasmConsumerSupport } from "../src/worklet/wasmSimdSupport.js";
 
@@ -410,6 +414,107 @@ function runSwapGlitch(): GlitchRow[] {
   return rows;
 }
 
+// ─── Cell 5: voice-batch speedup (Apollo Frontier 7, Stage 4) ────────────────
+//
+// The payoff number of the whole stateful arc. A loop-carried recurrence is
+// un-vectorizable along TIME (the recurrence wall), so Stages 1–3 ran stateful
+// kernels SCALAR. Stage 4 re-engages SIMD along the VOICE axis: V independent voices,
+// W packed per v128 (lane = voice). This cell measures the actual win — the SAME
+// stateful kernel run as `scalar-per-voice` (V scalar module calls, one per voice)
+// vs `voice-batched` (V/W v128 calls). The work ratio is V / (V/W) = W, so a
+// compute-bound kernel should approach ≈ W× (4× for f32, 2× for f64).
+
+// A one-pole lowpass IR (a real recurrence: out[i] = (1-c)·x[i] + c·s; s := out[i]).
+function onePoleIr(width: LaneWidth): IrKernel {
+  const C = (value: number): IrNode => ({ kind: "const", value });
+  const S = (name: string): IrNode => ({ kind: "scalar", name });
+  const L = (array: string): IrNode => ({ kind: "load", array, stride: 1, intercept: 0 });
+  const RS = (name: string): IrNode => ({ kind: "readState", name });
+  const Bn = (op: BinaryOp, a: IrNode, b: IrNode): IrNode => ({ kind: "binary", op, a, b });
+  const P = (name: string, role: ParamRole): KernelParam => ({ name, role });
+  const expr: IrNode = Bn("add", Bn("mul", Bn("sub", C(1), S("c")), L("x")), Bn("mul", S("c"), RS("s")));
+  const bound: LoopBound = { kind: "param", name: "n" };
+  const store: IrStore = { array: "out", stride: 1, intercept: 0, value: expr };
+  const stateDecls: IrStateDecl[] = [{ name: "s", init: 0 }];
+  const stateStores: IrStateStore[] = [{ name: "s", value: expr }];
+  return { width, bound, stores: [store], signature: { params: [P("n", "length"), P("out", "output"), P("x", "input"), P("c", "scalar")], width }, stateDecls, stateStores };
+}
+
+interface VoiceRow { width: LaneWidth; W: number; V: number; scalarP50: number; voiceP50: number; }
+
+/** Build a zero-alloc `scalar-per-voice` thunk (V scalar calls) and a `voice-batched`
+ *  thunk (V/W v128 calls) for the one-pole, over a shared memory laid out by hand. */
+function voiceThunks(width: LaneWidth, V: number, n: number): { scalar: () => void; voice: () => void; W: number } {
+  const W = LANES[width];
+  const eb = ELEM_BYTES[width];
+  const TA = typed(width);
+  const round = roundW(width);
+  const ir = onePoleIr(width);
+  const elements = Math.max(1, stateLayout(ir).elements); // 1 register
+  const cutoffs = Array.from({ length: V }, (_, v) => round(0.3 + (0.6 * v) / V));
+  const input = (v: number, i: number): number => round(0.8 * Math.sin((2 * Math.PI * (v + 2) * i) / n));
+
+  // ── scalar module (mode "scalar"), ABI [n, out, x, $__state, c] ──────────────
+  const sAcc = compileIr(ir, { compileWat });
+  if (sAcc.status !== "accepted") throw new Error(`voice bench: scalar one-pole ${width} ${sAcc.status}`);
+  const sMem = new WebAssembly.Memory({ initial: 64, maximum: 16384, shared: true });
+  const sKernel = new WebAssembly.Instance(moduleFromBytes(sAcc.wasm), { env: { memory: sMem } }).exports["kernel"] as (...a: number[]) => void;
+  // per-voice disjoint slabs: x_v, out_v (n each), state_v (elements each).
+  const sXOff = 16, sOutOff = sXOff + align16(V * n * eb), sStOff = sOutOff + align16(V * n * eb);
+  {
+    const xv = new TA(sMem.buffer, sXOff, V * n);
+    for (let v = 0; v < V; v++) for (let i = 0; i < n; i++) xv[v * n + i] = input(v, i);
+    new TA(sMem.buffer, sStOff, V * elements).fill(0);
+  }
+  const scalar = (): void => {
+    for (let v = 0; v < V; v++) {
+      sKernel(n, sOutOff + v * n * eb, sXOff + v * n * eb, sStOff + v * elements * eb, cutoffs[v]!);
+    }
+  };
+
+  // ── voice module (mode "simd-voice"), voice ABI [n, out, x, $__state, $__scalars] ──
+  const vAcc = compileIr(ir, { compileWat, voices: V });
+  if (vAcc.status !== "accepted") throw new Error(`voice bench: voice one-pole ${width} ${vAcc.status}`);
+  if (vAcc.plan.mode !== "simd-voice") throw new Error(`voice bench: expected simd-voice, got ${vAcc.plan.mode}`);
+  const nB = V / W; // batches
+  const vMem = new WebAssembly.Memory({ initial: 64, maximum: 16384, shared: true });
+  const vKernel = new WebAssembly.Instance(moduleFromBytes(vAcc.wasm), { env: { memory: vMem } }).exports["kernel"] as (...a: number[]) => void;
+  // voice-interleaved I/O (block b at b·n·W), lane-packed state (block b at b·elements·W),
+  // lane-packed scalars (block b at b·1·W — one scalar `c`).
+  const vXOff = 16;
+  const vOutOff = vXOff + align16(V * n * eb);
+  const vStOff = vOutOff + align16(V * n * eb);
+  const vScOff = vStOff + align16(V * elements * eb);
+  {
+    const xv = new TA(vMem.buffer, vXOff, V * n);
+    for (let b = 0; b < nB; b++) for (let i = 0; i < n; i++) for (let j = 0; j < W; j++) xv[b * n * W + i * W + j] = input(b * W + j, i);
+    new TA(vMem.buffer, vStOff, V * elements).fill(0);
+    const sv = new TA(vMem.buffer, vScOff, V); // 1 scalar × V voices, lane-packed per block
+    for (let b = 0; b < nB; b++) for (let j = 0; j < W; j++) sv[b * W + j] = cutoffs[b * W + j]!;
+  }
+  const voice = (): void => {
+    for (let b = 0; b < nB; b++) {
+      vKernel(n, vOutOff + b * n * W * eb, vXOff + b * n * W * eb, vStOff + b * elements * W * eb, vScOff + b * W * eb);
+    }
+  };
+
+  return { scalar, voice, W };
+}
+
+function runVoiceBatch(): VoiceRow[] {
+  const rows: VoiceRow[] = [];
+  // f32 → W=4, V=8 (2 batches); f64 → W=2, V=8 (4 batches). V fixed across widths so
+  // the speedup reflects W, not the voice count.
+  for (const width of ["f32", "f64"] as LaneWidth[]) {
+    const V = 8;
+    const { scalar, voice, W } = voiceThunks(width, V, N);
+    const s = summarize(scalar);
+    const vv = summarize(voice);
+    rows.push({ width, W, V, scalarP50: s.p50, voiceP50: vv.p50 });
+  }
+  return rows;
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -510,6 +615,26 @@ async function main(): Promise<void> {
     );
     process.exitCode = 1;
   }
+  console.log();
+
+  // ── Cell 5: voice-batch speedup (the polyphony payoff) ─────────────────────
+  console.log("  ── Cell 5: voice-batch speedup — scalar-per-voice vs voice-SIMD (one-pole, V=8) ──");
+  const voiceRows = runVoiceBatch();
+  console.log("  " + pad("width", 8) + pad("W (lanes)", 12) + pad("scalar×V", 14) + pad("voice×(V/W)", 14) + pad("speedup", 10) + "of ideal W×");
+  console.log("  " + "-".repeat(74));
+  for (const r of voiceRows) {
+    const sp = r.scalarP50 / r.voiceP50;
+    const ofIdeal = (sp / r.W) * 100;
+    console.log(
+      "  " + pad(r.width, 8) + pad(`${r.W}`, 12) + pad(fmt(r.scalarP50), 14) + pad(fmt(r.voiceP50), 14) +
+        pad(`${sp.toFixed(2)}×`, 10) + `${ofIdeal.toFixed(0)}%`,
+    );
+  }
+  console.log(
+    "  the SAME stateful one-pole run V=8 ways scalar (8 calls) vs voice-batched (V/W v128\n" +
+      "  calls); the work ratio is W, so a compute-bound kernel approaches W× (4× f32 / 2× f64).\n" +
+      "  the recurrence wall took SIMD from the time axis — polyphony hands it back along voices.",
+  );
   console.log();
 }
 

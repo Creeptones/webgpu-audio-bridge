@@ -29,6 +29,12 @@
  *      JS fallback by inverting the IR (emitJsKernel), ships a { kind: "tokens" }
  *      request, runJitCompile runs compileTokens, and the f64 stream upgrades to
  *      SIMD bit-exactly through the same forward → install wiring.
+ *   H  the VOICE token path (Apollo Frontier 7, Stage 4): connectJit({ tokens,
+ *      voices: W }) over a STATEFUL token kernel threads the voice count through the
+ *      whole wiring — the compile request, the jit-result, the forwarded jit-install
+ *      (carrying voices + stateDecls), and the worklet install guard — and the
+ *      voice-batched consumer upgrades to voice-SIMD bit-exactly per lane (each
+ *      voice's lane-packed state persisting across quanta + the promotion).
  *
  * `tsx` script; `assert`/`assertEq`/`ok` from `_assert.ts`. No framework.
  */
@@ -40,10 +46,11 @@ import {
   createJitConsumer, handleJitInstallMessage, jitMemoryPages,
   type JitCompileResponse, type JitInstallMessage, type JitPostTarget, type JitMessageSource,
 } from "../src/jit/connectJit.js";
-import { kernelToTokens, tokensToKernel, emitJsKernel } from "../src/jit/index.js";
+import { kernelToTokens, tokensToKernel, emitJsKernel, evalReference } from "../src/jit/index.js";
 import {
   type KernelSignature, type LaneWidth,
-  type IrKernel, type IrNode, type IrStore, type KernelParam, type ParamRole, type LoopBound,
+  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore,
+  type KernelParam, type ParamRole, type LoopBound,
 } from "../src/jit/ir.js";
 import { hasWasmConsumerSupport } from "../src/worklet/wasmSimdSupport.js";
 
@@ -101,6 +108,34 @@ const TOKEN_GAIN = (() => {
     sig: { params, width: "f64" } as KernelSignature,
     tokens: kernelToTokens(ir),
     scalars: { g: 0.75 },
+  };
+})();
+
+// A STATEFUL VOICE token kernel (Apollo Frontier 7, Stage 4): an f64 one-pole
+// lowpass `out[i] = (1-c)·x[i] + c·s; s := out[i]`, compiled for W = 2 voices (f64 ⇒
+// W = 2). f64 so the gate's scalar/SIMD/emitJsKernel/evalReference all agree BIT-EXACT
+// and, installed before q0, A (JS) + B (voice-SIMD) start cold and stay in lockstep —
+// so the whole swap stream is bit-exact to an independent per-voice evalReference run.
+const VOICE_ONEPOLE = (() => {
+  const P = (name: string, role: ParamRole): KernelParam => ({ name, role });
+  const Cn = (value: number): IrNode => ({ kind: "const", value });
+  const Sc = (name: string): IrNode => ({ kind: "scalar", name });
+  const Ld = (array: string): IrNode => ({ kind: "load", array, stride: 1, intercept: 0 });
+  const RS = (name: string): IrNode => ({ kind: "readState", name });
+  const Bn = (op: "add" | "sub" | "mul", a: IrNode, b: IrNode): IrNode => ({ kind: "binary", op, a, b });
+  const expr: IrNode = Bn("add", Bn("mul", Bn("sub", Cn(1), Sc("c")), Ld("x")), Bn("mul", Sc("c"), RS("s")));
+  const bound: LoopBound = { kind: "param", name: "n" };
+  const store: IrStore = { array: "out", stride: 1, intercept: 0, value: expr };
+  const params = [P("n", "length"), P("out", "output"), P("x", "input"), P("c", "scalar")];
+  const stateDecls: IrStateDecl[] = [{ name: "s", init: 0 }];
+  const stateStores: IrStateStore[] = [{ name: "s", value: expr }];
+  const ir: IrKernel = { width: "f64", bound, stores: [store], signature: { params, width: "f64" }, stateDecls, stateStores };
+  return {
+    ir,
+    sig: { params, width: "f64" } as KernelSignature,
+    tokens: kernelToTokens(ir),
+    voices: 2, // f64 ⇒ W = 2
+    cutoffs: [0.4, 0.66] as const, // per-voice (distinct ⇒ a lane cross would diverge)
   };
 })();
 
@@ -394,6 +429,80 @@ async function testTokenEndToEnd(): Promise<void> {
   ok("G: token path bind → compileTokens → forward → install → bit-exact SIMD upgrade");
 }
 
+// ── H: the VOICE token path end-to-end (Apollo Frontier 7, Stage 4) ───────────
+async function testVoiceTokenEndToEnd(): Promise<void> {
+  const V = VOICE_ONEPOLE.voices; // 2 (f64 ⇒ W = 2)
+  // Shape: connectJit derives `voices` from the spec because the token IR is STATEFUL
+  // (a stateless kernel would collapse to voices = 1). The compile request carries it.
+  const c = connectJit({ tokens: VOICE_ONEPOLE.tokens, signature: VOICE_ONEPOLE.sig, voices: V, maxBlock: N, sampleRate: SR });
+  assertEq(c.processorOptions.voices, V, "H: processorOptions carries voices");
+  assert(c.processorOptions.stateDecls.length === 1, "H: processorOptions carries the kernel's stateDecls");
+  assertEq(c.compileRequest.kind, "tokens", "H: tokens compile-request variant");
+  assertEq((c.compileRequest as { voices?: number }).voices, V, "H: compileRequest carries voices");
+
+  if (!hasWasmConsumerSupport() || !c.jitEnabled) { ok("H: voice token shape OK; e2e skipped (jit not enabled on host)"); return; }
+
+  const worker = new FakeWorker();
+  const port = new FakePort();
+  let upgraded = false;
+  c.bind({ worker, workletPort: port, callbacks: { onUpgrade: () => { upgraded = true; } } });
+  c.requestCompile();
+  await flush();
+
+  assert(upgraded, "H: a compilable voice token kernel upgrades (no fallback)");
+  assertEq(port.posted.length, 1, "H: one install message reached the port");
+  const installMsg = port.posted[0]!;
+  assertEq((installMsg as JitInstallMessage).type, "jit-install", "H: it's a jit-install");
+  // The voice count + state shape ride on the install (the worklet install guard checks them).
+  const im = installMsg as unknown as { voices: number; stateDecls: IrStateDecl[]; bytes: Uint8Array };
+  assertEq(im.voices, V, "H: the jit-install carries voices = W");
+  assert(im.stateDecls.length === 1, "H: the jit-install carries stateDecls");
+
+  // Worklet-side consumer from the SAME processorOptions; install BEFORE q0 so A (JS)
+  // + B (voice-SIMD) start cold and stay f64 lockstep ⇒ the whole stream is bit-exact
+  // to an independent per-voice evalReference run.
+  const consumer = createJitConsumer(c.processorOptions);
+  assertEq(consumer.jitEnabled, true, "H: consumer jitEnabled over the shared memory");
+  assertEq(consumer.installCompiledKernelFromBytes(im.bytes, im.stateDecls, undefined, V), true, "H: voice install armed the swap (voices match)");
+
+  const QUANTA = 24; const total = QUANTA * N;
+  const cutoffs = VOICE_ONEPOLE.cutoffs;
+  // Distinct per-voice inputs (high enough that the lowpass visibly attenuates).
+  const xv: Float64Array[] = [new Float64Array(total), new Float64Array(total)];
+  for (let i = 0; i < total; i++) {
+    xv[0]![i] = 0.8 * Math.sin((2 * Math.PI * 60 * i) / total);
+    xv[1]![i] = 0.8 * Math.sin((2 * Math.PI * 110 * i) / total);
+  }
+  const xInter = new Float64Array(total * V);
+  for (let i = 0; i < total; i++) for (let v = 0; v < V; v++) xInter[i * V + v] = xv[v]![i]!;
+
+  const streamInter = new Float64Array(total * V);
+  let sawComplete = false;
+  for (let q = 0; q < QUANTA; q++) {
+    const inSlice = xInter.subarray(q * N * V, q * N * V + N * V);
+    const out = new Float64Array(N * V); // voice-interleaved, length ≥ n·voices
+    const r = consumer.process({ x: inSlice }, { c: cutoffs as unknown as number[] }, { out }, N, (q * N / SR) * 1e9);
+    if (r.phase === "complete") sawComplete = true;
+    streamInter.set(out, q * N * V);
+  }
+  assert(sawComplete, "H: the voice swap reached complete on the voice-SIMD kernel");
+  assert(consumer.isUpgraded(), "H: upgraded to the voice-SIMD kernel");
+
+  // Each voice's de-interleaved stream is BIT-EXACT to its own independent scalar run.
+  for (let v = 0; v < V; v++) {
+    const got = new Array<number>(total);
+    for (let i = 0; i < total; i++) got[i] = streamInter[i * V + v]!;
+    const ref = evalReference(VOICE_ONEPOLE.ir, { x: Array.from(xv[v]!) }, { c: cutoffs[v]! }, total)["out"]!;
+    let maxDiff = 0;
+    for (let i = 0; i < total; i++) maxDiff = Math.max(maxDiff, Math.abs(got[i]! - ref[i]!));
+    assertEq(maxDiff, 0, `H: voice ${v} stream BIT-EXACT to evalReference (c=${cutoffs[v]}) through the connectJit wiring`);
+    let div = 0; for (let i = 0; i < total; i++) div = Math.max(div, Math.abs(got[i]! - xv[v]![i]!));
+    assert(div > 0.05, `H: voice ${v} one-pole is real (output ≠ input passthrough)`);
+  }
+  c.dispose();
+  ok("H: voice token path bind → compileTokens(voices) → forward → install → bit-exact-per-lane voice-SIMD upgrade");
+}
+
 async function main(): Promise<void> {
   testShape();
   await testRunCompile();
@@ -401,6 +510,7 @@ async function main(): Promise<void> {
   await testEndToEnd();
   await testDegrade();
   await testTokenEndToEnd();
+  await testVoiceTokenEndToEnd();
   console.log("\nconnectJit: all pins passed.");
 }
 
