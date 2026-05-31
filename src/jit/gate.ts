@@ -20,7 +20,7 @@
  * browser worker it is wabt or a direct binary encoder.
  */
 
-import { type IrKernel, type LaneWidth, ELEM_BYTES, signatureWidth, isStateful, stateLayout } from "./ir.js";
+import { type IrKernel, type LaneWidth, ELEM_BYTES, LANES, signatureWidth, isStateful, stateLayout } from "./ir.js";
 import { type CorpusCase } from "./corpus.js";
 import { evalReference } from "./acousticGate.js";
 import { hasWasmSimd } from "../worklet/wasmSimdSupport.js";
@@ -30,13 +30,15 @@ export type CompileWat = (wat: string, name?: string) => Uint8Array;
 export type GateStatus = "accepted" | "rejected-gate" | "unsupported";
 
 export interface GateMismatch {
-  readonly kind: "simd-vs-scalar" | "scalar-vs-js" | "scalar-vs-ref";
+  readonly kind: "simd-vs-scalar" | "scalar-vs-js" | "scalar-vs-ref" | "voice-vs-ref";
   readonly caseIndex: number;
   readonly n: number;
   readonly array: string;
   readonly index: number;
   readonly a: number; // reference value
   readonly b: number; // candidate value
+  /** Voice-SIMD gate only (Frontier 7, Stage 4): the offending lane (voice) index. */
+  readonly lane?: number;
 }
 
 export interface GateReport {
@@ -62,6 +64,16 @@ export interface GateInput {
    *  scalar-only), so the proof is the scalar WASM ≡ `evalReference(ir)` (the IR spec),
    *  not SIMD ≡ scalar. When set, `simdWat` is ignored and the JS oracle is N/A. */
   readonly scalarOnly?: boolean;
+  /** Voice-SIMD kernels (Frontier 7, Stage 4): the candidate (`simdWat`) is the
+   *  voice-axis module that packs W voices per v128. The proof is: lane `j` ≡
+   *  `evalReference(ir, voice-j inputs/scalars, n)`, bit-exact, for every lane
+   *  `j ∈ [0, W)`. When set, `runVoiceGate` runs (the scalar/SIMD/JS paths are N/A).
+   *  Requires `voiceCorpora` — W per-voice corpora (distinct rows per voice so a
+   *  lane-crossing bug surfaces). */
+  readonly voiceMode?: boolean;
+  /** W per-voice corpora for the voice gate (one per lane), all sharing the same
+   *  n-values so case indices align across lanes. */
+  readonly voiceCorpora?: ReadonlyArray<ReadonlyArray<CorpusCase>>;
 }
 
 const dvF64 = new DataView(new ArrayBuffer(8));
@@ -172,6 +184,10 @@ export function runGate(input: GateInput): GateReport {
   const { ir, scalarWat, simdWat, corpus, compileWat } = input;
   const w = signatureWidth(ir.signature);
   const maxUlp = input.maxUlpF32 ?? 0;
+
+  // Frontier 7, Stage 4: a voice-SIMD kernel proves lane j ≡ evalReference(voice j),
+  // bit-exact for every lane. Distinct path from the time-axis SIMD vs scalar check.
+  if (input.voiceMode) return runVoiceGate(input, w, maxUlp);
 
   // Frontier 7: a stateful (scalar-only) kernel has no SIMD candidate, so the proof is
   // scalar WASM ≡ evalReference(ir). No SIMD support needed; no JS oracle.
@@ -317,6 +333,139 @@ function runScalarOnlyGate(input: GateInput, w: LaneWidth, maxUlp: number): Gate
     }
   }
   return { status: "accepted", casesChecked: corpus.length, comparisons, worstUlpF32 };
+}
+
+// ── voice-SIMD gate (Apollo Frontier 7, Stage 4) ─────────────────────────────
+
+interface VoiceLayout {
+  readonly offsets: Record<string, number>; // array name → byte offset (slab of maxN·W)
+  readonly maxN: number;
+  readonly pages: number;
+  readonly stateOffset: number; // lane-packed state slab (elements·W)
+  readonly scalarOffset: number; // lane-packed scalar slab (scalarCount·W), or -1
+  readonly scalarNames: string[]; // signature order
+}
+
+/** Memory layout for the voice gate: each I/O array a voice-interleaved slab of
+ *  `maxN·W` elements; the lane-packed state slab (`stateLayout.elements·W`); a
+ *  lane-packed scalar slab (`scalarCount·W`). One W-voice batch. */
+function planVoiceLayout(ir: IrKernel, corpus: ReadonlyArray<CorpusCase>, W: number): VoiceLayout {
+  const eb = ELEM_BYTES[ir.width];
+  const maxN = Math.max(1, ...corpus.map((c) => c.n));
+  const slot = align16(maxN * W * eb);
+  const offsets: Record<string, number> = {};
+  let cursor = 16;
+  for (const p of ir.signature.params) {
+    if (p.role === "input" || p.role === "output") { offsets[p.name] = cursor; cursor += slot; }
+  }
+  const slab = stateLayout(ir);
+  const stateOffset = cursor;
+  cursor += align16(Math.max(1, slab.elements) * W * eb);
+  const scalarNames = ir.signature.params.filter((p) => p.role === "scalar").map((p) => p.name);
+  let scalarOffset = -1;
+  if (scalarNames.length > 0) { scalarOffset = cursor; cursor += align16(scalarNames.length * W * eb); }
+  const pages = Math.max(1, Math.ceil(cursor / 65536));
+  return { offsets, maxN, pages, stateOffset, scalarOffset, scalarNames };
+}
+
+/** Seed the lane-packed state slab COLD: zero the whole region (rings + cursors → 0),
+ *  then write each register's declared init into ALL W lanes. */
+function seedVoiceState(memory: WebAssembly.Memory, layout: VoiceLayout, ir: IrKernel, TA: Float32ArrayConstructor | Float64ArrayConstructor, W: number): void {
+  const slab = stateLayout(ir);
+  const view = new TA(memory.buffer, layout.stateOffset, Math.max(1, slab.elements) * W);
+  view.fill(0);
+  for (const r of slab.regs) for (let j = 0; j < W; j++) view[r.offset * W + j] = r.init;
+}
+
+/**
+ * The voice-SIMD gate (Frontier 7, Stage 4): proves the voice-axis module's lane `j`
+ * equals `evalReference(ir, voice-j inputs/scalars, n)` — the IR spec — BIT-EXACTLY for
+ * EVERY lane `j ∈ [0, W)`, over W DISTINCT per-voice corpora (so a lane-crossing bug —
+ * reading voice 0's state for voice 1, swapping two lanes — actually surfaces). Bit-
+ * exact for f32 AND f64 (each f32x4/f64x2 lane rounds identically to the scalar op),
+ * so this is STRONGER than the time-axis f32 path (no ULP budget).
+ */
+function runVoiceGate(input: GateInput, w: LaneWidth, maxUlp: number): GateReport {
+  const { ir, simdWat, compileWat } = input;
+  const W = LANES[w];
+  const corpora = input.voiceCorpora;
+  if (!corpora || corpora.length !== W) {
+    return { status: "rejected-gate", casesChecked: 0, comparisons: 0, worstUlpF32: 0, reason: `voice-gate: expected ${W} per-lane corpora, got ${corpora?.length ?? 0}` };
+  }
+  if (!hasWasmSimd()) {
+    return { status: "unsupported", casesChecked: 0, comparisons: 0, worstUlpF32: 0, reason: "no-wasm-simd" };
+  }
+  const corpus0 = corpora[0]!;
+  const layout = planVoiceLayout(ir, corpus0, W);
+  let inst: WebAssembly.Instance;
+  let memory: WebAssembly.Memory;
+  try {
+    memory = new WebAssembly.Memory({ initial: layout.pages, maximum: 16384, shared: true });
+    inst = instantiate(compileWat(simdWat, "voice"), memory);
+  } catch (err) {
+    return { status: "rejected-gate", casesChecked: 0, comparisons: 0, worstUlpF32: 0, reason: `instantiate-failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const fn = inst.exports["kernel"] as (...a: number[]) => void;
+  const TA = typedCtor(w);
+  const outputs = ir.signature.params.filter((p) => p.role === "output").map((p) => p.name);
+  const inputs = ir.signature.params.filter((p) => p.role === "input").map((p) => p.name);
+
+  let comparisons = 0;
+  let worstUlpF32 = 0;
+
+  for (let ci = 0; ci < corpus0.length; ci++) {
+    const n = corpus0[ci]!.n;
+
+    // Write each input lane-packed: view[i·W + j] = voice-j's row.
+    for (const name of inputs) {
+      const view = new TA(memory.buffer, layout.offsets[name]!, layout.maxN * W);
+      for (let j = 0; j < W; j++) {
+        const row = corpora[j]![ci]!.arrays[name]!;
+        for (let i = 0; i < n; i++) view[i * W + j] = row[i]!;
+      }
+    }
+    // Lane-pack the per-voice scalars.
+    if (layout.scalarOffset >= 0) {
+      const sv = new TA(memory.buffer, layout.scalarOffset, layout.scalarNames.length * W);
+      for (let s = 0; s < layout.scalarNames.length; s++) {
+        const name = layout.scalarNames[s]!;
+        for (let j = 0; j < W; j++) sv[s * W + j] = roundW(corpora[j]![ci]!.scalars[name] ?? 0, w);
+      }
+    }
+    // Cold-seed the lane-packed state slab; zero the outputs.
+    seedVoiceState(memory, layout, ir, TA, W);
+    for (const name of outputs) new TA(memory.buffer, layout.offsets[name]!, layout.maxN * W).fill(0);
+
+    // Build args (voiceParamLayout order): trip, arrays (sig order), __state, __scalars?
+    const args: number[] = [n];
+    for (const p of ir.signature.params) {
+      if (p.role === "input" || p.role === "output") args.push(layout.offsets[p.name]!);
+    }
+    args.push(layout.stateOffset);
+    if (layout.scalarOffset >= 0) args.push(layout.scalarOffset);
+    fn(...args);
+
+    // Compare each lane against evalReference(voice j).
+    for (const name of outputs) {
+      const view = new TA(memory.buffer, layout.offsets[name]!, layout.maxN * W);
+      for (let j = 0; j < W; j++) {
+        const ref = evalReference(ir, corpora[j]![ci]!.arrays, corpora[j]![ci]!.scalars, n)[name] ?? [];
+        for (let i = 0; i < n; i++) {
+          comparisons++;
+          const a = ref[i] ?? 0;
+          const b = view[i * W + j]!;
+          if (w === "f32") worstUlpF32 = Math.max(worstUlpF32, ulpF32(a, b));
+          // NaN sign/payload is IEEE-unspecified (JS vs WASM), so NaN≡NaN is a match;
+          // a real ±Inf divergence still fails (mirrors runScalarOnlyGate).
+          if (!equalW(a, b, w, maxUlp) && !(Number.isNaN(a) && Number.isNaN(b))) {
+            return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+              mismatch: { kind: "voice-vs-ref", caseIndex: ci, n, array: name, index: i, a, b, lane: j } };
+          }
+        }
+      }
+    }
+  }
+  return { status: "accepted", casesChecked: corpus0.length, comparisons, worstUlpF32 };
 }
 
 function zeroOutputs(memory: WebAssembly.Memory, layout: Layout, outputs: string[], TA: Float32ArrayConstructor | Float64ArrayConstructor): void {

@@ -28,10 +28,10 @@ export { isStateful, stateLayout } from "./ir.js";
 
 export type { Diagnostic, DiagnosticCode } from "./diagnostics.js";
 
-export type { VectorizedKernelPlan } from "./vectorize.js";
+export type { VectorizedKernelPlan, VectorizeMode, VectorizeOptions } from "./vectorize.js";
 
 // Lower-level building blocks (useful for the runtime + tests; still experimental).
-export { emitScalarModule, emitSimdModule, paramLayout } from "./emitKernelWat.js";
+export { emitScalarModule, emitSimdModule, emitVoiceSimdModule, paramLayout, voiceParamLayout } from "./emitKernelWat.js";
 export { buildCorpus, CORPUS_N_VALUES } from "./corpus.js";
 export type { CorpusOptions, CorpusCase } from "./corpus.js";
 export { vectorize } from "./vectorize.js";

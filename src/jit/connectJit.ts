@@ -73,7 +73,7 @@
 
 import {
   type KernelSignature, type LaneWidth, type IrStateDecl, type IrStateBufferDecl,
-  ELEM_BYTES, signatureWidth, paramsByRole, stateLayout,
+  ELEM_BYTES, LANES, signatureWidth, paramsByRole, stateLayout,
 } from "./ir.js";
 import { compileKernel, compileTokens, type CompileResult } from "./compileKernel.js";
 import { emitJsKernel } from "./emitJsKernel.js";
@@ -132,6 +132,13 @@ export interface ConnectJitSpec {
   readonly memory?: WebAssembly.Memory;
   /** Override the SIMD lane width for the compile (default: `signature.width`). */
   readonly width?: LaneWidth;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). Default 1 (single voice).
+   *  When `> 1` (a multiple of the lane width `W`) and the kernel is STATEFUL (the
+   *  token path), `connectJit` compiles a voice-SIMD kernel (W independent voices per
+   *  v128) and the worklet runs the voice-batched runtime: voice-interleaved I/O +
+   *  per-voice scalars (see `JitKernelConsumer.process`). Ignored for a stateless
+   *  kernel (time-axis SIMD). */
+  readonly voices?: number;
 }
 
 /** The `processorOptions` object to pass to
@@ -156,6 +163,10 @@ export interface JitWorkletOptions {
    *  declaration order. Empty for a kernel with no delay lines. With `stateDecls` these
    *  size + seed the per-generation state slab. Clone-safe plain data ({name,length}[]). */
   readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). 1 for single-voice; `> 1`
+   *  (a multiple of the lane width) selects the worklet's voice-batched runtime. The
+   *  compiled SIMD kernel must be a voice-SIMD module for the same count. */
+  readonly voices: number;
 }
 
 /** Fields common to both compile-request variants. */
@@ -164,6 +175,8 @@ export interface JitCompileRequestBase {
   readonly signature: KernelSignature;
   readonly width?: LaneWidth;
   readonly exportName: string;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). Default 1. */
+  readonly voices?: number;
 }
 
 /** The message the main thread posts to the compile worker to start a compile. A
@@ -194,6 +207,10 @@ export type JitCompileResponse =
        *  when it has no delay lines. With `stateDecls`, sizes + seeds the incoming
        *  generation's state slab; not derivable from the signature. */
       readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
+      /** The polyphonic voice batch this kernel was compiled for (Frontier 7, Stage 4).
+       *  1 for single-voice; `> 1` for a voice-SIMD kernel. The worklet's install guard
+       *  checks it against what the consumer reserved. */
+      readonly voices: number;
     }
   | {
       readonly type: "jit-result";
@@ -204,8 +221,8 @@ export type JitCompileResponse =
 
 /** Install / control messages the main thread posts to the worklet port. */
 export type JitInstallMessage =
-  | { readonly type: "jit-install"; readonly transport: "module"; readonly module: WebAssembly.Module; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl> }
-  | { readonly type: "jit-install"; readonly transport: "bytes"; readonly bytes: Uint8Array; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl> }
+  | { readonly type: "jit-install"; readonly transport: "module"; readonly module: WebAssembly.Module; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>; readonly voices: number }
+  | { readonly type: "jit-install"; readonly transport: "bytes"; readonly bytes: Uint8Array; readonly exportName: string; readonly stateDecls: ReadonlyArray<IrStateDecl>; readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>; readonly voices: number }
   | { readonly type: "jit-fallback"; readonly verdict: string; readonly detail: string }
   | { readonly type: "jit-force-js" };
 
@@ -286,13 +303,25 @@ function align16(n: number): number { return (n + 15) & ~15; }
  *  reserves `max(MAX_STATE_REGISTERS, stateElements)` per generation (the same floor +
  *  exact-sizing the consumer uses), so the budgets always agree — and a registers-only
  *  kernel (elements ≤ 64) stays byte-identical to Stage 2. */
-export function jitMemoryPages(signature: KernelSignature, maxBlock: number, baseOffset = 16, stateElements = 0): number {
+export function jitMemoryPages(signature: KernelSignature, maxBlock: number, baseOffset = 16, stateElements = 0, voices = 1): number {
   const width = signatureWidth(signature);
-  const slot = align16(maxBlock * ELEM_BYTES[width]);
+  const eb = ELEM_BYTES[width];
   const nIn = paramsByRole(signature, "input").length;
   const nOut = paramsByRole(signature, "output").length;
+  // Voice-batched layout (Frontier 7, Stage 4): every slab is `· voices` (voice-
+  // interleaved); the per-generation state slab uses the EXACT `stateElements` (no
+  // 64-register floor — the voice path sizes exactly), plus a per-voice scalar slab.
+  if (voices > 1) {
+    const ioSlot = align16(maxBlock * voices * eb);
+    const stateSlot = align16(Math.max(1, stateElements) * voices * eb);
+    const nScalar = paramsByRole(signature, "scalar").length;
+    const scalarSlot = nScalar > 0 ? align16(nScalar * voices * eb) : 0;
+    const regionEnd = baseOffset + (nIn + 2 * nOut) * ioSlot + 2 * stateSlot + scalarSlot;
+    return Math.max(1, Math.ceil(regionEnd / 65536));
+  }
+  const slot = align16(maxBlock * eb);
   const reserved = stateElements > 0 ? Math.max(MAX_STATE_REGISTERS, stateElements) : 0;
-  const stateBytes = reserved > 0 ? 2 * align16(reserved * ELEM_BYTES[width]) : 0;
+  const stateBytes = reserved > 0 ? 2 * align16(reserved * eb) : 0;
   const regionEnd = baseOffset + (nIn + 2 * nOut) * slot + stateBytes;
   return Math.max(1, Math.ceil(regionEnd / 65536));
 }
@@ -338,6 +367,10 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   const exportName = spec.exportName ?? "kernel";
   const width = spec.width ?? signatureWidth(spec.signature);
   const signature: KernelSignature = spec.width ? { ...spec.signature, width } : spec.signature;
+  const requestedVoices = spec.voices ?? 1;
+  if (requestedVoices > 1 && (!Number.isInteger(requestedVoices) || requestedVoices % LANES[width] !== 0)) {
+    throw new RangeError(`connectJit(): voices must be a positive multiple of W=${LANES[width]} for width ${width}, got ${requestedVoices}`);
+  }
 
   // Resolve the kernel SOURCE (shipped to both off-thread realms) + the compile
   // request from whichever input was given. On the token path the worklet fallback
@@ -353,16 +386,21 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   // `kernel`-function kernel is always stateless here.
   let stateDecls: ReadonlyArray<IrStateDecl> = [];
   let stateBuffers: ReadonlyArray<IrStateBufferDecl> = [];
+  // Voice-SIMD (Frontier 7, Stage 4) is for STATEFUL kernels only; for a stateless
+  // kernel (or the JS-source path, which is stateless in v1) `voices` collapses to 1
+  // (time-axis SIMD). Derived after the token IR reveals statefulness.
+  let voices = 1;
   if (hasTokens) {
     const tokens = spec.tokens!;
     const ir = tokensToKernel(tokens);
     stateDecls = ir.stateDecls ?? [];
     stateBuffers = ir.stateBuffers ?? [];
+    voices = requestedVoices > 1 && (stateDecls.length > 0 || stateBuffers.length > 0) ? requestedVoices : 1;
     kernelSource = emitJsKernel(ir);
-    compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName };
+    compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName, voices };
   } else {
     kernelSource = spec.kernel!.toString();
-    compileRequest = { type: "jit-compile", kind: "js", source: kernelSource, signature, width, exportName };
+    compileRequest = { type: "jit-compile", kind: "js", source: kernelSource, signature, width, exportName, voices };
   }
 
   // Allocate the working memory unless the caller adopts one. Shared when the host
@@ -370,7 +408,7 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   // has somewhere to run (jitEnabled will be false and installs become no-ops).
   let memory = spec.memory;
   if (!memory) {
-    const pages = jitMemoryPages(signature, spec.maxBlock, baseOffset, stateLayout({ stateDecls, stateBuffers }).elements);
+    const pages = jitMemoryPages(signature, spec.maxBlock, baseOffset, stateLayout({ stateDecls, stateBuffers }).elements, voices);
     memory = canAllocateShared()
       ? new WebAssembly.Memory({ initial: pages, maximum: 16384, shared: true })
       : new WebAssembly.Memory({ initial: pages });
@@ -380,7 +418,7 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
 
   const processorOptions: JitWorkletOptions = {
     memory, kernelSource, signature,
-    maxBlock: spec.maxBlock, sampleRate: spec.sampleRate, windowSeconds, baseOffset, exportName, stateDecls, stateBuffers,
+    maxBlock: spec.maxBlock, sampleRate: spec.sampleRate, windowSeconds, baseOffset, exportName, stateDecls, stateBuffers, voices,
   };
 
   let boundWorker: JitMessageSource | null = null;
@@ -450,11 +488,12 @@ export async function runJitCompile(
   // `accepted` result ships. On the token path the width rides in the stream, so no
   // width override is applied.
   const result: CompileResult = request.kind === "tokens"
-    ? compileTokens(request.tokens, { compileWat: opts.compileWat, exportName: request.exportName })
+    ? compileTokens(request.tokens, { compileWat: opts.compileWat, exportName: request.exportName, voices: request.voices })
     : compileKernel(request.source, request.signature, {
         compileWat: opts.compileWat,
         width: request.width,
         exportName: request.exportName,
+        voices: request.voices,
       });
 
   if (result.status !== "accepted") {
@@ -476,7 +515,7 @@ export async function runJitCompile(
   return {
     type: "jit-result", status: "accepted",
     module, bytes: result.wasm, exportName: result.exportName, gate: result.gate,
-    stateDecls: result.stateDecls, stateBuffers: result.stateBuffers,
+    stateDecls: result.stateDecls, stateBuffers: result.stateBuffers, voices: result.voices,
   };
 }
 
@@ -525,14 +564,14 @@ export function forwardCompileResponse(
   }
   if (opts.transport === "module" && response.module) {
     try {
-      port.postMessage({ type: "jit-install", transport: "module", module: response.module, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers } satisfies JitInstallMessage);
+      port.postMessage({ type: "jit-install", transport: "module", module: response.module, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers, voices: response.voices } satisfies JitInstallMessage);
       return "module";
     } catch {
       // DataCloneError: a WebAssembly.Module would not clone into this realm.
       // Fall through to the bytes transport (always clone-safe).
     }
   }
-  port.postMessage({ type: "jit-install", transport: "bytes", bytes: response.bytes, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers } satisfies JitInstallMessage);
+  port.postMessage({ type: "jit-install", transport: "bytes", bytes: response.bytes, exportName: response.exportName, stateDecls: response.stateDecls, stateBuffers: response.stateBuffers, voices: response.voices } satisfies JitInstallMessage);
   return "bytes";
 }
 
@@ -560,6 +599,7 @@ export function createJitConsumer(options: JitWorkletOptions): JitKernelConsumer
     exportName: options.exportName,
     stateDecls: options.stateDecls,
     stateBuffers: options.stateBuffers,
+    voices: options.voices,
   });
 }
 
@@ -583,8 +623,8 @@ export function handleJitInstallMessage(consumer: JitKernelConsumer, message: un
   if (!msg || typeof msg !== "object" || !("type" in msg)) return { installed: false, transport: "none" };
   switch (msg.type) {
     case "jit-install":
-      if (msg.transport === "module") return { installed: consumer.installCompiledKernel(msg.module, msg.stateDecls, msg.stateBuffers), transport: "module" };
-      return { installed: consumer.installCompiledKernelFromBytes(msg.bytes, msg.stateDecls, msg.stateBuffers), transport: "bytes" };
+      if (msg.transport === "module") return { installed: consumer.installCompiledKernel(msg.module, msg.stateDecls, msg.stateBuffers, msg.voices), transport: "module" };
+      return { installed: consumer.installCompiledKernelFromBytes(msg.bytes, msg.stateDecls, msg.stateBuffers, msg.voices), transport: "bytes" };
     case "jit-force-js":
       consumer.revertToFallback();
       return { installed: false, transport: "none" };

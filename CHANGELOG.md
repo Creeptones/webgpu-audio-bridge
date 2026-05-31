@@ -4,6 +4,108 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.932] — 2026-05-31
+
+### Added — Apollo Frontier 7, Stage 4: SIMD across voices (the polyphony payoff)
+
+Stages 1–3 made a stateful kernel compile, run click-free across quanta, and carry
+delay-line ring buffers — all **scalar-only**, because a loop-carried recurrence is
+structurally un-vectorizable along TIME (the recurrence wall). **Stage 4 re-engages SIMD
+along the VOICE axis**: polyphony hands us `V` INDEPENDENT voices, each running the SAME
+kernel with its OWN state + per-voice scalars. Pack `W` voices into one `v128` (lane
+`j` = voice `j`), run the sequential time loop ONCE, and every iteration advances all `W`
+recurrences lock-step lane-parallel. The recurrence stays sequential WITHIN a lane and
+goes parallel ACROSS lanes — sound precisely because no `IrNode` can reference another
+voice, so lane `j` is **bit-for-bit a scalar run of voice `j`** (the gate is bit-exact
+even for f32, stronger than the time-axis path's ULP budget). Purely additive — the
+single-voice (`voices === 1`) and stateless paths stay byte-for-byte identical (the
+frontier gate).
+
+- **A new voice-axis emitter.** `emitVoiceSimdModule(ir, W, exportName)` (sibling of
+  `emitScalarModule`, NOT an overload of the time-axis `emitSimdModule`): one straight
+  time loop (`i` strides by 1 — the recurrence is sequential) whose every leaf is a
+  `v128` reading `W` voices at once. **Voice-interleaved layout** (voice is the fast
+  axis): inputs/outputs at `x[i·W + j]`; per-voice scalars in a lane-packed `$__scalars`
+  slab (loaded once before the loop into a `v128` local); the state slab lane-packed
+  (every `stateLayout` element offset · W). **The shared-cursor insight** (the analogue
+  of Stage 3's `d ≥ 1`): all `W` voices share the time loop ⇒ are time-aligned ⇒ a delay
+  buffer has ONE shared `i32` cursor over a lane-packed ring — not per-voice. The
+  `$__next_*` deferral, commit-at-iteration-end, and advance-cursor-at-end ordering are
+  IDENTICAL to the scalar module — the SIMULTANEOUS semantics fall out per-lane exactly
+  as they do per-sample. `voiceParamLayout(ir)` defines the ABI (trip → arrays → `$__state`
+  → `$__scalars`; the one difference from `paramLayout` is scalars become a lane-packed
+  pointer). `stateLayout` is UNCHANGED — the `·W` fold lives only in the voice emitter +
+  the voice consumer.
+- **`vectorize` is now a three-way mode.** `scalarOnly` generalizes to
+  `mode: "simd-time" | "scalar" | "simd-voice"` (`scalarOnly` kept as a derived getter
+  `mode !== "simd-time"`). `vectorize(ir, exportName, { voices })` selects `"simd-voice"`
+  for a stateful kernel when `voices ≥ W && voices % W === 0`; else the single-voice
+  `"scalar"` fallback (stateful) or `"simd-time"` (stateless).
+- **A new voice-equivalence gate.** `runVoiceGate` (gate `voiceMode`) proves lane `j` ≡
+  `evalReference(ir, voice-j inputs/scalars, n)`, bit-exact, for EVERY lane `j ∈ [0, W)`,
+  over `W` DISTINCT per-voice corpora (so a lane-crossing bug — reading voice 0's state
+  for voice 1, swapping lanes — actually surfaces; an all-identical corpus would hide
+  it). The offending lane index rides in the `GateMismatch` (`kind: "voice-vs-ref"`).
+  The acoustic gate needs no change (a per-voice-identical kernel's acoustics are
+  lane-independent).
+- **`compileIr({ voices })`** threads the count through `CompileKernelOptions` /
+  `CompileIrOptions` / `compileTokens`; on `"simd-voice"` it emits the voice module, runs
+  `runVoiceGate`, and the deliverable bytes are the voice module. The `accepted`
+  `CompileResult` carries `voices` (1 elsewhere) so the runtime + install guard agree.
+- **A voice-batched runtime.** `JitKernelConsumer` gains a `voices` option (default 1 ⇒
+  the existing path, byte-identical). When `> 1`: voice-interleaved I/O slabs
+  (`voices · maxBlock`), lane-packed per-generation state slabs (`stateLayout.elements ·
+  voices`), a per-voice scalar slab, and `voices / W` per-batch WASM calls. `process()`
+  takes caller-interleaved buffers (`[i·V + v]`) + per-voice scalars (a number broadcasts
+  to all voices, an array is per-voice), translating to/from the batched slabs (identity
+  when `V === W`). The JS fallback runs once per VOICE, marshalling each voice's
+  lane-packed state through a contiguous scratch slab — so slab-A/B stay UNIFORMLY
+  lane-packed (no dual-layout hazard) and promotion/abort are unchanged in structure. The
+  count is threaded through `connectJit` → the compile request → the `jit-result` →
+  `forwardCompileResponse`'s `jit-install` (both transports) → `handleJitInstallMessage` →
+  the consumer + the install guard (refuses a voice/slab-shape mismatch). `jitMemoryPages`
+  gains a `voices` factor (and the scalar slab); `voices === 1` is byte-identical.
+
+### Why
+
+Polyphony is the natural place SIMD comes back: every synth voice is an independent
+recurrence, so packing voices into lanes recovers the throughput the recurrence wall took
+from the time axis — without ANY reassociation or cross-lane op, which is why the gate
+stays bit-exact (not merely within-ULP). Keeping `stateLayout` / `paramLayout` / the
+scalar emitter untouched and folding `·W` only in the new voice emitter + voice consumer
+makes the single-voice + stateless paths a structural no-op (the frontier gate), so the
+addition is a pure opt-in.
+
+### Wire compatibility
+
+Fully wire-compatible. Stage 4 is additive: a new opt-in `voices` knob with `voices === 1`
+byte-identical to 0.9.931, no SAB-layout or frame-format change, no public-API break (new
+optional fields + a new emitter/gate function, all `@experimental` subpath). The voice ABI
+is a new module shape used only when `voices > 1`.
+
+### Tests
+
+- New **`tests/voiceKernel.test.ts`** (compiler + gate, real wabt; registered in
+  `package.json` `test` AND `test:unit`): pin 1 voice one-pole ≡ 4 scalar one-poles (f32,
+  W=4, bit-exact, distinct per-voice inputs + cutoffs); pin 2 voice delay ≡ 4 scalar
+  delays (the shared-cursor pin, run to wrap the ring); pin 3 f64 → W=2; pin 4 the gate
+  REJECTS a hand-written lane-crossed module (broadcast lane 0) with the offending lane
+  index; pin 6 frontier gate (`voices === 1` byte-identical scalar; a non-multiple-of-W
+  count falls back to scalar; a stateless kernel stays time-axis SIMD).
+- New **`tests/stateKernelConsumer.test.ts` pin 7** (runtime): a `voices = 2` (f64)
+  one-pole driven over 32 small quanta with voice-interleaved I/O + per-voice cutoffs —
+  the concatenated per-voice output is BIT-EXACT to an independent per-voice
+  `evalReference` run, proving the lane-packed state slab persists across `process()` and
+  through the promotion.
+- Full suite green (`npm run typecheck` clean; all suites pass).
+
+### Documentation
+
+- CHANGELOG (this entry) + the Stage-4 handoff (`docs/frontier7-stage4-simd-voices-handoff.md`).
+- Deferred follow-ups (flagged, not built): dynamic voice allocation / note-on-off /
+  stealing (the synth layer); `V % W ≠ 0` masked tail batches; a voice-SIMD bench cell;
+  a playable poly-synth demo (Stage 5).
+
 ## [0.9.931] — 2026-05-31
 
 ### Added — Apollo Frontier 7, Stage 3: delay lines (`z⁻N` ring buffers)

@@ -121,7 +121,7 @@ export type {
 // (the root entry point) never reaches it. The live hot-swap runtime
 // (`JitKernelConsumer` / `connectJit`) is Stage 1b. See docs/frontier5-jit-handoff.md.
 export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/index.js";
-export { emitScalarModule, emitSimdModule, paramLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
+export { emitScalarModule, emitSimdModule, emitVoiceSimdModule, paramLayout, voiceParamLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
 export { isStateful, stateLayout } from "../jit/index.js";
 export type {
   CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch,

@@ -426,6 +426,60 @@ function testDelayPersistenceAcrossQuanta(): void {
   ok("6 cross-quantum delay persistence: ring + cursor survive process() boundaries (≡ evalReference)");
 }
 
+// ─── Pin 7: cross-quantum VOICE persistence (Stage 4 runtime headline) ────────
+
+function testVoicePersistenceAcrossQuanta(): void {
+  // A voice-batched one-pole (f64 ⇒ W=2 ⇒ voices=2) driven over many small quanta with
+  // voice-interleaved I/O + per-voice cutoffs. The lane-packed per-generation state slab
+  // MUST persist across process() (and through the promotion) or the per-voice streams
+  // diverge. Install before q0 ⇒ A (JS) + B (voice-SIMD) stay f64 lockstep ⇒ the whole
+  // stream is bit-exact to an independent per-voice evalReference run.
+  const V = 2; const Q = 16;
+  const r = compileIr(onePole, { compileWat, voices: V });
+  if (r.status !== "accepted") { assert(false, `voice one-pole must accept (got ${r.status})`); return; }
+  assertEq(r.plan.mode, "simd-voice", "voice one-pole compiles simd-voice");
+  assertEq(r.voices, V, "compiled for V voices");
+  const { wasm, stateDecls } = r;
+
+  const mem = sharedMemory(8);
+  const c = new JitKernelConsumer({
+    memory: mem, signature: onePole.signature, jsKernel: reconstituteJs(onePole),
+    maxBlock: Q, sampleRate: SR, windowSeconds: 0.01, voices: V, stateDecls,
+  });
+  const labels = c.describeLayout().regions.map((x) => x.label).sort();
+  assertEq(labels.join("|"), "in:x|outA:out|outB:out|scalars|stateA|stateB", "voice layout adds state + per-voice scalar slabs");
+
+  assert(c.installCompiledKernel(moduleFromBytes(wasm), stateDecls, undefined, V), "voice install arms");
+  assertEq(c.phase(), "priming", "primed");
+
+  const QUANTA = 32; const total = QUANTA * Q;
+  const cutoffs = [0.5, 0.7];
+  const xv = [sine(total, 60), sine(total, 110)]; // distinct per voice, high enough to attenuate
+  const xInter = new Float64Array(total * V);
+  for (let i = 0; i < total; i++) for (let v = 0; v < V; v++) xInter[i * V + v] = xv[v]![i]!;
+
+  const streamInter = new Float64Array(total * V);
+  let sawComplete = false;
+  for (let q = 0; q < QUANTA; q++) {
+    const inSlice = xInter.subarray(q * Q * V, q * Q * V + Q * V);
+    const out = new Float64Array(Q * V);
+    const res = c.process({ x: inSlice }, { c: cutoffs }, { out }, Q, (q * Q / SR) * 1e9);
+    if (res.phase === "complete") sawComplete = true;
+    streamInter.set(out, q * Q * V);
+  }
+  assert(sawComplete, "voice swap reached complete");
+  assert(c.isUpgraded(), "upgraded to the voice-SIMD kernel");
+
+  for (let v = 0; v < V; v++) {
+    const got = new Array<number>(total);
+    for (let i = 0; i < total; i++) got[i] = streamInter[i * V + v]!;
+    const ref = evalReference(onePole, { x: Array.from(xv[v]!) }, { c: cutoffs[v]! }, total)["out"]!;
+    assertEq(maxAbsDiff(got, ref), 0, `voice ${v}: cross-quantum stream BIT-EXACT to evalReference (lane-packed slab persists)`);
+    assert(maxAbsDiff(got, Array.from(xv[v]!)) > 0.05, `voice ${v}: the one-pole is real (output ≠ input)`);
+  }
+  ok("7 cross-quantum voice persistence: lane-packed per-voice state survives process() + promotion (≡ evalReference)");
+}
+
 async function main(): Promise<void> {
   testJsFallbackPersistence();
   testIndependentStateSwap();
@@ -433,7 +487,8 @@ async function main(): Promise<void> {
   testAbortToLiveJsState();
   testStatelessUntouched();
   testDelayPersistenceAcrossQuanta();
-  console.log("\nAll stateKernelConsumer (Frontier 7, Stage 2 + Stage 3) pins passed.");
+  testVoicePersistenceAcrossQuanta();
+  console.log("\nAll stateKernelConsumer (Frontier 7, Stage 2 + 3 + 4) pins passed.");
 }
 
 await main();

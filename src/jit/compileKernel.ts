@@ -24,7 +24,7 @@ import { parseProgram } from "./parse.js";
 import { lowerKernel } from "./lower.js";
 import { JitRejection, type Diagnostic } from "./diagnostics.js";
 import { vectorize, type VectorizedKernelPlan } from "./vectorize.js";
-import { emitScalarModule, emitSimdModule } from "./emitKernelWat.js";
+import { emitScalarModule, emitSimdModule, emitVoiceSimdModule } from "./emitKernelWat.js";
 import { buildCorpus, CORPUS_N_VALUES, type CorpusOptions } from "./corpus.js";
 import { runGate, type CompileWat, type GateReport } from "./gate.js";
 import { type IrKernel, type IrStateDecl, type IrStateBufferDecl, type KernelSignature, type LaneWidth } from "./ir.js";
@@ -40,6 +40,12 @@ export interface CompileKernelOptions {
   readonly corpus?: CorpusOptions;
   /** f32 ULP budget for the gate (default 0 — v1 is bit-exact). */
   readonly maxUlpF32?: number;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). When `> 1` and a multiple
+   *  of the lane width `W`, a STATEFUL kernel is compiled along the VOICE axis (W
+   *  independent voices per v128) instead of the scalar fallback — gate-proven lane
+   *  `j` ≡ a scalar run of voice `j`. Default 1 (the single-voice scalar path,
+   *  byte-identical to pre-Stage-4). Ignored for a stateless kernel (time-axis SIMD). */
+  readonly voices?: number;
 }
 
 /** Options for the IR back-half (`compileIr`) and the token entry (`compileTokens`).
@@ -56,6 +62,8 @@ export interface CompileIrOptions {
    *  the spec and SIMD≡scalar is the safety, so leave it undefined. Threaded only
    *  from the legacy `compileKernel(source)` entry. */
   readonly jsSource?: string;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4) — see `CompileKernelOptions.voices`. */
+  readonly voices?: number;
 }
 
 /** Options for the token entry (`compileTokens`). Identical to `CompileIrOptions`
@@ -82,6 +90,12 @@ export type CompileResult =
        *  these (with `stateDecls`) to size + seed the per-generation state slab; like
        *  registers, they are NOT derivable from the `KernelSignature`. */
       readonly stateBuffers: ReadonlyArray<IrStateBufferDecl>;
+      /** The polyphonic voice batch this kernel was compiled for (Apollo Frontier 7,
+       *  Stage 4). `1` for the single-voice scalar / stateless paths; `> 1` (a
+       *  multiple of `plan.laneWidth`) for the voice-SIMD path — the runtime sizes its
+       *  lane-packed slabs + drives its voice-interleaved I/O by this count, and the
+       *  install guard checks it against what the consumer reserved. */
+      readonly voices: number;
     }
   | { readonly status: "rejected-source"; readonly diagnostic: Diagnostic }
   | { readonly status: "rejected-gate"; readonly gate: GateReport }
@@ -120,13 +134,17 @@ export function compileKernel(
     throw err;
   }
 
-  // The user's source is the gate's THIRD oracle on this (JS) path only.
+  // The user's source is the gate's THIRD oracle on this (JS) path only. (The JS
+  // authoring path is stateless in v1 — `lower.ts` statefulness is deferred — so
+  // `voices` here is inert unless a future stateful lowering lands; threaded for
+  // completeness.)
   return compileIr(ir, {
     compileWat: opts.compileWat,
     exportName,
     corpus: opts.corpus,
     maxUlpF32: opts.maxUlpF32,
     jsSource: source,
+    voices: opts.voices,
   });
 }
 
@@ -144,30 +162,58 @@ export function compileKernel(
  */
 export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
   const exportName = opts.exportName ?? "kernel";
+  const voices = opts.voices ?? 1;
 
   // vectorize — surfaces v1-non-emittable shapes as `unsupported` (→ JS fallback);
-  // flags a stateful kernel as scalarOnly (supported, scalar-only — Frontier 7).
-  const vec = vectorize(ir, exportName);
+  // picks the lowering mode: stateless ⇒ "simd-time"; stateful + a power-of-W voice
+  // batch ⇒ "simd-voice" (Frontier 7, Stage 4); else "scalar" (the recurrence wall).
+  const vec = vectorize(ir, exportName, { voices });
   if (!vec.ok) return { status: "unsupported", reason: vec.reason };
 
   const scalarWat = emitScalarModule(ir, exportName);
+  const stateDecls = ir.stateDecls ?? [];
+  const stateBuffers = ir.stateBuffers ?? [];
 
-  // ── Frontier 7: the scalar-only (stateful) path ──────────────────────────────
+  // The long-run corpus must exceed the longest delay so the ring WRAPS (a too-short
+  // run never re-reads a wrapped slot — a ring-addressing / off-by-one bug would hide).
+  const maxBuf = Math.max(0, ...(ir.stateBuffers ?? []).map((b) => b.length));
+  const longRun = maxBuf > 0 ? [256, 512, maxBuf * 2 + 17] : [256, 512];
+
+  // ── Frontier 7, Stage 4: the voice-axis SIMD path ────────────────────────────
+  // A stateful kernel compiled across W independent voices (lane j = voice j). The
+  // deliverable is the voice module; the gate proves lane j ≡ evalReference(voice j),
+  // bit-exact, over W DISTINCT per-voice corpora (a lane-crossing bug surfaces).
+  if (vec.plan.mode === "simd-voice") {
+    const W = vec.plan.laneWidth;
+    const voiceWat = emitVoiceSimdModule(ir, W, exportName);
+    const nValues = [...CORPUS_N_VALUES, ...longRun];
+    const baseSeed = opts.corpus?.seed ?? 0xc0ffee;
+    // W per-lane corpora — same n-values (case indices align) but DISTINCT values per
+    // voice, so reading another voice's state/inputs is caught.
+    const voiceCorpora = Array.from({ length: W }, (_, j) =>
+      buildCorpus(ir.signature, { ...(opts.corpus ?? { nValues }), seed: baseSeed + j * 0x9e3779b1 }),
+    );
+    const gate = runGate({
+      ir, scalarWat, simdWat: voiceWat, corpus: voiceCorpora[0]!, voiceCorpora,
+      compileWat: opts.compileWat, maxUlpF32: opts.maxUlpF32, voiceMode: true,
+    });
+    if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
+    if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
+    const wasm = opts.compileWat(voiceWat, "voice");
+    return { status: "accepted", wasm, scalarWat, simdWat: voiceWat, plan: vec.plan, exportName, gate, stateDecls, stateBuffers, voices };
+  }
+
+  // ── Frontier 7: the scalar-only (stateful, single-voice) path ────────────────
   // No SIMD candidate (the recurrence is not time-axis vectorizable), so the
   // deliverable IS the scalar module and the gate proves scalar WASM ≡ evalReference
-  // over a corpus that includes a LONG run (so an IIR transient develops past the
-  // residue rows). The stateless SIMD path below is untouched.
+  // over a corpus that includes a LONG run. The stateless SIMD path below is untouched.
   if (vec.plan.scalarOnly) {
-    // The long-run corpus must exceed the longest delay so the ring WRAPS (a too-short
-    // run never re-reads a wrapped slot — a ring-addressing / off-by-one bug would hide).
-    const maxBuf = Math.max(0, ...(ir.stateBuffers ?? []).map((b) => b.length));
-    const longRun = maxBuf > 0 ? [256, 512, maxBuf * 2 + 17] : [256, 512];
     const corpus = buildCorpus(ir.signature, opts.corpus ?? { nValues: [...CORPUS_N_VALUES, ...longRun] });
     const gate = runGate({ ir, scalarWat, simdWat: scalarWat, corpus, compileWat: opts.compileWat, maxUlpF32: opts.maxUlpF32, scalarOnly: true });
     if (gate.status === "unsupported") return { status: "unsupported", reason: gate.reason ?? "unsupported", gate };
     if (gate.status === "rejected-gate") return { status: "rejected-gate", gate };
     const wasm = opts.compileWat(scalarWat, "scalar");
-    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [], stateBuffers: ir.stateBuffers ?? [] };
+    return { status: "accepted", wasm, scalarWat, simdWat: scalarWat, plan: vec.plan, exportName, gate, stateDecls, stateBuffers, voices: 1 };
   }
 
   const simdWat = emitSimdModule(ir, exportName);
@@ -180,7 +226,7 @@ export function compileIr(ir: IrKernel, opts: CompileIrOptions): CompileResult {
 
   // accepted — produce the deliverable SIMD bytes.
   const wasm = opts.compileWat(simdWat, "simd");
-  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate, stateDecls: ir.stateDecls ?? [], stateBuffers: ir.stateBuffers ?? [] };
+  return { status: "accepted", wasm, scalarWat, simdWat, plan: vec.plan, exportName, gate, stateDecls, stateBuffers, voices: 1 };
 }
 
 /**
@@ -212,5 +258,6 @@ export function compileTokens(
     exportName: opts.exportName,
     corpus: opts.corpus,
     maxUlpF32: opts.maxUlpF32,
+    voices: opts.voices,
   });
 }

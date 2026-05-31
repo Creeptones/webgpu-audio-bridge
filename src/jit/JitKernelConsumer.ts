@@ -98,7 +98,7 @@
 
 import {
   type KernelSignature, type LaneWidth, type IrStateDecl, type IrStateBufferDecl, type StateLayout,
-  ELEM_BYTES, signatureWidth, stateLayout,
+  ELEM_BYTES, LANES, signatureWidth, stateLayout,
 } from "./ir.js";
 import { JitKernelSwap, type JitKernelSwapOptions, type JitSwapPhase } from "./JitKernelSwap.js";
 import { hasWasmConsumerSupport } from "../worklet/wasmSimdSupport.js";
@@ -157,6 +157,15 @@ export interface JitKernelConsumerOptions extends JitKernelSwapOptions {
    *  cursor — see `stateLayout`). The construction kernel's buffers fix the reserved
    *  slab size; an incoming kernel's buffers ride on the install message. */
   readonly stateBuffers?: ReadonlyArray<IrStateBufferDecl>;
+  /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). Default 1 ⇒ the existing
+   *  single-voice path (byte-identical — the frontier gate). When `> 1` (a multiple of
+   *  the lane width `W`, and the kernel MUST be stateful) the consumer runs a
+   *  VOICE-BATCHED runtime: voice-interleaved I/O, lane-packed per-generation state
+   *  slabs (W voices per v128), a per-voice scalar slab, and `voices / W` per-batch
+   *  kernel calls. `process()` then takes voice-interleaved buffers + per-voice scalars
+   *  (see `process`). The compiled SIMD kernel must be a `simd-voice` module compiled
+   *  for the SAME `voices` (in v1 `connectJit` derives both from one spec). */
+  readonly voices?: number;
 }
 
 /** One memory region in the consumer's layout (for the disjointness test). */
@@ -212,7 +221,7 @@ export class JitKernelConsumer {
   private readonly outputNames: string[] = [];
   private readonly scalarNames: string[] = []; // signature order
   private readonly regions: JitMemoryRegion[] = [];
-  private readonly regionEnd: number;
+  private regionEnd = 0;
 
   // ── per-generation state slabs (Frontier 7, Stage 2) ────────────────────────
   // `stateful` is fixed at construction (the JS fallback's state shape). When
@@ -234,6 +243,51 @@ export class JitKernelConsumer {
   private _stateViewA: TypedArray | null = null;
   private _stateViewB: TypedArray | null = null;
   private _jsStateSlot = -1; // trailing state-slab arg index in _jsArgsA/_jsArgsB
+
+  // ── voice-batched runtime (Frontier 7, Stage 4) ─────────────────────────────
+  // `voiceMode` (voices > 1) is fixed at construction. When true, EVERY slab is
+  // voice-batched: I/O slabs hold `voices · maxBlock` elements (nBatches blocks of W
+  // voices, internally [i·W + j]); each per-generation state slab is lane-packed
+  // (`stateLayout.elements · voices`, nBatches blocks of elements·W); a per-voice
+  // scalar slab holds `scalarCount · voices`. The WASM voice kernel runs once per
+  // batch; the JS fallback runs once per VOICE (marshalling each voice's lane-packed
+  // state through a contiguous scratch slab — so slab-A/B stay UNIFORMLY lane-packed
+  // and the dual-layout problem never arises). Everything here is inert when
+  // voiceMode is false (the frontier gate).
+  private readonly voiceMode: boolean;
+  private readonly voices: number;
+  private readonly W: number;
+  private readonly nBatches: number;
+  private vReservedElements = 0; // per-voice slab elements (= stateLayout.elements, exact)
+  private vScalarCount = 0;
+  private _vLayoutA: StateLayout = { elements: 0, regs: [], buffers: [] };
+  private _vLayoutB: StateLayout = { elements: 0, regs: [], buffers: [] };
+  // byte offsets
+  private readonly vInOff: Record<string, number> = {};
+  private readonly vOutOffA: Record<string, number> = {};
+  private readonly vOutOffB: Record<string, number> = {};
+  private vStateOffA = 0;
+  private vStateOffB = 0;
+  private vScalarOff = 0;
+  // views
+  private _vInViews: Record<string, TypedArray> = {};
+  private _vOutViewsA: Record<string, TypedArray> = {};
+  private _vOutViewsB: Record<string, TypedArray> = {};
+  private _vStateViewA: TypedArray | null = null;
+  private _vStateViewB: TypedArray | null = null;
+  private _vScalarView: TypedArray | null = null;
+  // prebuilt per-batch WASM args ([batch][n, ...arrayOffsets, stateOffset, scalarOffset?])
+  private readonly _vArgsA: number[][] = [];
+  private readonly _vArgsB: number[][] = [];
+  private _vHasScalarArg = false;
+  // contiguous per-voice JS-fallback scratch (NOT memory-backed) + its arg map
+  private _vJsIn: Record<string, TypedArray> = {};
+  private _vJsOut: Record<string, TypedArray> = {};
+  private _vJsState: TypedArray | null = null;
+  private _vJsArgs: unknown[] = [];
+  private _vJsLengthSlot = -1;
+  private readonly _vJsScalarSlots: Array<{ index: number; name: string }> = [];
+  private readonly _vJsArraySlots: Array<{ index: number; name: string; role: "input" | "output" }> = [];
 
   // ── cached views over `memory.buffer` (rebuilt if the buffer identity moves) ─
   private _viewBuffer: ArrayBufferLike | null = null;
@@ -292,6 +346,23 @@ export class JitKernelConsumer {
     this._layoutA = ctorLayout;
     this._layoutB = ctorLayout;
 
+    // ── voice batch (Frontier 7, Stage 4) — fixed at construction ─────────────
+    this.voices = opts.voices ?? 1;
+    this.W = LANES[this.width];
+    this.voiceMode = this.voices > 1;
+    if (this.voiceMode) {
+      if (!Number.isInteger(this.voices) || this.voices % this.W !== 0) {
+        throw new Error(`JitKernelConsumer: voices must be a positive multiple of W=${this.W} (got ${this.voices})`);
+      }
+      if (!this.stateful) {
+        throw new Error("JitKernelConsumer: voice mode (voices > 1) requires a stateful kernel");
+      }
+    }
+    this.nBatches = this.voiceMode ? this.voices / this.W : 1;
+    this.vReservedElements = this.voiceMode ? ctorLayout.elements : 0;
+    this._vLayoutA = ctorLayout;
+    this._vLayoutB = ctorLayout;
+
     // ── classify params + lay out the disjoint slabs ──────────────────────────
     for (const p of this.signature.params) {
       if (p.role === "input") { this.arrayParams.push({ name: p.name, role: "input" }); this.inputNames.push(p.name); }
@@ -302,6 +373,9 @@ export class JitKernelConsumer {
       throw new Error("JitKernelConsumer: signature declares no output array");
     }
 
+    if (this.voiceMode) {
+      this.initVoice(opts);
+    } else {
     const base = opts.baseOffset ?? 16;
     if (!Number.isInteger(base) || base < 0 || base % 16 !== 0) {
       throw new Error(`JitKernelConsumer: baseOffset must be a non-negative multiple of 16, got ${base}`);
@@ -379,13 +453,17 @@ export class JitKernelConsumer {
       this._jsArgsA.push(null);
       this._jsArgsB.push(null);
     }
+    } // end !voiceMode layout
 
     this.jitEnabled = hasWasmConsumerSupport() && isShared(this.memory);
     this.refreshViews();
 
     // Seed both generations cold — exactly once, off the audio thread. Persistence
     // across quanta then follows from never re-seeding.
-    if (this.stateful) {
+    if (this.voiceMode) {
+      this.seedVoiceSlab(this._vStateViewA!, this._vLayoutA);
+      this.seedVoiceSlab(this._vStateViewB!, this._vLayoutB);
+    } else if (this.stateful) {
       this.seedSlab(this._stateViewA!, this._layoutA);
       this.seedSlab(this._stateViewB!, this._layoutB);
     }
@@ -437,7 +515,7 @@ export class JitKernelConsumer {
    * instantiation threw, missing export) — in which case the current kernel keeps
    * running unchanged. Never throws.
    */
-  installCompiledKernel(module: WebAssembly.Module, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>): boolean {
+  installCompiledKernel(module: WebAssembly.Module, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>, voices?: number): boolean {
     if (!this.jitEnabled) return false;
     let inst: WebAssembly.Instance;
     try {
@@ -445,7 +523,7 @@ export class JitKernelConsumer {
     } catch {
       return false; // `new Instance` threw → do NOT arm; current kernel stays.
     }
-    return this.armInstance(inst, stateDecls, stateBuffers);
+    return this.armInstance(inst, stateDecls, stateBuffers, voices);
   }
 
   /**
@@ -456,7 +534,7 @@ export class JitKernelConsumer {
    * instantiating a pre-compiled Module — still microseconds for a kernel-sized
    * module, but keep it in `port.onmessage`, never in `process()`.
    */
-  installCompiledKernelFromBytes(bytes: Uint8Array, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>): boolean {
+  installCompiledKernelFromBytes(bytes: Uint8Array, stateDecls?: ReadonlyArray<IrStateDecl>, stateBuffers?: ReadonlyArray<IrStateBufferDecl>, voices?: number): boolean {
     if (!this.jitEnabled) return false;
     let inst: WebAssembly.Instance;
     try {
@@ -469,13 +547,14 @@ export class JitKernelConsumer {
     } catch {
       return false;
     }
-    return this.armInstance(inst, stateDecls, stateBuffers);
+    return this.armInstance(inst, stateDecls, stateBuffers, voices);
   }
 
   private armInstance(
     inst: WebAssembly.Instance,
     stateDecls?: ReadonlyArray<IrStateDecl>,
     stateBuffers?: ReadonlyArray<IrStateBufferDecl>,
+    voices?: number,
   ): boolean {
     const fn = inst.exports[this.exportName];
     if (typeof fn !== "function") return false; // not a valid kernel module
@@ -486,7 +565,26 @@ export class JitKernelConsumer {
     // source, so the shapes always match and neither guard fires.
     const incomingLayout = (stateDecls || stateBuffers)
       ? stateLayout({ stateDecls: stateDecls ?? [], stateBuffers: stateBuffers ?? [] })
-      : this._layoutA;
+      : (this.voiceMode ? this._vLayoutA : this._layoutA);
+    // ── voice install (Frontier 7, Stage 4): the incoming voice count must match what
+    // was reserved, and the lane-packed slab must fit. Seed slab-B lane-packed (cold),
+    // arm. The WASM voice kernel and the consumer agree on `voices` (connectJit derives
+    // both from one spec). ────────────────────────────────────────────────────────────
+    if (this.voiceMode) {
+      if (voices !== undefined && voices !== this.voices) return false;
+      if (incomingLayout.elements > this.vReservedElements) return false;
+      if (this.swap.isSwapping()) {
+        this.swap.reset();
+        this._incoming = null;
+        this._incomingKernelFn = null;
+      }
+      this._vLayoutB = incomingLayout;
+      this.seedVoiceSlab(this._vStateViewB!, incomingLayout);
+      this._incoming = inst;
+      this._incomingKernelFn = fn as (...a: number[]) => void;
+      this.swap.armSwap(this.defaultWindowSeconds);
+      return true;
+    }
     if (incomingLayout.elements > 0 && !this.stateful) return false;
     if (incomingLayout.elements > this.reservedElements) return false;
     // Replace any in-flight incoming: abandon it, snap the swap, re-arm fresh.
@@ -538,12 +636,13 @@ export class JitKernelConsumer {
    */
   process(
     inputs: Record<string, ArrayLike<number>>,
-    scalars: Record<string, number>,
+    scalars: Record<string, number | ArrayLike<number>>,
     outs: Record<string, WritableBuffer>,
     n: number,
     baseConsumerNs: number,
     sampleRate?: number,
   ): JitProcessResult {
+    if (this.voiceMode) return this.processVoice(inputs, scalars, outs, n, baseConsumerNs, sampleRate);
     if (!Number.isInteger(n) || n < 0 || n > this.maxBlock) {
       throw new Error(`JitKernelConsumer.process: n must be in [0, ${this.maxBlock}], got ${n}`);
     }
@@ -577,13 +676,15 @@ export class JitKernelConsumer {
     this._wasmArgsA[0] = n;
     this._wasmArgsB[0] = n;
     for (const s of this._wasmScalarSlots) {
-      const v = this.round(scalars[s.name] ?? 0);
+      const raw = scalars[s.name];
+      const v = this.round(typeof raw === "number" ? raw : 0);
       this._wasmArgsA[s.index] = v;
       this._wasmArgsB[s.index] = v;
     }
     if (this._jsLengthSlot >= 0) { this._jsArgsA[this._jsLengthSlot] = n; this._jsArgsB[this._jsLengthSlot] = n; }
     for (const s of this._jsScalarSlots) {
-      const v = this.round(scalars[s.name] ?? 0);
+      const raw = scalars[s.name];
+      const v = this.round(typeof raw === "number" ? raw : 0);
       this._jsArgsA[s.index] = v;
       this._jsArgsB[s.index] = v;
     }
@@ -720,6 +821,7 @@ export class JitKernelConsumer {
   /** Rebuild the typed-array views if the underlying buffer identity changed
    *  (a defensive guard — with a fixed-max non-growing memory it never does). */
   private refreshViews(): void {
+    if (this.voiceMode) { this.refreshVoiceViews(); return; }
     if (this._viewBuffer === this.memory.buffer) return;
     const buf = this.memory.buffer;
     this._viewBuffer = buf;
@@ -741,6 +843,345 @@ export class JitKernelConsumer {
     // at call time (cheap, and keeps the A/B arg arrays correct after a rebuild).
     this.bindJsArrayViews(this._jsArgsA, "A");
     this.bindJsArrayViews(this._jsArgsB, "B");
+  }
+
+  // ── voice-batched runtime methods (Frontier 7, Stage 4) ──────────────────────
+  //
+  // All inert unless voiceMode (voices > 1). Layout: I/O slabs are voice-interleaved
+  // in nBatches blocks of W voices (block b at element b·maxBlock·W, internally
+  // [i·W + j]); per-generation state slabs are lane-packed (block b at element
+  // b·reservedElements·W, register r / ring slot k at offset·W + lane j); the scalar
+  // slab is the same shape with reservedElements → scalarCount. The caller-facing I/O
+  // is FULLY voice-interleaved [i·V + v] (the natural poly frame), translated to/from
+  // the batched slabs in the copy/blend helpers (identity when V === W). The WASM voice
+  // kernel runs once per batch; the JS fallback runs once per VOICE, marshalling each
+  // voice's lane-packed state through a contiguous scratch slab — so slab-A/B stay
+  // UNIFORMLY lane-packed (the WASM kernel only reads slab-A after a promotion-copy; the
+  // JS fallback marshals, never reinterprets), and there is no dual-layout hazard.
+
+  /** Build the voice layout + per-batch WASM args + per-voice JS-fallback scratch. */
+  private initVoice(opts: JitKernelConsumerOptions): void {
+    const base = opts.baseOffset ?? 16;
+    if (!Number.isInteger(base) || base < 0 || base % 16 !== 0) {
+      throw new Error(`JitKernelConsumer: baseOffset must be a non-negative multiple of 16, got ${base}`);
+    }
+    const eb = this.elemBytes;
+    const V = this.voices;
+    this.vScalarCount = this.scalarNames.length;
+    const ioSlot = align16(this.maxBlock * V * eb);
+    const stateSlot = align16(Math.max(1, this.vReservedElements) * V * eb);
+    const scalarSlot = this.vScalarCount > 0 ? align16(this.vScalarCount * V * eb) : 0;
+
+    let cursor = base;
+    const place = (label: string, table: Record<string, number>, name: string): void => {
+      table[name] = cursor;
+      this.regions.push({ label, offset: cursor, bytes: ioSlot });
+      cursor += ioSlot;
+    };
+    for (const name of this.inputNames) place(`in:${name}`, this.vInOff, name);
+    for (const name of this.outputNames) place(`outA:${name}`, this.vOutOffA, name);
+    for (const name of this.outputNames) place(`outB:${name}`, this.vOutOffB, name);
+    this.vStateOffA = cursor; this.regions.push({ label: "stateA", offset: cursor, bytes: stateSlot }); cursor += stateSlot;
+    this.vStateOffB = cursor; this.regions.push({ label: "stateB", offset: cursor, bytes: stateSlot }); cursor += stateSlot;
+    if (this.vScalarCount > 0) { this.vScalarOff = cursor; this.regions.push({ label: "scalars", offset: cursor, bytes: scalarSlot }); cursor += scalarSlot; }
+    this.regionEnd = cursor;
+    assertDisjoint(this.regions);
+    if (this.regionEnd > this.memory.buffer.byteLength) {
+      throw new Error(
+        `JitKernelConsumer: voice layout needs ${this.regionEnd} bytes but memory has only ` +
+          `${this.memory.buffer.byteLength} (grow the WebAssembly.Memory)`,
+      );
+    }
+
+    // Prebuild per-batch WASM arg arrays (offsets stable; only `n` updates per quantum).
+    const blockIOBytes = this.maxBlock * this.W * eb;
+    const blockStateBytes = Math.max(1, this.vReservedElements) * this.W * eb;
+    const blockScalarBytes = this.vScalarCount * this.W * eb;
+    this._vHasScalarArg = this.vScalarCount > 0;
+    for (let b = 0; b < this.nBatches; b++) {
+      const a: number[] = [0];
+      const bb: number[] = [0];
+      for (const ap of this.arrayParams) {
+        if (ap.role === "input") { a.push(this.vInOff[ap.name]! + b * blockIOBytes); bb.push(this.vInOff[ap.name]! + b * blockIOBytes); }
+        else { a.push(this.vOutOffA[ap.name]! + b * blockIOBytes); bb.push(this.vOutOffB[ap.name]! + b * blockIOBytes); }
+      }
+      a.push(this.vStateOffA + b * blockStateBytes);
+      bb.push(this.vStateOffB + b * blockStateBytes);
+      if (this._vHasScalarArg) { a.push(this.vScalarOff + b * blockScalarBytes); bb.push(this.vScalarOff + b * blockScalarBytes); }
+      this._vArgsA.push(a);
+      this._vArgsB.push(bb);
+    }
+
+    // Contiguous per-voice JS-fallback scratch (NOT memory-backed) + the JS arg map.
+    for (const name of this.inputNames) this._vJsIn[name] = new this.TA(this.maxBlock);
+    for (const name of this.outputNames) this._vJsOut[name] = new this.TA(this.maxBlock);
+    this._vJsState = new this.TA(Math.max(1, this.vReservedElements));
+    for (const p of this.signature.params) {
+      const idx = this._vJsArgs.length;
+      if (p.role === "length") { this._vJsLengthSlot = idx; this._vJsArgs.push(0); }
+      else if (p.role === "scalar") { this._vJsScalarSlots.push({ index: idx, name: p.name }); this._vJsArgs.push(0); }
+      else { this._vJsArraySlots.push({ index: idx, name: p.name, role: p.role as "input" | "output" }); this._vJsArgs.push(p.role === "input" ? this._vJsIn[p.name]! : this._vJsOut[p.name]!); }
+    }
+    this._vJsArgs.push(this._vJsState);
+  }
+
+  /** Rebuild the voice views if the buffer identity changed (defensive). */
+  private refreshVoiceViews(): void {
+    if (this._viewBuffer === this.memory.buffer) return;
+    const buf = this.memory.buffer;
+    this._viewBuffer = buf;
+    const ioLen = this.maxBlock * this.voices;
+    for (const name of this.inputNames) this._vInViews[name] = new this.TA(buf, this.vInOff[name]!, ioLen);
+    for (const name of this.outputNames) {
+      this._vOutViewsA[name] = new this.TA(buf, this.vOutOffA[name]!, ioLen);
+      this._vOutViewsB[name] = new this.TA(buf, this.vOutOffB[name]!, ioLen);
+    }
+    const stateLen = Math.max(1, this.vReservedElements) * this.voices;
+    this._vStateViewA = new this.TA(buf, this.vStateOffA, stateLen);
+    this._vStateViewB = new this.TA(buf, this.vStateOffB, stateLen);
+    if (this.vScalarCount > 0) this._vScalarView = new this.TA(buf, this.vScalarOff, this.vScalarCount * this.voices);
+  }
+
+  /** Seed a lane-packed state slab COLD: zero the whole region, then write each
+   *  register's declared init into ALL W lanes of EVERY batch. */
+  private seedVoiceSlab(view: TypedArray, layout: StateLayout): void {
+    view.fill(0);
+    const re = Math.max(1, this.vReservedElements);
+    const W = this.W;
+    for (let b = 0; b < this.nBatches; b++) {
+      for (const r of layout.regs) {
+        for (let j = 0; j < W; j++) {
+          const idx = b * re * W + r.offset * W + j;
+          if (idx < view.length) view[idx] = r.init;
+        }
+      }
+    }
+  }
+
+  /** One voice-batched audio quantum (the voiceMode branch of `process`). */
+  private processVoice(
+    inputs: Record<string, ArrayLike<number>>,
+    scalars: Record<string, number | ArrayLike<number>>,
+    outs: Record<string, WritableBuffer>,
+    n: number,
+    baseConsumerNs: number,
+    sampleRate?: number,
+  ): JitProcessResult {
+    if (!Number.isInteger(n) || n < 0 || n > this.maxBlock) {
+      throw new Error(`JitKernelConsumer.process: n must be in [0, ${this.maxBlock}], got ${n}`);
+    }
+    const sr = sampleRate ?? this._sampleRate;
+    if (!Number.isFinite(sr) || sr <= 0) {
+      throw new Error(`JitKernelConsumer.process: sampleRate must be set (got ${sr})`);
+    }
+    for (const name of this.outputNames) {
+      const buf = outs[name];
+      if (!buf || buf.length < n * this.voices) throw new Error(`JitKernelConsumer.process: outs["${name}"] missing or shorter than n·voices=${n * this.voices}`);
+    }
+
+    this.refreshViews();
+
+    if (this._retiring !== null && --this._retireCountdown <= 0) {
+      this._retiring = null;
+      this._retireCountdown = 0;
+    }
+
+    // Translate caller-interleaved inputs → batched slabs; lane-pack the scalar slab.
+    this.copyInputsVoice(inputs, n);
+    this.fillScalarsVoice(scalars);
+    for (const a of this._vArgsA) a[0] = n;
+    for (const b of this._vArgsB) b[0] = n;
+    if (this._vJsLengthSlot >= 0) this._vJsArgs[this._vJsLengthSlot] = n;
+
+    const q = this.swap.beginQuantum(baseConsumerNs);
+
+    if (q.phase === "idle" || q.phase === "priming") {
+      this.runCurrentAVoice(scalars, n);
+      this.copyAtoOutsVoice(outs, n);
+      return { phase: q.phase, weight: 0, ranSimd: this._currentWasm !== null, abortedToJs: false };
+    }
+
+    if (q.phase === "fading") {
+      this.runCurrentAVoice(scalars, n);
+      this.runIncomingBVoice();
+      if (!this.outputsFiniteBVoice(n)) {
+        // Non-finite incoming → project current-A (already computed) + drop incoming.
+        this.copyAtoOutsVoice(outs, n);
+        this.revertToFallback();
+        return { phase: this.swap.phase(), weight: 0, ranSimd: false, abortedToJs: true };
+      }
+      this.blendVoice(outs, n, baseConsumerNs, sr);
+      return { phase: q.phase, weight: q.weight, ranSimd: true, abortedToJs: false };
+    }
+
+    if (q.justCompleted) {
+      this._retiring = this._currentWasm;
+      this._retireCountdown = this._retiring ? 1 : 0;
+      this._currentWasm = this._incoming;
+      this._currentKernelFn = this._incomingKernelFn;
+      this._incoming = null;
+      this._incomingKernelFn = null;
+      // Promotion: B's lane-packed slab BECOMES current-A (continuity, not a re-seed).
+      const a = this._vStateViewA!;
+      const b = this._vStateViewB!;
+      const len = Math.min(a.length, b.length);
+      for (let k = 0; k < len; k++) a[k] = b[k]!;
+      this._vLayoutA = this._vLayoutB;
+    }
+    this.runCurrentAVoice(scalars, n);
+    this.copyAtoOutsVoice(outs, n);
+    return { phase: q.phase, weight: 1, ranSimd: true, abortedToJs: false };
+  }
+
+  private scalarForVoice(scalars: Record<string, number | ArrayLike<number>>, name: string, v: number): number {
+    const s = scalars[name];
+    if (s === undefined) return 0;
+    if (typeof s === "number") return s;
+    return s[v] ?? 0;
+  }
+
+  /** Run the current kernel (promoted SIMD voice, or per-voice JS fallback) into gen A. */
+  private runCurrentAVoice(scalars: Record<string, number | ArrayLike<number>>, n: number): void {
+    if (this._currentWasm !== null && this._currentKernelFn !== null) {
+      for (const args of this._vArgsA) this._currentKernelFn(...args);
+    } else {
+      this.runJsFallbackAVoice(scalars, n);
+    }
+  }
+
+  /** Run the incoming SIMD voice kernel into generation B (one call per batch). */
+  private runIncomingBVoice(): void {
+    for (const args of this._vArgsB) this._incomingKernelFn!(...args);
+  }
+
+  /** Run the developer's scalar JS kernel once per VOICE into generation A, marshalling
+   *  each voice's lane-packed state through the contiguous scratch slab. */
+  private runJsFallbackAVoice(scalars: Record<string, number | ArrayLike<number>>, n: number): void {
+    const W = this.W;
+    const re = Math.max(1, this.vReservedElements);
+    const blockIO = this.maxBlock * W;
+    const elements = Math.min(this._vLayoutA.elements, re);
+    const sv = this._vStateViewA!;
+    const js = this._vJsState!;
+    for (let v = 0; v < this.voices; v++) {
+      const b = Math.floor(v / W);
+      const j = v % W;
+      const ioBase = b * blockIO;
+      const sBase = b * re * W;
+      // marshal inputs in
+      for (const name of this.inputNames) {
+        const src = this._vInViews[name]!;
+        const dst = this._vJsIn[name]!;
+        for (let i = 0; i < n; i++) dst[i] = src[ioBase + i * W + j]!;
+      }
+      // marshal state in
+      for (let k = 0; k < elements; k++) js[k] = sv[sBase + k * W + j]!;
+      // set per-voice scalars
+      for (const slot of this._vJsScalarSlots) this._vJsArgs[slot.index] = this.round(this.scalarForVoice(scalars, slot.name, v));
+      // run the kernel
+      this.jsKernel(...this._vJsArgs);
+      // marshal output out
+      for (const name of this.outputNames) {
+        const out = this._vOutViewsA[name]!;
+        const jo = this._vJsOut[name]!;
+        for (let i = 0; i < n; i++) out[ioBase + i * W + j] = jo[i]!;
+      }
+      // marshal state back
+      for (let k = 0; k < elements; k++) sv[sBase + k * W + j] = js[k]!;
+    }
+  }
+
+  /** Lane-pack the per-voice scalar slab for the WASM voice kernel. */
+  private fillScalarsVoice(scalars: Record<string, number | ArrayLike<number>>): void {
+    if (this.vScalarCount === 0) return;
+    const sv = this._vScalarView!;
+    const W = this.W;
+    const scalarBlock = this.vScalarCount * W;
+    for (let s = 0; s < this.scalarNames.length; s++) {
+      const name = this.scalarNames[s]!;
+      for (let v = 0; v < this.voices; v++) {
+        const b = Math.floor(v / W);
+        const j = v % W;
+        sv[b * scalarBlock + s * W + j] = this.round(this.scalarForVoice(scalars, name, v));
+      }
+    }
+  }
+
+  /** Translate caller-interleaved inputs ([i·V + v]) → batched slabs ([i·W + j]). */
+  private copyInputsVoice(inputs: Record<string, ArrayLike<number>>, n: number): void {
+    const W = this.W;
+    const V = this.voices;
+    const blockIO = this.maxBlock * W;
+    for (const name of this.inputNames) {
+      const src = inputs[name];
+      if (!src || src.length < n * V) throw new Error(`JitKernelConsumer.process: inputs["${name}"] missing or shorter than n·voices=${n * V}`);
+      const view = this._vInViews[name]!;
+      for (let i = 0; i < n; i++) {
+        for (let v = 0; v < V; v++) {
+          const b = Math.floor(v / W);
+          const j = v % W;
+          view[b * blockIO + i * W + j] = src[i * V + v]!;
+        }
+      }
+    }
+  }
+
+  /** Project generation A's batched output slabs → caller-interleaved outs ([i·V + v]). */
+  private copyAtoOutsVoice(outs: Record<string, WritableBuffer>, n: number): void {
+    const W = this.W;
+    const V = this.voices;
+    const blockIO = this.maxBlock * W;
+    for (const name of this.outputNames) {
+      const a = this._vOutViewsA[name]!;
+      const dst = outs[name]!;
+      for (let i = 0; i < n; i++) {
+        for (let v = 0; v < V; v++) {
+          const b = Math.floor(v / W);
+          const j = v % W;
+          dst[i * V + v] = a[b * blockIO + i * W + j]!;
+        }
+      }
+    }
+  }
+
+  /** Per-sample (per-TIME) amplitude crossfade A→B into caller-interleaved outs. */
+  private blendVoice(outs: Record<string, WritableBuffer>, n: number, baseNs: number, sr: number): void {
+    const W = this.W;
+    const V = this.voices;
+    const blockIO = this.maxBlock * W;
+    const nsPerSample = 1e9 / sr;
+    for (const name of this.outputNames) {
+      const a = this._vOutViewsA[name]!;
+      const bv = this._vOutViewsB[name]!;
+      const dst = outs[name]!;
+      for (let i = 0; i < n; i++) {
+        const w = this.swap.weightAt(baseNs + i * nsPerSample);
+        for (let v = 0; v < V; v++) {
+          const b = Math.floor(v / W);
+          const j = v % W;
+          const idx = b * blockIO + i * W + j;
+          dst[i * V + v] = a[idx]! + w * (bv[idx]! - a[idx]!);
+        }
+      }
+    }
+  }
+
+  /** True iff every generation-B output sample over the voice batch is finite. */
+  private outputsFiniteBVoice(n: number): boolean {
+    const W = this.W;
+    const V = this.voices;
+    const blockIO = this.maxBlock * W;
+    for (const name of this.outputNames) {
+      const bv = this._vOutViewsB[name]!;
+      for (let i = 0; i < n; i++) {
+        for (let v = 0; v < V; v++) {
+          const b = Math.floor(v / W);
+          const j = v % W;
+          if (!Number.isFinite(bv[b * blockIO + i * W + j]!)) return false;
+        }
+      }
+    }
+    return true;
   }
 }
 
