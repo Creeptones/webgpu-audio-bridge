@@ -2222,6 +2222,8 @@ Three realms, three entry points (one file): `connectJit(spec)` (main), `runJitC
 
 Live demo: `npm run dev:jit-vectorize` (`examples/jit-vectorize/`, port 5185 — a naive cubic waveshaper silently upgrading to SIMD mid-playback with zero audible glitch). Speedups + the swap-glitch / quantum-budget numbers: `npm run bench:jit` (3.8×–9.2×). Design note: [`docs/jit-vectorize-design.md`](./docs/jit-vectorize-design.md).
 
+The **kernel grammar** (Apollo Frontier 6, `0.9.918`–`0.9.919`) extends this: a DSP kernel can be expressed as a closed-grammar **token stream** instead of JS, content-addressed and gate-verified through the same equivalence gate, with a `KernelCache` that makes a repeated kernel free. Live demo: `npm run dev:kernel-palette` (`examples/kernel-palette/`, port 5186 — pick a kernel from a palette; it compiles + gate-verifies and live-swaps into the running AudioWorklet, and re-picking it is a visible **cache hit**). Design note: [`docs/frontier6-grammar-design.md`](./docs/frontier6-grammar-design.md).
+
 > **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectJit` + the JIT compiler/runtime may break across PATCH releases until the JIT promotes to the root. The compilable sub-language is documented by the gate (one counted loop, affine array loads, the `Math.min`/`max`/`abs`/`sqrt`/`floor`/`ceil`/`trunc` whitelist). `compileKernel` requires an injected `compileWat` (WAT→bytes); the zero-runtime-dep core ships no encoder — tests/bench inject wabt, the demo vendors it. A one-shot `console.warn` fires on first compile.
 
 ## What this is, and what it isn't

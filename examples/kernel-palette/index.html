@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — Kernel Palette (token grammar → gate → cache → live audio)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 880px; }
+      h1 { font-size: 18px; margin: 0 0 16px; color: #fff; }
+      h2 { font-size: 13px; margin: 24px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 18px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #force { background: #7a3df4; } #force:hover:not(:disabled) { background: #9355ff; }
+      #reload { background: #2f7a55; } #reload:hover:not(:disabled) { background: #3a9568; }
+      label { display: block; margin: 12px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      select, input[type=range] { width: 100%; font: inherit; }
+      select { background: #15171c; color: #d4d7dc; border: 1px solid #21252d; border-radius: 6px; padding: 8px 10px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; } .dim { color: #6b7280; }
+      .wbarwrap { height: 14px; background: #101218; border: 1px solid #21252d; border-radius: 7px; overflow: hidden; margin: 8px 0; }
+      .wbar { height: 100%; width: 0%; background: #2b3550; transition: width 60ms linear; }
+      .wbar.fade { background: linear-gradient(90deg, #7a3df4, #c79bff); }
+      .wbar.done { background: #2f7a55; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+      pre.k { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; overflow-x: auto; color: #c8cdd4; }
+      #scalars > div { margin-bottom: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — Kernel Palette</h1>
+    <p>
+      Apollo Frontier 6 turns the JIT into a <strong>language→music</strong> engine: a model emits DSP kernels as
+      <strong>token streams</strong> in a closed kernel grammar, each <strong>content-addressed</strong>,
+      <strong>gate-verified</strong> bit-exact, and live-swapped into a running AudioWorklet. There is no model yet — this
+      demo drives the <em>model-free</em> chain with a hand-authored palette. Pick a kernel: a background worker runs the
+      syntax + equivalence gates, <code>getOrCompile</code> caches it by content hash, and the gate-verified WASM SIMD
+      kernel <strong>fades in over the JS fallback click-free</strong>. <strong>Re-pick a kernel and it is a cache
+      hit</strong> — the same characterized kernel, no recompile.
+    </p>
+
+    <h2>Kernel</h2>
+    <select id="kernel" disabled></select>
+    <pre class="k" id="tokens">(pick a kernel to see its self-contained token stream)</pre>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="reload" disabled>Re-pick (cache hit) ↻</button>
+    <button id="force" disabled>Force JS</button>
+
+    <h2>Crossfade weight (audio clock — JS → SIMD)</h2>
+    <div class="wbarwrap"><div id="wbar" class="wbar"></div></div>
+
+    <h2>Grammar · gate · cache</h2>
+    <div id="hud" class="panel"></div>
+
+    <h2>Controls</h2>
+    <div class="grid">
+      <div>
+        <label for="freq">oscillator <span class="val" id="freq-val"></span> Hz</label>
+        <input id="freq" type="range" min="55" max="440" step="1" value="110" />
+      </div>
+      <div>
+        <label for="level">input level <span class="val" id="level-val"></span>×</label>
+        <input id="level" type="range" min="0.2" max="2" step="0.01" value="1.3" />
+      </div>
+    </div>
+    <div id="scalars"></div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Open DevTools and check <code>crossOriginIsolated === true</code>. The compile + cache run in a background worker
+      (one <code>KernelCache</code> + vendored wabt); the equivalence gate proves each SIMD kernel bit-exact before it can
+      reach the audio thread; the worklet installs the bytes between quanta and crossfades click-free. Experimental
+      (<code>webgpu-audio-bridge/experimental</code>). Sibling demo: <code>npm run dev:jit-vectorize</code> (the JS-path
+      off-thread compile).
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

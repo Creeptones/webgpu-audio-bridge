@@ -4,6 +4,70 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.920] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 1 (demo): the kernel-palette hot-swap browser demo
+
+Stage 1 shipped the model-free `tokens → IR → gate → install → audio` pipeline + the
+content-addressed `KernelCache`. This patch makes that chain *tangible in the browser*:
+a new `examples/kernel-palette/` demo where picking a kernel from a palette compiles +
+gate-verifies its token stream and live-swaps the gate-verified WASM SIMD kernel into a
+running AudioWorklet click-free — and **re-picking a kernel is a visible CACHE HIT**
+(the same characterized kernel, no recompile). Additive example only — no library code
+changes.
+
+- **`examples/kernel-palette/`** — six hand-authored TOKEN kernels (the Stage-3 SLM
+  stand-in: gain / hardclip / cubic-softclip / ringmod / mix / rectify-scale — exactly
+  the palette `tests/compileTokens.test.ts` pins gate bit-exact). Each is built as an
+  `IrKernel` and serialized with `kernelToTokens` to a self-contained token stream.
+  - **A background compile + cache worker** (`worker.js`) holds ONE `KernelCache` (the
+    Stage-1 class) + the vendored wabt encoder. Each selection `getOrCompile`s the
+    stream: a miss runs the syntax + equivalence gates and characterizes; a hit returns
+    the same characterized kernel with `cached: true` and no recompile. The `cached`
+    flag, the gate report, the content hash, and the gate-verified SIMD bytes flow back
+    to the page.
+  - **`connectJit({ tokens })`** on the page builds the worklet `processorOptions`
+    (shared memory + the `emitJsKernel` JS fallback); the gate-verified bytes are
+    installed into the worklet and fade in over the JS fallback click-free.
+  - **A signature-driven worklet** (`worklet.js`) generates one oscillator per input
+    array and runs the consumer — so the single demo plays every kernel shape (1/2
+    inputs, 0/1 scalars, f32/f64) without per-kernel worklet code.
+  - The HUD surfaces COMPILED-vs-CACHE-HIT, the gate characterization (worst ULP,
+    comparisons), the content hash, the live cache size, and the flat token text.
+- **`npm run dev:kernel-palette`** (port 5186) — serves it with the COOP/COEP
+  isolation headers + the bare-`acorn` rewrite (the shared experimental barrel
+  transitively imports acorn even though the token path is acorn-free at runtime).
+
+### Why — make the grammar + the cache visible
+
+Stage 1 proved the model-free chain in Node; this demo proves it in a real AudioWorklet
+and makes the content-addressed cache *observable* — the whole point of
+content-addressing (a repeated computation is free) only lands when you can watch a
+re-selected kernel skip the gate and swap instantly. It also exercises the `connectJit`
+token path + the `emitJsKernel` fallback end-to-end in the browser, ahead of the
+Stage-2 acoustic gate and the Stage-3 model.
+
+### Wire compatibility
+
+**Unchanged.** A new example + one `package.json` dev script; no source, type, SAB
+layout, or dependency change. The demo consumes only existing
+`webgpu-audio-bridge/experimental` symbols (`connectJit`, `KernelCache`,
+`kernelToTokens`, `tokensToString`, `kernelHash`). Patch-level per the versioning
+policy.
+
+### Tests
+
+No new automated tests (a browser demo; the token/cache path is already pinned by
+`tests/compileTokens.test.ts` + `tests/connectJit.test.ts` pin G). `npm run typecheck`
+clean (examples are outside the tsc `include`), full `npm test` green, `npm run bench`
+push/pull/pullLatest within the ~1.20 µs baseline. A Playwright smoke for the palette
+is a deliberate follow-up.
+
+### Documentation
+
+- **`README.md`** — a kernel-palette demo paragraph under the Autonomous JIT section.
+- **`CLAUDE.md`** "What lives where" — noted the new demo on the `src/jit/` entry.
+
 ## [0.9.919] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 1: the model-free compile pipeline + content-addressed characterized cache
