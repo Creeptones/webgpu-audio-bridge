@@ -73,6 +73,14 @@ function fmtUs(us) {
   return us < 1 ? `${(us * 1000).toFixed(0)} ns` : `${us.toFixed(2)} µs`;
 }
 
+// A unicode block sparkline of the L1-normalized magnitude bands (relative scale).
+const SPARK = "▁▂▃▄▅▆▇█";
+function sparkline(bands) {
+  if (!bands || bands.length === 0) return "—";
+  const max = bands.reduce((m, v) => Math.max(m, v), 0) || 1;
+  return bands.map((v) => SPARK[Math.min(SPARK.length - 1, Math.round((v / max) * (SPARK.length - 1)))]).join("");
+}
+
 function render() {
   const d = state.diag;
   const w = d.weight ?? 0;
@@ -102,6 +110,13 @@ function render() {
     }
     lines.push(`<span class="k">gate</span> <span class="v ok">VERIFIED ${lc.gate.status} — worst f32 ULP ${lc.gate.worstUlpF32}, ${lc.gate.casesChecked} cases</span>`);
     lines.push(`<span class="k">content hash</span> <span class="v">${lc.hash}</span>`);
+    if (lc.acoustic) {
+      const a = lc.acoustic;
+      lines.push(
+        `<span class="k">acoustic (gate #3)</span> <span class="v ok">SANE — peak ${a.peak.toFixed(3)} · rms ${a.rms.toFixed(3)} · crest ${a.crestFactor.toFixed(2)} · dc ${a.dcOffset.toFixed(3)} · centroid ${a.spectralCentroid.toFixed(3)}</span>`,
+      );
+      lines.push(`<span class="k">fingerprint</span> <span class="v">${sparkline(a.magnitude)} <span class="dim">(16-band L1-normalized spectrum)</span></span>`);
+    }
   } else {
     lines.push(`<span class="k">cache</span> <span class="v dim">pick a kernel — it compiles + gate-verifies; re-pick it for a cache hit</span>`);
   }
@@ -211,10 +226,14 @@ function onWorkerMessage(e) {
 
   if (m.status !== "accepted") {
     state.lastCompile = null;
-    setStatus([["status", `compile fallback — ${m.verdict}: ${m.detail}`, "err"]]);
+    // gate #3 (rejected-acoustic) is a meaningful verdict, not an error — surface it
+    // with the fingerprint that explains the rejection (peak / dc / non-finite).
+    const cls = m.verdict === "rejected-acoustic" ? "hot" : "err";
+    const fp = m.acoustic ? ` — peak ${m.acoustic.peak.toExponential(2)}, finite ${m.acoustic.finite}` : "";
+    setStatus([["status", `compile fallback — ${m.verdict}: ${m.detail}${fp}`, cls]]);
     return;
   }
-  state.lastCompile = { cached: m.cached, gate: m.gate, hash: m.hash, ms };
+  state.lastCompile = { cached: m.cached, gate: m.gate, hash: m.hash, acoustic: m.acoustic, ms };
 
   // Install the gate-verified SIMD bytes (a no-op if the host isn't JIT-enabled —
   // audio then stays on the JS fallback forever, the graceful-degrade floor).

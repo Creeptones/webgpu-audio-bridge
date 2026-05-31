@@ -1,9 +1,10 @@
 # Apollo Frontier 6 — the kernel grammar + the model-free compile pipeline (design note)
 
-> Status: Stage 0 (`0.9.918`) + Stage 1 (`0.9.919`) shipped. Model-free. The
-> Stage-3 small language model (SLM) is future. This note is the analogue of
-> `docs/jit-vectorize-design.md` for Frontier 6 — it records *why* the grammar is
-> shaped the way it is and what the Stage-1 plumbing locks in before any model.
+> Status: Stage 0 (`0.9.918`) + Stage 1 (`0.9.919`) + Stage 2 (`0.9.921`, the
+> acoustic gate) shipped. Model-free. The Stage-3 small language model (SLM) is
+> future. This note is the analogue of `docs/jit-vectorize-design.md` for Frontier 6
+> — it records *why* the grammar is shaped the way it is and what the model-free
+> plumbing locks in before any model.
 
 ## The bet
 
@@ -40,13 +41,14 @@ for a different failure class:
 |---|------|-------|---------|--------|
 | 1 | **Syntax** | `validateTokens` (`kernelGrammar.ts`) | malformed IR — stack underflow, unknown op, fractional stride, undeclared name | ✓ Stage 0 |
 | 2 | **Equivalence** | `runGate` (`gate.ts`), via `compileTokens` → `compileIr` | a faithful-looking but *numerically wrong* vectorization | ✓ Frontier 5 |
-| 3 | **Acoustic** | — | a bit-exact kernel that *sounds wrong* (taste, not faithfulness) | Stage 2, reserved |
+| 3 | **Acoustic** | `acousticGate` (`acousticGate.ts`), via `KernelCache.getOrCompile` | a bit-exact kernel that is *numerically insane* (non-finite / runaway peak / DC) | ✓ Stage 2 |
 
 Gate #1 proves the stream is well-formed IR. Gate #2 proves the SIMD candidate equals
-its scalar reference. Gate #3 (future) proves the *result is musically intended* — a
-gap the equivalence gate structurally cannot close, because the IR is the spec and
-the gate only proves the SIMD matches it. `CharacterizedKernel.acoustic?` is reserved
-now so the message format is forward-compatible.
+its scalar reference. Gate #3 proves the *result is acoustically sane* (finite +
+within sane bounds) and attaches a fingerprint — a gap the equivalence gate
+structurally cannot close, because the IR is the spec and the gate only proves the
+SIMD matches it (a bit-exact vectorization of an insane spec is still insane).
+`CharacterizedKernel.acoustic` carries the fingerprint on every characterized kernel.
 
 ## Why postfix (RPN)
 
@@ -167,13 +169,13 @@ interface CharacterizedKernel {
   gate: GateReport;             // the equivalence characterization (gate #2)
   wasm: Uint8Array;             // gate-PASSED SIMD bytes
   jsSource: string;             // emitJsKernel(ir) — the worklet fallback
-  // acoustic?: AcousticProfile; // gate #3 — RESERVED (Stage 2)
+  acoustic: AcousticProfile;    // gate #3 — the acoustic fingerprint (Stage 2)
 }
 ```
 
 `hash` is the join key (cache + identity); `tokens` is the model-facing form;
-`gate`/`wasm`/`jsSource` are the runtime-facing artifacts; `acoustic?` is the
-forward-compatible slot for the third gate.
+`gate`/`wasm`/`jsSource` are the runtime-facing artifacts; `acoustic` is the gate-#3
+fingerprint (level + spectral shape), present on every characterized kernel.
 
 ## `connectJit` token path
 
@@ -185,19 +187,74 @@ compile request; `runJitCompile` branches `"tokens"` → `compileTokens`, JS →
 discriminant, so the pre-Frontier-6 request shape still type-checks — the `{ kernel }`
 path is 100% intact.
 
+## Stage 2 — the acoustic gate (gate #3)
+
+Gate #2 can accept a kernel that is bit-exactly faithful to a *numerically insane*
+spec: the SIMD equals the scalar, both insane (an enormous-gain kernel, a
+multiply-overflow kernel, a divide that runs to ±Inf). Gate #3 is the deterministic
+floor that catches that class **without a model** — and the fingerprint it attaches is
+the feature vector a Stage-3 model selects against.
+
+```
+IR ──acousticGate(ir)──▶ { ok, profile } | { ok:false, profile, reason }
+       │  (evalReference over a fixed sine probe — NO wasm)
+       └─▶ KernelCache.getOrCompile: pass ⇒ attach profile; fail ⇒ rejected-acoustic
+```
+
+- **Scope: acoustic SANITY + a FINGERPRINT, not TASTE.** It is *not* "is this the
+  musically-correct kernel" (the model's / a human's job). It runs the accepted IR over
+  a fixed deterministic probe, extracts an `AcousticProfile`, ACCEPTs iff finite +
+  within sane bounds, and ATTACHes the fingerprint. It deliberately does not overclaim:
+  a kernel can be acoustically sane and still be the wrong kernel.
+- **No wasm — profiling the reference == profiling the SIMD.** Gate #2 already proved
+  the SIMD candidate equals the scalar reference bit-exactly (f64) / within-ULP (f32),
+  so profiling a faithful scalar evaluation of the IR is equivalent to profiling the
+  SIMD — with ZERO `WebAssembly.Instance`. `evalReference(ir, inputs, scalars, n)`
+  (exported, reusable by Stage 3) interprets the IR in JS, rounding every leaf +
+  arithmetic result to the lane width (`Math.fround` for f32), so for an f32 kernel it
+  is *bit-identical* to the scalar WASM the gate compiled. The whole gate is pure +
+  Node-testable.
+- **Deterministic.** No `Date.now` / `Math.random` — a fixed bin-aligned sine probe
+  (full-scale, a distinct harmonic per input) + a stock radix-2 FFT. Same kernel ⇒
+  byte-identical profile ⇒ a cacheable, pinnable verdict. The profile is computed
+  **once per content hash** (the cache attaches it; free on a hit).
+- **The `AcousticProfile`** (level + spectral shape, read from the primary output;
+  finiteness checked across all outputs):
+  - `finite` — true iff every sample of every output is finite (the load-bearing
+    safety: a NaN/Inf anywhere rejects);
+  - `rms` / `peak` / `dcOffset` / `crestFactor` — level statistics;
+  - `spectralCentroid` — normalized [0,1] of Nyquist (a timbre coordinate);
+  - `magnitude` — a 16-band L1-normalized magnitude fingerprint over the AC spectrum.
+    L1-normalization makes it **amplitude-invariant** (a gain change leaves it
+    unchanged), so it is a "sounds-like" shape vector — the basis for dedup-by-sound /
+    similarity search and the Stage-3 model's features.
+- **Sane bounds** (generous defaults — they catch genuine blowups, never legitimate
+  effects; tunable via `GetOrCompileOptions.acoustic`): `maxPeak` 1e3, `maxAbsDcOffset`
+  1e3, `maxCrestFactor` 1e4 (the crest bound is skipped for a silent output).
+- **The cache layer owns the gate.** `rejected-acoustic` is added to
+  `GetOrCompileResult` ONLY — `compileIr` / `compileTokens` (the equivalence layer)
+  are untouched, so gate #3 is a cache-layer concern. A rejected kernel is not stored
+  (rejection is a value).
+- **Why a div-by-0 kernel can't demonstrate the gap.** A natural "passes #2, fails #3"
+  candidate is `out = x / 0`, but `f32x4.div(0,0)` and scalar `f32.div(0,0)` produce
+  *different NaN payloads* in V8, so it is gate-#2-*rejected* before gate #3 sees it.
+  The test's pathologies use only `mul` (bit-stable SIMD-vs-scalar even on the corpus's
+  NaN edge input): `(x·3e38)·3e38` overflows to ±Inf (→ `non-finite`) and `x·1e9` runs
+  the peak past the bound (→ `peak-out-of-bounds`), both *after* passing gate #2.
+
 ## Dependency quarantine, preserved
 
-The token path is **acorn-free**: `kernelGrammar.ts`, `emitJsKernel.ts`, and
-`kernelCache.ts` depend only on the IR types + the gate, never on the parser. The
-JitCompiler import-graph guard still pins that the zero-runtime-dep 1.0 core never
-reaches `acorn` (it lives only behind `parse.ts`, on the JS path).
+The token path is **acorn-free**: `kernelGrammar.ts`, `emitJsKernel.ts`,
+`kernelCache.ts`, and `acousticGate.ts` depend only on the IR types + the gate, never
+on the parser. The JitCompiler import-graph guard still pins that the zero-runtime-dep
+1.0 core never reaches `acorn` (it lives only behind `parse.ts`, on the JS path).
 
 ## What is deliberately *not* here yet
 
 - **The model.** Stage 1's palette is hand-authored. The SLM + constrained decoder is
-  Stage 3.
-- **The acoustic gate.** Gate #3 (does it *sound* intended?) is Stage 2. The field is
-  reserved; the logic is not built.
+  Stage 3. (Gate #3 — the acoustic gate — shipped in Stage 2; see above.)
+- **Acoustic *taste*.** Gate #3 is sanity + a fingerprint, NOT "is this the musically
+  intended kernel" — that judgment is the model's / a human's, against the fingerprint.
 - **Statefulness.** No recurrence in the grammar. The stateful-palette division is
   later.
 - **A negative cache.** `getOrCompile` does not memoize *rejections* (only accepted

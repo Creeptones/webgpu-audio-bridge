@@ -56,6 +56,17 @@ export type {
   CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult,
 } from "./kernelCache.js";
 
+// ── Stage-2 acoustic gate (gate #3) ──────────────────────────────────────────
+// `acousticGate(ir, opts)` runs the accepted IR over a deterministic probe (no wasm —
+// gate #2 already proved SIMD ≡ the IR reference) and returns an `AcousticProfile`
+// fingerprint, accepting iff it is finite + within sane bounds. `evalReference` is the
+// pure IR interpreter the probe rides on (reusable by Stage 3). `KernelCache` owns the
+// gate; this is the standalone surface. See acousticGate.ts.
+export { acousticGate, evalReference } from "./acousticGate.js";
+export type {
+  AcousticProfile, AcousticGateOptions, AcousticGateResult,
+} from "./acousticGate.js";
+
 // ── live-swap runtime (Stage 1b) ─────────────────────────────────────────────
 export { JitKernelSwap } from "./JitKernelSwap.js";
 export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum } from "./JitKernelSwap.js";

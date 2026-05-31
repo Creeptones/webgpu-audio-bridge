@@ -4,6 +4,86 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.921] — 2026-05-31
+
+### Added — Apollo Frontier 6, Stage 2: the acoustic gate (gate #3)
+
+The three-gate stack's last *deterministic, model-free* gate. The equivalence gate
+(#2) proves the SIMD kernel equals its scalar reference — *faithfulness* — but it
+structurally cannot prove the kernel *sounds sane*, because the IR is the spec and the
+gate only proves SIMD ≡ that spec. Gate #3 closes that gap: it runs the accepted IR
+over a fixed deterministic probe, extracts a small acoustic fingerprint, ACCEPTs iff
+the fingerprint is finite + within sane bounds, and ATTACHes it for downstream use.
+All additive, experimental-subpath, wire-compat unchanged.
+
+- **`src/jit/acousticGate.ts`** — `acousticGate(ir, opts) → { ok, profile } | { ok:
+  false, profile, reason }` (rejection is a VALUE, never thrown). It is **acoustic
+  SANITY + a FINGERPRINT, not TASTE** — not "is this the musically-correct kernel"
+  (that is the model's / a human's job), but "is this finite and within sane bounds,
+  and what does it sound like".
+  - **`AcousticProfile`** — `finite` (across ALL outputs) + `rms` / `peak` /
+    `dcOffset` / `crestFactor` / `spectralCentroid` + a 16-band L1-normalized
+    `magnitude` fingerprint (amplitude-invariant — a gain change leaves it unchanged,
+    so it is a "sounds-like" shape vector), read from the primary output.
+  - **No wasm.** Gate #2 already proved SIMD ≡ the scalar IR reference bit-exactly, so
+    profiling a faithful scalar evaluation of the IR is equivalent to profiling the
+    SIMD — with ZERO `WebAssembly.Instance`. `evalReference(ir, inputs, scalars, n)`
+    (exported, reusable by Stage 3) interprets the IR in JS, rounding every leaf +
+    arithmetic result to the lane width (`Math.fround` for f32), so for an f32 kernel
+    it is bit-identical to the scalar WASM the gate compiled.
+  - **Deterministic.** No `Date.now` / `Math.random` — a fixed bin-aligned sine probe
+    + a stock radix-2 FFT. Same kernel ⇒ byte-identical profile ⇒ a cacheable,
+    pinnable verdict.
+  - **Sane bounds** (generous defaults — they catch genuine blowups, not legitimate
+    effects): `maxPeak` 1e3, `maxAbsDcOffset` 1e3, `maxCrestFactor` 1e4.
+- **`KernelCache` owns gate #3.** `getOrCompile` runs `acousticGate` after the
+  equivalence gate accepts: a pass attaches the profile to the `CharacterizedKernel`
+  (the previously-reserved `acoustic` field, now **present on every characterized
+  kernel** — computed ONCE per content hash, free on a hit); a runaway/non-finite
+  kernel returns the new **`rejected-acoustic`** verdict (in `GetOrCompileResult`
+  ONLY — the equivalence layer `compileIr` / `compileTokens` is untouched) and is NOT
+  stored. `GetOrCompileOptions.acoustic` tunes the probe + bounds.
+- **The palette demo surfaces it for free** — the worker forwards the cache-attached
+  `acoustic` profile + handles `rejected-acoustic`; the HUD shows the level/spectral
+  fingerprint + a 16-band sparkline of the magnitude spectrum.
+
+### Why — close faithfulness → sanity, and seed the model's feature vector
+
+Gate #2 can accept a kernel that is bit-exactly faithful to a *numerically insane*
+spec (e.g. an enormous-gain or overflow kernel — the SIMD equals the scalar, both
+insane). Gate #3 is the deterministic floor that catches that class without a model,
+and the fingerprint it attaches is exactly the feature vector a Stage-3 model selects
+against (and the basis for dedup-by-sound / "sounds-like" search). It is the last
+model-free piece before the SLM, deliberately scoped to sanity so it never overclaims
+taste.
+
+### Wire compatibility
+
+**Unchanged.** Additive fields/statuses on experimental-subpath types only:
+`CharacterizedKernel.acoustic` (the reserved slot, now populated),
+`rejected-acoustic` added to `GetOrCompileResult`, `GetOrCompileOptions.acoustic`. No
+SAB layout, no wire-format, no public 1.0-core change. Patch-level per the versioning
+policy.
+
+### Tests
+
+- **`tests/acousticGate.test.ts`** (4 pins, registered in `test` + `test:unit`): the
+  palette is acoustically sane + the `gain` fingerprint is structurally pinned;
+  pathological kernels — a multiply-overflow ((x·3e38)·3e38) and an enormous-gain
+  (×1e9) — **PASS gate #2 yet are rejected by gate #3** (`non-finite` /
+  `peak-out-of-bounds`) and are not cached; determinism (byte-identical profile across
+  runs) + `evalReference` math exactness; the cache attaches the profile + a hit
+  returns it without re-running gate #3. `npm run typecheck` clean, full `npm test`
+  green, `npm run bench` push/pull/pullLatest within the ~1.20 µs baseline.
+
+### Documentation
+
+- **`docs/frontier6-grammar-design.md`** — the three-gate table's gate-#3 row is now
+  shipped; a new "Stage 2 — the acoustic gate" section documents the profile, the
+  no-wasm reasoning, the bounds, and the scope ("sanity + fingerprint, not taste").
+- **`CLAUDE.md`** "What lives where" — the `src/jit/` entry now describes gate #3.
+- **`README.md`** — an acoustic-gate paragraph under the Autonomous JIT section.
+
 ## [0.9.920] — 2026-05-31
 
 ### Added — Apollo Frontier 6, Stage 1 (demo): the kernel-palette hot-swap browser demo

@@ -4,8 +4,10 @@
 // injected wabt WAT→bytes encoder. For each `{ type:"compile", tokens }` request it
 // calls `cache.getOrCompile(tokens, { compileWat })`:
 //   • a MISS runs the SYNTAX gate (validateTokens) → the EQUIVALENCE gate
-//     (compileIr: vectorize + emit + prove SIMD ≡ scalar bit-exact/within-ULP) →
-//     characterize + store, and returns `cached:false`;
+//     (compileIr: vectorize + emit + prove SIMD ≡ scalar bit-exact/within-ULP) → the
+//     ACOUSTIC gate (gate #3: profile the IR over a deterministic probe, reject a
+//     runaway/non-finite kernel as `rejected-acoustic`) → characterize + store, and
+//     returns `cached:false` with the acoustic fingerprint attached;
 //   • a HIT returns the SAME characterized kernel with `cached:true` and NO
 //     recompile — the property that makes a repeated kernel free.
 // The `cached` flag, the gate report, and the gate-verified SIMD bytes flow back to
@@ -55,11 +57,16 @@ self.onmessage = async (e) => {
     const r = cache.getOrCompile(m.tokens, { compileWat: makeCompileWat(wabt) });
 
     if (r.status !== "accepted") {
+      // rejected-acoustic (gate #3) carries a `reason` like unsupported does, so the
+      // final branch catches it; the profile is forwarded for the HUD.
       const detail =
         r.status === "rejected-source" ? `${r.diagnostic.code}: ${r.diagnostic.message}`
         : r.status === "rejected-gate" ? (r.gate.reason ?? "gate mismatch")
         : r.reason;
-      self.postMessage({ type: "compiled", id: m.id, status: "fallback", verdict: r.status, detail });
+      self.postMessage({
+        type: "compiled", id: m.id, status: "fallback", verdict: r.status, detail,
+        acoustic: r.status === "rejected-acoustic" ? r.profile : undefined,
+      });
       return;
     }
 
@@ -75,6 +82,7 @@ self.onmessage = async (e) => {
       hash: r.kernel.hash,
       exportName: r.kernel.exportName,
       gate: r.kernel.gate,
+      acoustic: r.kernel.acoustic, // gate #3 fingerprint (free — the cache attached it)
       cacheSize: cache.size,
       bytes,
     }, [bytes.buffer]);

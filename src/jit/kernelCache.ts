@@ -19,7 +19,15 @@
  * Pure + Node-testable: no I/O, no clock, no randomness. Rejection is a VALUE
  * (mirrors `compileTokens` / `compileKernel`) — a malformed stream returns
  * `rejected-source` (with the `E_TOKENS` diagnostic), an out-of-subset shape
- * `unsupported`, a gate failure `rejected-gate`; none are cached as accepted.
+ * `unsupported`, an equivalence-gate failure `rejected-gate`, an acoustic-gate
+ * failure `rejected-acoustic`; none are cached as accepted.
+ *
+ * The cache layer OWNS gate #3 (the acoustic gate). After the equivalence gate
+ * accepts, `acousticGate` runs the IR over a deterministic probe and ACCEPTs iff the
+ * `AcousticProfile` is finite + within sane bounds — attaching the profile to the
+ * `CharacterizedKernel` (so it is computed ONCE per content hash, free on a hit) and
+ * rejecting a runaway/non-finite kernel as `rejected-acoustic`. Gate #3 lives only
+ * here, not in `compileIr` / `compileTokens` (the equivalence layer is untouched).
  *
  * `@experimental` — exported from `webgpu-audio-bridge/experimental`.
  */
@@ -30,13 +38,13 @@ import { type CompileWat, type GateReport } from "./gate.js";
 import { type CorpusOptions } from "./corpus.js";
 import { compileIr, type CompileResult } from "./compileKernel.js";
 import { emitJsKernel } from "./emitJsKernel.js";
+import { acousticGate, type AcousticProfile, type AcousticGateOptions } from "./acousticGate.js";
 import {
   validateTokens, kernelHash, kernelToTokens, type KernelToken,
 } from "./kernelGrammar.js";
 
-/** A kernel that has passed the syntax + equivalence gates and been characterized.
- *  The `acoustic` field is RESERVED for Stage 2 (the third gate) — left open so the
- *  message format is forward-compatible. */
+/** A kernel that has passed the syntax + equivalence + acoustic gates and been
+ *  characterized. */
 export interface CharacterizedKernel {
   /** Content address / identity — `kernelHash(ir)` (the cache key). */
   readonly hash: string;
@@ -52,7 +60,11 @@ export interface CharacterizedKernel {
   readonly wasm: Uint8Array;
   /** The naive scalar JS the worklet runs as the permanent fallback / fade source. */
   readonly jsSource: string;
-  // readonly acoustic?: AcousticProfile;  // Stage 2 — the third (acoustic) gate.
+  /** The acoustic-gate (#3) fingerprint over a deterministic probe (level + spectral
+   *  shape). PRESENT on every characterized kernel (gate #3 passed). Computed once per
+   *  content hash; free on a cache hit. The Stage-3 model's feature vector + the
+   *  basis for dedup-by-sound / "sounds-like" search. */
+  readonly acoustic: AcousticProfile;
 }
 
 /** Options for `KernelCache.getOrCompile` — the injected WAT→bytes compiler plus the
@@ -62,13 +74,18 @@ export interface GetOrCompileOptions {
   readonly exportName?: string;
   readonly corpus?: CorpusOptions;
   readonly maxUlpF32?: number;
+  /** Tuning for gate #3 (the acoustic probe + sane bounds). Defaults are generous —
+   *  they catch genuine blowups, not legitimate effects. */
+  readonly acoustic?: AcousticGateOptions;
 }
 
 /** The result of `getOrCompile`: an `accepted` carrying the characterized kernel +
- *  a `cached` flag (true ⇒ returned from the store without recompiling), or exactly
- *  the failure variants of `CompileResult` (rejection is a value). */
+ *  a `cached` flag (true ⇒ returned from the store without recompiling), the failure
+ *  variants of `CompileResult` (rejection is a value), or `rejected-acoustic` — the
+ *  cache-layer-only gate-#3 verdict (the equivalence layer never emits it). */
 export type GetOrCompileResult =
   | { readonly status: "accepted"; readonly kernel: CharacterizedKernel; readonly cached: boolean }
+  | { readonly status: "rejected-acoustic"; readonly profile: AcousticProfile; readonly reason: string }
   | Exclude<CompileResult, { readonly status: "accepted" }>;
 
 /**
@@ -103,8 +120,10 @@ export class KernelCache {
    * Look up (or, on a miss, compile + characterize + store) the kernel for a token
    * stream. On a HIT the SAME `CharacterizedKernel` object is returned with
    * `cached: true` and NO recompile happens (the property that makes a repeated
-   * kernel free — assert it by object identity). On a syntax/equivalence/support
-   * failure the matching failure variant is returned and nothing is stored.
+   * kernel free — assert it by object identity); the attached acoustic profile is
+   * returned without re-running gate #3. On a miss the stream runs the full
+   * three-gate stack (syntax → equivalence → acoustic); a syntax/support/equivalence/
+   * acoustic failure returns the matching failure variant and nothing is stored.
    */
   getOrCompile(tokens: ReadonlyArray<KernelToken>, opts: GetOrCompileOptions): GetOrCompileResult {
     const v = validateTokens(tokens);
@@ -126,6 +145,14 @@ export class KernelCache {
     });
     if (result.status !== "accepted") return result;
 
+    // Gate #3 (acoustic): the equivalence gate proved SIMD ≡ the IR; profile the IR
+    // reference over a deterministic probe and reject a runaway/non-finite kernel.
+    // A rejected kernel is NOT stored (rejection is a value).
+    const acoustic = acousticGate(ir, opts.acoustic);
+    if (!acoustic.ok) {
+      return { status: "rejected-acoustic", profile: acoustic.profile, reason: acoustic.reason };
+    }
+
     const characterized: CharacterizedKernel = {
       hash,
       tokens: kernelToTokens(ir),
@@ -134,6 +161,7 @@ export class KernelCache {
       gate: result.gate,
       wasm: result.wasm,
       jsSource: emitJsKernel(ir),
+      acoustic: acoustic.profile,
     };
     this.store.set(hash, characterized);
     return { status: "accepted", kernel: characterized, cached: false };

@@ -188,3 +188,21 @@ export type {
   CompileIrOptions, CompileTokensOptions,
   CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult,
 } from "../jit/index.js";
+
+// ── The kernel grammar — Stage 2: the acoustic gate (gate #3) ─────────────────
+//
+// Apollo Frontier 6, Stage 2: the last model-free gate. `acousticGate(ir, opts)`
+// runs the equivalence-accepted IR over a fixed DETERMINISTIC probe (a bin-aligned
+// sine) — with NO `WebAssembly.Instance` (gate #2 already proved SIMD ≡ the scalar IR
+// reference, so profiling `evalReference(ir, …)` is equivalent) — and returns an
+// `AcousticProfile` (rms / peak / dcOffset / crestFactor / spectralCentroid + an
+// L1-normalized magnitude fingerprint). It ACCEPTs iff the profile is finite + within
+// sane bounds (acoustic SANITY + a fingerprint, NOT taste). `KernelCache.getOrCompile`
+// owns the gate: a pass attaches the profile to the `CharacterizedKernel` (computed
+// once per content hash, free on a hit); a runaway/non-finite kernel returns
+// `rejected-acoustic` (the cache-layer-only verdict). All additive + `@experimental`.
+// See docs/frontier6-grammar-design.md.
+export { acousticGate, evalReference } from "../jit/index.js";
+export type {
+  AcousticProfile, AcousticGateOptions, AcousticGateResult,
+} from "../jit/index.js";
