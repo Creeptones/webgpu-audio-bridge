@@ -21,6 +21,7 @@
 | **0.9.902** | `Bridge.pullKalmanPredictedLatest(out, opts?)` — wires the predictor to the ring + per-field filters, confidence-bounded (`w = c_horizon · clamp01(1 − maxVar/varianceFloor)`, `confidenceFloor` cliff). Never worse than `pullLatest`. Beside the Taylor `pullPredictedLatest` (untouched). Requires `.withTimestamps`. | `src/Bridge.ts`, `tests/Bridge.kalmanPredict.test.ts` (11 pins), `bench/Bridge.bench.ts` |
 | **0.9.903** | WASM **scalar** kernels (`kalmanIngestCvF64`/`kalmanPredictCvF64` + CA pair on `WorkletConsumer`), bit-exact to JS (left-to-right f64, no FMA). Generic looped update kernel shared by both models. | `wasm/decoder.wat`, `src/worklet/index.ts`, `tests/StatePredictor.wasm.test.ts` (3 pins) |
 | **0.9.904** | WASM **SIMD** kernels (`…SoaSimd` variants), f64x2 lane-parallel over a **struct-of-arrays** state layout, bit-exact to scalar. Bench: **predict 1.60×, ingest 1.52×** vs scalar. | `wasm/decoder.wat`, `src/worklet/index.ts`, `tests/StatePredictor.wasm.test.ts` (+2 pins), `bench/kalman-simd.bench.ts` |
+| **0.9.905** | `pullKalmanPredictedLatest` now uses the gated f32x4 SoA SIMD path for eligible `f32` fields (`sampleCount % 4 === 0`, exports + scratch available). Representative local callsite benchmark: **~10.80 µs JS vs ~2.40 µs f32x4 SoA (~4.50×)** for a 16-lane CA macro field. | `src/Bridge.ts`, `src/worklet/index.ts`, `wasm/decoder.wat`, `bench/kalman-simd.bench.ts` |
 
 ### The two decisive design findings (both probe/bench-driven, both worth remembering)
 
@@ -33,22 +34,20 @@ Also: the independent matrix-Kalman cross-check pin (0.9.901) caught a real tran
 
 ## Known scope edges / honest caveats (don't mistake these for bugs)
 
-- **The WASM kernels are NOT wired into `pullKalmanPredictedLatest`.** Stage 2 (the Bridge pull) uses the **JS** `StatePredictor` (AoS Float64Arrays). The WASM scalar/SIMD kernels are surfaced on `WorkletConsumer` and equivalence-pinned, but a worklet has to call them directly (same status the Hermite WASM evaluators had at 0.9.82–0.9.83 — surfaced + pinned, not auto-wired into the high-level pull). Wiring the SoA-SIMD kernels into a worklet-side predicted pull (with the AoS→SoA transpose + even-`n` padding) is the natural follow-up if a real worklet wants the speedup. The JS path at a realistic macro width (≤16 lanes) is already ~3.2 µs/quantum, well inside budget.
+- **The f32x4 SoA SIMD path is now wired into `pullKalmanPredictedLatest` under the same opt-in gate.** If `kalmanWasm` is configured with a compatible `WorkletConsumer` and scratch setup, eligible trajectory fields (`f32` + `sampleCount % 4 === 0`) run through `kalmanIngest*F32x4SoaSimd` + `kalmanPredict*F32x4SoaSimd`. Otherwise they stay on the JS `StatePredictor`.
 - **SIMD requires even `n`** (documented). No scalar tail — the caller pads an odd lane count (trivial for a fixed-width macro field). If a worklet integration needs odd `n`, add a scalar-SoA tail (a small generic helper) rather than relaxing the SIMD loop.
 - **Bridge confidence uses a single field-level weight** (most-conservative `maxVariance` across lanes), not per-lane. Simpler + strictly safe (one bad lane → whole field holds). Per-lane weighting is a possible refinement if a use case wants it.
 - **`pullKalmanPredictedLatest` predicts at a FIXED lead** (`cachedTimestampNs + leadMs`), matching the Taylor path — it does NOT yet exploit the predictor's monotone stall-variance by predicting at an advancing consumer-mapped time during a famine. That's the single highest-value functional extension (see below).
 - **Tuning is captured once.** The `processNoise`/`meas*Noise`/`initialVariance` opts are read on the FIRST `pullKalmanPredictedLatest` call (when the per-field filters are built). Later changes are ignored — construct a fresh `Bridge` to retune. Documented on `KalmanPredictedPullOptions`.
-- **f32 SIMD not done.** Stage 4 shipped f64x2 (bit-exact). An f32x4 path (4 lanes/iter, within-ULP) is a possible further perf win but was out of scope; f64 is the safe default for covariance.
+- **`kalmanWasm` is intentionally opt-in.** The runtime defaults to JS. To activate SIMD, callers must pass a valid `kalmanWasm` contract (`consumer`, `scratchBuffer`, optional window). This preserves predictable behavior on runtimes without worklet SIMD setup.
 
 ---
 
 ## Future directions (if extending the predictor — in rough value order)
 
 1. **Famine-aware advancing-horizon fade** (highest value, small change). `pullKalmanPredictedLatest` currently predicts at a fixed `leadMs`. Predicting at `pll.phaseLockedTime(consumerNs) + leadNs` when the PLL is locked would make the target ADVANCE during a producer famine → the predictor's monotone covariance growth (already pinned!) would drive a principled crossfade-to-hold as the stall lengthens. This is the predictor's *headline* benefit over Taylor and it's currently underused at the Bridge layer. A focused patch + a `Bridge.recovery`-style famine pin.
-2. **Wire the SoA-SIMD kernels into a worklet predicted pull.** AoS→SoA transpose of the per-field state + even-`n` padding + call `…SoaSimd`. Demo or bench it end-to-end. Only worth it for genuinely wide macro fields.
-3. **f32x4 SIMD** (4 lanes/iter, within-ULP) if a worklet proves the f64x2 path the bottleneck.
-4. **Per-lane confidence weighting** in `pullKalmanPredictedLatest` (each lane bounded by its own variance) if a coherent-but-noisy field wants it.
-5. **A browser demo** (`examples/…`) toggling Taylor vs Kalman prediction on a famine-prone GPU source — the audible/visible counterpart to the numbers, mirroring `examples/hermite-orders`.
+2. **Per-lane confidence weighting** in `pullKalmanPredictedLatest` (each lane bounded by its own variance) if a coherent-but-noisy field wants it.
+3. **A browser demo** (`examples/…`) toggling Taylor vs Kalman prediction on a famine-prone GPU source — the audible/visible counterpart to the numbers, mirroring `examples/hermite-orders`.
 
 ---
 

@@ -596,6 +596,21 @@ export interface WorkletConsumer {
   kalmanPredictCaF64SoaSimd(
     xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
   ): void;
+  kalmanIngestCvF32x4SoaSimd(
+    xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, useVel: number, vscratch: number,
+  ): void;
+  kalmanPredictCvF32x4SoaSimd(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
+  kalmanIngestCaF32x4SoaSimd(
+    xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+    dt: number, q: number, rp: number, rv: number, ra: number,
+    useVel: number, useAcc: number, vscratch: number,
+  ): void;
+  kalmanPredictCaF32x4SoaSimd(
+    xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+  ): void;
 
   /** Descriptor-driven whole-frame decode (0.9.74). Decodes an ENTIRE frame
    *  in ONE call by looping over a pre-built descriptor table (one
@@ -766,6 +781,21 @@ export function instantiateConsumer(
     readonly kalman_predict_ca_f64_soa_simd: (
       xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
     ) => void;
+    readonly kalman_ingest_cv_f32x4_soa_simd: (
+      xOff: number, pOff: number, posOff: number, velOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, useVel: number, vscratch: number,
+    ) => void;
+    readonly kalman_predict_cv_f32x4_soa_simd: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
+    readonly kalman_ingest_ca_f32x4_soa_simd: (
+      xOff: number, pOff: number, posOff: number, velOff: number, accOff: number, n: number,
+      dt: number, q: number, rp: number, rv: number, ra: number,
+      useVel: number, useAcc: number, vscratch: number,
+    ) => void;
+    readonly kalman_predict_ca_f32x4_soa_simd: (
+      xOff: number, pOff: number, valOff: number, varOff: number, n: number, dt: number, q: number,
+    ) => void;
   };
   // Validate every export at instantiation time so a stale or
   // mis-built binary surfaces here rather than as a cryptic "is not a
@@ -826,6 +856,10 @@ export function instantiateConsumer(
     "kalman_predict_cv_f64_soa_simd",
     "kalman_ingest_ca_f64_soa_simd",
     "kalman_predict_ca_f64_soa_simd",
+    "kalman_ingest_cv_f32x4_soa_simd",
+    "kalman_predict_cv_f32x4_soa_simd",
+    "kalman_ingest_ca_f32x4_soa_simd",
+    "kalman_predict_ca_f32x4_soa_simd",
   ] as const;
   for (const name of expectedExports) {
     if (typeof (exports as Record<string, unknown>)[name] !== "function") {
@@ -936,6 +970,14 @@ export function instantiateConsumer(
       exports.kalman_ingest_ca_f64_soa_simd(xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, vscratch),
     kalmanPredictCaF64SoaSimd: (xOff, pOff, valOff, varOff, n, dt, q) =>
       exports.kalman_predict_ca_f64_soa_simd(xOff, pOff, valOff, varOff, n, dt, q),
+    kalmanIngestCvF32x4SoaSimd: (xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, vscratch) =>
+      exports.kalman_ingest_cv_f32x4_soa_simd(xOff, pOff, posOff, velOff, n, dt, q, rp, rv, useVel, vscratch),
+    kalmanPredictCvF32x4SoaSimd: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_cv_f32x4_soa_simd(xOff, pOff, valOff, varOff, n, dt, q),
+    kalmanIngestCaF32x4SoaSimd: (xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, vscratch) =>
+      exports.kalman_ingest_ca_f32x4_soa_simd(xOff, pOff, posOff, velOff, accOff, n, dt, q, rp, rv, ra, useVel, useAcc, vscratch),
+    kalmanPredictCaF32x4SoaSimd: (xOff, pOff, valOff, varOff, n, dt, q) =>
+      exports.kalman_predict_ca_f32x4_soa_simd(xOff, pOff, valOff, varOff, n, dt, q),
   };
 }
 

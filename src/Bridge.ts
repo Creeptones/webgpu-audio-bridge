@@ -276,6 +276,7 @@ import {
 } from "./predictiveExtrapolation.js";
 import { StatePredictor, type StatePredictorModel } from "./StatePredictor.js";
 import { newHeapTypedArray, buildScratchFrame } from "./_heap.js";
+import type { WorkletConsumer } from "./worklet/index.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
 // tests) that import them from "./Bridge.js" continue to compile. The
@@ -432,6 +433,8 @@ export const DEFAULT_KALMAN_MEAS_POS_NOISE = 1e-4;
  *  freshly-seeded filter reports variance ≥ P0 ⇒ confidence 0 ⇒ hold, the
  *  cold-safety property). */
 export const DEFAULT_KALMAN_INITIAL_VARIANCE = 1e6;
+const DEFAULT_KALMAN_MEAS_VEL_NOISE = 1e-3;
+const DEFAULT_KALMAN_MEAS_ACC_NOISE = 1e-1;
 
 /**
  * Options for `pullKalmanPredictedLatest` (0.9.902 — history-aware classical
@@ -551,6 +554,36 @@ export interface BridgeOptions extends SpscRingOptions {
    *  atomic stores per observation (≈ 100 ns total); disable only if
    *  you've measured the cost mattering for your hot path. */
   readonly publishPllToSab?: boolean;
+  /** Optional runtime for the f32x4 Wasm SIMD `pullKalmanPredictedLatest`
+   *  path. Omit to force JS-only behavior. */
+  readonly kalmanWasm?: {
+    /** Worklet consumer exports that include the required f32x4 Kalman symbols. */
+    readonly consumer: WorkletConsumer;
+    /** Shared scratch memory window used by per-field Wasm Kalman state. */
+    readonly scratchBuffer: SharedArrayBuffer;
+    /** Start offset in bytes of that scratch window. */
+    readonly scratchByteOffset?: number;
+    /** Window length in bytes. */
+    readonly scratchByteLength?: number;
+  };
+}
+
+interface BridgeKalmanWasmPlan {
+  model: StatePredictorModel;
+  sampleCount: number;
+  xOff: number;
+  pOff: number;
+  posOff: number;
+  velOff: number;
+  accOff: number;
+  predOff: number;
+  varOff: number;
+  vScratchOff: number;
+  pos: Float32Array;
+  vel: Float32Array;
+  acc: Float32Array | null;
+  pred: Float32Array;
+  varr: Float32Array;
 }
 
 /**
@@ -823,6 +856,17 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   /** Publish PLL state to SAB lanes 4-7 after every PLL state change.
    *  See `BridgeOptions.publishPllToSab` for the contract. (0.6.16) */
   private readonly publishPllToSab: boolean;
+  private readonly _kalmanWasmConsumer: WorkletConsumer | null;
+  private readonly _kalmanWasmScratchBuffer: SharedArrayBuffer | null;
+  private readonly _kalmanWasmScratchOffset: number;
+  private readonly _kalmanWasmScratchLimit: number;
+  private _kalmanWasmPlans: Map<string, BridgeKalmanWasmPlan> | null = null;
+  private _kalmanWasmHasLastProducerNs = false;
+  private _kalmanWasmLastProducerNs = 0;
+  private _kalmanProcessNoise = DEFAULT_KALMAN_PROCESS_NOISE;
+  private _kalmanMeasPosNoise = DEFAULT_KALMAN_MEAS_POS_NOISE;
+  private _kalmanMeasVelNoise = DEFAULT_KALMAN_MEAS_VEL_NOISE;
+  private _kalmanMeasAccNoise = DEFAULT_KALMAN_MEAS_ACC_NOISE;
 
   constructor(
     sab: SharedArrayBuffer,
@@ -843,6 +887,27 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     // process visibility. Callers who don't need cross-process readers
     // can pass `publishPllToSab: false` to save the ~100 ns/observe.
     this.publishPllToSab = opts.publishPllToSab !== false;
+    const kcfg = opts.kalmanWasm;
+    this._kalmanWasmConsumer = kcfg?.consumer ?? null;
+    this._kalmanWasmScratchBuffer = kcfg?.scratchBuffer ?? null;
+    const rawOffset = kcfg?.scratchByteOffset;
+    const offset = typeof rawOffset === "number" && Number.isFinite(rawOffset) ? rawOffset : 0;
+    this._kalmanWasmScratchOffset = offset >= 0 ? offset : 0;
+    const wBuffer = this._kalmanWasmScratchBuffer;
+    if (wBuffer === null) {
+      this._kalmanWasmScratchLimit = 0;
+    } else if (
+      kcfg && Number.isFinite(kcfg.scratchByteLength) && (kcfg.scratchByteLength as number) > 0
+    ) {
+      const rawLen = kcfg.scratchByteLength as number;
+      const limit = this._kalmanWasmScratchOffset + rawLen;
+      this._kalmanWasmScratchLimit = Math.min(wBuffer.byteLength, limit);
+    } else {
+      this._kalmanWasmScratchLimit = wBuffer.byteLength;
+    }
+    if (this._kalmanWasmScratchLimit < this._kalmanWasmScratchOffset) {
+      this._kalmanWasmScratchLimit = 0;
+    }
 
     // FrameSmoother owns the consumer-side prev buffer + classification
     // tables + the trajectory-aware blender. Pass `scratchFrame` as the
@@ -1944,6 +2009,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     if (this._kalmanPredictors === null) this._buildKalmanPredictors(opts);
     const predictors = this._kalmanPredictors!;
     const scratch = this._kalmanScratch!;
+    const wasmPlans = this._kalmanWasmPlans;
     const varianceFloor = opts?.varianceFloor ?? this._kalmanInitialVariance;
 
     if (this.cachedRawFrame === null) {
@@ -2017,6 +2083,16 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     const src = this.cachedRawFrame as unknown as Record<string, unknown>;
     const dst = out as unknown as Record<string, unknown>;
     const fields = this.schema.compiled.fields;
+    const useWasm = wasmPlans !== null && this._kalmanWasmConsumer !== null && wasmPlans.size > 0;
+    let wasmDt = 0;
+    if (fresh && useWasm) {
+      if (this._kalmanWasmHasLastProducerNs) {
+        wasmDt = (this.cachedTimestampNs - this._kalmanWasmLastProducerNs) * 1e-9;
+        if (!Number.isFinite(wasmDt) || wasmDt < 0) wasmDt = 0;
+      }
+      this._kalmanWasmLastProducerNs = this.cachedTimestampNs;
+      this._kalmanWasmHasLastProducerNs = true;
+    }
 
     let resultMaxVar = 0;
     let headlineWeight = 0;
@@ -2029,6 +2105,93 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
         sawTrajectory = true;
         const order = field.trajectory.order;
         const sc = field.trajectory.sampleCount;
+        const plan = useWasm ? wasmPlans!.get(name) : null;
+        if (plan !== null && plan !== undefined) {
+          const isPlanar = field.trajectory.layout === "planar";
+          const flat = src[name] as Float32Array;
+          for (let i = 0; i < sc; i++) {
+            const posIdx = isPlanar ? i : i * order;
+            plan.pos[i] = flat[posIdx]!;
+            if (order >= 2) plan.vel[i] = flat[isPlanar ? sc + i : posIdx + 1]!;
+            if (order >= 3 && plan.acc !== null) plan.acc[i] = flat[isPlanar ? 2 * sc + i : posIdx + 2]!;
+          }
+          if (fresh) {
+            const useVel = order >= 2 ? 1 : 0;
+            const useAcc = order >= 3 ? 1 : 0;
+            if (plan.model === "cv") {
+              this._kalmanWasmConsumer!.kalmanIngestCvF32x4SoaSimd(
+                plan.xOff,
+                plan.pOff,
+                plan.posOff,
+                plan.velOff,
+                sc,
+                wasmDt,
+                this._kalmanProcessNoise,
+                this._kalmanMeasPosNoise,
+                this._kalmanMeasVelNoise,
+                useVel,
+                plan.vScratchOff,
+              );
+            } else {
+              this._kalmanWasmConsumer!.kalmanIngestCaF32x4SoaSimd(
+                plan.xOff,
+                plan.pOff,
+                plan.posOff,
+                plan.velOff,
+                plan.accOff,
+                sc,
+                wasmDt,
+                this._kalmanProcessNoise,
+                this._kalmanMeasPosNoise,
+                this._kalmanMeasVelNoise,
+                this._kalmanMeasAccNoise,
+                useVel,
+                useAcc,
+                plan.vScratchOff,
+              );
+            }
+          }
+          if (plan.model === "cv") {
+            this._kalmanWasmConsumer!.kalmanPredictCvF32x4SoaSimd(
+              plan.xOff,
+              plan.pOff,
+              plan.predOff,
+              plan.varOff,
+              sc,
+              leadSeconds,
+              this._kalmanProcessNoise,
+            );
+          } else {
+            this._kalmanWasmConsumer!.kalmanPredictCaF32x4SoaSimd(
+              plan.xOff,
+              plan.pOff,
+              plan.predOff,
+              plan.varOff,
+              sc,
+              leadSeconds,
+              this._kalmanProcessNoise,
+            );
+          }
+          let maxVar = 0;
+          for (let i = 0; i < sc; i++) if (plan.varr[i]! > maxVar) maxVar = plan.varr[i]!;
+          let cVar = varianceFloor > 0 ? 1 - maxVar / varianceFloor : 0;
+          if (cVar < 0) cVar = 0;
+          else if (cVar > 1) cVar = 1;
+          let w = cHorizon * cVar;
+          if (w < confidenceFloor) w = 0;
+          const dstField = dst[name] as Float32Array;
+          const oneMinusW = 1 - w;
+          for (let i = 0; i < sc; i++) {
+            dstField[i] = w * plan.pred[i]! + oneMinusW * plan.pos[i]!;
+          }
+          if (w > 0) predictedAny = true;
+          if (maxVar >= resultMaxVar) {
+            resultMaxVar = maxVar;
+            headlineWeight = w;
+          }
+          continue;
+        }
+
         const predictor = predictors.get(name)!;
         const sb = scratch[name]!;
         const flat = src[name] as Float64Array | Float32Array;
@@ -2097,7 +2260,13 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     const q = opts?.processNoise ?? DEFAULT_KALMAN_PROCESS_NOISE;
     const rp = opts?.measPosNoise ?? DEFAULT_KALMAN_MEAS_POS_NOISE;
     const p0 = opts?.initialVariance ?? DEFAULT_KALMAN_INITIAL_VARIANCE;
+    const rv = opts?.measVelNoise ?? DEFAULT_KALMAN_MEAS_VEL_NOISE;
+    const ra = opts?.measAccNoise ?? DEFAULT_KALMAN_MEAS_ACC_NOISE;
     this._kalmanInitialVariance = p0;
+    this._kalmanProcessNoise = q;
+    this._kalmanMeasPosNoise = rp;
+    this._kalmanMeasVelNoise = rv;
+    this._kalmanMeasAccNoise = ra;
     const preds = new Map<string, StatePredictor>();
     const scratch: Record<
       string,
@@ -2115,8 +2284,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
           model,
           processNoise: q,
           measPosNoise: rp,
-          measVelNoise: opts?.measVelNoise,
-          measAccNoise: opts?.measAccNoise,
+          measVelNoise: rv,
+          measAccNoise: ra,
           initialVariance: p0,
         }),
       );
@@ -2130,6 +2299,95 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     }
     this._kalmanPredictors = preds;
     this._kalmanScratch = scratch;
+    this._buildKalmanWasmPredictors();
+  }
+
+  /** Build one f32x4 Wasm plan per eligible trajectory field. If a field fails
+   * any gate, it stays on the JS path. */
+  private _buildKalmanWasmPredictors(): void {
+    const consumer = this._kalmanWasmConsumer;
+    const scratchBuffer = this._kalmanWasmScratchBuffer;
+    if (consumer === null || scratchBuffer === null) {
+      this._kalmanWasmPlans = new Map();
+      return;
+    }
+    if (!(scratchBuffer instanceof SharedArrayBuffer)) {
+      this._kalmanWasmPlans = new Map();
+      return;
+    }
+    const cAny = consumer as unknown as Record<string, unknown>;
+    const hasExports = [
+      "kalmanIngestCvF32x4SoaSimd",
+      "kalmanPredictCvF32x4SoaSimd",
+      "kalmanIngestCaF32x4SoaSimd",
+      "kalmanPredictCaF32x4SoaSimd",
+    ].every((name) => typeof cAny[name] === "function");
+    if (!hasExports) {
+      this._kalmanWasmPlans = new Map();
+      return;
+    }
+    const start = this._kalmanWasmScratchOffset;
+    const end = this._kalmanWasmScratchLimit > start ? this._kalmanWasmScratchLimit : 0;
+    if (end <= start) {
+      this._kalmanWasmPlans = new Map();
+      return;
+    }
+
+    let cursor = start;
+    const align16 = (x: number): number => (x + 15) & ~15;
+    const plans = new Map<string, BridgeKalmanWasmPlan>();
+    for (const field of this.schema.compiled.fields) {
+      if (!field.trajectory || field.kind !== "f32") continue;
+      const sc = field.trajectory.sampleCount;
+      if (!Number.isInteger(sc) || sc <= 0 || sc % 4 !== 0) continue;
+
+      const order = field.trajectory.order;
+      const model: StatePredictorModel = order >= 3 ? "ca" : "cv";
+      const m = model === "ca" ? 3 : 2;
+      const bytesX = sc * m * 4;
+      const bytesP = sc * m * m * 4;
+      const bytesPos = sc * 4;
+      const bytesVel = sc * 4;
+      const bytesAcc = sc * 4;
+      const bytesPred = sc * 4;
+      const bytesVar = sc * 4;
+      const bytesScratch = 2 * m * 16;
+      const used = bytesX + bytesP + bytesPos + bytesVel + bytesAcc + bytesPred + bytesVar + bytesScratch;
+      const xOff = align16(cursor);
+      if (xOff + used > end) {
+        break;
+      }
+      const pOff = xOff + bytesX;
+      const posOff = pOff + bytesP;
+      const velOff = posOff + bytesPos;
+      const accOff = velOff + bytesVel;
+      const predOff = accOff + bytesAcc;
+      const varOff = predOff + bytesPred;
+      const vScratchOff = align16(varOff + bytesVar);
+      const next = vScratchOff + bytesScratch;
+      if (next > end) break;
+
+      const useAcc = model === "ca";
+      plans.set(field.name, {
+        model,
+        sampleCount: sc,
+        xOff,
+        pOff,
+        posOff,
+        velOff,
+        accOff: useAcc ? accOff : 0,
+        predOff,
+        varOff,
+        vScratchOff,
+        pos: new Float32Array(scratchBuffer, posOff, sc),
+        vel: new Float32Array(scratchBuffer, velOff, sc),
+        acc: useAcc ? new Float32Array(scratchBuffer, accOff, sc) : null,
+        pred: new Float32Array(scratchBuffer, predOff, sc),
+        varr: new Float32Array(scratchBuffer, varOff, sc),
+      });
+      cursor = next;
+    }
+    this._kalmanWasmPlans = plans;
   }
 
   /** Build one hold-scratch buffer per trajectory field, sized to its

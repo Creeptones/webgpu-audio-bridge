@@ -1,18 +1,10 @@
 /**
  * kalman-simd microbenchmark — scalar (AoS) vs f64x2 SIMD (SoA) StatePredictor
- * kernels (Apollo Frontier 2, 0.9.904).
+ * kernels, plus Step-1 f32x4 candidate validation.
  *
  *   npx tsx bench/kalman-simd.bench.ts      (or `npm run bench:kalman-simd`)
  *
- * Correctness (bit-exact f64) is pinned in tests/StatePredictor.wasm.test.ts.
- * This answers the throughput question the project's "every SIMD path must win
- * the bench" discipline demands: does the SoA f64x2 lane-parallel port actually
- * beat the AoS scalar kernel? The SoA layout (each derivative / covariance
- * element its own contiguous array across lanes) is the whole point — it makes
- * every load/store contiguous (no gather), which a naive lane-parallel SIMD over
- * the per-lane AoS state could not.
- *
- * N=64 lanes (a generous macro-field width), batched to beat the hrtime tick.
+ * N=64 lanes (macro-field width), batched to beat the hrtime tick.
  */
 
 import { hrtime } from "node:process";
@@ -24,7 +16,7 @@ import { instantiateConsumer, hasWasmConsumerSupport } from "../src/worklet/inde
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const wasmPath = resolve(__dirname, "..", "dist", "worklet", "decoder.wasm");
 
-const N = 64;          // even lane count (SIMD requires even)
+const N = 64;
 const WARMUP = 20_000;
 const BATCH = 512;
 const SAMPLES = 2_000;
@@ -32,20 +24,38 @@ const SAMPLES = 2_000;
 function percentile(sorted: number[], p: number): number {
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * p)))]!;
 }
-function mean(a: number[]): number { let s = 0; for (const x of a) s += x; return s / a.length; }
-function fmt(ns: number): string { return ns >= 1000 ? `${(ns / 1000).toFixed(2)} µs` : `${ns.toFixed(0)} ns`; }
-function pad(s: string, w: number): string { return s.padEnd(w); }
+function mean(a: number[]): number {
+  let s = 0;
+  for (const x of a) s += x;
+  return s / a.length;
+}
+function fmt(ns: number): string {
+  return ns >= 1000 ? `${(ns / 1000).toFixed(2)} us` : `${ns.toFixed(0)} ns`;
+}
+function pad(s: string, w: number): string {
+  return s.padEnd(w);
+}
 
 function main(): void {
   if (!hasWasmConsumerSupport()) {
-    console.log("kalman-simd bench skipped — no WASM SIMD/threads in this runtime.");
+    console.log("kalman-simd bench skipped: no WASM SIMD/threads in this runtime.");
     return;
   }
+
   const memory = new WebAssembly.Memory({ initial: 16, maximum: 16, shared: true });
   const c = instantiateConsumer(readFileSync(wasmPath), memory);
+  const cAny = c as unknown as Record<string, unknown>;
   const f64 = new Float64Array(memory.buffer as ArrayBufferLike);
+  const f32 = new Float32Array(memory.buffer as ArrayBufferLike);
 
-  const m = 3; // CA — the heaviest, most representative model
+  const hasF32x4Kalman = [
+    "kalmanIngestCvF32x4SoaSimd",
+    "kalmanPredictCvF32x4SoaSimd",
+    "kalmanIngestCaF32x4SoaSimd",
+    "kalmanPredictCaF32x4SoaSimd",
+  ].every((name) => typeof cAny[name] === "function");
+
+  const m = 3; // CA
   const q = 5e2, rp = 1e-3, rv = 1e-2, ra = 1e-1, p0 = 1e6;
   const dt = 0.016, pdt = 0.008;
 
@@ -59,7 +69,7 @@ function main(): void {
   const aVal = off; off += N * 8;
   const aVar = off; off += N * 8;
   const aScratch = off; off += 2 * m * 8;
-  // SoA region (separate): arrays-of-lanes, vscratch in v128.
+  // SoA region (f64): arrays-of-lanes, vscratch in v128.
   const sXoff = off; off += N * m * 8;
   const sPoff = off; off += N * m * m * 8;
   const sPos = off; off += N * 8;
@@ -68,19 +78,40 @@ function main(): void {
   const sVal = off; off += N * 8;
   const sVar = off; off += N * 8;
   const sScratch = off; off += 2 * m * 16;
+  // Step-1 SoA region (f32): same SoA layout, f32 lanes.
+  const f32Xoff = off; off += N * m * 4;
+  const f32Poff = off; off += N * m * m * 4;
+  const f32Pos = off; off += N * 4;
+  const f32Vel = off; off += N * 4;
+  const f32Acc = off; off += N * 4;
+  const f32Val = off; off += N * 4;
+  const f32Var = off; off += N * 4;
+  const f32Scratch = off; off += 2 * m * 16;
 
-  // Seed both with the same valid state (x finite, P diag = p0).
+  // Seed all buffers with same state (finite x, diagonal P = p0).
   for (let i = 0; i < N; i++) {
     for (let k = 0; k < m; k++) {
       const v = Math.sin(i + k);
       f64[aXoff / 8 + i * m + k] = v;
       f64[sXoff / 8 + k * N + i] = v;
+      f32[f32Xoff / 4 + k * N + i] = v;
     }
-    for (let k = 0; k < m * m; k++) { f64[aPoff / 8 + i * m * m + k] = 0; f64[sPoff / 8 + k * N + i] = 0; }
-    for (const d of [0, m + 1, 2 * m + 2]) { f64[aPoff / 8 + i * m * m + d] = p0; f64[sPoff / 8 + d * N + i] = p0; }
+    for (let k = 0; k < m * m; k++) {
+      f64[aPoff / 8 + i * m * m + k] = 0;
+      f64[sPoff / 8 + k * N + i] = 0;
+      f32[f32Poff / 4 + k * N + i] = 0;
+    }
+    for (const d of [0, m + 1, 2 * m + 2]) {
+      f64[aPoff / 8 + i * m * m + d] = p0;
+      f64[sPoff / 8 + d * N + i] = p0;
+      f32[f32Poff / 4 + d * N + i] = p0;
+    }
     const mp = Math.sin(i), mv = Math.cos(i), maa = -Math.sin(i);
     f64[aPos / 8 + i] = mp; f64[aVel / 8 + i] = mv; f64[aAcc / 8 + i] = maa;
     f64[sPos / 8 + i] = mp; f64[sVel / 8 + i] = mv; f64[sAcc / 8 + i] = maa;
+    f32[f32Pos / 4 + i] = mp;
+    f32[f32Vel / 4 + i] = mv;
+    f32[f32Acc / 4 + i] = maa;
   }
 
   function time(fn: () => void): { p50: number; mean: number } {
@@ -96,28 +127,85 @@ function main(): void {
     return { p50: percentile(s, 0.5), mean: mean(s) };
   }
 
-  console.log(`\nkalman-simd bench — N=${N} lanes (order-3 CA), ${(SAMPLES * BATCH).toLocaleString()} calls/cell\n`);
-  console.log(pad("kernel", 12), pad("scalar (AoS) p50", 18), pad("SIMD (SoA) p50", 18), "speedup");
-  console.log("-".repeat(64));
+  console.log(
+    `\nkalman-simd bench — N=${N} lanes (order-3 CA), ${(SAMPLES * BATCH).toLocaleString()} calls/cell\n`,
+  );
+  console.log(
+    pad("kernel", 12),
+    pad("scalar (AoS) p50", 18),
+    pad("f64x2 SoA p50", 18),
+    pad("f32x4 SoA p50", 18),
+    pad("f64 speedup", 12),
+    "f32 speedup",
+  );
+  console.log("-".repeat(84));
 
   const predScalar = time(() => c.kalmanPredictCaF64(aXoff, aPoff, aVal, aVar, N, pdt, q));
   const predSimd = time(() => c.kalmanPredictCaF64SoaSimd(sXoff, sPoff, sVal, sVar, N, pdt, q));
-  console.log(pad("predict", 12), pad(fmt(predScalar.p50), 18), pad(fmt(predSimd.p50), 18),
-    `${(predScalar.p50 / predSimd.p50).toFixed(2)}×`);
+  const predF32x4 = hasF32x4Kalman
+    ? time(() => c.kalmanPredictCaF32x4SoaSimd(f32Xoff, f32Poff, f32Val, f32Var, N, pdt, q))
+    : null;
+  console.log(
+    pad("predict", 12),
+    pad(fmt(predScalar.p50), 18),
+    pad(fmt(predSimd.p50), 18),
+    pad(predF32x4 ? fmt(predF32x4.p50) : "n/a", 18),
+    pad((predScalar.p50 / predSimd.p50).toFixed(2), 12),
+    predF32x4 ? `${(predSimd.p50 / predF32x4.p50).toFixed(2)}x` : "n/a",
+  );
 
-  const ingScalar = time(() => c.kalmanIngestCaF64(aXoff, aPoff, aPos, aVel, aAcc, N, dt, q, rp, rv, ra, 1, 1, aScratch));
-  const ingSimd = time(() => c.kalmanIngestCaF64SoaSimd(sXoff, sPoff, sPos, sVel, sAcc, N, dt, q, rp, rv, ra, 1, 1, sScratch));
-  console.log(pad("ingest", 12), pad(fmt(ingScalar.p50), 18), pad(fmt(ingSimd.p50), 18),
-    `${(ingScalar.p50 / ingSimd.p50).toFixed(2)}×`);
+  const ingScalar = time(() =>
+    c.kalmanIngestCaF64(aXoff, aPoff, aPos, aVel, aAcc, N, dt, q, rp, rv, ra, 1, 1, aScratch),
+  );
+  const ingSimd = time(() =>
+    c.kalmanIngestCaF64SoaSimd(sXoff, sPoff, sPos, sVel, sAcc, N, dt, q, rp, rv, ra, 1, 1, sScratch),
+  );
+  const ingF32x4 = hasF32x4Kalman
+    ? time(() =>
+      c.kalmanIngestCaF32x4SoaSimd(f32Xoff, f32Poff, f32Pos, f32Vel, f32Acc, N, dt, q, rp, rv, ra, 1, 1, f32Scratch),
+    )
+    : null;
+  console.log(
+    pad("ingest", 12),
+    pad(fmt(ingScalar.p50), 18),
+    pad(fmt(ingSimd.p50), 18),
+    pad(ingF32x4 ? fmt(ingF32x4.p50) : "n/a", 18),
+    pad((ingScalar.p50 / ingSimd.p50).toFixed(2), 12),
+    ingF32x4 ? `${(ingSimd.p50 / ingF32x4.p50).toFixed(2)}x` : "n/a",
+  );
 
   console.log();
   const predWin = predScalar.p50 / predSimd.p50;
-  if (predWin > 1.0) {
-    console.log(`  predict SIMD wins: ${predWin.toFixed(2)}× vs scalar (SoA f64x2 lane-parallel, contiguous loads)`);
+  const ingWin = ingScalar.p50 / ingSimd.p50;
+  if (predWin > 1.0 && ingWin > 1.0) {
+    console.log(
+      `  baseline f64x2 SoA wins both paths: predict ${predWin.toFixed(2)}x, ingest ${ingWin.toFixed(2)}x vs scalar`,
+    );
   } else {
-    console.error(`  predict SIMD does NOT win (${predWin.toFixed(2)}×) — assess`);
+    console.error(`  baseline f64x2 SoA does NOT win both paths (predict ${predWin.toFixed(2)}x, ingest ${ingWin.toFixed(2)}x)`);
+    process.exitCode = 1;
+  }
+
+  if (!hasF32x4Kalman) {
+    console.log(
+      "  Step 1 blocked: f32x4 exports are not present in this build.",
+    );
+    return;
+  }
+
+  const f32PredWin = predSimd.p50 / (predF32x4?.p50 ?? predSimd.p50);
+  const f32IngWin = ingSimd.p50 / (ingF32x4?.p50 ?? ingSimd.p50);
+  if (f32PredWin > 1.0 && f32IngWin > 1.0) {
+    console.log(
+      `  Step 1 PASS: f32x4 SoA outperforms f64x2 SoA (predict ${f32PredWin.toFixed(2)}x, ingest ${f32IngWin.toFixed(2)}x).`,
+    );
+  } else {
+    console.log(
+      `  Step 1 BLOCKED: f32x4 SoA does not outperform f64x2 SoA (predict ${f32PredWin.toFixed(2)}x, ingest ${f32IngWin.toFixed(2)}x).`,
+    );
     process.exitCode = 1;
   }
 }
 
 main();
+
