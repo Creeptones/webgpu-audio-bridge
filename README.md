@@ -2188,6 +2188,29 @@ The hard problem moved with the role flip. MP→SC's danger was producer-side (c
 
 > **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `SpmcRing` may break across PATCH releases until the SP→MC broadcast primitive promotes to the root. Constructing a `SpmcRing` emits a one-shot `console.warn`.
 
+### Experimental MP→MC work queue — `MpmcWorkQueue` (0.9.934)
+
+The third fan edge, and the one where **both** ends are contended: **N producers, M consumers, every frame to exactly one consumer** — a *partition*, a work queue (the render pool dispatching interchangeable work units), the opposite of `SpmcRing`'s broadcast. `MpmcWorkQueue` is the wait-free primitive with its own SAB layout (the frozen `SpscRing` / `MpmcRing` / `SpmcRing` cores are never touched). It ships from the **`webgpu-audio-bridge/experimental`** subpath while the MP→MC wire format soaks. (The declarative `connectWorkQueue()` constructor + the end-of-stream protocol are a later stage; for now you wire the queue directly.)
+
+```ts
+import { MpmcWorkQueue } from "webgpu-audio-bridge/experimental";
+
+// Allocating thread — allocate ONCE, declare the concurrent producer count.
+const { queue, sab } = MpmcWorkQueue.create(schema, 1024, { producerCount: 3 });
+
+// Each peer thread reconstructs the SAME SAB via the bare ctor (no re-init).
+const producer = new MpmcWorkQueue(sab, schema, 1024, { producerCount: 3 });
+const consumer = new MpmcWorkQueue(sab, schema, 1024, { producerCount: 3 });
+
+producer.push(frame);          // wait-free; drop-newest when full (returns false)
+const out = consumer.createFrame();
+consumer.pull(out);            // competing dequeue — claims a unique frame, or rides
+```
+
+The new hazard is **consumer-side contention** (each frame to exactly one of M consumers, no duplicate, no loss, while staying wait-free). The classic bounded MPMC queue (Vyukov's) is only *lock-free* — a CAS-retry on the dequeue position — which fails the audio bar. The wait-free answer is **symmetric fetch-add + a held-claim**: a consumer claims a unique ticket `D` with a single `Atomics.add` (so no two consumers ever touch the same frame — no double-deliver, for free), and if its claimed frame is not yet published it **holds** `D` and re-polls rather than skipping (so a published frame is never orphaned). Tear-freedom comes from a **per-slot Vyukov sequence stamp** that serializes the slot producer→consumer→producer (a held frame is never overwritten — no seqlock needed). The producer reuse envelope is `MpmcRing`'s, measured from the contiguous delivered frontier. Proven exhaustively by `tests/MpmcWorkQueue.interleaving.test.ts` (every interleaving, the wait-free witness, and negative pins where a shared-peek consumer double-delivers, a skip consumer orphans, and an ungated producer tears) and by a 1 M-frame cross-thread partition stress. The one residual is a bounded teardown strand (< consumerCount) at end-of-stream — it strands a consumer, never loses a frame.
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `MpmcWorkQueue` may break across PATCH releases until the MP→MC primitive promotes to the root. Constructing an `MpmcWorkQueue` emits a one-shot `console.warn`.
+
 ### Experimental — The Autonomous JIT — `connectJit()` (0.9.917)
 
 A developer writes a **naive scalar JS** DSP kernel. The Autonomous JIT compiles it off-thread to **WASM SIMD**, proves the result **bit-exact** to the scalar source through an equivalence gate, and **live-swaps it into a running AudioWorklet click-free** — degrading to the developer's JS on every failure. `connectJit` is the one-call constructor that hides the three-realm dance.

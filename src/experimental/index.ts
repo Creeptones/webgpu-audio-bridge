@@ -86,6 +86,27 @@ export type {
 export { SpmcRing, SPMC_HEADER_BYTES } from "../SpmcRing.js";
 export type { SpmcRingOptions } from "../SpmcRing.js";
 
+// ── MpmcWorkQueue (0.9.934) ─────────────────────────────────────────────────
+//
+// Apollo Frontier 3's wait-free MP→MC (multi-producer, multi-CONSUMER)
+// competing-consumer WORK QUEUE (MP→MC Work-Queue Stage 1) — N producers, M
+// consumers, every frame to EXACTLY ONE consumer (a partition, not a broadcast —
+// contrast SpmcRing). The THIRD single-edge primitive (after MpmcRing@0.9.907 and
+// SpmcRing@0.9.911); the genuinely-new hazard is consumer-side contention, solved
+// HARD WAIT-FREE on both ends by symmetric fetch-add + a held-claim (the classic
+// bounded MPMC queue, Vyukov's, is only lock-free). Tear-freedom comes from the
+// per-slot Vyukov sequence stamp (mechanism 1), which serializes the slot
+// producer→consumer→producer; the producer reuse envelope is MpmcRing's, measured
+// from a lazily-scanned contiguous delivered frontier. Internal-first +
+// `@experimental`: the MP→MC wire format is OUTSIDE the 1.0 stability contract
+// until it soaks + promotes (mirrors SpscRing internal@0.6.8 → public@0.6.10,
+// MpmcRing/SpmcRing's pending promotion); a one-shot construction warning fires.
+// The connectWorkQueue() topology constructor + the end-of-stream protocol (to
+// release the bounded teardown strand) are Stage 3. See
+// docs/mpmc-workqueue-design.md.
+export { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../MpmcWorkQueue.js";
+export type { MpmcWorkQueueOptions } from "../MpmcWorkQueue.js";
+
 // ── connectFanOut/mountFanOut (0.9.928) ─────────────────────────────────────
 //
 // Apollo Frontier 3, Stage 4.3: the `connect()`-style SP→MC broadcast topology

@@ -4,6 +4,91 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.934] — 2026-05-31
+
+### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 1: `MpmcWorkQueue` (the wait-free competing-consumer work queue)
+
+Stage 0 (0.9.933) settled the design on paper; Stage 1 ships the production primitive
+`src/MpmcWorkQueue.ts`. It is the **third single-edge ring** of Frontier 3 (after
+`MpmcRing`@0.9.907 MP→SC fan-in and `SpmcRing`@0.9.911 SP→MC broadcast) and the one that
+makes the **consumer** side contended: **N producers, M consumers, every frame to EXACTLY
+ONE consumer** — a partition / work queue, NOT a broadcast (contrast `SpmcRing`, where every
+consumer sees every frame). The genuinely-new hazard is consumer-side contention, and the
+Stage-0 question it answers is whether the dequeue can stay **hard wait-free** — the classic
+bounded MPMC queue (Vyukov's) is only *lock-free* (a CAS-retry on the dequeue position), which
+fails the project bar.
+
+- **Hard wait-free on BOTH ends.** The dequeue is a **symmetric fetch-add + held-claim**: a
+  consumer claims a UNIQUE ticket `D` with a single `Atomics.add(dequeueTicket, 1)` (each
+  consumer a distinct OLD value → no double-deliver, no consumer-consumer race, for free), and
+  if its claimed frame is not yet published it **holds** `D` and re-polls rather than skipping
+  (so a published frame is never orphaned). No `Atomics.wait`, no unbounded CAS-retry on
+  either path.
+- **Tear-freedom for free — the per-slot Vyukov sequence stamp (the design note's mechanism
+  1).** Each slot's generation runs `Free(T) = T → Complete(T) = T+1 → Free(T+CAPACITY)` (the
+  consumer stores the last on delivery), serializing the slot producer→consumer→producer so it
+  is never reused until its occupant is fully consumed. No seqlock, no busy marker (unlike
+  `SpmcRing`, whose producer laps freely) — the work-queue producer is NOT decoupled, so a
+  stuck consumer back-pressures (drop-newest) instead of letting the ring lap a held frame.
+- **The producer reuse envelope == `MpmcRing`'s.** In-flight is measured from the contiguous
+  **delivered frontier `F`** (a header lane), so a slot holding an undelivered/held frame is
+  never reused; `SLACK = producerCount − 1` covers the non-atomic check↔fetch-add race
+  (usable depth = `CAPACITY − SLACK`). `F` is advanced **lazily by a bounded per-slot scan on
+  the producer threads** (amortized O(1), wait-free, never over-advances) — the consumer's
+  free is O(1), never a scan (the audio-thread discipline).
+- **The one residual: a bounded teardown strand.** At end-of-production up to
+  `consumerCount − 1` consumers may hold a claim for a ticket no producer reached — it strands
+  a *consumer*, never loses a produced *frame*. Resolved by the Stage-3 end-of-stream
+  protocol; the `strandedClaims` lane is reserved (0) for it.
+
+**Internal-first + `@experimental`** (mirrors `SpscRing` internal@0.6.8 → public@0.6.10, and
+`MpmcRing`/`SpmcRing`'s pending promotion): NOT exported from `src/index.ts`; exported from the
+`webgpu-audio-bridge/experimental` subpath; a one-shot construction warning fires. The MP→MC
+wire format is OUTSIDE the 1.0 stability contract until it soaks + promotes. The frozen SPSC
+protocol and `MpmcRing` / `SpmcRing` are UNTOUCHED — this primitive is purely additive (its own
+SAB layout, counters, coercions).
+
+### Why
+
+Frontier 3's DAG topology layer needs a fourth edge type — a partitioned work queue (a render
+pool dispatching work to a set of interchangeable consumers). Stage 0 proved a competing-
+consumer queue *can* be hard wait-free (symmetric fetch-add + held-claim) and falsified the two
+tempting shortcuts; Stage 1 turns that into shippable code, proven the same way the other rings
+were: an exhaustive interleaving fuzzer + a cross-thread bit-exact stress.
+
+### Wire compatibility
+
+Additive only. A brand-new SAB layout for a brand-new, non-root-exported primitive; no existing
+ring, frame format, or public-API surface changes. `MpmcWorkQueue`'s own wire format is
+experimental (pre-promotion) and may change.
+
+### Tests
+
+- **`tests/MpmcWorkQueue.interleaving.test.ts`** (the load-bearing proof, 11 pins) — a
+  loom/relacy-style EXHAUSTIVE DFS over every interleaving of N producers + M competing
+  consumers, modeling the CONCRETE per-slot Vyukov stamp algebra src ships (the Stage-0 probe
+  modeled the reuse frontier abstractly). Proves INV-1 no torn read / INV-2 no double-deliver /
+  INV-3 conservation (no orphan) / INV-W wait-free (one stamp check per poll, producer monotone
+  no-retry), plus the bounded teardown strand. NEGATIVE pins falsify all three shortcuts: a
+  shared-peek consumer DOUBLE-DELIVERS, a fetch-add-then-skip consumer ORPHANS, an ungated
+  producer TEARS.
+- **`tests/MpmcWorkQueue.test.ts`** (8 single-thread API pins) — layout / guards / bit-exact
+  round-trip across every FieldKind / drop-newest + reuse-after-consume / held-claim ride-over /
+  two competing consumers partition the stream / `producerCount` reserves SLACK.
+- **`tests/MpmcWorkQueue.concurrent.test.ts`** — 1.0 M-attempted-frame real-`worker_threads`
+  stress with BOTH ends contended (2 producer + 2 consumer inline-eval workers). Every delivered
+  frame bit-exact; a shared `Atomics.exchange` flag catches any double-deliver directly;
+  conservation reconciles `delivered + dropped === attempted`, `tornGuarded === 0`, both
+  consumers competed. Registered in `test` + `test:concurrent`.
+
+### Documentation
+
+- `docs/mpmc-workqueue-design.md` gains a **Shipped postscript** (the mechanism-1 → Vyukov-stamp
+  concretization, the `F`-counter realization of the producer envelope, and what the in-CI fuzzer
+  supersedes from the probe).
+- `src/experimental/index.ts`, `CLAUDE.md`, and `README.md` document the new primitive beside its
+  two sibling rings.
+
 ## [0.9.933] — 2026-05-31
 
 ### Added — Apollo Frontier 7, Stage 5: consolidation (poly-synth demo + token-path coverage + promotion verdict)
