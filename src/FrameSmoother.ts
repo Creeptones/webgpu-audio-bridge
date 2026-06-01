@@ -114,6 +114,10 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
    *  the dispatch — no per-call branch on field metadata. See Bridge.ts
    *  file header "Smoothed pulls" for the rationale. */
   private readonly arrayTrajectoryOrder: ReadonlyArray<number>;
+  /** Per-array-field trajectory layout flag. `true` => planar layout per sample. */
+  private readonly arrayTrajectoryPlanar: ReadonlyArray<boolean>;
+  /** Per-array-field trajectory sample count, used for planar indexing. */
+  private readonly arrayTrajectorySampleCount: ReadonlyArray<number>;
   /** Per-scalar-field circular period. 0 ⇒ ordinary (flat-ℝ one-pole blend,
    *  bit-exact preserved); > 0 ⇒ angular lane, blended along the shorter arc
    *  of the circle of that period via `circularLerp`. (0.9.935) */
@@ -181,6 +185,12 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
         const order = f.trajectory?.order ?? 0;
         return order >= 2 ? order : 0;
       }),
+    );
+    this.arrayTrajectoryPlanar = Object.freeze(
+      arrays.map((f) => f.trajectory?.layout === "planar"),
+    );
+    this.arrayTrajectorySampleCount = Object.freeze(
+      arrays.map((f) => f.trajectory?.sampleCount ?? 0),
     );
     // Circular period per field. 0 ⇒ ordinary lane (flat-ℝ blend, bit-exact
     // preserved). > 0 ⇒ angular lane, blended along the shorter arc. BigInt
@@ -276,6 +286,8 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
     const abi = this.arrayIsBigInt;
     const aii = this.arrayIsInteger;
     const ato = this.arrayTrajectoryOrder;
+    const atp = this.arrayTrajectoryPlanar;
+    const ats = this.arrayTrajectorySampleCount;
     const acp = this.arrayCircularPeriod;
     for (let i = 0; i < al.length; i++) {
       const name = al[i]!.name;
@@ -289,7 +301,9 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
         const isInt = aii[i];
         const L = cA.length;
         const order = ato[i]!;
+        const isPlanar = atp[i]!;
         const period = acp[i]!;
+        const sampleCount = ats[i]!;
         if (order === 0) {
           // Plain array (or order=1 trajectory): blend every element. A
           // circular plain array blends every element along the shorter arc.
@@ -306,6 +320,30 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
             }
           }
         } else {
+          if (sampleCount <= 0 || sampleCount * order !== L) {
+            throw new Error(
+              `FrameSmoother.observe: invalid trajectory array '${name}' sampleCount=${sampleCount}, order=${order}, length=${L}`,
+            );
+          }
+          if (isPlanar) {
+            for (let j = 0; j < sampleCount; j++) {
+              if (period > 0) {
+                cA[j] = pA[j] = this._circularBlend(pA[j]!, cA[j]!, alpha, period);
+              } else {
+                let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+                if (isInt) b = Math.round(b);
+                cA[j] = b;
+                pA[j] = b;
+              }
+            }
+            for (let lane = 1; lane < order; lane++) {
+              const base = lane * sampleCount;
+              for (let j = 0; j < sampleCount; j++) {
+                pA[base + j] = cA[base + j]!;
+              }
+            }
+            continue;
+          }
           // Trajectory order=2 or order=3. Layout is interleaved:
           //   order=2 → [p, v, p, v, ...]; order=3 → [p, v, a, p, v, a, ...].
           // Blend positions (`j % order === 0`) and copy derivative slots

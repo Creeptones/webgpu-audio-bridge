@@ -87,6 +87,10 @@
 import type { TrajectorySpec } from "./schema.js";
 import { wrapSymmetric, shortestArcDelta, TWO_PI } from "./circular.js";
 
+function isPlanarLayout(spec: TrajectorySpec): boolean {
+  return spec.layout === "planar";
+}
+
 /** Does this spec carry any per-sample safety clamp? Used to select the
  *  fast path (no clamps, 0.6.6 bit-exact) vs the clamped path. */
 function specHasClamps(spec: TrajectorySpec): boolean {
@@ -131,6 +135,7 @@ export function evaluateTrajectoryInto(
     evaluateClamped(flat, spec, dt, out);
     return;
   }
+  const isPlanar = isPlanarLayout(spec);
   switch (order) {
     case 1: {
       for (let i = 0; i < sampleCount; i++) {
@@ -139,17 +144,32 @@ export function evaluateTrajectoryInto(
       return;
     }
     case 2: {
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 2;
-        out[i] = flat[j]! + flat[j + 1]! * dt;
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] = flat[i]! + flat[i + vOffset]! * dt;
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 2;
+          out[i] = flat[j]! + flat[j + 1]! * dt;
+        }
       }
       return;
     }
     case 3: {
       const halfDt2 = 0.5 * dt * dt;
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 3;
-        out[i] = flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2;
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        const aOffset = sampleCount * 2;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] = flat[i]! + flat[i + vOffset]! * dt + flat[i + aOffset]! * halfDt2;
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 3;
+          out[i] = flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2;
+        }
       }
       return;
     }
@@ -159,13 +179,26 @@ export function evaluateTrajectoryInto(
       // the lower orders so the WASM scalar/SIMD ports stay bit-exact.
       const halfDt2 = 0.5 * dt * dt;
       const sixthDt3 = (1 / 6) * dt * dt * dt;
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 4;
-        out[i] =
-          flat[j]! +
-          flat[j + 1]! * dt +
-          flat[j + 2]! * halfDt2 +
-          flat[j + 3]! * sixthDt3;
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        const aOffset = sampleCount * 2;
+        const jOffset = sampleCount * 3;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] =
+            flat[i]! +
+            flat[i + vOffset]! * dt +
+            flat[i + aOffset]! * halfDt2 +
+            flat[i + jOffset]! * sixthDt3;
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 4;
+          out[i] =
+            flat[j]! +
+            flat[j + 1]! * dt +
+            flat[j + 2]! * halfDt2 +
+            flat[j + 3]! * sixthDt3;
+        }
       }
       return;
     }
@@ -183,6 +216,7 @@ function evaluateClamped(
   out: Float64Array | Float32Array,
 ): void {
   const { order, sampleCount } = spec;
+  const isPlanar = isPlanarLayout(spec);
   // Resolve clamps into local primitives. Use +Infinity when no clamp is
   // set so `Math.max(-INF, Math.min(INF, x)) === x` becomes a no-op — keeps
   // the inner loop straight-line without per-sample branching.
@@ -236,14 +270,13 @@ function evaluateClamped(
       return;
     }
     case 2: {
+      const vOffset = sampleCount;
       let prev = 0;
       for (let i = 0; i < sampleCount; i++) {
-        const j = i * 2;
-        const p = flat[j]!;
-        let v = flat[j + 1]!;
-        if (v > vClamp) v = vClamp;
-        else if (v < -vClamp) v = -vClamp;
-        let y = p + v * dt;
+        const p = isPlanar ? flat[i]! : flat[i * 2]!;
+        const v = isPlanar ? flat[i + vOffset]! : flat[i * 2 + 1]!;
+        const clampedV = v > vClamp ? vClamp : v < -vClamp ? -vClamp : v;
+        let y = p + clampedV * dt;
         if (hasDelta && i > 0) {
           const d = y - prev;
           if (d > maxDelta || d < -maxDelta) {
@@ -265,13 +298,14 @@ function evaluateClamped(
       return;
     }
     case 3: {
+      const vOffset = sampleCount;
+      const aOffset = sampleCount * 2;
       const halfDt2 = 0.5 * dt * dt;
       let prev = 0;
       for (let i = 0; i < sampleCount; i++) {
-        const j = i * 3;
-        const p = flat[j]!;
-        let v = flat[j + 1]!;
-        let a = flat[j + 2]!;
+        const p = isPlanar ? flat[i]! : flat[i * 3]!;
+        let v = isPlanar ? flat[i + vOffset]! : flat[i * 3 + 1]!;
+        let a = isPlanar ? flat[i + aOffset]! : flat[i * 3 + 2]!;
         if (v > vClamp) v = vClamp;
         else if (v < -vClamp) v = -vClamp;
         if (a > aClamp) a = aClamp;
@@ -378,6 +412,7 @@ export function evaluateHermiteTrajectoryInto(
   out: Float64Array | Float32Array,
 ): void {
   const { order, sampleCount } = spec;
+  const isPlanar = isPlanarLayout(spec);
   if (order < 2) {
     // Mirrors the schema-construction guard so direct callers that bypass
     // the DSL get the same error.
@@ -422,12 +457,22 @@ export function evaluateHermiteTrajectoryInto(
   // loop is six multiplies + three adds per sample regardless of order.
   const h10s = h10 * segmentSeconds;
   const h11s = h11 * segmentSeconds;
-
   // The per-sample stride is `order`; for order=2 it's (p, v), for order>=3
   // it's (p, v, a, …). The acceleration (and jerk) lanes are ignored on the
   // cubic path; consume acceleration via 'quintic-hermite'
   // (`evaluateQuinticHermiteTrajectoryInto`) for C², and jerk via
   // 'septic-hermite' for C³ (both 0.9.80).
+  if (isPlanar) {
+    const vOffset = sampleCount;
+    for (let i = 0; i < sampleCount; i++) {
+      const p0 = flatPrev[i]!;
+      const m0 = flatPrev[i + vOffset]!;
+      const p1 = flatCurr[i]!;
+      const m1 = flatCurr[i + vOffset]!;
+      out[i] = h00 * p0 + h10s * m0 + h01 * p1 + h11s * m1;
+    }
+    return;
+  }
   const stride = order;
   for (let i = 0; i < sampleCount; i++) {
     const j = i * stride;
@@ -550,8 +595,23 @@ export function evaluateQuinticHermiteTrajectoryInto(
   const h4s = h4 * T;
   const h2s = h2 * T2;
   const h5s = h5 * T2;
+  const isPlanar = isPlanarLayout(spec);
 
   // stride = order (3 or 4). The jerk lane (order=4) is skipped here.
+  if (isPlanar) {
+    const vOffset = sampleCount;
+    const aOffset = sampleCount * 2;
+    for (let i = 0; i < sampleCount; i++) {
+      const p0 = flatPrev[i]!;
+      const v0 = flatPrev[i + vOffset]!;
+      const a0 = flatPrev[i + aOffset]!;
+      const p1 = flatCurr[i]!;
+      const v1 = flatCurr[i + vOffset]!;
+      const a1 = flatCurr[i + aOffset]!;
+      out[i] = h0 * p0 + h1s * v0 + h2s * a0 + h3 * p1 + h4s * v1 + h5s * a1;
+    }
+    return;
+  }
   const stride = order;
   for (let i = 0; i < sampleCount; i++) {
     const j = i * stride;
@@ -683,10 +743,47 @@ export function evaluateSepticHermiteTrajectoryInto(
   const h6s = h6 * T2;
   const h3s = h3 * T3;
   const h7s = h7 * T3;
+  const isPlanar = isPlanarLayout(spec);
 
   const useF32FastPath = flatPrev instanceof Float32Array
     && flatCurr instanceof Float32Array
     && out instanceof Float32Array;
+  if (isPlanar) {
+    const vOffset = sampleCount;
+    const aOffset = sampleCount * 2;
+    const jOffset = sampleCount * 3;
+    if (useF32FastPath) {
+      for (let i = 0; i < sampleCount; i++) {
+        const p0 = flatPrev[i]!;
+        const v0 = flatPrev[i + vOffset]!;
+        const a0 = flatPrev[i + aOffset]!;
+        const j0 = flatPrev[i + jOffset]!;
+        const p1 = flatCurr[i]!;
+        const v1 = flatCurr[i + vOffset]!;
+        const a1 = flatCurr[i + aOffset]!;
+        const j1 = flatCurr[i + jOffset]!;
+        out[i] =
+          h0 * (p0 - p1) + p1 +
+          h1s * v0 + h5s * v1 +
+          h2s * a0 + h6s * a1 + h3s * j0 + h7s * j1;
+      }
+      return;
+    }
+    for (let i = 0; i < sampleCount; i++) {
+      const p0 = flatPrev[i]!;
+      const v0 = flatPrev[i + vOffset]!;
+      const a0 = flatPrev[i + aOffset]!;
+      const j0 = flatPrev[i + jOffset]!;
+      const p1 = flatCurr[i]!;
+      const v1 = flatCurr[i + vOffset]!;
+      const a1 = flatCurr[i + aOffset]!;
+      const j1 = flatCurr[i + jOffset]!;
+      out[i] =
+        h0 * p0 + h1s * v0 + h2s * a0 + h3s * j0 +
+        h4 * p1 + h5s * v1 + h6s * a1 + h7s * j1;
+    }
+    return;
+  }
   if (useF32FastPath) {
     // Algebraically equivalent for Float32 outputs:
     // h0*p0 + h4*p1 == p1 + h0*(p0 - p1), since h0 + h4 == 1.
@@ -793,6 +890,7 @@ export function evaluateCircularTrajectoryInto(
   period: number = TWO_PI,
 ): void {
   const { order, sampleCount } = spec;
+  const isPlanar = isPlanarLayout(spec);
   if (!Number.isFinite(period) || period <= 0) {
     throw new Error(`evaluateCircularTrajectoryInto: period must be finite positive, got ${period}`);
   }
@@ -813,29 +911,60 @@ export function evaluateCircularTrajectoryInto(
       return;
     }
     case 2: {
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 2;
-        out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt, period);
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] = wrapSymmetric(flat[i]! + flat[i + vOffset]! * dt, period);
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 2;
+          out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt, period);
+        }
       }
       return;
     }
     case 3: {
       const halfDt2 = 0.5 * dt * dt;
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 3;
-        out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2, period);
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        const aOffset = sampleCount * 2;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] = wrapSymmetric(
+            flat[i]! + flat[i + vOffset]! * dt + flat[i + aOffset]! * halfDt2,
+            period,
+          );
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 3;
+          out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2, period);
+        }
       }
       return;
     }
     case 4: {
       const halfDt2 = 0.5 * dt * dt;
       const sixthDt3 = (1 / 6) * dt * dt * dt;
-      for (let i = 0; i < sampleCount; i++) {
-        const j = i * 4;
-        out[i] = wrapSymmetric(
-          flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2 + flat[j + 3]! * sixthDt3,
-          period,
-        );
+      if (isPlanar) {
+        const vOffset = sampleCount;
+        const aOffset = sampleCount * 2;
+        const jOffset = sampleCount * 3;
+        for (let i = 0; i < sampleCount; i++) {
+          out[i] = wrapSymmetric(
+            flat[i]! + flat[i + vOffset]! * dt + flat[i + aOffset]! * halfDt2 + flat[i + jOffset]! *
+              sixthDt3,
+            period,
+          );
+        }
+      } else {
+        for (let i = 0; i < sampleCount; i++) {
+          const j = i * 4;
+          out[i] = wrapSymmetric(
+            flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2 + flat[j + 3]! * sixthDt3,
+            period,
+          );
+        }
       }
       return;
     }
@@ -916,8 +1045,22 @@ export function evaluateCircularHermiteTrajectoryInto(
   const h11 = t3 - t2;
   const h10s = h10 * segmentSeconds;
   const h11s = h11 * segmentSeconds;
+  const isPlanar = isPlanarLayout(spec);
 
   const stride = order;
+  if (isPlanar) {
+    const vOffset = sampleCount;
+    for (let i = 0; i < sampleCount; i++) {
+      const p0 = flatPrev[i]!;
+      const m0 = flatPrev[i + vOffset]!;
+      // Unwrap p1 onto the same sheet as p0 (shorter arc), so the cubic blend
+      // never traverses the long way around the circle.
+      const p1 = p0 + shortestArcDelta(p0, flatCurr[i]!, period);
+      const m1 = flatCurr[i + vOffset]!;
+      out[i] = wrapSymmetric(h00 * p0 + h10s * m0 + h01 * p1 + h11s * m1, period);
+    }
+    return;
+  }
   for (let i = 0; i < sampleCount; i++) {
     const j = i * stride;
     const p0 = flatPrev[j]!;

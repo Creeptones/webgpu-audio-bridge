@@ -88,6 +88,9 @@ export interface GetOrCompileOptions {
   readonly exportName?: string;
   readonly corpus?: CorpusOptions;
   readonly maxUlpF32?: number;
+  /** Fast-math opt-in for SIMD emit and gate tolerance.
+   *  Default false: strict math + strict/ULP gate. */
+  readonly fastMath?: boolean;
   /** Tuning for gate #3 (the acoustic probe + sane bounds). Defaults are generous —
    *  they catch genuine blowups, not legitimate effects. */
   readonly acoustic?: AcousticGateOptions;
@@ -199,6 +202,7 @@ export class KernelCache {
       exportName: opts.exportName,
       corpus: opts.corpus,
       maxUlpF32: opts.maxUlpF32,
+      fastMath: opts.fastMath,
     });
     if (result.status !== "accepted") {
       this.rejectsByHash.set(hash, result);

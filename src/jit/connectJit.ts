@@ -120,6 +120,10 @@ export interface ConnectJitSpec {
   readonly maxBlock: number;
   /** Audio sample rate (Hz). */
   readonly sampleRate: number;
+  /** Enable relaxed SIMD fast-math (fused multiply-add) in the compile path.
+   *  Default false: strict, non-fused candidate + strict/ULP gate.
+   *  When true, the gate uses the dedicated fast-math tolerance band. */
+  readonly fastMath?: boolean;
   /** Crossfade window seconds. Default 0.01 (the consumer default; Stage 2 proved
    *  the doubled fade quantum is ~0.04 % of the budget, so there is huge headroom
    *  and no hard-switch is needed at these kernel sizes). */
@@ -178,6 +182,9 @@ export interface JitCompileRequestBase {
   readonly signature: KernelSignature;
   readonly width?: LaneWidth;
   readonly exportName: string;
+  /** Fast-math opt-in for SIMD emit + gate tolerance.
+   *  Default false: strict, non-fused path. */
+  readonly fastMath?: boolean;
   /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). Default 1. */
   readonly voices?: number;
 }
@@ -400,7 +407,16 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
     stateBuffers = ir.stateBuffers ?? [];
     voices = requestedVoices > 1 && isStateful(ir) ? requestedVoices : 1;
     kernelSource = emitJsKernel(ir);
-    compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName, voices };
+    compileRequest = {
+      type: "jit-compile",
+      kind: "tokens",
+      tokens,
+      signature,
+      width,
+      exportName,
+      fastMath: spec.fastMath,
+      voices,
+    };
   } else {
     const source = spec.kernel!.toString();
     kernelSource = source;
@@ -421,7 +437,16 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
       // Keep the original source and stateless sizing; runJitCompile will surface
       // the precise rejected-source verdict asynchronously.
     }
-    compileRequest = { type: "jit-compile", kind: "js", source, signature, width, exportName, voices };
+    compileRequest = {
+      type: "jit-compile",
+      kind: "js",
+      source,
+      signature,
+      width,
+      exportName,
+      fastMath: spec.fastMath,
+      voices,
+    };
   }
 
   // Allocate the working memory unless the caller adopts one. Shared when the host
@@ -509,12 +534,18 @@ export async function runJitCompile(
   // `accepted` result ships. On the token path the width rides in the stream, so no
   // width override is applied.
   const result: CompileResult = request.kind === "tokens"
-    ? compileTokens(request.tokens, { compileWat: opts.compileWat, exportName: request.exportName, voices: request.voices })
+    ? compileTokens(request.tokens, {
+      compileWat: opts.compileWat,
+      exportName: request.exportName,
+      voices: request.voices,
+      fastMath: request.fastMath,
+    })
     : compileKernel(request.source, request.signature, {
         compileWat: opts.compileWat,
         width: request.width,
         exportName: request.exportName,
         voices: request.voices,
+        fastMath: request.fastMath,
       });
 
   if (result.status !== "accepted") {

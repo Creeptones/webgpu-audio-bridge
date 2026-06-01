@@ -312,11 +312,13 @@ export function predictiveExtrapolateInto(
       (pll.driftEstimatorEnabled
         ? Math.abs(pll.driftPpm) * 1e-6 * dtEff
         : 0);
+    const isPlanar = spec.layout === "planar";
     let maxAbsV = 0;
     for (let i = 0; i < sampleCount; i++) {
-      const j = i * order;
-      holdScratch[i] = flat[j]!; // position = hold value
-      const av = Math.abs(flat[j + 1]!); // velocity lane
+      const posIdx = isPlanar ? i : i * order;
+      const velIdx = isPlanar ? sampleCount + i : posIdx + 1;
+      holdScratch[i] = flat[posIdx]!; // position = hold value
+      const av = Math.abs(flat[velIdx]!); // velocity lane
       if (av > maxAbsV) maxAbsV = av;
     }
     valueUncertainty = maxAbsV * sigmaDtSeconds;

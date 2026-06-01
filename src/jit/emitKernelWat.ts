@@ -1,19 +1,19 @@
-/**
- * JIT WAT emitter — IR → WebAssembly Text (Apollo Frontier 5, Stage 1a).
+﻿/**
+ * JIT WAT emitter â€” IR â†’ WebAssembly Text (Apollo Frontier 5, Stage 1a).
  *
  * Mirrors `emitWasmDecoder.ts`: a monomorphized SOURCE STRING with offsets/
- * strides folded to `i32.const` literals, behind a "GENERATED — DO NOT EDIT"
+ * strides folded to `i32.const` literals, behind a "GENERATED â€” DO NOT EDIT"
  * banner that fingerprints the kernel. Imports `env.memory` as a `shared`
  * memory (the SAB-as-memory contract) and exports one `kernel` function.
  *
  * Two emitters from the SAME IR (the tree-shape-preserving (NR) lowering):
- *   emitScalarModule — single-lane f{32,64}.* ops, one straight loop. The gate's
+ *   emitScalarModule â€” single-lane f{32,64}.* ops, one straight loop. The gate's
  *                      compiled scalar REFERENCE (the ground truth `S`).
- *   emitSimdModule   — packed f{32x4,64x2}.* ops in a W-lane body + a SCALAR
+ *   emitSimdModule   â€” packed f{32x4,64x2}.* ops in a W-lane body + a SCALAR
  *                      EPILOGUE for the n%W tail (the simdEnd/tailEnd partition).
  *                      The candidate that must equal the reference lane-wise.
  *
- * NEVER emits a fused / `relaxed_*` opcode (the (NF) invariant — the FMA
+ * NEVER emits a fused / `relaxed_*` opcode (the (NF) invariant â€” the FMA
  * finding). Both modules share the canonical WASM param layout from
  * `paramLayout` so the gate can call either with the same arguments.
  *
@@ -34,7 +34,7 @@ function nextLocal(name: string): string { return `$__next_${name}`; }
 /** WASM i32 local holding a delay buffer's live write cursor (Stage 3). */
 function curLocal(name: string): string { return `$__cur_${name}`; }
 /** Byte offset of register `name` within the `$state` slab (via `stateLayout`,
- *  the single source of truth — registers occupy the slab prefix). */
+ *  the single source of truth â€” registers occupy the slab prefix). */
 function stateOffset(ir: IrKernel, name: string): number {
   const r = stateLayout(ir).regs.find((x) => x.name === name);
   return (r ? r.offset : 0) * ELEM_BYTES[ir.width];
@@ -52,7 +52,7 @@ export interface WasmParam {
 }
 
 /** Canonical WASM export param order, shared by both modules and the gate:
- *  trip count (i32) → arrays (i32 base offsets, signature order) → scalars
+ *  trip count (i32) â†’ arrays (i32 base offsets, signature order) â†’ scalars
  *  (width type, signature order). The trip count reuses the length-param name
  *  when present, else `__trip`. */
 export function paramLayout(ir: IrKernel): WasmParam[] {
@@ -62,7 +62,7 @@ export function paramLayout(ir: IrKernel): WasmParam[] {
   for (const p of ir.signature.params) {
     if (p.role === "input" || p.role === "output") params.push({ name: p.name, wasm: "i32" });
   }
-  // The state slab base pointer (Frontier 7) — appended after the arrays, before the
+  // The state slab base pointer (Frontier 7) â€” appended after the arrays, before the
   // scalars, ONLY for a stateful kernel, so a stateless layout (and its emitted SIMD
   // bytes) are byte-identical to pre-statefulness.
   if (isStateful(ir)) params.push({ name: "__state", wasm: "i32" });
@@ -76,14 +76,14 @@ function tripName(ir: IrKernel): string {
   return lengthParamName(ir.signature) ?? "__trip";
 }
 
-// ── number formatting (shortest round-trip decimal; wabt parses it exactly) ──
+// â”€â”€ number formatting (shortest round-trip decimal; wabt parses it exactly) â”€â”€
 function fmtNum(v: number): string {
   // Source literals are finite & non-negative (neg is a unary node). Integers
   // print exactly; others use the shortest round-trip decimal.
   return Number.isInteger(v) ? v.toFixed(1) : v.toString();
 }
 
-// ── scalar expression → WAT that pushes one f32/f64 ──────────────────────────
+// â”€â”€ scalar expression â†’ WAT that pushes one f32/f64 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function emitScalar(node: IrNode, ir: IrKernel): string {
   const t = ir.width; // "f32" | "f64"
   switch (node.kind) {
@@ -97,20 +97,41 @@ function emitScalar(node: IrNode, ir: IrKernel): string {
   }
 }
 
-// ── vector expression → WAT that pushes one v128 ─────────────────────────────
-function emitVector(node: IrNode, ir: IrKernel): string {
+// â”€â”€ vector expression â†’ WAT that pushes one v128 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function emitAddMulFma(
+  node: IrNode,
+  ir: IrKernel,
+  emitValue: (n: IrNode) => string,
+  fastMath: boolean,
+): string | null {
+  if (!fastMath || ir.width !== "f32") return null;
+  if (node.kind !== "binary" || node.op !== "add") return null;
+  if (node.a.kind === "binary" && node.a.op === "mul") {
+    return `(f32x4.relaxed_madd ${emitValue(node.a.a)} ${emitValue(node.a.b)} ${emitValue(node.b)})`;
+  }
+  if (node.b.kind === "binary" && node.b.op === "mul") {
+    return `(f32x4.relaxed_madd ${emitValue(node.b.a)} ${emitValue(node.b.b)} ${emitValue(node.a)})`;
+  }
+  return null;
+}
+
+function emitVector(node: IrNode, ir: IrKernel, fastMath = false): string {
   const v = ir.width === "f32" ? "f32x4" : "f64x2";
   const t = ir.width;
   switch (node.kind) {
     case "const": return `(${v}.splat (${t}.const ${fmtNum(node.value)}))`;
     case "scalar": return `(${v}.splat (local.get $${node.name}))`;
     case "load": return `(v128.load ${addr(node.array, node.stride, node.intercept, ir)})`;
-    // A stateful kernel is scalar-only (vectorize → scalarOnly), so emitSimdModule is
+    // A stateful kernel is scalar-only (vectorize â†’ scalarOnly), so emitSimdModule is
     // never called for one; this arm is unreachable and guards the (NR) invariant.
     case "readState": throw new Error("emitVector: readState has no SIMD lowering (stateful kernels are scalar-only)");
     case "readDelay": throw new Error("emitVector: readDelay has no SIMD lowering (delay-line kernels are scalar-only)");
-    case "unary": return `(${v}.${unaryOp(node.op)} ${emitVector(node.a, ir)})`;
-    case "binary": return `(${v}.${node.op} ${emitVector(node.a, ir)} ${emitVector(node.b, ir)})`;
+    case "unary": return `(${v}.${unaryOp(node.op)} ${emitVector(node.a, ir, fastMath)})`;
+    case "binary": {
+      const fused = emitAddMulFma(node, ir, (x) => emitVector(x, ir, fastMath), fastMath);
+      if (fused) return fused;
+      return `(${v}.${node.op} ${emitVector(node.a, ir, fastMath)} ${emitVector(node.b, ir, fastMath)})`;
+    }
   }
 }
 
@@ -129,9 +150,9 @@ function addr(name: string, stride: number, intercept: number, ir: IrKernel): st
   return `(i32.add (local.get $${name}) (i32.mul ${elem} (i32.const ${eb})))`;
 }
 
-/** Byte address of `buffer[(w − delay + L) mod L]` in the state slab, where `w` is the
- *  buffer's live cursor i32 local. `(w − delay + L)` is in `[0, 2L)`, so `i32.rem_u`
- *  by `L` lands non-negative in `[0, L)`. (delay ≥ 1, so this never aliases slot `w`.) */
+/** Byte address of `buffer[(w âˆ’ delay + L) mod L]` in the state slab, where `w` is the
+ *  buffer's live cursor i32 local. `(w âˆ’ delay + L)` is in `[0, 2L)`, so `i32.rem_u`
+ *  by `L` lands non-negative in `[0, L)`. (delay â‰¥ 1, so this never aliases slot `w`.) */
 function delayReadAddr(buffer: string, delay: number, ir: IrKernel): string {
   const eb = ELEM_BYTES[ir.width];
   const { byteBase, length } = bufferInfo(ir, buffer);
@@ -141,7 +162,7 @@ function delayReadAddr(buffer: string, delay: number, ir: IrKernel): string {
 }
 
 /** Byte address of the slot the buffer's cursor `w` currently points at (the
- *  `writeDelay` target — written AFTER all reads, before the cursor advances). */
+ *  `writeDelay` target â€” written AFTER all reads, before the cursor advances). */
 function delayWriteAddr(buffer: string, ir: IrKernel): string {
   const eb = ELEM_BYTES[ir.width];
   const { byteBase } = bufferInfo(ir, buffer);
@@ -152,8 +173,8 @@ function delayWriteAddr(buffer: string, ir: IrKernel): string {
 function storeScalar(s: IrStore, ir: IrKernel): string {
   return `(${ir.width}.store ${addr(s.array, s.stride, s.intercept, ir)} ${emitScalar(s.value, ir)})`;
 }
-function storeVector(s: IrStore, ir: IrKernel): string {
-  return `(v128.store ${addr(s.array, s.stride, s.intercept, ir)} ${emitVector(s.value, ir)})`;
+function storeVector(s: IrStore, ir: IrKernel, fastMath = false): string {
+  return `(v128.store ${addr(s.array, s.stride, s.intercept, ir)} ${emitVector(s.value, ir, fastMath)})`;
 }
 
 function paramDecls(ir: IrKernel): string {
@@ -163,8 +184,8 @@ function paramDecls(ir: IrKernel): string {
 function banner(ir: IrKernel, mode: "scalar" | "simd"): string {
   const W = LANES[ir.width];
   return [
-    `;; ── GENERATED by emitKernelWat (${mode}) — DO NOT EDIT ──────────────`,
-    `;; Apollo Frontier 5 — The Autonomous JIT. width=${ir.width} laneWidth=${mode === "simd" ? W : 1}`,
+    `;; â”€â”€ GENERATED by emitKernelWat (${mode}) â€” DO NOT EDIT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€`,
+    `;; Apollo Frontier 5 â€” The Autonomous JIT. width=${ir.width} laneWidth=${mode === "simd" ? W : 1}`,
     `;; kernel fingerprint: ${kernelKey(ir)}`,
   ].join("\n");
 }
@@ -172,11 +193,11 @@ function banner(ir: IrKernel, mode: "scalar" | "simd"): string {
 const PAGES = { min: 1, max: 16384 };
 
 /** Scalar reference module: one straight loop in single-lane ops. For a stateful
- *  kernel (Frontier 7) it threads the state registers — load the slab into locals
- *  before the loop, read them (`readState` → `local.get`) and compute each register's
+ *  kernel (Frontier 7) it threads the state registers â€” load the slab into locals
+ *  before the loop, read them (`readState` â†’ `local.get`) and compute each register's
  *  next value into a `$__next_*` local inside the loop, COMMIT all next-values at the
  *  END of the iteration body (so every read in the iteration saw the pre-commit value
- *  — the SIMULTANEOUS semantics, docs/frontier7-statefulness-semantics.md §2.2), and
+ *  â€” the SIMULTANEOUS semantics, docs/frontier7-statefulness-semantics.md Â§2.2), and
  *  store the locals back to the slab after the loop. A stateless kernel emits exactly
  *  as before (no state preamble/commit/epilogue). */
 export function emitScalarModule(ir: IrKernel, exportName = "kernel"): string {
@@ -189,7 +210,7 @@ export function emitScalarModule(ir: IrKernel, exportName = "kernel"): string {
   const cvt = ir.width === "f32" ? "f32" : "f64"; // i32.trunc_<cvt>_s / <cvt>.convert_i32_s
 
   // Per-register locals: $__st_* (current) + $__next_* (to-commit, only if written);
-  // per-buffer: a single i32 cursor local $__cur_* (Stage 3 — a buffer needs NO
+  // per-buffer: a single i32 cursor local $__cur_* (Stage 3 â€” a buffer needs NO
   // deferral temp: it writes directly to buf[w] after the reads, then w advances).
   const written = new Set(stateStores.map((ss) => ss.name));
   const regLocals = decls
@@ -207,9 +228,9 @@ export function emitScalarModule(ir: IrKernel, exportName = "kernel"): string {
   });
   const statePreamble = [...regPreamble, ...cursorPreamble].join("\n");
 
-  // In-loop body (SIMULTANEOUS — all reads see pre-iteration state):
-  //   1 output stores · 2 register next-values · 3 buffer writes (direct to buf[w],
-  //   reading pre-commit registers + w−d slots) · 4 commit registers · 5 advance cursors.
+  // In-loop body (SIMULTANEOUS â€” all reads see pre-iteration state):
+  //   1 output stores Â· 2 register next-values Â· 3 buffer writes (direct to buf[w],
+  //   reading pre-commit registers + wâˆ’d slots) Â· 4 commit registers Â· 5 advance cursors.
   const outStores = ir.stores.map((s) => "        " + storeScalar(s, ir)).join("\n");
   const computeNext = stateStores
     .map((ss) => `        (local.set ${nextLocal(ss.name)} ${emitScalar(ss.value, ir)})`)
@@ -257,11 +278,11 @@ ${loopBody}
 }
 
 /** SIMD candidate module: W-lane body over [0, trip & ~(W-1)) + scalar tail. */
-export function emitSimdModule(ir: IrKernel, exportName = "kernel"): string {
+export function emitSimdModule(ir: IrKernel, exportName = "kernel", fastMath = false): string {
   const trip = tripName(ir);
   const W = LANES[ir.width];
   const mask = (~(W - 1)) | 0; // -2 (W=2) / -4 (W=4)
-  const vbody = ir.stores.map((s) => "        " + storeVector(s, ir)).join("\n");
+  const vbody = ir.stores.map((s) => "        " + storeVector(s, ir, fastMath)).join("\n");
   const sbody = ir.stores.map((s) => "        " + storeScalar(s, ir)).join("\n");
   return `${banner(ir, "simd")}
 (module
@@ -291,7 +312,7 @@ ${sbody}
 )`;
 }
 
-// ── voice-axis SIMD (Apollo Frontier 7, Stage 4) ─────────────────────────────
+// â”€â”€ voice-axis SIMD (Apollo Frontier 7, Stage 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // A STATEFUL kernel cannot be vectorized along TIME (the recurrence wall), but
 // polyphony hands us `V` INDEPENDENT voices, each running the SAME kernel with its
@@ -299,37 +320,37 @@ ${sbody}
 // pack W voices into one v128 (lane j = voice j), run the sequential time loop ONCE,
 // and every iteration advances all W recurrences lock-step lane-parallel. The
 // recurrence stays sequential WITHIN a lane; it goes parallel ACROSS lanes. Sound
-// because no IrNode can reference another voice ⇒ lane j is bit-for-bit a scalar run
-// of voice j (so the gate is bit-exact even for f32 — stronger than the time path).
+// because no IrNode can reference another voice â‡’ lane j is bit-for-bit a scalar run
+// of voice j (so the gate is bit-exact even for f32 â€” stronger than the time path).
 //
-// LAYOUT — VOICE-INTERLEAVED (voice is the fast axis), so one v128.load gathers a
+// LAYOUT â€” VOICE-INTERLEAVED (voice is the fast axis), so one v128.load gathers a
 // lane group:
-//   • inputs/outputs : x[i·W + j]            → v128.load (base + i·W·eb)
-//   • per-voice scalars: lane-packed $__scalars slab, scalar s at element s·W (+j),
+//   â€¢ inputs/outputs : x[iÂ·W + j]            â†’ v128.load (base + iÂ·WÂ·eb)
+//   â€¢ per-voice scalars: lane-packed $__scalars slab, scalar s at element sÂ·W (+j),
 //     loaded ONCE before the loop into a v128 local (loop-invariant per voice).
-//   • state slab     : every `stateLayout` element offset · W. register r → v128 at
-//     (regOffset·W)·eb; ring slot k of buffer b → (b.offset+k)·W·eb; the cursor is a
-//     SCALAR float at (cursorOffset·W)·eb — ONE shared i32 for the whole lane group
-//     (all W voices share the time loop ⇒ are time-aligned ⇒ share the write cursor;
-//     the §2 shared-cursor insight, the analogue of Stage 3's d ≥ 1).
+//   â€¢ state slab     : every `stateLayout` element offset Â· W. register r â†’ v128 at
+//     (regOffsetÂ·W)Â·eb; ring slot k of buffer b â†’ (b.offset+k)Â·WÂ·eb; the cursor is a
+//     SCALAR float at (cursorOffsetÂ·W)Â·eb â€” ONE shared i32 for the whole lane group
+//     (all W voices share the time loop â‡’ are time-aligned â‡’ share the write cursor;
+//     the Â§2 shared-cursor insight, the analogue of Stage 3's d â‰¥ 1).
 //
-// `stateLayout` is NOT changed (it stays the per-voice element map); the ·W fold lives
+// `stateLayout` is NOT changed (it stays the per-voice element map); the Â·W fold lives
 // ONLY here (and in the voice consumer), so the single-voice scalar path + the
 // stateless SIMD path stay byte-identical (the frontier gate). The deferral temps, the
 // commit-at-iteration-end, and the advance-cursor-at-end ordering are IDENTICAL to the
-// scalar module — just v128 instead of scalar — so the SIMULTANEOUS semantics fall out
+// scalar module â€” just v128 instead of scalar â€” so the SIMULTANEOUS semantics fall out
 // per-lane exactly as they do per-sample.
 
 /** WASM v128 local holding a scalar's per-voice values (loaded once before the loop). */
 function scLocal(name: string): string { return `$__sc_${name}`; }
 
-/** Lane-packed byte offset of register `name` (regOffset·W elements into the slab). */
+/** Lane-packed byte offset of register `name` (regOffsetÂ·W elements into the slab). */
 function voiceStateOffset(ir: IrKernel, name: string, W: number): number {
   const r = stateLayout(ir).regs.find((x) => x.name === name);
   return (r ? r.offset : 0) * W * ELEM_BYTES[ir.width];
 }
 /** Lane-packed slab descriptor for a delay buffer: the ring base byte, the (scalar,
- *  lane-0) cursor byte, the ring length, and the per-time-step lane stride (W·eb). */
+ *  lane-0) cursor byte, the ring length, and the per-time-step lane stride (WÂ·eb). */
 function voiceBufferInfo(ir: IrKernel, name: string, W: number): { byteBase: number; cursorByte: number; length: number; laneStride: number } {
   const eb = ELEM_BYTES[ir.width];
   const b = stateLayout(ir).buffers.find((x) => x.name === name)!;
@@ -337,7 +358,7 @@ function voiceBufferInfo(ir: IrKernel, name: string, W: number): { byteBase: num
 }
 
 /** byte address of the v128 lane group at (i + intercept) in voice-interleaved array
- *  `name` — element (i+intercept)·W, byte ·eb (loads the W voices at that time). */
+ *  `name` â€” element (i+intercept)Â·W, byte Â·eb (loads the W voices at that time). */
 function voiceAddr(name: string, intercept: number, ir: IrKernel, W: number): string {
   const eb = ELEM_BYTES[ir.width];
   const elem = intercept === 0
@@ -346,8 +367,8 @@ function voiceAddr(name: string, intercept: number, ir: IrKernel, W: number): st
   return `(i32.add (local.get $${name}) (i32.mul ${elem} (i32.const ${eb})))`;
 }
 
-/** byte address of the lane group `buffer[(w − delay + L) mod L]` in the lane-packed
- *  ring — the shared i32 cursor `w`, lane stride W·eb (delay ≥ 1 ⇒ never aliases w). */
+/** byte address of the lane group `buffer[(w âˆ’ delay + L) mod L]` in the lane-packed
+ *  ring â€” the shared i32 cursor `w`, lane stride WÂ·eb (delay â‰¥ 1 â‡’ never aliases w). */
 function voiceDelayReadAddr(buffer: string, delay: number, ir: IrKernel, W: number): string {
   const { byteBase, length, laneStride } = voiceBufferInfo(ir, buffer, W);
   const w = curLocal(buffer);
@@ -361,8 +382,8 @@ function voiceDelayWriteAddr(buffer: string, ir: IrKernel, W: number): string {
   return `(i32.add (local.get $__state) (i32.add (i32.const ${byteBase}) (i32.mul (local.get ${w}) (i32.const ${laneStride}))))`;
 }
 
-/** Voice-SIMD WASM export param order: trip (i32) → arrays (i32 base, signature order)
- *  → $__state (i32) → $__scalars (i32, only when the kernel has scalar params). The one
+/** Voice-SIMD WASM export param order: trip (i32) â†’ arrays (i32 base, signature order)
+ *  â†’ $__state (i32) â†’ $__scalars (i32, only when the kernel has scalar params). The one
  *  ABI difference from `paramLayout`: scalars become a LANE-PACKED slab POINTER (each
  *  voice its own value), not f32/f64 value args. (The voice path is stateful-only, so
  *  $__state is always present.) */
@@ -379,10 +400,10 @@ function voiceParamDecls(ir: IrKernel): string {
   return voiceParamLayout(ir).map((p) => `(param $${p.name} ${p.wasm})`).join(" ");
 }
 
-/** vector expression → WAT that pushes one v128, with VOICE-interleaved leaf addressing
+/** vector expression â†’ WAT that pushes one v128, with VOICE-interleaved leaf addressing
  *  (the only difference from `emitVector`: leaves read the W voices at time `i` rather
  *  than W times of one voice). Arithmetic is the layout-agnostic f{32x4,64x2}.* op. */
-function emitVoice(node: IrNode, ir: IrKernel, W: number): string {
+function emitVoice(node: IrNode, ir: IrKernel, W: number, fastMath = false): string {
   const v = ir.width === "f32" ? "f32x4" : "f64x2";
   const t = ir.width;
   switch (node.kind) {
@@ -391,27 +412,31 @@ function emitVoice(node: IrNode, ir: IrKernel, W: number): string {
     case "load": return `(v128.load ${voiceAddr(node.array, node.intercept, ir, W)})`;
     case "readState": return `(local.get ${stLocal(node.name)})`;
     case "readDelay": return `(v128.load ${voiceDelayReadAddr(node.buffer, node.delay, ir, W)})`;
-    case "unary": return `(${v}.${unaryOp(node.op)} ${emitVoice(node.a, ir, W)})`;
-    case "binary": return `(${v}.${node.op} ${emitVoice(node.a, ir, W)} ${emitVoice(node.b, ir, W)})`;
+    case "unary": return `(${v}.${unaryOp(node.op)} ${emitVoice(node.a, ir, W, fastMath)})`;
+    case "binary": {
+      const fused = emitAddMulFma(node, ir, (x) => emitVoice(x, ir, W, fastMath), fastMath);
+      if (fused) return fused;
+      return `(${v}.${node.op} ${emitVoice(node.a, ir, W, fastMath)} ${emitVoice(node.b, ir, W, fastMath)})`;
+    }
   }
 }
 
 function voiceBanner(ir: IrKernel, W: number): string {
   return [
-    `;; ── GENERATED by emitKernelWat (voice-simd) — DO NOT EDIT ───────────`,
-    `;; Apollo Frontier 7 — SIMD across voices. width=${ir.width} voicesPerBatch=${W}`,
+    `;; â”€â”€ GENERATED by emitKernelWat (voice-simd) â€” DO NOT EDIT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€`,
+    `;; Apollo Frontier 7 â€” SIMD across voices. width=${ir.width} voicesPerBatch=${W}`,
     `;; kernel fingerprint: ${kernelKey(ir)}`,
   ].join("\n");
 }
 
 /**
  * Voice-SIMD candidate module (Apollo Frontier 7, Stage 4): one straight time loop
- * (`i` strides by 1, like the scalar module — the recurrence is sequential) whose every
+ * (`i` strides by 1, like the scalar module â€” the recurrence is sequential) whose every
  * leaf is a v128 reading W voices at once. Stateful-only; `W` voices per batch. The
  * register deferral / commit-at-end / advance-cursor-at-end ordering mirrors
- * `emitScalarModule` exactly — the SIMULTANEOUS semantics hold per-lane as per-sample.
+ * `emitScalarModule` exactly â€” the SIMULTANEOUS semantics hold per-lane as per-sample.
  */
-export function emitVoiceSimdModule(ir: IrKernel, W: number, exportName = "kernel"): string {
+export function emitVoiceSimdModule(ir: IrKernel, W: number, exportName = "kernel", fastMath = false): string {
   if (!isStateful(ir)) throw new Error("emitVoiceSimdModule: voice-SIMD is for stateful kernels only");
   const trip = tripName(ir);
   const t = ir.width;
@@ -444,10 +469,10 @@ export function emitVoiceSimdModule(ir: IrKernel, W: number, exportName = "kerne
   });
   const preamble = [...scalarPreamble, ...regPreamble, ...cursorPreamble].join("\n");
 
-  // In-loop body (SIMULTANEOUS, per-lane): output stores · register next-values · buffer
-  // writes (direct to buf[w]) · commit registers · advance cursors.
+  // In-loop body (SIMULTANEOUS, per-lane): output stores Â· register next-values Â· buffer
+  // writes (direct to buf[w]) Â· commit registers Â· advance cursors.
   const outStores = ir.stores
-    .map((s) => `        (v128.store ${voiceAddr(s.array, s.intercept, ir, W)} ${emitVoice(s.value, ir, W)})`).join("\n");
+    .map((s) => `        (v128.store ${voiceAddr(s.array, s.intercept, ir, W)} ${emitVoice(s.value, ir, W, fastMath)})`).join("\n");
   const computeNext = stateStores
     .map((ss) => `        (local.set ${nextLocal(ss.name)} ${emitVoice(ss.value, ir, W)})`).join("\n");
   const bufferWrites = bufferStores
@@ -492,3 +517,4 @@ ${loopBody}
 
 export { ELEM_BYTES, LANES };
 export type { LaneWidth, BinaryOp };
+

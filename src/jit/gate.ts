@@ -60,6 +60,9 @@ export interface GateInput {
   readonly jsSource?: string;
   /** f32 ULP budget (default 0 — v1 is bit-exact). */
   readonly maxUlpF32?: number;
+  /** Fast-math mode: SIMD f32x4.relaxed_madd is allowed, so SIMD-vs-scalar uses
+   *  the fast-math tolerance band unless `maxUlpF32` is explicitly set. */
+  readonly fastMath?: boolean;
   /** Stateful kernels (Frontier 7): there is no SIMD candidate (the recurrence is
    *  scalar-only), so the proof is the scalar WASM ≡ `evalReference(ir)` (the IR spec),
    *  not SIMD ≡ scalar. When set, `simdWat` is ignored and the JS oracle is N/A. */
@@ -80,6 +83,8 @@ const dvF64 = new DataView(new ArrayBuffer(8));
 const dvF32 = new DataView(new ArrayBuffer(4));
 function bitsF64(x: number): bigint { dvF64.setFloat64(0, x); return dvF64.getBigUint64(0); }
 function bitsF32(x: number): number { dvF32.setFloat32(0, x); return dvF32.getUint32(0) >>> 0; }
+const FAST_MATH_SIMD_TOLERANCE_MAX = 1e-3;
+const FAST_MATH_SIMD_TOLERANCE_RMS = 1e-4;
 function ulpF32(a: number, b: number): number {
   if (Number.isNaN(a) || Number.isNaN(b)) return Number.isNaN(a) === Number.isNaN(b) ? 0 : Infinity;
   const order = (u: number) => (u & 0x80000000 ? (0x100000000 - u) >>> 0 : (u | 0x80000000) >>> 0);
@@ -89,6 +94,14 @@ function equalW(a: number, b: number, w: LaneWidth, maxUlp: number): boolean {
   if (w === "f64") return bitsF64(a) === bitsF64(b);
   if (maxUlp === 0) return bitsF32(a) === bitsF32(b);
   return ulpF32(a, b) <= maxUlp;
+}
+function diffStats(): { sumSq: number; maxAbs: number } {
+  return { sumSq: 0, maxAbs: 0 };
+}
+function recordDiff(a: number, b: number, stats: { sumSq: number; maxAbs: number }): void {
+  const d = Math.abs(a - b);
+  stats.sumSq += d * d;
+  if (d > stats.maxAbs) stats.maxAbs = d;
 }
 
 /** Tolerance for the JS THIRD-oracle cross-check (scalar-WASM vs the user's JS).
@@ -184,6 +197,8 @@ export function runGate(input: GateInput): GateReport {
   const { ir, scalarWat, simdWat, corpus, compileWat } = input;
   const w = signatureWidth(ir.signature);
   const maxUlp = input.maxUlpF32 ?? 0;
+  const useFastMath = input.fastMath === true && input.maxUlpF32 === undefined;
+  const fastStats = useFastMath ? diffStats() : null;
 
   // Frontier 7, Stage 4: a voice-SIMD kernel proves lane j ≡ evalReference(voice j),
   // bit-exact for every lane. Distinct path from the time-axis SIMD vs scalar check.
@@ -241,10 +256,32 @@ export function runGate(input: GateInput): GateReport {
       const cand = readOut(memory, layout, name, c.n, TA);
       for (let i = 0; i < c.n; i++) {
         comparisons++;
-        if (w === "f32") worstUlpF32 = Math.max(worstUlpF32, ulpF32(ref[name]![i]!, cand[i]!));
-        if (!equalW(ref[name]![i]!, cand[i]!, w, maxUlp)) {
+        const a = ref[name]![i]!;
+        const b = cand[i]!;
+        if (w === "f32") worstUlpF32 = Math.max(worstUlpF32, ulpF32(a, b));
+        if (useFastMath) {
+        if (Number.isNaN(a) && Number.isNaN(b)) continue;
+        if (!Number.isFinite(a) || !Number.isFinite(b)) return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
+        const stats = fastStats;
+        if (stats === null) {
           return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
-            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a: ref[name]![i]!, b: cand[i]! } };
+            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
+        }
+        recordDiff(a, b, stats);
+        if (stats.maxAbs > FAST_MATH_SIMD_TOLERANCE_MAX) {
+          return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
+        }
+        if (Math.sqrt(stats.sumSq / comparisons) > FAST_MATH_SIMD_TOLERANCE_RMS) {
+          return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
+        }
+        continue;
+      }
+        if (!equalW(a, b, w, maxUlp)) {
+          return { status: "rejected-gate", casesChecked: ci + 1, comparisons, worstUlpF32,
+            mismatch: { kind: "simd-vs-scalar", caseIndex: ci, n: c.n, array: name, index: i, a, b } };
         }
       }
     }
@@ -266,6 +303,18 @@ export function runGate(input: GateInput): GateReport {
           }
         }
       }
+    }
+  }
+  if (useFastMath && fastStats) {
+    const rms = Math.sqrt(fastStats.sumSq / Math.max(1, comparisons));
+    if (fastStats.maxAbs > FAST_MATH_SIMD_TOLERANCE_MAX || rms > FAST_MATH_SIMD_TOLERANCE_RMS) {
+      return {
+        status: "rejected-gate",
+        casesChecked: corpus.length,
+        comparisons,
+        worstUlpF32,
+        reason: `fast-math tolerance failure (maxAbs=${fastStats.maxAbs}, rms=${rms})`,
+      };
     }
   }
 

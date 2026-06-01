@@ -275,6 +275,7 @@ export type {
   SchemaLayoutDescription,
   SchemaLayoutFieldDescription,
   TrajectoryOrder,
+  TrajectoryLayout,
   TrajectorySpec,
   TrajectoryOverflowFallback,
   TrajectoryInterpolationMode,

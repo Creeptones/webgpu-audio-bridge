@@ -64,6 +64,10 @@
  *     order=1:  [p0, p1, ..., p_{n-1}]                       — position only
  *     order=2:  [p0, v0, p1, v1, ..., p_{n-1}, v_{n-1}]      — pos + velocity
  *     order=3:  [p0, v0, a0, p1, v1, a1, ..., p_{n-1}, v_{n-1}, a_{n-1}]
+ *     order=4:  [p0, v0, a0, j0, p1, v1, a1, j1, ...]      — jerk lane (0.9.80)
+ *
+ * `layout: "interleaved"` (default) preserves this layout. `layout: "planar"`
+ * stores contiguous lanes as `[p0, p1, ...], [v0, v1, ...], [a0, a1, ...], ...`.
  *
  * The interleaved layout (rather than concatenated `[p…, v…, a…]`) keeps
  * each sample's position and derivatives cache-line adjacent so a downstream
@@ -224,6 +228,8 @@ export function kindTsType(kind: FieldKind): "bigint" | "number" {
  *      0.9.80). The order-4 jerk lane is interleaved as `[p, v, a, j, …]`; it is
  *      an **additive** widening — order 1/2/3 producers are byte-unchanged. */
 export type TrajectoryOrder = 1 | 2 | 3 | 4;
+/** Storage layout for trajectory arrays. */
+export type TrajectoryLayout = "interleaved" | "planar";
 
 /** Behavior of the clamped trajectory evaluator when a per-sample clamp band is
  *  exceeded (0.6.7). Only consulted when `maxDeltaPerSample` is set.
@@ -295,6 +301,10 @@ export interface TrajectorySpec {
   readonly order: TrajectoryOrder;
   /** Number of logical samples. Underlying typed-array length = sampleCount * order. */
   readonly sampleCount: number;
+  /** Optional trajectory layout for `sampleCount` samples.
+   *  Omitted means `interleaved` for backward compatibility.
+   *  `planar` stores each derivative lane contiguously. */
+  readonly layout?: TrajectoryLayout;
   /** Upper bound on `|v_i|` pre-evaluation. When set the clamped evaluator
    *  clamps each loaded velocity to `[-velocityClamp, +velocityClamp]` before
    *  the Taylor multiply. Must be finite + positive. */
@@ -404,7 +414,7 @@ export const i8Array  = (n: number): FieldSpec<Int8Array>      => array<Int8Arra
 // Byte-wise identical to `f{32,64}Array(n * order)`. The `trajectory` tag
 // labels the field so downstream consumers (a future `evaluateInto`
 // evaluator, worklet inliners) can detect that the flat element stream is
-// an interleaved (p, v, [a]) sequence rather than opaque samples. See the
+// a trajectory `(p, v, [a], [j])` sequence rather than opaque samples. See the
 // "Trajectory arrays" section at the top of this file for the layout.
 
 /** Options accepted by `f{32,64}TrajectoryArray(n, opts)`. The `order` field
@@ -412,6 +422,10 @@ export const i8Array  = (n: number): FieldSpec<Int8Array>      => array<Int8Arra
  *  path in `evaluateTrajectoryInto` (0.6.7). */
 export interface TrajectoryArrayOptions {
   readonly order: TrajectoryOrder;
+  /** Storage layout. Omitted or `"interleaved"` stores `[p,v,[a],[j]]`
+   *  samples together. `"planar"` stores each derivative plane contiguously.
+   *  Defaults to `"interleaved"` for backward compatibility. */
+  readonly layout?: TrajectoryLayout;
   readonly velocityClamp?: number;
   readonly accelerationClamp?: number;
   readonly maxDeltaPerSample?: number;
@@ -437,6 +451,9 @@ const VALID_INTERPOLATION_MODES: ReadonlySet<TrajectoryInterpolationMode> = new 
 const VALID_OVERFLOW_FALLBACKS: ReadonlySet<TrajectoryOverflowFallback> = new Set<
   TrajectoryOverflowFallback
 >(["hold", "linear", "saturate"]);
+const VALID_TRAJECTORY_LAYOUTS: ReadonlySet<TrajectoryLayout> = new Set<
+  TrajectoryLayout
+>(["interleaved", "planar"]);
 
 function validatePositiveFiniteClamp(label: string, v: unknown): void {
   if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
@@ -502,10 +519,17 @@ function trajectoryArray<T>(
       `Schema: trajectory interpolationMode 'septic-hermite' requires order == 4 (need endpoint jerk for C³ continuity), got order=${order}`,
     );
   }
+  const layout = opts.layout ?? "interleaved";
+  if (!VALID_TRAJECTORY_LAYOUTS.has(layout)) {
+    throw new Error(
+      `Schema: trajectory layout must be 'interleaved' | 'planar', got ${String(layout)}`,
+    );
+  }
   const flatLength = sampleCount * order;
   const trajectory: TrajectorySpec = Object.freeze({
     order,
     sampleCount,
+    ...(layout !== "interleaved" ? { layout } : {}),
     ...(opts.velocityClamp !== undefined ? { velocityClamp: opts.velocityClamp } : {}),
     ...(opts.accelerationClamp !== undefined ? { accelerationClamp: opts.accelerationClamp } : {}),
     ...(opts.maxDeltaPerSample !== undefined ? { maxDeltaPerSample: opts.maxDeltaPerSample } : {}),

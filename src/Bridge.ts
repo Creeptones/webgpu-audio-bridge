@@ -2033,11 +2033,13 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
         const sb = scratch[name]!;
         const flat = src[name] as Float64Array | Float32Array;
         // Deinterleave the stamped (p[,v[,a]]) lanes from the flat trajectory.
+        // Layout-aware: planar layout stores each derivative lane contiguously.
+        const isPlanar = field.trajectory.layout === "planar";
         for (let i = 0; i < sc; i++) {
-          const j = i * order;
-          sb.pos[i] = flat[j]!;
-          if (order >= 2) sb.vel[i] = flat[j + 1]!;
-          if (order >= 3) sb.acc[i] = flat[j + 2]!;
+          const posIdx = isPlanar ? i : i * order;
+          sb.pos[i] = flat[posIdx]!;
+          if (order >= 2) sb.vel[i] = flat[isPlanar ? sc + i : posIdx + 1]!;
+          if (order >= 3) sb.acc[i] = flat[isPlanar ? 2 * sc + i : posIdx + 2]!;
         }
         // Fuse only on a fresh pull (re-feeding a stale stamp would corrupt dt).
         if (fresh) {
