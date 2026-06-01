@@ -57,6 +57,8 @@ import { ConnectUnsupportedError } from "../src/connect.js";
 import { connectWorkQueue, mountWorkQueue } from "../src/connectWorkQueue.js";
 import { getEnvironmentReport, type EnvironmentReport } from "../src/environment.js";
 import { MpmcWorkQueue } from "../src/MpmcWorkQueue.js";
+import { WasmMpmcWorkQueue } from "../src/WasmMpmcWorkQueue.js";
+import { hasWasmThreads } from "../src/worklet/wasmSimdSupport.js";
 
 // Silence (and capture) the one-shot experimental warning from MpmcWorkQueue.
 const warnings: string[] = [];
@@ -417,6 +419,39 @@ function pin10_endOfStream(): void {
   ok("10 Stage-3 end-of-stream through the wiring (close/isClosed/isDrained, no hang)");
 }
 
+function pin11_wasmBackend(): void {
+  const topo = connectWorkQueue<AllKinds>({
+    schema: allKinds,
+    producerCount: 1,
+    consumerCount: 1,
+    capacity: 8,
+    environment: turbo(),
+    backend: "wasm",
+  });
+  const shouldWasm =
+    hasWasmThreads() &&
+    typeof WebAssembly !== "undefined" &&
+    typeof WebAssembly.Module === "function";
+  assertEq(topo.handle.backend, shouldWasm ? "wasm" : "js", "backend resolves based on WASM thread support");
+  const mounted = topo.mount({ role: "consumer", schema: allKinds });
+  if (topo.handle.backend === "wasm") {
+    assert(mounted instanceof WasmMpmcWorkQueue, "wasm handle mounts WasmMpmcWorkQueue by default");
+    assert(topo.handle.wasmMemory instanceof WebAssembly.Memory, "wasm handle carries memory");
+    assert(topo.handle.wasmModule instanceof WebAssembly.Module, "wasm handle carries module");
+    const jsOverride = mountWorkQueue(topo.handle, { role: "consumer", schema: allKinds, backend: "js" });
+    assert(jsOverride instanceof MpmcWorkQueue, "per-mount backend:'js' override stays on JS facade");
+    assert(!(jsOverride instanceof WasmMpmcWorkQueue), "JS override is not the WASM subclass");
+  } else {
+    assert(mounted instanceof MpmcWorkQueue, "fallback handle mounts JS queue");
+  }
+  const producer = mountWorkQueue(topo.handle, { role: "producer", schema: allKinds });
+  producer.push(makeFrame(0, 123) as never);
+  const out = mounted.createFrame() as Record<string, unknown>;
+  assert(mounted.pull(out as never), "backend-selected consumer pulls a frame");
+  assertEq(out.seq as number, 123, "payload crosses backend-selected queue");
+  ok("11 backend:'wasm' opt-in resolves, mounts, and falls back cleanly");
+}
+
 function main(): void {
   console.log("connectWorkQueue — single-thread API pins");
   pin1_handleShape();
@@ -429,8 +464,9 @@ function main(): void {
   pin8_mountSymmetry();
   pin9_advisoryRole();
   pin10_endOfStream();
+  pin11_wasmBackend();
   console.warn = realWarn;
-  console.log("\nconnectWorkQueue: 10 pins passed.");
+  console.log("\nconnectWorkQueue: 11 pins passed.");
 }
 
 main();

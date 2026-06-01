@@ -55,6 +55,7 @@ import { getEnvironmentReport, type EnvironmentReport } from "../src/environment
 import { MpmcRing } from "../src/MpmcRing.js";
 import { SpmcRing } from "../src/SpmcRing.js";
 import { MpmcWorkQueue } from "../src/MpmcWorkQueue.js";
+import { WasmMpmcWorkQueue } from "../src/WasmMpmcWorkQueue.js";
 import { BridgeProducer } from "../src/BridgeProducer.js";
 import { BridgeConsumer } from "../src/BridgeConsumer.js";
 
@@ -495,6 +496,48 @@ function pin10_mountSymmetryAndErrors(): void {
   ok("10 topology.mount symmetric with free mountGraph; missing-schema + unknown-node rejected");
 }
 
+function pin11_workQueueWasmBackend(): void {
+  const topo = connectGraph({
+    nodes: ["w0", "wk0"],
+    edges: [
+      {
+        id: "work",
+        kind: "mpmc-wq",
+        schema: allKinds,
+        from: ["w0"],
+        to: ["wk0"],
+        capacity: 8,
+        backend: "wasm",
+      },
+    ],
+    environment: turbo(),
+  });
+  const handle = topo.handle.edges.work!;
+  assertEq(handle.kind, "mpmc-wq", "work edge kind");
+  const producerNode = topo.mount({ node: "w0", schemas: { work: allKinds } });
+  const consumerNode = mountGraph(topo.handle, { node: "wk0", schemas: { work: allKinds } });
+  const producer = producerNode.outbound.work as MpmcWorkQueue<AllKinds>;
+  const consumer = consumerNode.inbound.work as MpmcWorkQueue<AllKinds>;
+  if (handle.kind === "mpmc-wq" && handle.backend === "wasm") {
+    assert(consumer instanceof WasmMpmcWorkQueue, "graph mpmc-wq wasm edge mounts WASM consumer facade");
+  } else {
+    assert(consumer instanceof MpmcWorkQueue, "graph mpmc-wq fallback mounts JS facade");
+  }
+  producer.push(makeFrame(0, 55) as never);
+  const out = consumer.createFrame() as Record<string, unknown>;
+  assert(consumer.pull(out as never), "graph wasm/fallback work edge delivers");
+  assertEq(out.seq as number, 55, "graph backend work edge payload");
+
+  assertThrows(
+    () => connectGraph({
+      nodes: ["a", "b"],
+      edges: [{ id: "bad", kind: "spsc", schema: allKinds, from: "a", to: "b", backend: "wasm" }],
+      environment: turbo(),
+    }),
+    /backend.*work-queue-only/, "backend on non-work-queue edge rejected");
+  ok("11 mpmc-wq backend:'wasm' flows through connectGraph/mountGraph");
+}
+
 function main(): void {
   console.log("connectGraph — single-thread API + validation pins");
   pin1_handleShape();
@@ -507,8 +550,9 @@ function main(): void {
   pin8_layoutSkew();
   pin9_rollups();
   pin10_mountSymmetryAndErrors();
+  pin11_workQueueWasmBackend();
   console.warn = realWarn;
-  console.log("\nconnectGraph: 10 pins passed.");
+  console.log("\nconnectGraph: 11 pins passed.");
 }
 
 main();

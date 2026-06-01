@@ -679,11 +679,9 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     const header = this.header;
     // Claim a unique ticket if not already holding one.
     if (!this.hasHeld) {
-      const R = Atomics.load(header, DEQUEUE_TICKET_LANE); // acquire
-      const W = Atomics.load(header, ENQUEUE_TICKET_LANE); // acquire
-      if (signedDiff(W, R) <= 0) return false; // nothing plausibly to claim
-      // Fetch-add → a UNIQUE claim D (wait-free; each consumer a distinct OLD).
-      this.heldTicket = Atomics.add(header, DEQUEUE_TICKET_LANE, 1);
+      const claimed = this.claimTicket();
+      if (claimed < 0) return false; // nothing plausibly to claim
+      this.heldTicket = claimed;
       this.hasHeld = true;
     }
 
@@ -737,6 +735,19 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
       }
     }
     return false;
+  }
+
+  /** Claim one dequeue ticket, or `-1` when the queue is empty. Kept as a tiny
+   *  override hook so experimental kernels can replace ONLY the contended claim
+   *  primitive while the proven held-claim/generation/teardown protocol remains
+   *  in `pull`. */
+  protected claimTicket(): number {
+    const header = this.header;
+    const R = Atomics.load(header, DEQUEUE_TICKET_LANE); // acquire
+    const W = Atomics.load(header, ENQUEUE_TICKET_LANE); // acquire
+    if (signedDiff(W, R) <= 0) return -1;
+    // Fetch-add → a UNIQUE claim D (wait-free; each consumer a distinct OLD).
+    return Atomics.add(header, DEQUEUE_TICKET_LANE, 1);
   }
 
   /**

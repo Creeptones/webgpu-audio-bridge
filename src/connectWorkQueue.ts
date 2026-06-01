@@ -89,7 +89,11 @@ import {
   type LatencyBudget,
 } from "./connect.js";
 import { MpmcWorkQueue } from "./MpmcWorkQueue.js";
+import { WasmMpmcWorkQueue } from "./WasmMpmcWorkQueue.js";
+import { emitWasmMpmcBytes } from "./emitWasmMpmc.js";
 import { getEnvironmentReport, type EnvironmentReport } from "./environment.js";
+import { allocateWasmSharedMemory } from "./wasm/memory.js";
+import { hasWasmThreads } from "./worklet/wasmSimdSupport.js";
 import {
   describeSchemaLayout,
   type FieldsObject,
@@ -98,6 +102,8 @@ import {
 } from "./schema.js";
 
 // ─── Public types ──────────────────────────────────────────────────────────
+
+export type WorkQueueBackend = "js" | "wasm";
 
 /** The declarative work-queue spec passed to `connectWorkQueue()`. */
 export interface ConnectWorkQueueSpec<S extends Schema<FieldsObject, any>> {
@@ -122,6 +128,10 @@ export interface ConnectWorkQueueSpec<S extends Schema<FieldsObject, any>> {
   /** Override the environment probe. Defaults to `getEnvironmentReport()`.
    *  Injectable for tests + for callers who cached a report. */
   readonly environment?: EnvironmentReport;
+  /** Optional implementation backend. `"js"` is the stable default. `"wasm"`
+   *  uses a WASM-backed memory allocation and a tiny atomic claim kernel when
+   *  WASM threads are available; otherwise it resolves seamlessly to `"js"`. */
+  readonly backend?: WorkQueueBackend;
 }
 
 /** Legible sizing result for the work queue. Always attached (the
@@ -154,6 +164,9 @@ export interface WorkQueueSizing {
  *  'mpmc-wq'` marks it for a future unified `mount` that branches the ring kinds. */
 export interface WorkQueueHandle {
   readonly kind: "mpmc-wq";
+  /** Actual resolved backend. A requested `"wasm"` falls back to `"js"` when the
+   *  runtime cannot instantiate a shared-memory atomic module. */
+  readonly backend: WorkQueueBackend;
   readonly capacity: number;
   readonly producerCount: number;
   /** Carried for close-coordination + strand accounting; NOT a SAB-sizing input
@@ -161,6 +174,10 @@ export interface WorkQueueHandle {
   readonly consumerCount: number;
   readonly layout: SchemaLayoutDescription;
   readonly sab: SharedArrayBuffer;
+  /** Present only for `backend:"wasm"`; the memory whose `.buffer` is `sab`. */
+  readonly wasmMemory?: WebAssembly.Memory;
+  /** Present only for `backend:"wasm"`; clone-safe precompiled claim kernel. */
+  readonly wasmModule?: WebAssembly.Module;
   readonly sizing: WorkQueueSizing;
 }
 
@@ -177,6 +194,9 @@ export interface MountWorkQueueOptions<S extends Schema<FieldsObject, any>> {
    *  clone-safe and do NOT cross `postMessage`. Validated against the handle's
    *  frozen `layout` for byte-size AND full field-shape agreement. */
   readonly schema: S;
+  /** Optional per-mount backend override. Defaults to the handle's resolved
+   *  backend. Requesting `"wasm"` on a JS-resolved handle falls back to JS. */
+  readonly backend?: WorkQueueBackend;
 }
 
 /** Returned by `connectWorkQueue()` on the allocating thread. Frozen. */
@@ -320,6 +340,16 @@ function resolveWorkQueue(
   };
 }
 
+function makeWasmClaimModule(): WebAssembly.Module | null {
+  if (!hasWasmThreads()) return null;
+  if (typeof WebAssembly === "undefined" || typeof WebAssembly.Module !== "function") return null;
+  try {
+    return new WebAssembly.Module(emitWasmMpmcBytes());
+  } catch {
+    return null;
+  }
+}
+
 // ─── connectWorkQueue() ──────────────────────────────────────────────────────
 
 /** The one-call declarative MP→MC work-queue constructor. Runs on the allocating
@@ -361,20 +391,57 @@ export function connectWorkQueue<S extends Schema<FieldsObject, any>>(
 
   const hint: LatencyHint = spec.latencyHint ?? "balanced";
   const resolved = resolveWorkQueue(spec.schema, spec.producerCount, spec.capacity, hint);
+  const requestedBackend: WorkQueueBackend = spec.backend ?? "js";
+  let backend: WorkQueueBackend = "js";
+  let sab: SharedArrayBuffer;
+  let wasmMemory: WebAssembly.Memory | undefined;
+  let wasmModule: WebAssembly.Module | undefined;
 
-  // Allocate + initialize the SAB exactly ONCE (MpmcWorkQueue.create calls
-  // initLayout). Peers attach via the BARE ctor in mountWorkQueue (no re-init).
-  const { sab } = MpmcWorkQueue.create(spec.schema, resolved.capacity, {
-    producerCount: spec.producerCount,
-  });
+  if (requestedBackend === "wasm") {
+    const mod = makeWasmClaimModule();
+    if (mod !== null) {
+      try {
+        const alloc = allocateWasmSharedMemory(resolved.sizing.sabBytes);
+        sab = alloc.sab;
+        wasmMemory = alloc.memory;
+        wasmModule = mod;
+        backend = "wasm";
+        const q = new MpmcWorkQueue(sab, spec.schema, resolved.capacity, {
+          producerCount: spec.producerCount,
+        });
+        q.initLayout();
+      } catch {
+        const created = MpmcWorkQueue.create(spec.schema, resolved.capacity, {
+          producerCount: spec.producerCount,
+        });
+        sab = created.sab;
+        backend = "js";
+        wasmMemory = undefined;
+        wasmModule = undefined;
+      }
+    } else {
+      const created = MpmcWorkQueue.create(spec.schema, resolved.capacity, {
+        producerCount: spec.producerCount,
+      });
+      sab = created.sab;
+    }
+  } else {
+    const created = MpmcWorkQueue.create(spec.schema, resolved.capacity, {
+      producerCount: spec.producerCount,
+    });
+    sab = created.sab;
+  }
 
   const handle: WorkQueueHandle = Object.freeze({
     kind: "mpmc-wq",
+    backend,
     capacity: resolved.capacity,
     producerCount: spec.producerCount,
     consumerCount: spec.consumerCount,
     layout: describeSchemaLayout(spec.schema),
     sab,
+    ...(wasmMemory !== undefined ? { wasmMemory } : {}),
+    ...(wasmModule !== undefined ? { wasmModule } : {}),
     sizing: resolved.sizing,
   });
 
@@ -470,6 +537,28 @@ export function mountWorkQueue<S extends Schema<FieldsObject, any>>(
   // frameByteSize agreement is necessary but not sufficient — compare full shape.
   assertWorkQueueLayoutMatches(describeSchemaLayout(opts.schema), handle.layout);
   // Bare ctor: attach to the already-initialized SAB. NO initLayout here.
+  const backend = opts.backend ?? handle.backend;
+  if (
+    backend === "wasm" &&
+    handle.backend === "wasm" &&
+    handle.wasmMemory !== undefined &&
+    handle.wasmModule !== undefined
+  ) {
+    try {
+      const instance = new WebAssembly.Instance(handle.wasmModule, {
+        env: { memory: handle.wasmMemory },
+      });
+      return new WasmMpmcWorkQueue<S>(
+        handle.sab,
+        opts.schema,
+        handle.capacity,
+        instance,
+        { producerCount: handle.producerCount },
+      );
+    } catch {
+      // Seamless fallback: the JS queue can attach to the same SAB.
+    }
+  }
   return new MpmcWorkQueue<S>(handle.sab, opts.schema, handle.capacity, {
     producerCount: handle.producerCount,
   });

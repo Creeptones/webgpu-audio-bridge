@@ -81,6 +81,7 @@ import {
   connectWorkQueue,
   mountWorkQueue,
   type WorkQueueHandle,
+  type WorkQueueBackend,
 } from "./connectWorkQueue.js";
 import type { MpmcRing } from "./MpmcRing.js";
 import type { SpmcRing } from "./SpmcRing.js";
@@ -125,6 +126,9 @@ export interface GraphEdgeSpec<S extends Schema<FieldsObject, any> = Schema<Fiel
   readonly policy?: GraphSpscPolicy;
   /** Per-edge latency intent override (defaults to the graph-level `latencyHint`). */
   readonly latencyHint?: LatencyHint;
+  /** MPMC work-queue only. Defaults to `"js"`; `"wasm"` is a best-effort opt-in
+   *  and resolves back to JS if WASM threads are unavailable. */
+  readonly backend?: WorkQueueBackend;
 }
 
 /** The declarative graph spec passed to `connectGraph()`. */
@@ -240,6 +244,9 @@ export type GraphSchemas = Record<string, Schema<FieldsObject, any>>;
 export interface MountGraphOptions {
   readonly node: string;
   readonly schemas: GraphSchemas;
+  /** Optional mount-time backend override for incident MPMC work-queue edges.
+   *  Defaults to each edge handle's resolved backend. */
+  readonly backend?: WorkQueueBackend;
 }
 
 /** Returned by `connectGraph()` on the allocating thread. Frozen. */
@@ -406,6 +413,7 @@ interface NormalizedEdge {
   readonly capacity?: number;
   readonly policy?: GraphSpscPolicy;
   readonly latencyHint: LatencyHint;
+  readonly backend?: WorkQueueBackend;
 }
 
 function asArray(x: string | readonly string[]): readonly string[] {
@@ -471,6 +479,9 @@ function normalizeEdge(
       throw new GraphEdgePolicyError(id);
     }
   }
+  if (edge.backend !== undefined && kind !== "mpmc-wq") {
+    fail("`backend` is MPMC work-queue-only");
+  }
 
   return {
     id,
@@ -480,6 +491,7 @@ function normalizeEdge(
     to,
     ...(edge.capacity !== undefined ? { capacity: edge.capacity } : {}),
     ...(edge.policy !== undefined ? { policy: edge.policy } : {}),
+    ...(edge.backend !== undefined ? { backend: edge.backend } : {}),
     latencyHint: edge.latencyHint ?? graphHint,
   };
 }
@@ -645,6 +657,7 @@ export function connectGraph(spec: ConnectGraphSpec): GraphTopology {
           ...(e.capacity !== undefined ? { capacity: e.capacity } : {}),
           latencyHint: e.latencyHint,
           environment: report,
+          ...(e.backend !== undefined ? { backend: e.backend } : {}),
         });
         handle = topo.handle;
         break;
@@ -851,7 +864,11 @@ export function mountGraph(handle: GraphHandle, opts: MountGraphOptions): Mounte
         break;
       case "mpmc-wq":
         // Anonymous producer — no index (like fan-in, NOT fan-out).
-        outbound[edgeId] = mountWorkQueue(edgeHandle, { role: "producer", schema });
+        outbound[edgeId] = mountWorkQueue(edgeHandle, {
+          role: "producer",
+          schema,
+          ...(opts.backend !== undefined ? { backend: opts.backend } : {}),
+        });
         break;
     }
   }
@@ -875,7 +892,11 @@ export function mountGraph(handle: GraphHandle, opts: MountGraphOptions): Mounte
       }
       case "mpmc-wq":
         // Anonymous competing consumer — NO consumerIndex (the key asymmetry).
-        inbound[edgeId] = mountWorkQueue(edgeHandle, { role: "consumer", schema });
+        inbound[edgeId] = mountWorkQueue(edgeHandle, {
+          role: "consumer",
+          schema,
+          ...(opts.backend !== undefined ? { backend: opts.backend } : {}),
+        });
         break;
     }
   }

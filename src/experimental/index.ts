@@ -106,6 +106,15 @@ export type { SpmcRingOptions } from "../SpmcRing.js";
 // docs/mpmc-workqueue-design.md.
 export { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../MpmcWorkQueue.js";
 export type { MpmcWorkQueueOptions } from "../MpmcWorkQueue.js";
+export { WasmMpmcWorkQueue } from "../WasmMpmcWorkQueue.js";
+export type {
+  WasmMpmcClaimSource,
+  WasmMpmcClaimTicket,
+} from "../WasmMpmcWorkQueue.js";
+export { emitWasmMpmc, emitWasmMpmcBytes } from "../emitWasmMpmc.js";
+export type { EmitWasmMpmcOptions, WasmMpmcClaimOffsets } from "../emitWasmMpmc.js";
+export { allocateWasmSharedMemory } from "../wasm/memory.js";
+export type { WasmSharedMemoryAllocation } from "../wasm/memory.js";
 
 // ── connectWorkQueue/mountWorkQueue (0.9.937) ───────────────────────────────
 //
@@ -129,6 +138,7 @@ export type {
   WorkQueueSizing,
   WorkQueueRole,
   MountWorkQueueOptions,
+  WorkQueueBackend,
 } from "../connectWorkQueue.js";
 
 // ── connectGraph/mountGraph (0.9.938) ───────────────────────────────────────
