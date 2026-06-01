@@ -148,6 +148,9 @@ max             : ${fmt(r.maxNs)}
 push rejects    : ${r.pushRejects}
 worklet pulls   : ${r.pulls}
 worklet misses  : ${r.workletMisses}
+underrun events : ${r.underrunEvents}
+max miss streak : ${r.maxMissStreak}
+miss rate       : ${(r.missRate * 100).toFixed(2)}%
 mean skipped    : ${r.meanSkipped.toFixed(2)}
 last signed     : ${fmt(r.lastSignedNs)}   (negative ≈ output buffer bias)
 outputLatency   : ${r.outputLatencyMs?.toFixed(2)} ms

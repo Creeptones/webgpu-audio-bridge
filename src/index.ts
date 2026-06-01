@@ -73,7 +73,7 @@ export type {
 export { TelemetryRing } from "./TelemetryRing.js";
 export type { TelemetryRingSample, TelemetryRingOptions } from "./TelemetryRing.js";
 
-// ── Standard mode (0.10.0) — MessageChannelBridge<Schema> ─────────────────
+// ── Standard mode (0.9.40) — MessageChannelBridge<Schema> ─────────────────
 //
 // Sibling tier to `Bridge<S>`'s Turbo mode. Same schema DSL surface,
 // `MessageChannel` + transferable `ArrayBuffer` transport instead of
@@ -208,6 +208,7 @@ export type {
   GpuCommandEncoderLike,
   GpuReadbackDecoder,
   BridgeGPUSourceOptions,
+  ReadbackLatencyStats,
   // Zero-copy WriteTarget scaffold (0.7.15 — Track 4). The strategy
   // interface and the kind selector are exported as types so callers
   // see the shape; today only the `'map-async'` resolution path is

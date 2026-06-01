@@ -145,6 +145,10 @@ async function testAutoDrainPushesWithoutPoll(): Promise<void> {
   assertEq(src.pushedCount(), 1, "frame pushed by the resolution microtask alone");
   assertEq(src.droppedCount(), 0, "nothing dropped");
   assertEq(src.inFlight(), 0, "slot recycled to idle by the microtask");
+  const stats = src.readbackLatencyStats();
+  assertEq(stats.samples, 1, "one readback latency sample recorded");
+  assertEq(stats.capacity, 256, "default readback latency window size");
+  assert(stats.p50Us >= 0, "p50 readback latency is non-negative");
 
   const out: Frame = { seq: 0n, payload: new Float64Array(2) };
   assert(bridge.pull(out), "frame readable after auto-drain");
@@ -311,6 +315,7 @@ async function testClosureAutoDrain(): Promise<void> {
 
   assertEq(decoderCalls, 1, "decoder ran in the resolution microtask");
   assertEq(src.pushedCount(), 1, "closure-decoded frame auto-pushed");
+  assertEq(src.readbackLatencyStats().samples, 1, "closure mode records one readback latency sample");
   const out: Frame = { seq: 0n, payload: new Float64Array(2) };
   assert(bridge.pull(out), "closure frame readable");
   assertEq(out.seq, 11n, "closure seq round-trips");

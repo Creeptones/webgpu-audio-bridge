@@ -52,10 +52,16 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
     this.samplesDelta = 0;
     this.workletQuanta = 0;
     this.workletMisses = 0;
+    this.consecutiveMisses = 0;
+    this.underrunEvents = 0;
+    this.maxMissStreak = 0;
     this.skippedTotal = 0;
     this.pulls = 0;
     this.pushRejects = 0;
     this.lastReportCt = currentTime;
+    this.latestSeq = 0;
+    this.latestTMacroNs = 0;
+    this.latestSkipped = 0;
 
     // Histogram: 1024 logarithmic bins from 100ns to 1s (7 decades).
     // The top of the range has to accommodate the output-buffer bias plus
@@ -75,16 +81,17 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
   pullLatest() {
     const readIdx = this.indices[1];          // plain read, Int32 lane 1
     const writeIdx = Atomics.load(this.indices, 0); // acquire, Int32 lane 0
-    if (writeIdx === readIdx) return null;
+    if (writeIdx === readIdx) return false;
     const newestIdx = (writeIdx - 1) | 0;     // Int32 wrap arithmetic
     const skipped = (newestIdx - readIdx) | 0;
     const slot = newestIdx & this.mask;
     const base = slot * this.stride8;
-    const seq = this.data[base + this.seqElemOff];
-    const tMacroNs = this.data[base + this.tMacroElemOff];
+    this.latestSeq = this.data[base + this.seqElemOff];
+    this.latestTMacroNs = this.data[base + this.tMacroElemOff];
+    this.latestSkipped = skipped;
     Atomics.store(this.indices, 1, writeIdx); // release: Int32 lane 1
     Atomics.notify(this.indices, 1, 1);
-    return { seq, tMacroNs, skipped };
+    return true;
   }
 
   binFor(latencyNs) {
@@ -113,7 +120,8 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
     const got = this.pullLatest();
     if (got) {
       this.pulls++;
-      this.skippedTotal += got.skipped;
+      this.consecutiveMisses = 0;
+      this.skippedTotal += this.latestSkipped;
       // Real end-to-end latency, in the producer's (performance.now()-origin)
       // clock. See header comment for the alignment derivation.
       //   nowPerfNs = audioStartPerfNs + currentTime * 1e9
@@ -128,7 +136,7 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
       // care about — that dispersion is the bridge's contribution plus
       // audio-thread scheduling jitter, which is what governs glitch behavior.
       const nowEpochNs = this.audioStartPerfNs + currentTime * 1e9;
-      const signedNs = nowEpochNs - got.tMacroNs;
+      const signedNs = nowEpochNs - this.latestTMacroNs;
       const latencyNs = Math.abs(signedNs);
       this.lastLatencyNs = latencyNs;
       this.lastSignedNs = signedNs;
@@ -143,6 +151,11 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
       }
     } else {
       this.workletMisses++;
+      this.consecutiveMisses++;
+      if (this.consecutiveMisses === 1) this.underrunEvents++;
+      if (this.consecutiveMisses > this.maxMissStreak) {
+        this.maxMissStreak = this.consecutiveMisses;
+      }
     }
 
     // Output silence (downstream gain is 0; we keep an output so the worklet
@@ -181,6 +194,9 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
       maxNs: this.maxNsObserved,
       pushRejects: this.pushRejects,
       workletMisses: this.workletMisses,
+      underrunEvents: this.underrunEvents,
+      maxMissStreak: this.maxMissStreak,
+      missRate: this.workletQuanta > 0 ? this.workletMisses / this.workletQuanta : 0,
       meanSkipped: this.pulls > 0 ? this.skippedTotal / this.pulls : 0,
       pulls: this.pulls,
       // Signed value of the most recent measurement, before abs(). Negative

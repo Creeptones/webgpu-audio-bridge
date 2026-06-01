@@ -1,0 +1,32 @@
+name: webgpu-readback
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 * * 1"
+
+jobs:
+  webgpu-readback:
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_WEBGPU_READBACK: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: WebGPU readback probe
+        run: npm run test:browser:webgpu
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu-readback-artifacts
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14

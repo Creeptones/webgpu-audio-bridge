@@ -56,6 +56,10 @@ test("e2e latency bench: CPU-stub mode produces sensible numbers", async ({ page
     workletQuanta: number;
     p99Ns: number;
     medianNs: number;
+    workletMisses: number;
+    underrunEvents: number;
+    maxMissStreak: number;
+    missRate: number;
   };
 
   expect(r.backend).toBe("cpu");
@@ -65,6 +69,11 @@ test("e2e latency bench: CPU-stub mode produces sensible numbers", async ({ page
   expect(r.samples, `samples=${r.samples} too low`).toBeGreaterThan(50);
   expect(r.pulls, "pulls match samples (no filter rejects on a healthy run)").toBeGreaterThanOrEqual(r.samples);
   expect(r.pushRejects, "ring never went full at idle").toBe(0);
+  expect(r.workletMisses, "miss counter is present").toBeGreaterThanOrEqual(0);
+  expect(r.underrunEvents, "underrun-event counter is present").toBeGreaterThanOrEqual(0);
+  expect(r.maxMissStreak, "max miss streak is present").toBeGreaterThanOrEqual(0);
+  expect(r.missRate, "miss rate lower bound").toBeGreaterThanOrEqual(0);
+  expect(r.missRate, "miss rate upper bound").toBeLessThanOrEqual(1);
   // Catastrophic-regression alarm. The constant output-buffer bias varies
   // wildly across machines (headless CI can show hundreds of ms), so this
   // budget is intentionally loose. If we ever see p99 over 500ms in idle

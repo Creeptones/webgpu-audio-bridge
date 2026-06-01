@@ -46,6 +46,7 @@
     "test:concurrent": "tsx tests/Bridge.concurrent.test.ts && tsx tests/MpmcRing.concurrent.test.ts && tsx tests/connectFanIn.concurrent.test.ts && tsx tests/SpmcRing.concurrent.test.ts && tsx tests/connectFanOut.concurrent.test.ts && tsx tests/MpmcWorkQueue.concurrent.test.ts && tsx tests/connectWorkQueue.concurrent.test.ts && tsx tests/connectGraph.concurrent.test.ts",
     "test:wasm-mpmc-wq": "tsx tests/emitWasmMpmc.test.ts && tsx tests/WasmMpmcWorkQueue.test.ts",
     "test:browser": "playwright test --config tests/browser/playwright.config.ts",
+    "test:browser:webgpu": "playwright test --config tests/browser/playwright.config.ts tests/browser/webgpu-readback.spec.ts --project=chromium",
     "bench": "tsx bench/Bridge.bench.ts",
     "bench:decode-path": "tsx bench/decode-path.bench.ts",
     "bench:emit-wasm-decoder": "npm run build:wasm && tsx bench/emit-wasm-decoder.bench.ts",
@@ -62,6 +63,7 @@
     "bench:graceful-degradation": "tsx bench/graceful-degradation.bench.ts",
     "bench:e2e": "node bench/e2e-latency/serve.mjs",
     "bench:notify-cost": "node bench/notify-cost-browser/serve.mjs",
+    "check:release-metadata": "node scripts/check-release-metadata.mjs",
     "dev:demo": "node examples/minimal/serve.mjs",
     "dev:wasm-decode": "node examples/wasm-decode-worklet/serve.mjs",
     "dev:fast-lane": "node examples/fast-lane/serve.mjs",
@@ -82,7 +84,7 @@
     "bench:render-size-hint": "node bench/render-size-hint/serve.mjs",
     "llm-bundle": "node scripts/regenerate-llm-bundle.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+    "prepublishOnly": "npm run check:release-metadata && npm run typecheck && npm run test && npm run build"
   },
   "keywords": [
     "webgpu",

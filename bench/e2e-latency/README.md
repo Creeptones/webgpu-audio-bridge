@@ -46,6 +46,23 @@ Bridge the contexts in absolute Unix-epoch ms space:
 - **median / p95 / p99 of `|signedNs|`** is bridge-contribution + audio-thread scheduling jitter **plus** the constant output-buffer bias. The **spread** (p99 − median) is the load-bearing metric for glitch prediction; the *absolute* number is dominated by the bias and varies between devices.
 - **`last signed`** in the live report is the most recent raw signed measurement. If it's roughly `-outputLatency`, alignment is healthy.
 - **`outputLatency` / `baseLatency`** are surfaced directly from `AudioContext`. Chrome doesn't always report `outputLatency` on local dev; `baseLatency` is more reliable.
+- **`underrun events`** increments on a transition from "fresh frame pulled" to
+  "no frame available this quantum." This is a worklet-side starvation counter,
+  not an audible click detector.
+- **`max miss streak`** is the longest consecutive run of empty pulls. This is
+  the practical glitch-risk metric: isolated misses are normal at control rate;
+  long streaks indicate producer starvation, bad capacity sizing, or scheduling
+  contention.
+- **`miss rate`** is `workletMisses / workletQuanta`. It is expected to be high
+  when a 60 Hz producer feeds a ~375 Hz worklet; use it together with `max miss
+  streak`, not as a standalone failure signal.
+
+## AudioWorklet hot-path rule
+
+The worklet consumer avoids allocating per successful pull. `pullLatest()` writes
+the latest `seq`, `tMacroNs`, and skip count into processor fields and returns a
+boolean instead of allocating a `{ seq, tMacroNs, skipped }` object per quantum.
+Report objects are still allocated at the low-rate diagnostic boundary.
 
 A clean, idle run on Chrome should show p99 − median in the low single-digit ms, with the absolute baseline near `outputLatency` (or `baseLatency` if `outputLatency` is unavailable). Under contention modes, watch p99 — that's the number that controls audio glitch behavior.
 
@@ -61,4 +78,4 @@ Open in Chromium, choose a backend / N / capacity / load mode, click **Start**, 
 
 ## CI usage
 
-The Playwright spec at `tests/browser/latency.spec.ts` (Phase 1b — not yet present in this commit) runs a fixed-duration headless version of this bench (CPU stub, no audio out) and asserts that p99 stays under a budget. The interactive page is for hand-measurement across real hardware where headless CI can't help.
+The Playwright spec at `tests/browser/latency.spec.ts` runs a fixed-duration headless version of this bench (CPU stub, no audio out) and asserts that p99 stays under a budget while the worklet reports underrun counters. The interactive page is for hand-measurement across real hardware where headless CI can't help.

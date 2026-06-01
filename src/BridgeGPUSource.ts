@@ -195,6 +195,24 @@ const GPU_MAP_MODE_READ = 0x0001;
  */
 export type WriteTargetKind = "auto" | "map-async" | "shared";
 
+/** Rolling latency snapshot for real GPU readback measurement (0.9.945).
+ *
+ * Values are microseconds measured from `flushPending()` starting `mapAsync`
+ * on a slot through `_drainSlot()` completing that slot. Recording samples is
+ * allocation-free; this stats object is computed on demand for diagnostics,
+ * CI artifacts, and dashboards. */
+export interface ReadbackLatencyStats {
+  readonly samples: number;
+  readonly capacity: number;
+  readonly lastUs: number;
+  readonly minUs: number;
+  readonly maxUs: number;
+  readonly meanUs: number;
+  readonly p50Us: number;
+  readonly p95Us: number;
+  readonly p99Us: number;
+}
+
 /**
  * Strategy interface for moving bytes from a producer-side GPU buffer
  * into a CPU-readable `ArrayBuffer` the decoder can consume (0.7.15).
@@ -356,7 +374,7 @@ function buildWriteTarget(
     throw new Error(
       "BridgeGPUSource: writeTarget 'shared' is not available in this build. " +
         "The W3C zero-copy / shared-memory readback interface has not shipped " +
-        "in any browser as of 2026-05; once it lands, this library will ship a " +
+        "in any browser as of 2026-06; once it lands, this library will ship a " +
         "SharedMemoryWriteTarget implementation. Use 'map-async' (or the default " +
         "'auto', which resolves to 'map-async' today). Inspect " +
         "getEnvironmentReport().webgpuZeroCopy for the platform capability sniff.",
@@ -471,6 +489,10 @@ export interface BridgeGPUSourceOptions {
    *  the AudioWorklet — microtask scheduling here carries no render-thread
    *  real-time-safety concern. Default `'manual'`. */
   readonly autoPollCompleted?: "manual" | "microtask";
+  /** Rolling sample window used by `readbackLatencyStats()` (0.9.945).
+   *  Default `256`. Recording remains allocation-free; the stats call
+   *  copies/sorts the retained window on demand. */
+  readonly readbackLatencySampleCount?: number;
 }
 
 /** Decoder callback shape (0.6.18). Receives the mapped staging-buffer
@@ -524,10 +546,15 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  decode → push cycle (0.7.3). Computed as `(performance.now() -
    *  slot.mapStartedAtMs) * 1000` at the moment `pollCompleted`
    *  finishes the slot. Returns 0 if no readback has completed yet.
-   *  Inspector use case: visualise the readback round-trip
-   *  characteristic on the page — `mapAsync` typically lands in
-   *  5-15 ms, dominated by the GPU driver. */
+  *  Inspector use case: visualise the readback round-trip
+  *  characteristic on the page — `mapAsync` typically lands in
+  *  5-15 ms, dominated by the GPU driver. */
   private _lastReadbackUs: number = 0;
+  /** Bounded rolling latency window for p50/p95/p99 reporting. */
+  private readonly _readbackLatencySamples: Float64Array;
+  private _readbackLatencyCursor: number = 0;
+  private _readbackLatencyCount: number = 0;
+  private _readbackLatencySumUs: number = 0;
 
   /** Opt-in error callback (0.9.32). `undefined` when omitted from
    *  options — the rejection path stays silent (the pre-0.9.32 default). */
@@ -590,10 +617,18 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
           `(got ${String(autoPoll)})`,
       );
     }
+    const sampleCount = opts.readbackLatencySampleCount ?? 256;
+    if (!Number.isInteger(sampleCount) || sampleCount < 1) {
+      throw new Error(
+        `BridgeGPUSource: readbackLatencySampleCount must be an integer >= 1 ` +
+          `(got ${String(sampleCount)})`,
+      );
+    }
     this.bridge = bridge;
     this._autoDrain = autoPoll === "microtask";
     this._rawMode = rawMode;
     this.decoder = rawMode ? null : (decoder as GpuReadbackDecoder<S>);
+    this._readbackLatencySamples = new Float64Array(sampleCount);
     const labelPrefix = opts.bufferLabelPrefix ?? "BridgeGPUSource";
     // Build the strategy AFTER validation so a `stagingBufferCount: 1`
     // or `stagingBufferSize: 0` rejection doesn't leak partial
@@ -766,7 +801,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     if (slot.error !== undefined) {
       this._droppedCount = (this._droppedCount + 1) | 0;
       if (slot.mapStartedAtMs > 0) {
-        this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
+        this._recordReadbackUs((performance.now() - slot.mapStartedAtMs) * 1000);
       }
       slot.state = "idle";
       slot.mapped = false;
@@ -854,7 +889,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       // not expected (single-threaded JS), so this is just "most
       // recently completed slot in this poll".
       if (slot.mapStartedAtMs > 0) {
-        this._lastReadbackUs = (performance.now() - slot.mapStartedAtMs) * 1000;
+        this._recordReadbackUs((performance.now() - slot.mapStartedAtMs) * 1000);
       }
       // 0.9.58 — releaseMap() calls buffer.unmap(), which can itself throw on a
       // real GPUDevice (an already-unmapped/destroyed buffer, or a device lost
@@ -952,6 +987,48 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     return this._lastReadbackUs;
   }
 
+  /** Rolling p50/p95/p99 readback latency snapshot (0.9.945).
+   *
+   * This is the CI/dashboard companion to `lastReadbackUs()`: run a real
+   * WebGPU probe, then publish these numbers per browser / adapter / driver.
+   * The hot path only records into a fixed `Float64Array`; this method copies
+   * and sorts the retained window, so call it from diagnostics, not per audio
+   * quantum. */
+  readbackLatencyStats(): ReadbackLatencyStats {
+    const n = this._readbackLatencyCount;
+    const capacity = this._readbackLatencySamples.length;
+    if (n === 0) {
+      return {
+        samples: 0,
+        capacity,
+        lastUs: 0,
+        minUs: 0,
+        maxUs: 0,
+        meanUs: 0,
+        p50Us: 0,
+        p95Us: 0,
+        p99Us: 0,
+      };
+    }
+    const values = Array.from(this._readbackLatencySamples.subarray(0, n));
+    values.sort((a, b) => a - b);
+    const nearestRank = (q: number): number => {
+      const idx = Math.min(n - 1, Math.max(0, Math.ceil(q * n) - 1));
+      return values[idx]!;
+    };
+    return {
+      samples: n,
+      capacity,
+      lastUs: this._lastReadbackUs,
+      minUs: values[0]!,
+      maxUs: values[n - 1]!,
+      meanUs: this._readbackLatencySumUs / n,
+      p50Us: nearestRank(0.50),
+      p95Us: nearestRank(0.95),
+      p99Us: nearestRank(0.99),
+    };
+  }
+
   /** Cumulative successful readback pushes. */
   pushedCount(): number {
     return this._pushedCount;
@@ -1000,6 +1077,25 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  `'closure'` (the user decoder runs per frame). Exposed for telemetry. */
   decoderMode(): "closure" | "raw" {
     return this._rawMode ? "raw" : "closure";
+  }
+
+  /** Record one completed mapAsync→drain cycle into the bounded latency
+   *  window. Allocation-free; stats are computed lazily on demand. */
+  private _recordReadbackUs(us: number): void {
+    const finiteUs = Number.isFinite(us) && us >= 0 ? us : 0;
+    this._lastReadbackUs = finiteUs;
+    const samples = this._readbackLatencySamples;
+    if (this._readbackLatencyCount < samples.length) {
+      samples[this._readbackLatencyCursor] = finiteUs;
+      this._readbackLatencySumUs += finiteUs;
+      this._readbackLatencyCount++;
+    } else {
+      const old = samples[this._readbackLatencyCursor]!;
+      samples[this._readbackLatencyCursor] = finiteUs;
+      this._readbackLatencySumUs += finiteUs - old;
+    }
+    this._readbackLatencyCursor =
+      (this._readbackLatencyCursor + 1) % samples.length;
   }
 
   /** Internal: find a slot in IDLE state, return its index. Returns -1
