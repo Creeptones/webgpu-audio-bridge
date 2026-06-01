@@ -52,6 +52,7 @@
     "bench:eval-simd": "npm run build:wasm && tsx bench/eval-simd.bench.ts",
     "bench:kalman-simd": "npm run build:wasm && tsx bench/kalman-simd.bench.ts",
     "bench:mpmc": "tsx bench/mpmc.bench.ts",
+    "bench:spmc": "tsx bench/spmc.bench.ts",
     "bench:mpmc-wq": "tsx bench/mpmc-wq.bench.ts",
     "bench:wasm-mpmc-wq": "tsx bench/wasm-mpmc-wq.bench.ts",
     "bench:wasm-mpmc-ticket-storm": "tsx bench/wasm-mpmc-ticket-storm.bench.ts",
