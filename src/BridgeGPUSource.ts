@@ -126,6 +126,7 @@
 import { describeSchemaLayout, kindByteSize, type FieldsObject, type FrameFor, type Schema } from "./schema.js";
 import type { Bridge } from "./Bridge.js";
 import type { BridgeProducer } from "./BridgeProducer.js";
+import { planWasmDecoder, type WasmDecoderPlan } from "./emitWasmDecoder.js";
 import { computeWgslLayout } from "./emitWgslStruct.js";
 
 // ── Minimal structural interfaces matching WebGPU's surface ──────────────
@@ -281,6 +282,23 @@ export interface FieldReadbackRange {
   readonly fields: ReadonlyArray<string>;
   readonly dstOffset: number;
   readonly byteLength: number;
+}
+
+export interface WasmReadbackDecoderOptions {
+  /** WASM memory used by the decoder export. The mapped readback bytes are
+   *  copied into this memory at `srcByteOffset`, then the decode export writes
+   *  its packed scratch output at `dstByteOffset`. */
+  readonly memory: WebAssembly.Memory;
+  /** Decoder export compatible with `emitWasmDecoder(schema)`'s default
+   *  two-argument form: `(srcBase, dstBase) => void`. */
+  readonly decodeFrame: (srcBase: number, dstBase: number) => void;
+  /** Source byte offset inside WASM memory. Default 0. */
+  readonly srcByteOffset?: number;
+  /** Destination scratch byte offset inside WASM memory. Default
+   *  `srcByteOffset + schema.frameByteSize`, rounded up to 8 bytes. */
+  readonly dstByteOffset?: number;
+  /** Optional precomputed plan. Defaults to `planWasmDecoder(schema)`. */
+  readonly plan?: WasmDecoderPlan;
 }
 
 /**
@@ -643,6 +661,44 @@ export type GpuReadbackDecoder<S extends Schema<FieldsObject, any>> = (
   frame: FrameFor<S>,
 ) => void;
 
+function validateWasmMemoryOffset(name: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0 || value !== Math.floor(value)) {
+    throw new Error(`BridgeGPUSource.wasmDecoder: ${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function validateWasmMemoryRange(
+  memory: WebAssembly.Memory,
+  name: string,
+  offset: number,
+  byteLength: number,
+): void {
+  if (offset + byteLength > memory.buffer.byteLength) {
+    throw new Error(
+      `BridgeGPUSource.wasmDecoder: ${name} range ${offset}..${offset + byteLength} ` +
+        `exceeds WASM memory byteLength ${memory.buffer.byteLength}`,
+    );
+  }
+}
+
+function readWasmDecodedValue(view: DataView, offset: number, kind: string): number | bigint {
+  switch (kind) {
+    case "f64": return view.getFloat64(offset, true);
+    case "f32": return view.getFloat32(offset, true);
+    case "u64": return view.getBigUint64(offset, true);
+    case "i64": return view.getBigInt64(offset, true);
+    case "u32": return view.getUint32(offset, true);
+    case "i32": return view.getInt32(offset, true);
+    case "u16": return view.getUint16(offset, true);
+    case "i16": return view.getInt16(offset, true);
+    case "u8": return view.getUint8(offset);
+    case "i8": return view.getInt8(offset);
+    default:
+      throw new Error(`BridgeGPUSource.wasmDecoder: unsupported decoded field kind '${kind}'`);
+  }
+}
+
 /**
  * GPU readback automation for `Bridge<S>`. See file header for the
  * lifecycle, the staging-buffer-ring rationale, and the structural
@@ -809,6 +865,68 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       report.compatible ? "raw" : fallbackDecoder,
       opts,
     );
+  }
+
+  /** Build a decoder closure around an `emitWasmDecoder(schema)` export.
+   *
+   * This is the non-raw counterpart to `rawIfCompatible()`: schemas that cannot
+   * use WGSL byte-identical raw mode can still keep the hot decode loop in a
+   * monomorphized WASM function. The returned closure plugs into the normal
+   * `BridgeGPUSource` constructor, so staging overlap, dirty-region merge,
+   * adaptive pacing, and bridge error handling remain unchanged. */
+  static wasmDecoder<S extends Schema<FieldsObject, any>>(
+    schema: S,
+    opts: WasmReadbackDecoderOptions,
+  ): GpuReadbackDecoder<S> {
+    const desc = describeSchemaLayout(schema);
+    const plan = opts.plan ?? planWasmDecoder(schema);
+    const srcBase = validateWasmMemoryOffset("srcByteOffset", opts.srcByteOffset ?? 0);
+    const defaultDst = (srcBase + desc.frameByteSize + 7) & ~7;
+    const dstBase = validateWasmMemoryOffset("dstByteOffset", opts.dstByteOffset ?? defaultDst);
+
+    if (typeof opts.decodeFrame !== "function") {
+      throw new Error("BridgeGPUSource.wasmDecoder: decodeFrame must be a function");
+    }
+    if (!Number.isFinite(plan.totalDstBytes) || plan.totalDstBytes < 0) {
+      throw new Error("BridgeGPUSource.wasmDecoder: plan.totalDstBytes is invalid");
+    }
+    validateWasmMemoryRange(opts.memory, "source", srcBase, desc.frameByteSize);
+    validateWasmMemoryRange(opts.memory, "destination", dstBase, plan.totalDstBytes);
+
+    return (mappedRange, frame) => {
+      if (mappedRange.byteLength < desc.frameByteSize) {
+        throw new Error(
+          `BridgeGPUSource.wasmDecoder: mapped range byteLength ${mappedRange.byteLength} ` +
+            `is smaller than frameByteSize ${desc.frameByteSize}`,
+        );
+      }
+
+      const memoryBytes = new Uint8Array(opts.memory.buffer);
+      memoryBytes.set(new Uint8Array(mappedRange, 0, desc.frameByteSize), srcBase);
+      opts.decodeFrame(srcBase, dstBase);
+
+      const view = new DataView(opts.memory.buffer);
+      const target = frame as Record<string, unknown>;
+      for (let i = 0; i < plan.fields.length; i++) {
+        const field = plan.fields[i]!;
+        const fieldBase = dstBase + field.dstRel;
+        const elemBytes = kindByteSize(field.kind);
+        if (field.isArray) {
+          const arr = target[field.name] as { length: number; [index: number]: number | bigint } | undefined;
+          if (arr === undefined || arr.length < field.length) {
+            throw new Error(
+              `BridgeGPUSource.wasmDecoder: frame field '${field.name}' is not a writable array ` +
+                `of length ${field.length}`,
+            );
+          }
+          for (let j = 0; j < field.length; j++) {
+            arr[j] = readWasmDecodedValue(view, fieldBase + j * elemBytes, field.kind);
+          }
+        } else {
+          target[field.name] = readWasmDecodedValue(view, fieldBase, field.kind);
+        }
+      }
+    };
   }
 
   constructor(

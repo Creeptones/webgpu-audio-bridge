@@ -181,6 +181,20 @@ is byte-compatible with the bridge frame. If the schema uses sub-32-bit fields
 or has an invariant lane, it falls back to the supplied decoder closure by
 default.
 
+For schemas that are not raw-compatible, use the WASM decoder adapter with an
+`emitWasmDecoder(schema)` export:
+
+```ts
+const decoder = BridgeGPUSource.wasmDecoder(schema, {
+  memory: wasmMemory,
+  decodeFrame: wasmInstance.exports.decode_frame as (src: number, dst: number) => void,
+});
+const source = new BridgeGPUSource(device, bridge, decoder);
+```
+
+The adapter keeps staging, partial-frame merge, pacing, and bridge error
+handling on the normal closure path while moving the layout decode into WASM.
+
 For diagnostics:
 
 ```ts

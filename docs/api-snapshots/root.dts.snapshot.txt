@@ -61,7 +61,7 @@ export type { BlockUnderflowPolicy, BlockChannelLayout, BridgeBlockConsumerOptio
 export { ResidualQualityController } from "./ResidualQualityController.js";
 export type { ResidualQualityHint, ResidualQualityControllerOptions, } from "./ResidualQualityController.js";
 export { BridgeGPUSource } from "./BridgeGPUSource.js";
-export type { GpuBufferLike, GpuDeviceLike, GpuCommandEncoderLike, GpuReadbackDecoder, BridgeGPUSourceOptions, ReadbackLatencyStats, ReadbackBackpressureMode, ReadbackPacingMode, ReadbackAction, ReadbackPressureSnapshot, RawReadbackCompatibility, RawReadbackCompatibilityOptions, RawReadbackCompatibilityReason, PartialReadbackInitialFrame, FieldReadbackOptions, FieldReadbackRange, WriteTarget, WriteTargetKind, } from "./BridgeGPUSource.js";
+export type { GpuBufferLike, GpuDeviceLike, GpuCommandEncoderLike, GpuReadbackDecoder, BridgeGPUSourceOptions, ReadbackLatencyStats, ReadbackBackpressureMode, ReadbackPacingMode, ReadbackAction, ReadbackPressureSnapshot, RawReadbackCompatibility, RawReadbackCompatibilityOptions, RawReadbackCompatibilityReason, PartialReadbackInitialFrame, FieldReadbackOptions, FieldReadbackRange, WasmReadbackDecoderOptions, WriteTarget, WriteTargetKind, } from "./BridgeGPUSource.js";
 export { BridgeBlockProducer } from "./BridgeBlockProducer.js";
 export type { BridgeBlockProducerOptions, } from "./BridgeBlockProducer.js";
 export { getEnvironmentReport } from "./environment.js";

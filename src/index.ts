@@ -219,6 +219,7 @@ export type {
   PartialReadbackInitialFrame,
   FieldReadbackOptions,
   FieldReadbackRange,
+  WasmReadbackDecoderOptions,
   // Zero-copy WriteTarget scaffold (0.7.15 â€” Track 4). The strategy
   // interface and the kind selector are exported as types so callers
   // see the shape; today only the `'map-async'` resolution path is

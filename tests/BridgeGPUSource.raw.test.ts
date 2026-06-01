@@ -35,6 +35,7 @@ import {
   defineSchema,
   f32,
   f64Array,
+  planWasmDecoder,
   u8,
   u64,
   type GpuBufferLike,
@@ -433,6 +434,47 @@ async function testFieldReadbackHelpers(): Promise<void> {
   ok("9. field-level dirty readback helpers derive layout offsets and support source-offset override");
 }
 
+async function testWasmDecoderAdapter(): Promise<void> {
+  const F: Frame = { seq: 123n, payload: new Float64Array([4.25, -5.5]) };
+  const plan = planWasmDecoder(schema);
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const decodeFrame = (srcBase: number, dstBase: number): void => {
+    const bytes = new Uint8Array(memory.buffer);
+    for (const copy of plan.copies) {
+      bytes.set(
+        bytes.slice(srcBase + copy.srcRel, srcBase + copy.srcRel + copy.byteCount),
+        dstBase + copy.dstRel,
+      );
+    }
+  };
+  const decoder = BridgeGPUSource.wasmDecoder(schema, {
+    memory,
+    decodeFrame,
+    plan,
+    srcByteOffset: 0,
+    dstByteOffset: 256,
+  });
+  const device = makeRawMockDevice(encodeFrame(F));
+  const bridge = makeBridge();
+  const src = new BridgeGPUSource(device, bridge, decoder, { stagingBufferCount: 2 });
+  assertEq(src.decoderMode(), "closure", "wasm adapter uses normal closure mode");
+
+  src.scheduleReadback(dummySrcBuffer, noopEncoder);
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed = src.pollCompleted();
+
+  assertEq(pushed, 1, "wasm adapter publishes one decoded frame");
+  const out: Frame = { seq: 0n, payload: new Float64Array(2) };
+  assert(bridge.pull(out), "wasm-decoded frame is readable");
+  assertEq(out.seq, 123n, "wasm adapter decodes u64 scalar");
+  assertEq(out.payload[0], 4.25, "wasm adapter decodes f64 array element 0");
+  assertEq(out.payload[1], -5.5, "wasm adapter decodes f64 array element 1");
+
+  src.destroy();
+  ok("10. wasmDecoder adapter plugs emitWasmDecoder plans into BridgeGPUSource");
+}
+
 async function main(): Promise<void> {
   await testRawDispatchPushesFrame();
   await testRawRingFullDrops();
@@ -443,6 +485,7 @@ async function main(): Promise<void> {
   await testPartialRawReadbackMergesDirtyRegion();
   await testPartialClosureReadbackReceivesMergedFrame();
   await testFieldReadbackHelpers();
+  await testWasmDecoderAdapter();
   console.log("\nAll BridgeGPUSource.raw.test.ts pins passed.");
 }
 

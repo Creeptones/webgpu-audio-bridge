@@ -114,6 +114,9 @@ Use `BridgeGPUSource.rawIfCompatible(device, bridge, decoder)` to select the
 zero-decode `pushRaw` path only when the schema's WGSL layout is byte-compatible;
 otherwise it falls back to the decoder closure.
 
+For non-raw-compatible schemas, pair `emitWasmDecoder(schema)` with
+`BridgeGPUSource.wasmDecoder(schema, opts)` to move layout decode into WASM.
+
 Write targets:
 
 - `auto`: resolves to `map-async` today
