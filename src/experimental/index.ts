@@ -131,6 +131,32 @@ export type {
   MountWorkQueueOptions,
 } from "../connectWorkQueue.js";
 
+// ── connectGraph/mountGraph (0.9.938) ───────────────────────────────────────
+//
+// Apollo Frontier 3, DAG Stage 1: the `connect()`-style topology constructor for
+// a whole multi-edge audio DAG — caller-named nodes connected by typed directed
+// edges, each edge one of the FOUR proven wait-free rings (SPSC / MP→SC fan-in /
+// SP→MC broadcast / MP→MC work-queue). `connectGraph(spec)` allocates every edge's
+// SAB ONCE → a clone-safe handle bag (per-edge `kind`-tagged handles + a
+// node→incidence index); each peer `mountGraph(handle, { node, schemas })`s only
+// its incident edges, reconstructed as the right Role facades via a four-way
+// branch over `mount`(SpscRing, wrapped directly) / `mountFanIn` / `mountFanOut`
+// (consumer index DERIVED) / `mountWorkQueue` (anonymous consumers). PURE additive
+// wiring — the four rings + their `.tla`/fuzzers are never touched, so the
+// per-edge proofs compose unchanged (no `Dag*.tla`). The one load-bearing decision
+// (Stage-0 §5): every edge must be wait-free on the PUSH side, so an SPSC edge with
+// `policy:'block'` is REJECTED (`GraphEdgePolicyError`); a cyclic spec is rejected
+// (`GraphCycleError`). Turbo-ONLY (no MessageChannel fallback). `@experimental`
+// until the four rings promote. See docs/dag-topology-design.md +
+// docs/frontier3-dag-stage1-handoff.md.
+export { connectGraph, mountGraph, GraphCycleError, GraphEdgePolicyError } from "../connectGraph.js";
+export type {
+  ConnectGraphSpec, GraphEdgeSpec, GraphEdgeKind, GraphSpscPolicy,
+  GraphHandle, GraphEdgeHandle, SpscEdgeHandle, SpscEdgeSizing, GraphEdgeWiring,
+  NodeIncidence, GraphTopology, MountGraphOptions, GraphSchemas,
+  MountedNode, MountedConsumerEnd, MountedProducerEnd,
+} from "../connectGraph.js";
+
 // ── connectFanOut/mountFanOut (0.9.928) ─────────────────────────────────────
 //
 // Apollo Frontier 3, Stage 4.3: the `connect()`-style SP→MC broadcast topology

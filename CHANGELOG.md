@@ -4,6 +4,103 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.938] — 2026-05-31
+
+### Added — Apollo Frontier 3, DAG Stage 1: `connectGraph()` / `mountGraph()` — the MPMC audio-DAG topology constructor
+
+The headline of Frontier 3 lands its wiring layer. All FOUR edge types the DAG
+composes are now built, proven, and `connect()`-integrated (SPSC, MP→SC fan-in,
+SP→MC broadcast, MP→MC work queue); Stage 0 (`docs/dag-topology-design.md`)
+settled the design on paper and concluded **no new memory-ordering hazard ⇒ no
+`Dag*.tla`**. Stage 1 is the pure additive wiring that turns those four
+point-to-point edges into a composable multi-node topology.
+
+- **`src/connectGraph.ts` — `connectGraph(spec)` / `mountGraph(handle, { node,
+  schemas })`.** `connectGraph` allocates + `initLayout`s EVERY edge's SAB exactly
+  once on the allocating thread (delegating to `connectFanIn` / `connectFanOut` /
+  `connectWorkQueue` for the three fan edges, and wrapping `SpscRing` directly for
+  the 1→1 edge) and returns a frozen `GraphTopology` with a clone-safe handle bag:
+  per-edge `kind`-tagged handles keyed by `edgeId`, a per-edge wiring record
+  (`from`/`to` node arrays), and a **node→incidence index** (`node → { inbound,
+  outbound }`). Each peer calls `mountGraph(handle, { node, schemas })` and gets
+  back ONLY its incident edges, reconstructed as the right Role facades via a
+  **four-way branch**: SPSC → `BridgeProducer`/`BridgeConsumer`; `mpmc` →
+  `mountFanIn` (`MpmcRing`); `spmc` → `mountFanOut` (`SpmcRing`, consumer
+  `consumerIndex` **DERIVED** from the node's position in `to[]`); `mpmc-wq` →
+  `mountWorkQueue` (`MpmcWorkQueue`, **anonymous** consumers — NO `consumerIndex`,
+  the key asymmetry vs fan-out). The topology also surfaces `criticalPathLatencyMs`
+  (a longest-path DP over the topo-sorted DAG, summing each edge's
+  `estimatedLatencyMs`) and `totalSabBytes` (Σ edge `sabBytes`).
+- **The two structural gates the DAG adds.** (1) **Acyclicity** — a Kahn
+  topological sort over the node graph induced by the edges; a cyclic spec throws
+  `GraphCycleError` naming the residual nodes (a feedback edge is a deliberate
+  later feature). (2) **The §5 push-discipline gate** — every DAG edge must be
+  wait-free on the PUSH side, so an SPSC edge with `policy:'block'` is rejected at
+  construction (`GraphEdgePolicyError`); the SPSC edge policy is
+  `Exclude<BackpressurePolicy,'block'>`, default `'drop-oldest'` (freshest data,
+  audio-correct). The three lossy fan/work-queue edges are wait-free-push by
+  construction. This does NOT weaken standalone `connect()` — its `'block'` stays
+  valid for a non-real-time batch producer.
+- **End-of-stream is the node's concern (Stage-1 decision).** The work-queue edge
+  carries a `close()`/`isDrained()` protocol the other edges lack; `mountGraph`
+  hands back the raw `MpmcWorkQueue` facade, so a node coordinates teardown itself.
+  The DAG exposes NO graph-wide drain helper in v1 (a synchronizing helper would
+  risk reintroducing the §5 cross-node wait) — consistent with "the DAG does not
+  execute nodes".
+- **Pure additive wiring.** `connectGraph.ts` **never opens** `connect.ts` /
+  `connectFanIn.ts` / `connectFanOut.ts` / `connectWorkQueue.ts` internals beyond
+  importing their public constructors + types, and never touches a ring or its
+  `.tla`/fuzzer — so the per-edge proofs compose unchanged and the "edges untouched
+  + SPSC bit-exact" frontier gate stays structural. Turbo-ONLY
+  (`ConnectUnsupportedError('isolation-required')`, no MessageChannel fallback);
+  exported from `webgpu-audio-bridge/experimental`, NOT root, until the four rings
+  promote.
+
+### Why
+
+The three (now four) fan edges are individually proven and `connect()`-integrated,
+but composing them into the multi-producer → mixer → splitter → effects → output
+topologies Frontier 3 promises required a topology layer: allocate every edge once,
+hand each node its incident facades, and enforce the two graph-level invariants
+(acyclicity + wait-free-push) the per-edge proofs do not cover. `connectGraph` is
+that layer — and because it is pure wiring over frozen rings with no cross-edge
+atomic coupling, it lands as an additive `@experimental` patch with no new wire
+format and no new formal model.
+
+### Wire compatibility
+
+No wire change. `connectGraph` introduces no new SAB lane and no new ring — it
+allocates the existing four edge formats and adds only a clone-safe handle bag +
+incidence index on top. Every existing ring's wire format is bit-identically
+untouched; the SPSC / MP→SC / SP→MC / MP→MC suites stay green. A new opt-in surface
+on the experimental subpath. **Patch** bump under the versioning policy.
+
+### Tests
+
+- **`tests/connectGraph.test.ts`** (10 single-thread pins, registered in `test` /
+  `test:unit`) over a graph that uses ALL FOUR edge kinds (`p0,p1 ─fan-in→ mixer
+  ─spsc→ fx ─broadcast→ sinkA,sinkB` + `w0,w1 ─work-queue→ wk0,wk1`): the handle
+  bag shape (kind-tagged per-edge handles + incidence index + roll-ups), the
+  Turbo-only env gate, spec validation (arity per kind, unknown node, duplicate id,
+  self-loop, empties), the acyclicity gate (`GraphCycleError` + an accepted
+  diamond), the push-discipline gate (SPSC `'block'` → `GraphEdgePolicyError`,
+  policy on a fan edge rejected, lossy default `'drop-oldest'`), the four-way mount
+  (producer/consumer ends, derived fan-out `consumerIndex`, anonymous work-queue
+  consumers), an allocate-once / mount-many **bit-exact round-trip across all four
+  edges** over one shared handle bag, the SPSC-edge layout-skew guard, the roll-ups
+  (`totalSabBytes` sum, `criticalPathLatencyMs` longest-path sum, honest `NaN`
+  poison for a control edge with no `producerHz`), and `topology.mount()` symmetry
+  with free `mountGraph()` + the missing-schema / unknown-node mount errors.
+- The cross-thread multi-node stress + an `examples/audio-dag/` browser smoke are
+  DAG Stage 2 (a later patch).
+
+### Documentation
+
+- `docs/dag-topology-design.md` (Stage-0 spec) + `docs/frontier3-dag-stage1-handoff.md`
+  (the build plan) are the authoritative references.
+- CHANGELOG + ROADMAP row + Frontier-3 narrative line + CLAUDE.md file inventory
+  (`connectGraph.ts`).
+
 ## [0.9.937] — 2026-05-31
 
 ### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 3: `connectWorkQueue()` + the end-of-stream protocol

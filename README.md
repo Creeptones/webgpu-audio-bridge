@@ -2225,7 +2225,7 @@ The hard problem moved with the role flip. MP→SC's danger was producer-side (c
 
 ### Experimental MP→MC work queue — `MpmcWorkQueue` (0.9.934)
 
-The third fan edge, and the one where **both** ends are contended: **N producers, M consumers, every frame to exactly one consumer** — a *partition*, a work queue (the render pool dispatching interchangeable work units), the opposite of `SpmcRing`'s broadcast. `MpmcWorkQueue` is the wait-free primitive with its own SAB layout (the frozen `SpscRing` / `MpmcRing` / `SpmcRing` cores are never touched). It ships from the **`webgpu-audio-bridge/experimental`** subpath while the MP→MC wire format soaks. (The declarative `connectWorkQueue()` constructor + the end-of-stream protocol are a later stage; for now you wire the queue directly.)
+The third fan edge, and the one where **both** ends are contended: **N producers, M consumers, every frame to exactly one consumer** — a *partition*, a work queue (the render pool dispatching interchangeable work units), the opposite of `SpmcRing`'s broadcast. `MpmcWorkQueue` is the wait-free primitive with its own SAB layout (the frozen `SpscRing` / `MpmcRing` / `SpmcRing` cores are never touched). It ships from the **`webgpu-audio-bridge/experimental`** subpath while the MP→MC wire format soaks. (The declarative `connectWorkQueue()` constructor + the `close()`/`isDrained()` end-of-stream protocol shipped at 0.9.937; the example below wires the queue directly.)
 
 ```ts
 import { MpmcWorkQueue } from "webgpu-audio-bridge/experimental";
@@ -2245,6 +2245,34 @@ consumer.pull(out);            // competing dequeue — claims a unique frame, o
 The new hazard is **consumer-side contention** (each frame to exactly one of M consumers, no duplicate, no loss, while staying wait-free). The classic bounded MPMC queue (Vyukov's) is only *lock-free* — a CAS-retry on the dequeue position — which fails the audio bar. The wait-free answer is **symmetric fetch-add + a held-claim**: a consumer claims a unique ticket `D` with a single `Atomics.add` (so no two consumers ever touch the same frame — no double-deliver, for free), and if its claimed frame is not yet published it **holds** `D` and re-polls rather than skipping (so a published frame is never orphaned). Tear-freedom comes from a **per-slot Vyukov sequence stamp** that serializes the slot producer→consumer→producer (a held frame is never overwritten — no seqlock needed). The producer reuse envelope is `MpmcRing`'s, measured from the contiguous delivered frontier. Proven exhaustively by `tests/MpmcWorkQueue.interleaving.test.ts` (every interleaving, the wait-free witness, and negative pins where a shared-peek consumer double-delivers, a skip consumer orphans, and an ungated producer tears) and by a 1 M-frame cross-thread partition stress. The one residual is a bounded teardown strand (< consumerCount) at end-of-stream — it strands a consumer, never loses a frame.
 
 > **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `MpmcWorkQueue` may break across PATCH releases until the MP→MC primitive promotes to the root. Constructing an `MpmcWorkQueue` emits a one-shot `console.warn`.
+
+### Experimental — MPMC audio DAG — `connectGraph()` (0.9.938)
+
+The four edges above (SPSC, MP→SC fan-in, SP→MC broadcast, MP→MC work queue) are the building blocks; `connectGraph()` composes them into a whole **directed acyclic topology** — caller-named nodes connected by typed directed edges — and hands each node only its incident edge facades. It is the `connect()` pattern lifted from one edge to a graph: allocate every edge's SAB **once** on the allocating thread, `postMessage` one clone-safe handle bag, and let each peer `mountGraph` only what it touches.
+
+```ts
+import { connectGraph, mountGraph } from "webgpu-audio-bridge/experimental";
+
+// Allocating thread — allocate every edge's SAB once.
+const topo = connectGraph({
+  nodes: ["p0", "p1", "mixer", "fx", "outA", "outB"],
+  edges: [
+    { id: "in",    kind: "mpmc",  schema: macro, from: ["p0", "p1"], to: "mixer" }, // N→1 fan-in
+    { id: "link",  kind: "spsc",  schema: macro, from: "mixer", to: "fx" },          // 1→1
+    { id: "split", kind: "spmc",  schema: macro, from: "fx", to: ["outA", "outB"] }, // 1→N broadcast
+  ],
+});
+// postMessage(topo.handle, topo.transferList) to every worker/worklet.
+
+// Each peer reconstructs ONLY its incident edges as the right Role facades.
+const me = mountGraph(topo.handle, { node: "mixer", schemas: { in: macro, link: macro } });
+me.inbound.in.pull(out);      // the fan-in consumer end (an MpmcRing)
+me.outbound.link.push(frame); // the SPSC producer end (a BridgeProducer)
+```
+
+`mountGraph` branches per edge kind: an SPSC edge gives a `BridgeProducer`/`BridgeConsumer`, fan-in/work-queue give the raw `MpmcRing`/`MpmcWorkQueue`, and a fan-out consumer gets its `consumerIndex` **derived** from its position in `to[]` (a work-queue consumer is anonymous — no index). Two graph-level rules are enforced at construction: the spec must be **acyclic** (a cycle throws `GraphCycleError`), and **every edge must be wait-free on the push side** — so an SPSC edge with `policy:'block'` is rejected (`GraphEdgePolicyError`), because a blocking edge could let a slow sink wedge a real-time source the full length of a path (the default SPSC policy is `'drop-oldest'`). The topology also reports `criticalPathLatencyMs` (the longest source→sink path) and `totalSabBytes`. It is **pure additive wiring** over the four frozen rings — no new wire format, no new SAB lane, no ring touched — and `Turbo-only` (a non-isolated host throws `isolation-required`).
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectGraph`/`mountGraph` may break across PATCH releases until the four edge rings promote to the root. A cross-thread multi-node stress + a browser smoke are the next stage.
 
 ### Experimental — The Autonomous JIT — `connectJit()` (0.9.917)
 
