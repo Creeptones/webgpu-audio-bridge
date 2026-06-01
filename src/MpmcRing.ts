@@ -46,7 +46,22 @@
  *                             depth — stays 0 under a correctly-sized ring).
  *     lane 4  tornFrames      consumer overwrite-detected counter (d>0 path —
  *                             also unreachable under the envelope; 0 == healthy).
- *     lanes 5..7              reserved (zero).
+ *     lane 5  flow_scale      consumer→producer soft pacing hint (Q16.16;
+ *                             0.9.941, DAG back-pressure Stage 1a). The single
+ *                             consumer runs an AdaptiveFlowController.tick on
+ *                             each successful pull and release-stores the
+ *                             encoded scale; all N producers read it via
+ *                             flowScaleHint(). ADVISORY — push() never blocks on
+ *                             it (§5-safe soft back-pressure). An independent
+ *                             side-channel cell: a stale read is harmless (the
+ *                             controller self-corrects), no happens-before with
+ *                             any payload/cursor/generation lane. The output
+ *                             clamp is the WIDENED DAG floor (DAG_FLOW_SCALE_MIN
+ *                             = 0.05), not SpscRing's [0.5, 2.0] — one hop can
+ *                             then pace far below 0.5 so back-pressure walks
+ *                             upstream to the exact bottleneck rate across a
+ *                             multi-hop DAG (design note §3).
+ *     lanes 6..7              reserved (zero).
  *
  *   Generation region (Int32 array at byte 32, one Int32 per slot):
  *     slot s's generation is the publish/visibility flag — it REPLACES the
@@ -131,6 +146,10 @@ import {
   type Schema,
   type SchemaLayoutDescription,
 } from "./schema.js";
+import {
+  AdaptiveFlowController,
+  DAG_FLOW_SCALE_MIN,
+} from "./AdaptiveFlowController.js";
 
 /** Header size in bytes (8 Int32 lanes). 8-aligned, so the generation region
  *  that follows at byte 32 keeps the payload base 8-aligned. */
@@ -143,6 +162,18 @@ const DEQUEUE_POS_LANE = 1;
 const DROPPED_LANE = 2;
 const OVERRUN_LOST_LANE = 3;
 const TORN_LANE = 4;
+// lane 5 — flow_scale (Q16.16 consumer→producer soft pacing hint; 0.9.941,
+// Apollo Frontier 3 DAG back-pressure Stage 1a). The consumer release-stores
+// the encoded scale on each successful pull; all N producers read it via
+// flowScaleHint(). An independent side-channel cell — relaxed load/store, no
+// happens-before with any cursor/generation/ticket lane (design note §0).
+const FLOW_SCALE_LANE = 5;
+// lanes 6..7 still reserved (zero).
+
+/** Q16.16 quantum for the flow_scale lane decode. Mirrors SpscRing's local
+ *  copy (the controller owns the encode; the producer-side decode needs only
+ *  the quantum). */
+const FLOW_SCALE_Q = AdaptiveFlowController.Q;
 
 const MAX_CAPACITY = 1 << 30;
 
@@ -244,6 +275,16 @@ export class MpmcRing<S extends Schema<FieldsObject, any>> {
 
   /** Declared concurrent producer count (SLACK = producerCount − 1). */
   public readonly producerCount: number;
+
+  /** Consumer-side flow_scale PI controller (lane 5; 0.9.941). Composed with
+   *  the WIDENED DAG output clamp (floor = DAG_FLOW_SCALE_MIN) so a single hop
+   *  can pace below 0.5 — see the class header "lane 5". Driven on each
+   *  successful pull; meaningful only on the single consumer's ring instance
+   *  (producer instances never call pull, so their controller sits unused —
+   *  cheap, no SAB). */
+  private readonly flowController = new AdaptiveFlowController({
+    minScale: DAG_FLOW_SCALE_MIN,
+  });
 
   /** Total SAB byte length for `capacity` slots of `schema` under this layout.
    *  Static so callers size the SAB before constructing the ring. */
@@ -383,6 +424,10 @@ export class MpmcRing<S extends Schema<FieldsObject, any>> {
     for (let lane = 0; lane < MPMC_HEADER_INT32_LANES; lane++) {
       Atomics.store(this.header, lane, 0);
     }
+    // Seed flow_scale = 1.0 so any producer that reads flowScaleHint() before
+    // the consumer has run a single tick sees "go at nominal rate" rather than
+    // the 0 the zero-fill above would otherwise leave (which decodes to 0.0).
+    Atomics.store(this.header, FLOW_SCALE_LANE, AdaptiveFlowController.DEFAULT_Q);
     const cap = this.capacity;
     for (let s = 0; s < cap; s++) {
       Atomics.store(this.gen, s, (s - cap) | 0);
@@ -421,6 +466,26 @@ export class MpmcRing<S extends Schema<FieldsObject, any>> {
     return true;
   }
 
+  /**
+   * Producer-side soft pacing hint (0.9.941, DAG back-pressure Stage 1a).
+   * Returns the most recent consumer→producer `flow_scale` (Q16.16-decoded
+   * from lane 5) in `[DAG_FLOW_SCALE_MIN, 2.0]`; `1.0` means "go at nominal
+   * rate", `< 1` means "the consumer is overfull — slow down", `> 1` means
+   * "the consumer is starved — speed up".
+   *
+   * **Advisory only.** `push()` never blocks on this — it stays the lossy,
+   * wait-free, never-blocking push §5 mandates. A producer *chooses* to pace
+   * (or, for a clock-locked source, to degrade earlier); nothing forces it to
+   * wait, so no stall can propagate (§5-safe soft back-pressure). All N
+   * producers read the same lane (one consumer → one hint). A relaxed
+   * `Atomics.load`; a stale read is harmless (the controller self-corrects on
+   * the next tick). Returns 1.0 before the consumer has run a single pull (the
+   * seeded default). See `docs/dag-backpressure-design.md`.
+   */
+  flowScaleHint(): number {
+    return (Atomics.load(this.header, FLOW_SCALE_LANE) | 0) / FLOW_SCALE_Q;
+  }
+
   // ─── Consumer ──────────────────────────────────────────────────────────────
 
   /**
@@ -457,6 +522,14 @@ export class MpmcRing<S extends Schema<FieldsObject, any>> {
       const readers = this.readers;
       for (let i = 0; i < readers.length; i++) readers[i]!(slot, o);
       Atomics.store(header, DEQUEUE_POS_LANE, (D + 1) | 0); // release
+      // Soft back-pressure (Stage 1a): run one PI cycle on the pre-pull
+      // occupancy and publish the encoded scale on lane 5. Only on the
+      // successful branch — an empty/gap pull must not feed the controller a
+      // misleading "occupancy = 0 because nobody pulled" sample (mirrors
+      // SpscRing._updateFlowScale). `D` is the pre-increment cursor, `W` the
+      // enqueue ticket loaded at entry → buffered = how full the ring was when
+      // the consumer arrived to take this frame.
+      this._updateFlowScale(W, D);
       return true;
     }
 
@@ -475,6 +548,24 @@ export class MpmcRing<S extends Schema<FieldsObject, any>> {
     // head (a lagging producer will fill it; we ride to the next quantum).
     if (D !== startD) Atomics.store(header, DEQUEUE_POS_LANE, D);
     return false;
+  }
+
+  /**
+   * Run one PI cycle on the consumer's pre-pull occupancy and release-store the
+   * Q16.16-encoded `flow_scale` into lane 5 (0.9.941). Called inline from `pull`
+   * on the successful-delivery branch only.
+   *
+   * `buffered = signedDiff(W, D)` is the wrap-correct in-flight count when the
+   * consumer arrived (`W` = enqueue ticket loaded at pull entry, `D` = the
+   * pre-increment cursor); the controller computes occupancy = buffered /
+   * capacity internally. A pure side-channel store — no happens-before edge
+   * with the payload or any protocol lane. Mirrors `SpscRing._updateFlowScale`,
+   * but with the widened DAG clamp baked into `this.flowController`.
+   */
+  private _updateFlowScale(W: number, D: number): void {
+    const buffered = signedDiff(W, D);
+    const encoded = this.flowController.tick(buffered, this.capacity);
+    Atomics.store(this.header, FLOW_SCALE_LANE, encoded);
   }
 
   // ─── Observers ─────────────────────────────────────────────────────────────

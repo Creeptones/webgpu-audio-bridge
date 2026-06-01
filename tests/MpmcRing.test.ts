@@ -16,6 +16,15 @@
  *   7.  overload-net counted-loss path (white-box: W − D > CAPACITY → catch up,
  *       count loss, deliver the oldest live frame, never tear).
  *   8.  producerCount > 1 reserves SLACK (usable depth = CAPACITY − SLACK).
+ *   9.  flow_scale lane (0.9.941, DAG back-pressure Stage 1a): seeded 1.0 before
+ *       the first pull; sustained-full occupancy drives the hint DOWN past 0.5
+ *       (proving the WIDENED DAG clamp is active — a default [0.5,2.0]
+ *       controller would pin at 0.5); sustained-low occupancy drives it UP
+ *       toward 2.0; every sample stays in [DAG_FLOW_SCALE_MIN, 2.0]; the lane
+ *       is a pure side channel (no tear/overrun). The behavioral "drops
+ *       collapse across a multi-hop DAG" is the Stage-0 probe's deliverable
+ *       (bench/dag-backpressure-probe.mjs, same controller); this pin proves
+ *       the lane MECHANICS deterministically through the real pull path.
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -25,6 +34,7 @@ import {
   f64Array, i32Array,
 } from "../src/index.js";
 import { MpmcRing, MPMC_HEADER_BYTES } from "../src/MpmcRing.js";
+import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 
 // Silence (and capture) the one-shot experimental warning so it doesn't
 // pollute the suite output, while still pinning that it fires.
@@ -256,6 +266,59 @@ function pin8_slackReserve(): void {
   pass("pin8: producerCount reserves SLACK");
 }
 
+// Pin 9 — flow_scale lane (DAG back-pressure Stage 1a). Deterministic, drives
+// the REAL consumer pull path (no white-box poking of lane 5) so the
+// AdaptiveFlowController runs exactly as it will in production.
+function pin9_flowScale(): void {
+  const cap = 16;
+  const f = makeFrame();
+  // The encode is Q16.16 floor, so a decoded value can sit up to one quantum
+  // (1/65536 ≈ 1.5e-5) BELOW the controller's clamped real value — e.g. the
+  // 0.05 floor decodes to floor(0.05·65536)/65536 = 0.049987… Allow one quantum
+  // of slack on the bounds check.
+  const Q_EPS = 1 / 65536 + 1e-9;
+  const inBounds = (x: number) =>
+    x >= DAG_FLOW_SCALE_MIN - Q_EPS && x <= 2.0 + Q_EPS;
+
+  // (a) Seeded neutral 1.0 before any pull → a producer reading the hint early
+  //     sees "go at nominal rate", not the 0 a bare zero-fill would leave.
+  const { ring } = MpmcRing.create(allKinds, cap, { producerCount: 1 });
+  const out = ring.createFrame();
+  assertEq(ring.flowScaleHint(), 1.0, "flow_scale seeded 1.0 (nominal) before first pull");
+
+  // (b) Sustained-FULL occupancy → hint DOWN past 0.5. Fill to capacity, then
+  //     steady pull-one/refill-one so each pull ticks the controller at
+  //     occupancy ≈ 1.0. Crossing below 0.5 is only reachable with the WIDENED
+  //     DAG clamp — the inherited [0.5, 2.0] would pin at the 0.5 floor.
+  for (let i = 0; i < cap; i++) assert(ring.push(f as any), `fill ${i}`);
+  for (let i = 0; i < 200; i++) {
+    assert(ring.pull(out), "steady pull");
+    assert(inBounds(ring.flowScaleHint()), "hint in [MIN, 2.0] while draining full");
+    assert(ring.push(f as any), "steady refill");
+  }
+  const fullHint = ring.flowScaleHint();
+  assert(fullHint < 0.5, `sustained-full drives hint below 0.5 (widened clamp active): got ${fullHint}`);
+  assert(fullHint >= DAG_FLOW_SCALE_MIN - Q_EPS, `hint never below the widened floor: got ${fullHint}`);
+  while (ring.pull(out)) { /* drain */ }
+  assertEq(ring.tornFrameCount(), 0, "full-occupancy run never tears");
+  assertEq(ring.overrunLostFrames(), 0, "full-occupancy run no overrun loss");
+
+  // (c) Sustained-LOW occupancy (push one / pull one) → hint UP toward 2.0.
+  const { ring: ring2 } = MpmcRing.create(allKinds, cap, { producerCount: 1 });
+  const out2 = ring2.createFrame();
+  for (let i = 0; i < 200; i++) {
+    assert(ring2.push(f as any), "push one");
+    assert(ring2.pull(out2), "pull one (low occupancy)");
+    assert(inBounds(ring2.flowScaleHint()), "hint in [MIN, 2.0] at low occupancy");
+  }
+  const lowHint = ring2.flowScaleHint();
+  assert(lowHint > 1.0, `sustained-low occupancy drives hint above 1.0: got ${lowHint}`);
+  assertEq(ring2.tornFrameCount(), 0, "side channel never tears the protocol");
+  assertEq(ring2.overrunLostFrames(), 0, "side channel no overrun loss");
+
+  pass("pin9: flow_scale lane (seed 1.0, widened clamp < 0.5, bounds, side-channel)");
+}
+
 function main(): void {
   console.log("MpmcRing — single-thread API pins");
   pin1_layout();
@@ -266,6 +329,7 @@ function main(): void {
   pin6_headOfLineGap();
   pin7_overloadNet();
   pin8_slackReserve();
+  pin9_flowScale();
   console.warn = realWarn;
   console.log(`\nMpmcRing: ${passed} pins passed.`);
 }

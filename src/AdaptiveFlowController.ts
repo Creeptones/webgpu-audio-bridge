@@ -19,7 +19,12 @@
  * (clamped to ±`INT_LIMIT` for anti-windup), and gains `Kp = 0.5`,
  * `Ki = 0.05`:
  *
- *     scale = clamp(1 − Kp·err − Ki·integral, 0.5, 2.0)
+ *     scale = clamp(1 − Kp·err − Ki·integral, minScale, maxScale)
+ *
+ * The output clamp is per-instance (Stage 1a, 0.9.941), defaulting to the
+ * frozen `[0.5, 2.0]`. The DAG fan-ring lanes widen the floor to
+ * `DAG_FLOW_SCALE_MIN` (0.05) so backpressure can pace across an arbitrary
+ * rate mismatch; SpscRing constructs with no options and is byte-identical.
  *
  * Sign: positive `err` (consumer is overfull) gives `scale < 1` (producer
  * should slow down); negative `err` (consumer is starved) gives `scale > 1`
@@ -54,6 +59,29 @@ const FLOW_SCALE_Q = 65536;
 const FLOW_SCALE_MIN = 0.5;
 const FLOW_SCALE_MAX = 2.0;
 
+/**
+ * The **widened DAG output-clamp floor** for the fan-ring `flow_scale` lanes
+ * (`MpmcRing`/`MpmcWorkQueue`/`SpmcRing`) — **locked at Stage 1a (0.9.941)** and
+ * reused verbatim across 1b/1c.
+ *
+ * `SpscRing`'s lane keeps the frozen `[0.5, 2.0]` (the default below); its
+ * narrow authority is correct for a point-to-point bridge that rarely needs
+ * more than a 2× trim. The DAG fan rings instead pace across an *arbitrary*
+ * source↔sink rate mismatch: a single hop can only halve the rate at the 0.5
+ * floor, so a deep mismatch keeps dropping at the bottleneck (design note §3 /
+ * `bench/dag-backpressure-probe.mjs` Scenario B1: drops only fall 87.3 % →
+ * 37.7 %, every hop pinned at 0.5). Widening the floor to `0.05` lets each hop
+ * pace far below 0.5, so congestion propagates to the exact bottleneck rate
+ * and drops collapse to 0.7 % (probe B2). The integrator/gains/anti-windup are
+ * unchanged — only the output clamp was the limiter (`INT_LIMIT = 20` already
+ * lets `Ki·integral` reach the 0.95 reduction a 0.05 scale needs).
+ *
+ * Bounded below by the Q16.16 resolution (`1/65536`), above by `0.5`. `0.05`
+ * is the probe-proven value (B2). Documented in `docs/dag-backpressure-design.md`
+ * §3 as the locked value; do not re-derive it per ring.
+ */
+export const DAG_FLOW_SCALE_MIN = 0.05;
+
 // PI gains. See file header for the derivation.
 const FLOW_SCALE_KP = 0.5;
 const FLOW_SCALE_KI = 0.05;
@@ -63,6 +91,20 @@ const FLOW_SCALE_KI = 0.05;
 const FLOW_SCALE_INT_LIMIT = 20; // = 1.0 / FLOW_SCALE_KI
 
 /**
+ * Optional output-clamp override (Stage 1a, 0.9.941). The DAG fan-ring lanes
+ * pass `{ minScale: DAG_FLOW_SCALE_MIN }` so backpressure can express a deep
+ * source↔sink mismatch (one hop pacing well below 0.5); `SpscRing` constructs
+ * the controller with no options, keeping its frozen `[0.5, 2.0]` authority.
+ */
+export interface AdaptiveFlowControllerOptions {
+  /** Output clamp lower bound in real units. Default `0.5` (the frozen SPSC
+   *  point-to-point floor). */
+  readonly minScale?: number;
+  /** Output clamp upper bound in real units. Default `2.0`. */
+  readonly maxScale?: number;
+}
+
+/**
  * AdaptiveFlowController — flow-scale PI controller for SpscRing's lane 2.
  * Internal as of 0.6.9 — not exported from index.ts.
  */
@@ -70,6 +112,18 @@ export class AdaptiveFlowController {
   /** PI controller integral state. Persists across `tick` calls; clamped to
    *  ±`INT_LIMIT` for anti-windup. */
   private integral: number = 0;
+
+  /** Per-instance output clamp. Defaults to the frozen `[0.5, 2.0]`; the DAG
+   *  fan-ring lanes widen the floor (see `AdaptiveFlowControllerOptions`). The
+   *  static `MIN`/`MAX` below remain the defaults, so a default-constructed
+   *  controller (SpscRing's) is byte-identical to pre-Stage-1a. */
+  private readonly minScale: number;
+  private readonly maxScale: number;
+
+  constructor(opts?: AdaptiveFlowControllerOptions) {
+    this.minScale = opts?.minScale ?? FLOW_SCALE_MIN;
+    this.maxScale = opts?.maxScale ?? FLOW_SCALE_MAX;
+  }
 
   /** Q16.16 quantum (1.0 → 65536). */
   static readonly Q = FLOW_SCALE_Q;
@@ -109,8 +163,8 @@ export class AdaptiveFlowController {
     // Sign: err > 0 (consumer overfull) → scale < 1 (producer slow down);
     // err < 0 (consumer starved) → scale > 1 (producer speed up).
     let scale = 1 - FLOW_SCALE_KP * err - FLOW_SCALE_KI * integral;
-    if (scale < FLOW_SCALE_MIN) scale = FLOW_SCALE_MIN;
-    else if (scale > FLOW_SCALE_MAX) scale = FLOW_SCALE_MAX;
+    if (scale < this.minScale) scale = this.minScale;
+    else if (scale > this.maxScale) scale = this.maxScale;
     // Q16.16 encode. floor not round — preserves the boundary semantics
     // documented in flowScaleHint().
     return Math.floor(scale * FLOW_SCALE_Q);

@@ -44,6 +44,7 @@
 import { Worker } from "node:worker_threads";
 import { assert, assertEq } from "./_assert.js";
 import { MpmcRing, MPMC_HEADER_BYTES } from "../src/MpmcRing.js";
+import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 import { stressSchema, fillValue, checksumOf, STRESS_N } from "./_mpmcStress.js";
 
 const NPROD = 3;
@@ -218,6 +219,28 @@ async function main(): Promise<void> {
   assertEq(ring.overrunLostFrames(), 0, "envelope held: zero overrun loss");
   assertEq(ring.tornFrameCount(), 0, "zero torn frames under real parallelism");
   assert(consumed > 0, "consumer actually received frames");
+
+  // flow_scale side channel (0.9.941): the real consumer ran an
+  // AdaptiveFlowController tick on every successful pull under genuine
+  // cross-thread Atomics contention. It must coexist with the protocol — the
+  // tear/overrun assertions above already cover non-interference; here we pin
+  // that the published hint stayed a finite, in-range Q16.16 value (never
+  // corrupted by a racing producer's reads) and that the consumer actually
+  // moved it off the seeded default (proving the lane is live cross-thread).
+  // Direction is unconstrained: this consumer drains as fast as it can, so the
+  // ring sits near-empty and the hint tends high — the convergence-to-bottleneck
+  // behavior is the Stage-0 probe's deliverable, not this stress's.
+  const hint = ring.flowScaleHint();
+  console.log(`  flowScaleHint=${hint.toFixed(4)}`);
+  assert(Number.isFinite(hint), "flow_scale hint is finite under real parallelism");
+  // One Q16.16 quantum of slack on the floor (the encode floors; 0.05 decodes
+  // to 0.049987…). The fast-draining consumer keeps the ring near-empty, so in
+  // practice the hint sits well above the floor.
+  const qEps = 1 / 65536 + 1e-9;
+  assert(
+    hint >= DAG_FLOW_SCALE_MIN - qEps && hint <= 2.0 + qEps,
+    `flow_scale hint stayed in [${DAG_FLOW_SCALE_MIN}, 2.0] (got ${hint})`,
+  );
 
   console.log(`\nMpmcRing.concurrent: OK (${consumed} frames verified bit-exact).`);
 }

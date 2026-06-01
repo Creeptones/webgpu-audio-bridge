@@ -4,6 +4,91 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.941] — 2026-06-01
+
+### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1a: the `MpmcRing` `flow_scale` lane
+
+Stage 0 (`docs/dag-backpressure-design.md` + `bench/dag-backpressure-probe.mjs`,
+no version bump) settled on paper how the consumer→producer `flow_scale` hint
+`SpscRing` has carried since 0.5.0 is extended to the three fan rings and made to
+**propagate backward through a multi-hop DAG with no central coordinator**. This
+patch is the first cut: the simplest fan ring, `MpmcRing` (MP→SC fan-in).
+
+- **`MpmcRing` reserved header lane 5 is now `flow_scale`** (Q16.16, the same
+  encoding as SPSC's lane 2). The single consumer runs one
+  `AdaptiveFlowController.tick(buffered, capacity)` on each *successful* `pull`
+  (occupancy from the wrap-correct `(enqueueTicket − dequeuePos)`) and
+  release-stores the encoded scale; an empty/gap pull skips the tick so the
+  controller never sees a misleading "occupancy = 0 because nobody pulled"
+  sample (mirrors `SpscRing._updateFlowScale`). No header resize —
+  `MPMC_HEADER_INT32_LANES` already allocated lanes 5–7.
+- **New `MpmcRing.flowScaleHint(): number`** — the producer-side read, decoding
+  lane 5 to `[DAG_FLOW_SCALE_MIN, 2.0]`. All N producers read the one lane (one
+  consumer → one hint). **Advisory only** — `push()` stays the lossy, wait-free,
+  never-blocking push §5 mandates; a producer *chooses* to pace (or, for a
+  clock-locked source, to degrade earlier), so no stall can ever propagate. The
+  lane is seeded `1.0` at `initLayout`, so a producer reading the hint before the
+  consumer's first pull sees "go at nominal rate."
+- **The widened DAG output clamp — the load-bearing Stage-0 finding — is
+  introduced and the value LOCKED.** `AdaptiveFlowController` gains an optional
+  `{ minScale?, maxScale? }` (defaults `0.5`/`2.0`, so `SpscRing`'s
+  default-constructed controller is **byte-identical** — its frozen `[0.5, 2.0]`
+  point-to-point authority is untouched). The fan-ring lanes construct it with
+  the new exported **`DAG_FLOW_SCALE_MIN = 0.05`**: SPSC's `0.5` floor caps a
+  single hop at a 2× slowdown, so a deep source↔sink mismatch keeps dropping at
+  the bottleneck (probe B1: drops only fall 87.3 % → 37.7 %); the widened floor
+  lets each hop pace far below 0.5 so congestion propagates to the exact
+  bottleneck rate and drops collapse to 0.7 % (probe B2). **This value is locked
+  here and reused verbatim by 1b (`MpmcWorkQueue`) and 1c (`SpmcRing`).**
+
+### Why
+
+After §5 a DAG is *safe* (a slow sink can never wedge a real-time source) but
+*wasteful* — every edge is lossy, so a source over-producing relative to a slow
+sink simply drops the excess at every hop (the probe measures 87.3 % dropped on a
+3-hop line into a 1/8-rate sink). The missing piece is **soft back-pressure**:
+the occupancy hint SPSC already carries, extended to the fan rings so a producer
+has live downstream feedback instead of only a post-hoc drop count. `MpmcRing` is
+the simplest fan ring (one consumer → one lane) and the right starting point.
+
+### Wire compatibility
+
+`MpmcRing` is `@experimental`, internal-first, not exported from `src/index.ts`;
+its wire format is explicitly outside the 1.0 contract (the one-shot construction
+warning already covers it). The new lane lands in **already-reserved** header
+space (lanes 5–7 were zero), so no header resize, no frozen wire-format change,
+no public TS surface change → **patch**. `SpscRing`'s lane 2 and its `[0.5, 2.0]`
+clamp are **frozen and untouched** (the `AdaptiveFlowController` default preserves
+byte-identical behavior; `tests/Bridge.facades.test.ts` pins it). Were `MpmcRing`
+promoted, a new active lane would be a minor-bump trigger; pre-promotion it is a
+patch with this wire-compat note (design note §5).
+
+### Tests
+
+- **`tests/MpmcRing.test.ts` pin 9** (new) — the `flow_scale` lane, deterministic
+  through the **real** `pull` path (no white-box poking of lane 5): seeded `1.0`
+  before the first pull; sustained-full occupancy drives the hint **below 0.5**
+  (only reachable with the widened clamp — a default `[0.5, 2.0]` controller
+  would pin at the floor); sustained-low occupancy drives it up toward `2.0`;
+  every sample stays in `[DAG_FLOW_SCALE_MIN, 2.0]` (one Q16.16 quantum of slack
+  on the floor); the lane never tears the protocol.
+- **`tests/MpmcRing.concurrent.test.ts`** — the 1.2 M-frame cross-thread stress
+  now also pins that, after the real consumer ran a controller tick on every
+  pull under genuine Atomics contention, `flowScaleHint()` stayed a finite,
+  in-range value (the side channel coexists with the protocol — `torn`/`overrun`
+  still 0, already asserted). The behavioral "drops collapse" is the Stage-0
+  probe's deliverable (same controller), not re-proven flakily cross-thread.
+- Full `npm test` + `npm run test:concurrent` + `npm run bench` green; `push`
+  median 1.20 μs, SPSC's `flow_scale recovery` bench cell unchanged.
+
+### Documentation
+
+- `docs/dag-backpressure-design.md` §3 records `DAG_FLOW_SCALE_MIN = 0.05` as the
+  **locked** widened-clamp value (was "the probe used 0.05; exact value a Stage-1
+  tuning") + a Stage-1a shipped note. `CLAUDE.md`'s `MpmcRing` bullet notes the
+  lane. The Stage-0 design note + probe + handoff are committed separately as the
+  `docs(frontier3)` Stage-0 deliverable.
+
 ## [0.9.940] — 2026-06-01
 
 ### Added — Apollo Frontier 3, DAG Stage 2 deliverable B: the `examples/audio-dag/` browser smoke
