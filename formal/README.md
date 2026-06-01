@@ -19,9 +19,18 @@ protocols, modeled under a weak-memory (release/acquire) abstraction.
   per-consumer **seqlock** double-check. Modeled **beside** the frozen SPSC *and*
   MP→SC models. See [SP→MC model](#spmc-model-spmcring--apollo-frontier-3-stage-40)
   below.
+- `MpmcWorkQueue.tla` / `MpmcWorkQueue.cfg` — the **additive** multi-producer /
+  multi-consumer (MP→MC) **competing-consumer work queue** protocol (Apollo
+  Frontier 3, MP→MC work-queue Stage 0, 2026-05-31). N producers AND M consumers
+  contend on one ring; every frame goes to **exactly one** consumer (a work queue,
+  not a broadcast). The genuinely-new axis is **consumer-side contention** — M
+  consumers fetch-add a shared `dequeueTicket` and must partition the stream with
+  no double-deliver, staying hard wait-free. Modeled **beside** the frozen SPSC /
+  MP→SC / SP→MC models. See [MP→MC model](#mpmc-model-mpmcworkqueue--apollo-frontier-3-stage-0)
+  below.
 
-The rest of this section describes the SPSC model; the MP→SC and SP→MC models
-have their own sections near the end.
+The rest of this section describes the SPSC model; the MP→SC, SP→MC, and MP→MC
+models have their own sections near the end.
 
 The `.tla` is written to be **syntactically faithful TLA+/PlusCal**; it does
 not have to be run inside this repo's toolchain (there is no Java/TLC in the
@@ -366,3 +375,82 @@ recorded in the proof note. The Stage-4.1 in-CI fuzzer
 `tests/SpmcRing.interleaving.test.ts` will carry the mechanical bounded-step
 wait-free witness (`INV-W`) plus the negative pins (single-store ⇒ torn;
 no-recheck ⇒ torn).
+
+---
+
+## MP→MC model (`MpmcWorkQueue`) — Apollo Frontier 3, Stage 0
+
+`MpmcWorkQueue.tla` / `MpmcWorkQueue.cfg` model the **additive** multi-producer /
+multi-consumer **competing-consumer work queue** (the new primitive the DAG
+composes as a fourth edge type, built ahead of the topology layer — see
+[`../docs/dag-topology-design.md`](../docs/dag-topology-design.md) § Q7). It is
+the sibling of the SPSC / MP→SC / SP→MC models; **all three of those and their
+wire formats are frozen and untouched**. Full context:
+[`../docs/mpmc-workqueue-design.md`](../docs/mpmc-workqueue-design.md) and the
+runnable probe [`../bench/mpmc-wq-probe.mjs`](../bench/mpmc-wq-probe.mjs).
+
+### What is modeled
+
+N producers AND M consumers contend on **one** ring; every enqueued frame is
+delivered to **exactly one** consumer (a work queue — contrast the SP→MC
+*broadcast*, where every consumer sees every frame). The **sound design** Stage 0
+settled on — **symmetric wait-free fetch-add on both ends + a held-claim
+consumer**:
+
+- **Producers** are identical to MP→SC: envelope-guard, fetch-add `enqueueTicket`
+  → a unique ticket (wait-free, **not** a CAS), write payload, RELEASE-store the
+  slot generation. The envelope is measured from the contiguous consumer **commit
+  frontier** `F` (the smallest undelivered ticket — in the real ring a per-slot
+  "consumed" generation stamp), so a slot is never reused while an earlier frame
+  is unconsumed, **including one a consumer is holding**.
+- **Competing consumers** (the new axis) fetch-add the shared `dequeueTicket` → a
+  **unique claim `D`** (wait-free — each consumer gets a distinct old value), then
+  gate on the slot generation: `d == 0` deliver; `d < 0` **HOLD** `D` and re-poll
+  (never skip — skipping orphans the frame); `d > 0` lapped (asserted unreachable
+  under the envelope).
+
+The wrap algebra (`SignedDiff` / `Slot` / `Incr`) is reused verbatim; `CAP2_32 >
+2·CAPACITY` **and** `> MAXFRAMES` (the `ASSUME`s) so TLC crosses the wrap boundary
+while keeping session claims collision-free (distinct claims are distinct
+integers — the `UniqueClaim` algebra).
+
+### Invariants & properties
+
+| Name | Meaning |
+|---|---|
+| `NoOverwrite` | in-flight (from `F`) `∈ [0, CAPACITY]` — the envelope holds (no slot reused while unconsumed, incl. held). |
+| `NoTornRead` | no consumer reads a slot a producer is mid-writing (per-slot release/acquire; `slotOwner` ghost + an `assert` in the consumer's `CVerify` step). |
+| `UniqueClaim` | **the new MP→MC safety property** — no two consumers hold the same claim `D`, and no held claim is already delivered. Holds because the claim is a single `Atomics.add` handing each consumer a distinct old value (the no-double-deliver core). Additionally witnessed by `assert ~(claim[self] ∈ delivered)` in `CVerify`. |
+| `UniqueDelivery` | `Cardinality(delivered) = consumed` — each delivered ticket counted exactly once (no duplicate). |
+| `Conservation` | `consumed ≤ produced` — no frame delivered before published. |
+| `EventuallyDrained` / `HeadProgress` (liveness) | every published frame is eventually delivered to *some* consumer; no permanent wedge under the envelope (requires `WF_vars` on all processes, emitted by `fair process`). |
+
+The `d > 0` branch in `CVerify` carries an `assert FALSE` — under the envelope a
+held (hence unconsumed) claim's slot can never be relapped, so reaching it would
+be a hard counterexample.
+
+Expected result under the default `NPRODUCERS=2, NCONSUMERS=2, CAPACITY=2,
+CAP2_32=16, MAXFRAMES=4` session: all five invariants hold, both liveness
+properties hold, all `assert`s hold, no deadlock. Re-run with `NCONSUMERS=3` to
+widen consumer contention; with `CAPACITY=4` set `CAP2_32=32`.
+
+### Why fetch-add + held-claim, not shared-peek or fetch-add-skip (the Stage-0 finding)
+
+The Stage-0 runnable probe ([`../bench/mpmc-wq-probe.mjs`](../bench/mpmc-wq-probe.mjs))
+**exhaustively** explored the two tempting shortcuts and falsified both with
+concrete witness traces: a **shared-peek** consumer (read the head, deliver,
+advance — no fetch-add) **double-delivers** when two consumers snapshot the same
+head; a **fetch-add-then-skip** consumer (claim `D`, skip it if unready) **orphans**
+a published frame it claimed but found not-yet-written. The probe also confirms
+the classic bounded MPMC queue (Vyukov) is rejected here for a different reason —
+its CAS-retry dequeue is **lock-free, not wait-free** (the project bar). So the
+resolution is **fetch-add (unique claim) + held-claim (conserving) + the envelope
+(tear-free)**, hard wait-free on both ends. The one residual — a **bounded
+teardown strand** (≤ `consumerCount−1` consumers holding a claim for a ticket
+production never reached) — loses **no** produced frame and is a stream-end
+concern; the probe exhibits it (Scenario D) and the model, with its atomic
+guard+fetch-add claim, abstracts it away (the strand is a liveness/teardown
+artifact, not a safety violation — exactly the regime split MP→SC and SP→MC use).
+The Stage-1 in-CI fuzzer `tests/MpmcWorkQueue.interleaving.test.ts` will carry the
+mechanical bounded-step wait-free witness (`INV-W`) plus the negative pins
+(shared-peek ⇒ double-deliver; fetch-add-skip ⇒ orphan).
