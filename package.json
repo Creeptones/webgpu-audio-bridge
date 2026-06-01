@@ -64,6 +64,7 @@
     "bench:e2e": "node bench/e2e-latency/serve.mjs",
     "bench:notify-cost": "node bench/notify-cost-browser/serve.mjs",
     "check:release-metadata": "node scripts/check-release-metadata.mjs",
+    "check:api-boundary": "node scripts/check-api-boundary.mjs",
     "dev:demo": "node examples/minimal/serve.mjs",
     "dev:wasm-decode": "node examples/wasm-decode-worklet/serve.mjs",
     "dev:fast-lane": "node examples/fast-lane/serve.mjs",
@@ -84,7 +85,7 @@
     "bench:render-size-hint": "node bench/render-size-hint/serve.mjs",
     "llm-bundle": "node scripts/regenerate-llm-bundle.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run check:release-metadata && npm run typecheck && npm run test && npm run build"
+    "prepublishOnly": "npm run check:release-metadata && npm run check:api-boundary && npm run typecheck && npm run test && npm run build"
   },
   "keywords": [
     "webgpu",

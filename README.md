@@ -18,6 +18,8 @@
 
 The 1.0 candidate surface is intentionally smaller than the repository. Treat the root import as the stable bridge track: `Bridge`, schema DSL, `BridgeGPUSource`, Standard mode, worklet/codegen helpers, environment diagnostics, and the documented consumer/producer facades. Treat `webgpu-audio-bridge/experimental` as the lab track: WebNN, render-quantum probes, MPMC/SPMC/work-queue/DAG topology, and the Autonomous JIT/kernel grammar. Experimental APIs may change before 1.0 even when they are heavily tested; stable adopters should avoid depending on them until promotion is called out in this README and the changelog.
 
+The boundary is checked in CI/publish flow by `npm run check:api-boundary`; see [`docs/api-boundary.md`](./docs/api-boundary.md) and [`docs/stable-api-manifest.json`](./docs/stable-api-manifest.json).
+
 ```
                 ┌──────────────────────────┐
                 │  DedicatedWorker         │
