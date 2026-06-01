@@ -1,13 +1,13 @@
-// main.js — page thread for the God-Node hot-swap demo.
+﻿// main.js â€” page thread for the God-Node hot-swap demo.
 //
-//   1. Compute migratePlan(A → B) up front and show what the swap will do.
+//   1. Compute migratePlan(A â†’ B) up front and show what the swap will do.
 //   2. Allocate two SABs (one per schema), spawn the producer worker (drives
 //      both rings), create the AudioContext + the pre-registered consumer
 //      worklet, and hand it both SABs + the plan.
 //   3. "Morph to B" arms the click-free cross-schema swap AND performs the
 //      Stage-4 headline: emit B's whole AudioWorklet module FROM ITS SCHEMA at
 //      button-press, Blob it, addModule it LIVE, and run a verifier node that
-//      decodes B's live ring through the freshly-materialized read path —
+//      decodes B's live ring through the freshly-materialized read path â€”
 //      proving the bridge rewrote its own consumer path while audio plays.
 
 import {
@@ -42,13 +42,13 @@ const state = {
   running: false,
   diag: {},
   regen: { materialized: false, decoded: 0, freq: 0, res: 0, detune: 0 },
-  // Each morph materializes a FRESH processor (unique name) — a runtime module
+  // Each morph materializes a FRESH processor (unique name) â€” a runtime module
   // can only be registered once per AudioContext, and a new name makes the
   // "regenerated at click" story literal across repeated morphs.
   regenCount: 0,
 };
 
-// Compute the plan once at load — pure, no audio needed.
+// Compute the plan once at load â€” pure, no audio needed.
 const PLAN_OBJ = migratePlan(
   describeSchemaLayout(makeSchemaA()),
   describeSchemaLayout(makeSchemaB()),
@@ -74,10 +74,10 @@ function renderPlan() {
     `<div class="prow"><span class="pk ${cls}">${kind}</span><span class="pn">${name}</span><span class="pd">${detail}</span></div>`;
   const rows = [];
   for (const f of PLAN_OBJ.crossfade) {
-    rows.push(row("crossfade", f.to, `${f.blend}${f.trajectory ? ` · traj(order ${f.trajectory.order})` : ""}`, "xf"));
+    rows.push(row("crossfade", f.to, `${f.blend}${f.trajectory ? ` Â· traj(order ${f.trajectory.order})` : ""}`, "xf"));
   }
   for (const f of PLAN_OBJ.rampIn) {
-    rows.push(row("ramp-in", f.to, `${f.reason} · from ${f.default}`, "ri"));
+    rows.push(row("ramp-in", f.to, `${f.reason} Â· from ${f.default}`, "ri"));
   }
   for (const f of PLAN_OBJ.drop) {
     rows.push(row("drop", f.from, f.reason, "dr"));
@@ -94,12 +94,12 @@ function setStatus(parts) {
 function renderRegen() {
   const g = state.regen;
   if (!g.materialized) {
-    REGEN.innerHTML = `<span class="k">runtime module</span> <span class="v">not yet materialized — press “Morph to B”</span>`;
+    REGEN.innerHTML = `<span class="k">runtime module</span> <span class="v">not yet materialized â€” press â€œMorph to Bâ€</span>`;
     return;
   }
   REGEN.innerHTML = [
-    `<span class="k">runtime module</span> <span class="v ok">materialized at click ✓ (emitWorkletProcessorModule → Blob → addModule)</span>`,
-    `<span class="k">live decode</span> <span class="v hot">${g.decoded} frames · freq ${g.freq.toFixed(1)} Hz · res ${g.res.toFixed(2)} · detune ${g.detune.toFixed(1)} Hz</span>`,
+    `<span class="k">runtime module</span> <span class="v ok">materialized at click âœ“ (emitWorkletProcessorModule â†’ Blob â†’ addModule)</span>`,
+    `<span class="k">live decode</span> <span class="v hot">${g.decoded} frames Â· freq ${g.freq.toFixed(1)} Hz Â· res ${g.res.toFixed(2)} Â· detune ${g.detune.toFixed(1)} Hz</span>`,
   ].join("\n");
 }
 
@@ -113,9 +113,9 @@ function render() {
     ["swap phase", d.phase ?? "idle", d.phase === "fading" ? "hot" : d.phase === "complete" ? "ok" : ""],
     ["weight", w.toFixed(4)],
     ["b ready", String(d.bReady ?? false)],
-    ["freq A / B", d.freqA != null ? `${d.freqA.toFixed(1)} / ${d.freqB.toFixed(1)} Hz` : "—"],
-    ["produce rate", d.pushRateHz != null ? `${d.pushRateHz.toFixed(0)} Hz` : "—"],
-    ["plan (worklet)", d.planSummary ?? "—"],
+    ["freq A / B", d.freqA != null ? `${d.freqA.toFixed(1)} / ${d.freqB.toFixed(1)} Hz` : "â€”"],
+    ["produce rate", d.pushRateHz != null ? `${d.pushRateHz.toFixed(0)} Hz` : "â€”"],
+    ["plan (worklet)", d.planSummary ?? "â€”"],
   ]);
   renderRegen();
 }
@@ -123,17 +123,17 @@ function render() {
 async function start() {
   if (state.running) return;
   if (!isolationOk()) {
-    setStatus([["status", "FAILED — not crossOriginIsolated", "err"], ["fix", "serve via serve.mjs (sets COOP/COEP)"]]);
+    setStatus([["status", "FAILED â€” not crossOriginIsolated", "err"], ["fix", "serve via serve.mjs (sets COOP/COEP)"]]);
     return;
   }
   if (typeof SharedArrayBuffer === "undefined") {
-    setStatus([["status", "FAILED — SharedArrayBuffer unavailable", "err"]]);
+    setStatus([["status", "FAILED â€” SharedArrayBuffer unavailable", "err"]]);
     return;
   }
   START.disabled = true;
-  setStatus([["status", "starting…"]]);
+  setStatus([["status", "startingâ€¦"]]);
 
-  // 1. Two SABs — one per schema. This is the two-ring overlap the swap needs.
+  // 1. Two SABs â€” one per schema. This is the two-ring overlap the swap needs.
   state.sabA = Bridge.allocate(CAP, makeSchemaA()).sab;
   state.sabB = Bridge.allocate(CAP, makeSchemaB()).sab;
 
@@ -168,11 +168,11 @@ async function start() {
   render();
 }
 
-// ─── The Stage-4 headline: regenerate B's read path at runtime ───────────────
+// â”€â”€â”€ The Stage-4 headline: regenerate B's read path at runtime â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function materializeRuntimeB() {
   // Emit B's WHOLE self-registering AudioWorklet module from its schema, at
   // click-time. The processBody decodes B's newest live slot through the emitted
-  // reader and reports it — proof the materialized path is decoding the real ring.
+  // reader and reports it â€” proof the materialized path is decoding the real ring.
   const layoutB = describeSchemaLayout(makeSchemaB());
   const processorName = `god-node-patch-b-runtime-${++state.regenCount}`;
   const processBody = [
@@ -196,7 +196,7 @@ async function materializeRuntimeB() {
 
   const { url, revoke } = toWorkletModuleURL(moduleSrc);
   state.verifierRevoke = revoke;
-  await state.ctx.audioWorklet.addModule(url); // ← the read path crosses into the audio realm, LIVE
+  await state.ctx.audioWorklet.addModule(url); // â† the read path crosses into the audio realm, LIVE
   revoke();
   state.verifierRevoke = null;
 
@@ -221,9 +221,9 @@ async function materializeRuntimeB() {
 async function morph() {
   if (!state.running) return;
   MORPH.disabled = true;
-  // Arm the audible click-free swap (HotSwapConsumer in the consumer worklet)…
+  // Arm the audible click-free swap (HotSwapConsumer in the consumer worklet)â€¦
   state.node.port.postMessage({ type: "arm", windowSeconds: WINDOW_SECONDS });
-  // …and materialize B's read path at runtime (the self-rewriting proof).
+  // â€¦and materialize B's read path at runtime (the self-rewriting proof).
   try {
     await materializeRuntimeB();
   } catch (err) {
@@ -263,7 +263,7 @@ function stop() {
   renderRegen();
 }
 
-// ─── Wiring ──────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 START.addEventListener("click", () => start().catch((e) => {
   setStatus([["status", `start failed: ${e.message ?? e}`, "err"]]);
   START.disabled = false;
@@ -286,6 +286,6 @@ setStatus([
   ["status", "idle. press Start.", ""],
   ["isolated", String(isolationOk()), isolationOk() ? "ok" : "err"],
   ["SAB", String(typeof SharedArrayBuffer !== "undefined"), typeof SharedArrayBuffer !== "undefined" ? "ok" : "err"],
-  ["tip", "Start → let it run → Morph to B"],
+  ["tip", "Start â†’ let it run â†’ Morph to B"],
 ]);
 renderRegen();

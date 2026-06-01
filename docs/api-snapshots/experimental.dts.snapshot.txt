@@ -1,0 +1,68 @@
+# experimental public API snapshot
+# Source: dist/experimental/index.d.ts
+# Generated from built declaration output. Run npm run build first.
+
+/**
+ * webgpu-audio-bridge / experimental â€” opt-in entry point for APIs that
+ * sit OUTSIDE the project's 1.0 stability contract.
+ *
+ * The shapes exported here may break across MINOR version bumps as the
+ * underlying browser specs (WebNN as of 0.7.16; future entries as they
+ * land) stabilize. Patch bumps within a minor preserve compatibility.
+ *
+ * Import path is the `webgpu-audio-bridge/experimental` subpath:
+ *
+ *   import { BridgeWebNNSource } from "webgpu-audio-bridge/experimental";
+ *
+ * Production code that wants pre-construction capability checks should
+ * use `getEnvironmentReport()` from the main entry point (the 0.7.17
+ * patch adds `webnn` + `mlTensor` capability flags) â€” that report-
+ * shape API is stable; the helpers under this subpath are not.
+ */
+export { BridgeWebNNSource } from "./BridgeWebNNSource.js";
+export type { BridgeWebNNSourceOptions, MLTensorLike, WebNNTensorReader, } from "./BridgeWebNNSource.js";
+export { crossfadeWeight, crossfadeInto } from "../crossfade.js";
+export type { CrossfadeContinuity, CrossfadeMode, CrossfadeOptions, } from "../crossfade.js";
+export { HotSwapConsumer } from "../HotSwapConsumer.js";
+export type { HotSwapPhase, HotSwapConsumerOptions, HotSwapPullResult, } from "../HotSwapConsumer.js";
+export { migratePlan } from "../migratePlan.js";
+export type { MigratePlan, MigratePlanOptions, MigrateBlend, MigrateCrossfadeField, MigrateRampInField, MigrateDropField, } from "../migratePlan.js";
+export { measureRenderQuantum, sweepRenderQuantum, quantumLatencyMs, isRenderSizeHintSupported, } from "./renderQuantum.js";
+export type { RenderSizeHint, RenderQuantumReport, QuantumLatencyMs, MeasureRenderQuantumOptions, AudioContextCtorLike, } from "./renderQuantum.js";
+export { MpmcRing, MPMC_HEADER_BYTES } from "../MpmcRing.js";
+export type { MpmcRingOptions } from "../MpmcRing.js";
+export { connectFanIn, mountFanIn } from "../connectFanIn.js";
+export type { ConnectFanInSpec, FanInHandle, FanInTopology, FanInSizing, FanInRole, MountFanInOptions, } from "../connectFanIn.js";
+export { SpmcRing, SPMC_HEADER_BYTES } from "../SpmcRing.js";
+export type { SpmcRingOptions } from "../SpmcRing.js";
+export { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../MpmcWorkQueue.js";
+export type { MpmcWorkQueueOptions } from "../MpmcWorkQueue.js";
+export { WasmMpmcWorkQueue } from "../WasmMpmcWorkQueue.js";
+export type { WasmMpmcClaimSource, WasmMpmcClaimTicket, } from "../WasmMpmcWorkQueue.js";
+export { emitWasmMpmc, emitWasmMpmcBytes } from "../emitWasmMpmc.js";
+export type { EmitWasmMpmcOptions, WasmMpmcClaimOffsets } from "../emitWasmMpmc.js";
+export { allocateWasmSharedMemory } from "../wasm/memory.js";
+export type { WasmSharedMemoryAllocation } from "../wasm/memory.js";
+export { connectWorkQueue, mountWorkQueue } from "../connectWorkQueue.js";
+export type { ConnectWorkQueueSpec, WorkQueueHandle, WorkQueueTopology, WorkQueueSizing, WorkQueueRole, MountWorkQueueOptions, WorkQueueBackend, } from "../connectWorkQueue.js";
+export { connectGraph, mountGraph, GraphCycleError, GraphEdgePolicyError } from "../connectGraph.js";
+export type { ConnectGraphSpec, GraphEdgeSpec, GraphEdgeKind, GraphSpscPolicy, GraphHandle, GraphEdgeHandle, SpscEdgeHandle, SpscEdgeSizing, GraphEdgeWiring, NodeIncidence, GraphTopology, MountGraphOptions, GraphSchemas, MountedNode, MountedConsumerEnd, MountedProducerEnd, } from "../connectGraph.js";
+export { connectFanOut, mountFanOut } from "../connectFanOut.js";
+export type { ConnectFanOutSpec, FanOutHandle, FanOutTopology, FanOutSizing, FanOutRole, MountFanOutOptions, } from "../connectFanOut.js";
+export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/index.js";
+export { emitScalarModule, emitSimdModule, emitVoiceSimdModule, paramLayout, voiceParamLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
+export { isStateful, stateLayout } from "../jit/index.js";
+export type { CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch, KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore, IrStateDecl, IrStateStore, IrStateBufferDecl, IrStateBufferStore, StateLayout, Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase, } from "../jit/index.js";
+export { JitKernelSwap, JitKernelConsumer } from "../jit/index.js";
+export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum, JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult, } from "../jit/index.js";
+export { connectJit, runJitCompile, forwardCompileResponse, createJitConsumer, handleJitInstallMessage, jitMemoryPages, } from "../jit/index.js";
+export type { ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection, JitWorkletOptions, JitCompileRequest, JitCompileRequestBase, JitCompileResponse, JitInstallMessage, JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions, } from "../jit/index.js";
+export { kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens, } from "../jit/index.js";
+export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/index.js";
+export { legalNextTokens } from "../jit/index.js";
+export type { LegalNextResult } from "../jit/index.js";
+export { compileIr, compileTokens, emitJsKernel, KernelCache } from "../jit/index.js";
+export type { CompileIrOptions, CompileTokensOptions, CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult, } from "../jit/index.js";
+export { acousticGate, evalReference } from "../jit/index.js";
+export type { AcousticProfile, AcousticGateOptions, AcousticGateResult, } from "../jit/index.js";
+//# sourceMappingURL=index.d.ts.map

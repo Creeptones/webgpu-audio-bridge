@@ -1,12 +1,11 @@
 /**
  * JIT parser — the ONLY file that imports `acorn` (Apollo Frontier 5, Stage 1a).
  *
- * Dependency quarantine (locked decision 2): `acorn` is a compile-time-only
- * dependency. It is reachable ONLY from here, and `src/jit/` is reachable ONLY
+ * Dependency quarantine (locked decision 2): `acorn` is an optional peer used
+ * only by the experimental JIT parser. It is reachable ONLY from here, and `src/jit/` is reachable ONLY
  * from the `webgpu-audio-bridge/experimental` subpath and the background compile
  * worker — NEVER from `src/index.ts` (the zero-runtime-dep core) and NEVER from
- * the audio hot path. `tests/JitCompiler.test.ts` statically pins that the core
- * import graph never reaches `acorn`.
+ * the audio hot path.
  *
  * This module is a thin wrapper: parse the source to an ESTree `Program` with
  * source locations (so `lower.ts` can attach precise `line`/`col` to a

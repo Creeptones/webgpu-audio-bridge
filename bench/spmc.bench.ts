@@ -16,9 +16,8 @@ import {
   f64Array,
   type FrameFor,
 } from "../src/schema.js";
-import { SPSC_HEADER_BYTES } from "../src/SpscRing.js";
 import { SpmcRing, SPMC_HEADER_BYTES } from "../src/SpmcRing.js";
-import { SpscRing } from "../src/SpscRing.js";
+import { RING_HEADER_BYTES, SpscRing } from "../src/SpscRing.js";
 
 const WARMUP_ITERS = 10_000;
 const MEASURE_ITERS = 100_000;
@@ -41,7 +40,7 @@ function percentile(sortedNs: number[], p: number): number {
     sortedNs.length - 1,
     Math.max(0, Math.floor(sortedNs.length * p)),
   );
-  return sortedNs[idx];
+  return sortedNs[idx]!;
 }
 
 function mean(arr: number[]): number {
@@ -162,8 +161,8 @@ function runDropCurveCell(
     frame.checksum = 1.5 + (i % 9973);
     ring.push(frame);
     for (let c = 0; c < consumerCount; c++) {
-      if (i % pullPeriodByConsumer[c] === 0) {
-        if (ring.pull(out, c)) delivered[c]++;
+      if (i % pullPeriodByConsumer[c]! === 0) {
+        if (ring.pull(out, c)) delivered[c] = delivered[c]! + 1;
       }
     }
   }
@@ -171,12 +170,12 @@ function runDropCurveCell(
   // Drain whatever remains so dropped is counted against pushed, not against
   // leftover unread backlog.
   for (let c = 0; c < consumerCount; c++) {
-    while (ring.pull(out, c)) delivered[c]++;
+    while (ring.pull(out, c)) delivered[c] = delivered[c]! + 1;
   }
 
   return Array.from({ length: consumerCount }, (_, c) => {
     const dropped = ring.dropped(c);
-    const d = delivered[c];
+    const d = delivered[c]!;
     const total = dropped + d;
     if (!dropCountsConserved(total, pushCount)) {
       throw new Error(
@@ -319,23 +318,25 @@ async function main(): Promise<void> {
       `(${pullDelta >= 0 ? "Spmc slower" : "Spmc faster"})`,
   );
   console.log(
-    `  SPMC header bytes=${SPMC_HEADER_BYTES}, SPSC header bytes=${SPSC_HEADER_BYTES}`,
+    `  SPMC header bytes=${SPMC_HEADER_BYTES}, SPSC header bytes=${RING_HEADER_BYTES}`,
   );
   console.log();
 
   console.log("  -- hard budget check (audio-thread style target: 10µs median) --");
   let failed = false;
   for (const C of consumerCounts) {
-    if (pushMedians[C] < HARD_BUDGET_NS) {
-      console.log(`  within hard budget  push (C=${C}) median ${fmt(pushMedians[C])}`);
+    const pushMedian = pushMedians[C]!;
+    const pullMedian = pullMedians[C]!;
+    if (pushMedian < HARD_BUDGET_NS) {
+      console.log(`  within hard budget  push (C=${C}) median ${fmt(pushMedian)}`);
     } else {
-      console.error(`  FAIL            push (C=${C}) median ${fmt(pushMedians[C])} >= ${fmt(HARD_BUDGET_NS)}`);
+      console.error(`  FAIL            push (C=${C}) median ${fmt(pushMedian)} >= ${fmt(HARD_BUDGET_NS)}`);
       failed = true;
     }
-    if (pullMedians[C] < HARD_BUDGET_NS) {
-      console.log(`  within hard budget  pull (C=${C}) median ${fmt(pullMedians[C])}`);
+    if (pullMedian < HARD_BUDGET_NS) {
+      console.log(`  within hard budget  pull (C=${C}) median ${fmt(pullMedian)}`);
     } else {
-      console.error(`  FAIL            pull (C=${C}) median ${fmt(pullMedians[C])} >= ${fmt(HARD_BUDGET_NS)}`);
+      console.error(`  FAIL            pull (C=${C}) median ${fmt(pullMedian)} >= ${fmt(HARD_BUDGET_NS)}`);
       failed = true;
     }
   }

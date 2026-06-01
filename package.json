@@ -65,6 +65,8 @@
     "bench:notify-cost": "node bench/notify-cost-browser/serve.mjs",
     "check:release-metadata": "node scripts/check-release-metadata.mjs",
     "check:api-boundary": "node scripts/check-api-boundary.mjs",
+    "api:snapshot": "node scripts/generate-api-snapshot.mjs --write",
+    "check:api-snapshot": "node scripts/generate-api-snapshot.mjs --check",
     "dev:demo": "node examples/minimal/serve.mjs",
     "dev:wasm-decode": "node examples/wasm-decode-worklet/serve.mjs",
     "dev:fast-lane": "node examples/fast-lane/serve.mjs",
@@ -85,7 +87,7 @@
     "bench:render-size-hint": "node bench/render-size-hint/serve.mjs",
     "llm-bundle": "node scripts/regenerate-llm-bundle.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run check:release-metadata && npm run check:api-boundary && npm run typecheck && npm run test && npm run build"
+    "prepublishOnly": "npm run check:release-metadata && npm run check:api-boundary && npm run check:api-snapshot && npm run typecheck && npm run test && npm run build"
   },
   "keywords": [
     "webgpu",
@@ -125,12 +127,18 @@
   "devDependencies": {
     "@playwright/test": "^1.48.0",
     "@types/node": "^20.19.41",
+    "acorn": "^8.16.0",
     "fast-check": "^4.8.0",
     "tsx": "^4.0.0",
     "typescript": "^5.3.0",
     "wabt": "^1.0.39"
   },
-  "dependencies": {
+  "peerDependencies": {
     "acorn": "^8.16.0"
+  },
+  "peerDependenciesMeta": {
+    "acorn": {
+      "optional": true
+    }
   }
 }

@@ -1,0 +1,86 @@
+# root public API snapshot
+# Source: dist/index.d.ts
+# Generated from built declaration output. Run npm run build first.
+
+/**
+ * webgpu-audio-bridge
+ *
+ * Lock-free SPSC SharedArrayBuffer ring for streaming structured frames from
+ * a Web Worker (typically driving WebGPU compute) into an AudioWorklet â€” the
+ * control-rate-GPU / audio-rate-CPU pattern.
+ *
+ * Two public surfaces:
+ *
+ *   - `Bridge<Schema>`: schema-driven frame codec. Describe your frame with
+ *     `defineSchema({ ... })` and arbitrary primitive types
+ *     (f64/f32/u64/i64/u32/i32/u16/i16/u8/i8 scalars and arrays). Ships the
+ *     monolithic producer + consumer API. Shipped 0.3.
+ *
+ *   - `SpscRing<Schema>` + `BridgeProducer<Schema>` /
+ *     `BridgeConsumer<Schema>` + `FrameSmoother<Schema>` /
+ *     `ConsumerClockRecovery` / `AdaptiveFlowController` (0.6.10): the
+ *     composable alternative. `Bridge<S>` continues to work unchanged; the
+ *     facades are for users who want explicit control over which primitives
+ *     are wired in and which invariant-failure policy is active. Same SAB
+ *     protocol â€” a facade-built peer interoperates with a Bridge-built peer.
+ *
+ * The 0.9.0 release removed three legacy surfaces (`Float64RingBuffer`, the
+ * `legacyPhysicsControlFrameSchema(n)` byte-twin, and the
+ * `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm). If you need any
+ * of those, pin `webgpu-audio-bridge@0.8.x` â€” see CHANGELOG `[0.9.0]` for
+ * the migration guide.
+ *
+ * See README.md for the architectural pattern and use cases.
+ */
+export { Bridge, RING_HEADER_BYTES, RING_HEADER_LANES } from "./Bridge.js";
+export { forWorklet, forWorker } from "./Bridge.js";
+export { DEFAULT_MAX_LEAD_MS } from "./Bridge.js";
+export { DEFAULT_KALMAN_PROCESS_NOISE, DEFAULT_KALMAN_MEAS_POS_NOISE, DEFAULT_KALMAN_INITIAL_VARIANCE, } from "./Bridge.js";
+export type { BridgeRole, DefaultRole } from "./Bridge.js";
+export type { BridgeAllocation, BridgeOptions, SmoothedPullOptions, SmootherSkipPolicy, PredictedPullOptions, PredictedPullResult, KalmanPredictedPullOptions, KalmanPredictedPullResult, TelemetrySnapshot, TelemetryListener, TelemetryUnsubscribe, SubscribeTelemetryOptions, } from "./Bridge.js";
+export { TelemetryRing } from "./TelemetryRing.js";
+export type { TelemetryRingSample, TelemetryRingOptions } from "./TelemetryRing.js";
+export { MessageChannelBridge } from "./MessageChannelBridge.js";
+export type { MessageChannelBridgeAllocation, } from "./MessageChannelBridge.js";
+export { connect, mount, ConnectUnsupportedError, audioFramesPerSlot } from "./connect.js";
+export type { LatencyHint, LatencyBudget, RingSizing, ConnectRingSpec, ConnectSpec, ConnectMode, ConnectRingHandle, ConnectHandle, ConnectRole, MountOptions, MountResult, ConnectTopology, } from "./connect.js";
+export { SpscRing } from "./SpscRing.js";
+export type { SpscPullResult, SpscRingOptions, BackpressurePolicy, } from "./SpscRing.js";
+export { FrameSmoother } from "./FrameSmoother.js";
+export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
+export type { ConsumerClockRecoveryOptions } from "./ConsumerClockRecovery.js";
+export { AdaptiveFlowController } from "./AdaptiveFlowController.js";
+export { StatePredictor } from "./StatePredictor.js";
+export type { StatePredictorModel, StatePredictorOptions } from "./StatePredictor.js";
+export { BridgeConsumer } from "./BridgeConsumer.js";
+export type { BridgeConsumerOptions, InvariantFailurePolicy, InvariantFailureCallback, } from "./BridgeConsumer.js";
+export { BridgeProducer } from "./BridgeProducer.js";
+export { BridgeInputLane } from "./BridgeInputLane.js";
+export { BridgeBlockConsumer } from "./BridgeBlockConsumer.js";
+export type { BlockUnderflowPolicy, BlockChannelLayout, BridgeBlockConsumerOptions, } from "./BridgeBlockConsumer.js";
+export { ResidualQualityController } from "./ResidualQualityController.js";
+export type { ResidualQualityHint, ResidualQualityControllerOptions, } from "./ResidualQualityController.js";
+export { BridgeGPUSource } from "./BridgeGPUSource.js";
+export type { GpuBufferLike, GpuDeviceLike, GpuCommandEncoderLike, GpuReadbackDecoder, BridgeGPUSourceOptions, ReadbackLatencyStats, WriteTarget, WriteTargetKind, } from "./BridgeGPUSource.js";
+export { BridgeBlockProducer } from "./BridgeBlockProducer.js";
+export type { BridgeBlockProducerOptions, } from "./BridgeBlockProducer.js";
+export { getEnvironmentReport } from "./environment.js";
+export type { EnvironmentReport, EnvironmentFix, EstimatedLatencyFloorMs, } from "./environment.js";
+export { defineSchema, describeSchemaLayout, kindByteSize, kindTsType, u64, i64, u32, i32, u16, i16, u8, i8, f64, f32, u64Array, i64Array, u32Array, i32Array, u16Array, i16Array, u8Array, i8Array, f64Array, f32Array, f64TrajectoryArray, f32TrajectoryArray, f64Phase, f32Phase, f64Circular, f32Circular, f64PhaseArray, f32PhaseArray, f64CircularArray, f32CircularArray, f64CircularTrajectoryArray, f32CircularTrajectoryArray, } from "./schema.js";
+export type { FieldKind, FieldSpec, FieldsObject, Schema, CompiledField, CompiledLayout, FrameFor, SchemaLayoutDescription, SchemaLayoutFieldDescription, TrajectoryOrder, TrajectoryLayout, TrajectorySpec, TrajectoryOverflowFallback, TrajectoryInterpolationMode, TrajectoryArrayOptions, WithInvariantOptions, CircularSpec, CircularOptions, CircularTrajectoryArrayOptions, } from "./schema.js";
+export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
+export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto, evaluateQuinticHermiteTrajectoryInto, evaluateSepticHermiteTrajectoryInto, evaluateCircularTrajectoryInto, evaluateCircularHermiteTrajectoryInto, } from "./trajectory.js";
+export { wrapSymmetric, shortestArcDelta, circularLerp, CircularUnwrapper, TWO_PI, } from "./circular.js";
+export { physicsControlFrameSchema } from "./schemas/physics.js";
+export type { PhysicsControlFrameSchema } from "./schemas/physics.js";
+export { predictiveExtrapolateInto } from "./predictiveExtrapolation.js";
+export type { PllUncertainty, PredictiveExtrapolationConfig, PredictiveExtrapolationResult, } from "./predictiveExtrapolation.js";
+export { TimelineRecorder, TimelinePlayer, deserialize, TimelineSchemaMismatchError, TimelineFormatError, } from "./TimelineRecorder.js";
+export type { TimelineTuple, TimelineRecorderOptions, } from "./TimelineRecorder.js";
+export { emitWorkletReader, emitWorkletProcessorModule, toWorkletModuleURL, compileWorkletReader, } from "./emitWorkletReader.js";
+export type { EmitWorkletReaderOptions, EmitWorkletReaderInput, EmitWorkletProcessorOptions, } from "./emitWorkletReader.js";
+export { emitWgslStruct, computeWgslLayout, WgslUnsupportedKindError, } from "./emitWgslStruct.js";
+export type { EmitWgslStructOptions, EmitWgslStructInput, WgslMember, WgslLayout, } from "./emitWgslStruct.js";
+export { emitWasmDecoder, planWasmDecoder, } from "./emitWasmDecoder.js";
+export type { EmitWasmDecoderOptions, EmitWasmDecoderInput, WasmDecoderField, WasmDecoderCopy, WasmDecoderPlan, } from "./emitWasmDecoder.js";
+//# sourceMappingURL=index.d.ts.map

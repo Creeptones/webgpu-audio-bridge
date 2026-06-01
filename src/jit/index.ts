@@ -3,8 +3,8 @@
  *
  * Re-exported by `src/experimental/index.ts` under the
  * `webgpu-audio-bridge/experimental` subpath. NOT exported from `src/index.ts`
- * (the zero-runtime-dep core): this subtree transitively imports `acorn` via
- * `parse.ts`, and the import-graph guard in `tests/JitCompiler.test.ts` pins
+ * (the zero-runtime-dep core): this subtree transitively imports the optional
+ * `acorn` peer via `parse.ts`, and the import-graph guard pins
  * that the core never reaches it.
  *
  * Internal-first + `@experimental` — the API and the compilable sub-language

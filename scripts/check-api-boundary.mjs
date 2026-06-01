@@ -1,10 +1,15 @@
-import { readFileSync } from "node:fs";
+﻿import { readFileSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
-const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8"));
-const rootIndex = readFileSync(new URL("src/index.ts", root), "utf8");
-const experimentalIndex = readFileSync(new URL("src/experimental/index.ts", root), "utf8");
-const stableManifest = JSON.parse(readFileSync(new URL("docs/stable-api-manifest.json", root), "utf8"));
+
+function readText(path) {
+  return readFileSync(new URL(path, root), "utf8").replace(/^\uFEFF/, "");
+}
+
+const pkg = JSON.parse(readText("package.json"));
+const rootIndex = readText("src/index.ts");
+const experimentalIndex = readText("src/experimental/index.ts");
+const stableManifest = JSON.parse(readText("docs/stable-api-manifest.json"));
 
 let failed = false;
 
@@ -26,6 +31,10 @@ const rootForbidden = [
   "./jit/",
   "./experimental/",
   "BridgeWebNNSource",
+  "crossfadeWeight",
+  "crossfadeInto",
+  "HotSwapConsumer",
+  "migratePlan",
   "MpmcRing",
   "SpmcRing",
   "MpmcWorkQueue",
@@ -43,6 +52,10 @@ for (const needle of rootForbidden) {
 
 const experimentalRequired = [
   "BridgeWebNNSource",
+  "crossfadeWeight",
+  "crossfadeInto",
+  "HotSwapConsumer",
+  "migratePlan",
   "MpmcRing",
   "SpmcRing",
   "MpmcWorkQueue",
@@ -64,6 +77,19 @@ if (!Array.isArray(stableManifest.rootExports) || stableManifest.rootExports.len
 
 if (!stableManifest.experimentalSubpath || stableManifest.experimentalSubpath !== "webgpu-audio-bridge/experimental") {
   fail("stable API manifest must name the experimental subpath");
+}
+
+if (pkg.dependencies && Object.prototype.hasOwnProperty.call(pkg.dependencies, "acorn")) {
+  fail("acorn must not be listed in dependencies; keep it out of stable core installs");
+}
+if (!pkg.devDependencies || !Object.prototype.hasOwnProperty.call(pkg.devDependencies, "acorn")) {
+  fail("acorn must remain in devDependencies for repository tests/builds");
+}
+if (!pkg.peerDependencies || pkg.peerDependencies.acorn !== "^8.16.0") {
+  fail("acorn must be declared as an optional peer for experimental JIT consumers");
+}
+if (pkg.peerDependenciesMeta?.acorn?.optional !== true) {
+  fail("acorn peer dependency must be marked optional");
 }
 
 if (failed) process.exitCode = 1;
