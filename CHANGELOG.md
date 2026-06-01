@@ -4,6 +4,75 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.936] — 2026-05-31
+
+### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 2: the characterization bench
+
+Stage 1 (0.9.934) shipped + proved the wait-free MP→MC competing-consumer work
+queue `MpmcWorkQueue` (exhaustive interleaving fuzzer + API pins + a 1.0 M-frame
+BOTH-ends-contended cross-thread partition stress). Stage 2 is the perf
+characterization the Stage-1 handoff calls for — the cheap gate before the
+Stage-3 integration work. It is **bench-only**: no `src/` change, the primitive
+and its wire format are untouched.
+
+- **`bench/mpmc-wq.bench.ts`** (`npm run bench:mpmc-wq`) — the near-mirror of
+  `bench/mpmc.bench.ts` (the MP→SC bench), adapted for the contended consumer.
+  Four cells:
+  1. **push/pull latency vs `producerCount`** (single-thread). Both medians sit
+     at the hrtime floor (~0.2 µs here) with **zero spread** across
+     `P ∈ {1,2,4,8}` — the hot path is `producerCount`-invariant (SLACK is a
+     constant subtracted in the envelope check), and the dequeue is
+     `consumerCount`-invariant **by construction** (consumers are anonymous —
+     there is no per-consumer lane, unlike `SpmcRing`).
+  2. **MP→MC (producerCount=1) vs the frozen SPSC core**, same schema — the
+     additive-path tax (the unique-claim `Atomics.add` + the per-slot stamp
+     acquire-load on the dequeue, the lazy frontier scan on the enqueue). Both
+     sit at the same floor on this hardware.
+  3. **The partition curve** under a real `worker_threads` sweep of N producers ×
+     M **competing** consumers (the headline): every produced frame goes to
+     EXACTLY one consumer, M consumers fetch-add the shared dequeue lane,
+     reporting partition throughput, drop%, and the **teardown-strand count**.
+     Conservation (`consumed === totalPushed`, `consumed + dropped === attempted`)
+     and `tornGuarded === 0` are asserted from the observers as a free
+     correctness net; the strand count is empirically `≤ consumerCount − 1`
+     (the Stage-0 residual that Stage 3's end-of-stream protocol releases).
+  4. Reuses the byte-faithful producer + consumer worker sources proven in
+     `tests/MpmcWorkQueue.concurrent.test.ts` (trimmed of the per-frame
+     bit-exact verification — that is the test's job; the bench measures
+     throughput).
+- **Gate:** push/pull medians `< 10 µs` at every `producerCount`. Registered as
+  `bench:mpmc-wq` in `package.json` beside `bench:mpmc`.
+
+### Why
+
+A perf characterization is the right gate before wiring the primitive into the
+`connect()` family (Stage 3). It confirms the contended dequeue stays inside the
+audio-thread budget and is flat across producer/consumer contention, quantifies
+the partition throughput and the drop envelope under genuine fetch-add
+contention, and surfaces the teardown-strand count — the one open loose end the
+Stage-3 `close()`/`isDrained()` protocol will release with a first-class
+end-of-stream signal.
+
+### Wire compatibility
+
+None — bench-only. No `src/` change, no SAB-layout change, no public-API change.
+The SPSC / MP→SC / SP→MC / MP→MC paths are bit-identically green; the "unchanged"
+claim is structural (the bench imports the primitive read-only). **Patch** bump
+under the versioning policy (matching the MP→SC `bench:mpmc` ship at 0.9.908).
+
+### Tests
+
+No new test files. The full unit suite, the concurrent suite (SPSC + all
+fan-in/out/work-queue cross-thread stress, bit-exact), and the core
+push/pull/pullLatest bench (median 1.20 µs, unchanged) all stay green.
+
+### Documentation
+
+- CHANGELOG + ROADMAP row for the Stage-2 bench.
+- The Stage-2/3 handoff note (`docs/frontier3-mpmc-workqueue-stage2-3-handoff.md`)
+  is the working plan for the mini-arc; Stage 3 (`connectWorkQueue()` + the
+  end-of-stream protocol) is next.
+
 ## [0.9.935] — 2026-05-31
 
 ### Added — Topological Lanes: angular (circular) fields end-to-end
