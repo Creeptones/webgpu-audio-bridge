@@ -377,6 +377,62 @@ async function testPartialClosureReadbackReceivesMergedFrame(): Promise<void> {
   ok("8. partial closure readback passes merged full-frame bytes to the decoder");
 }
 
+async function testFieldReadbackHelpers(): Promise<void> {
+  const initial: Frame = { seq: 30n, payload: new Float64Array([5, 6]) };
+  const update: Frame = { seq: 77n, payload: new Float64Array([13, 14]) };
+  const device = makeRawMockDevice(encodeFrame(update));
+  const bridge = makeBridge();
+  const src = new BridgeGPUSource(device, bridge, "raw", {
+    stagingBufferCount: 2,
+    initialFrameBytes: encodeFrame(initial),
+  });
+
+  const payloadRange = src.fieldReadbackRange(["payload"]);
+  assertEq(payloadRange.dstOffset, 8, "payload field offset is derived from schema layout");
+  assertEq(payloadRange.byteLength, 16, "payload field byte length is derived from schema layout");
+
+  const fullRange = src.fieldReadbackRange(["seq", "payload"]);
+  assertEq(fullRange.dstOffset, 0, "multi-field range starts at the first field");
+  assertEq(fullRange.byteLength, FRAME_BYTES, "multi-field range spans both requested fields");
+
+  assert(src.scheduleFieldReadback("payload", dummySrcBuffer, noopEncoder), "field readback schedule succeeds");
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed = src.pollCompleted();
+  assertEq(pushed, 1, "field readback publishes one merged frame");
+
+  const out: Frame = { seq: 0n, payload: new Float64Array(2) };
+  assert(bridge.pull(out), "field-readback frame is readable");
+  assertEq(out.seq, 30n, "field helper retained unchanged seq");
+  assertEq(out.payload[0], 13, "field helper updated payload[0]");
+  assertEq(out.payload[1], 14, "field helper updated payload[1]");
+  src.destroy();
+
+  const copies: Array<{ srcOffset: number; dstOffset: number; byteLength: number }> = [];
+  const captureEncoder: GpuCommandEncoderLike = {
+    copyBufferToBuffer(_s, sourceOffset, _d, destinationOffset, size) {
+      copies.push({ srcOffset: sourceOffset, dstOffset: destinationOffset, byteLength: size });
+    },
+  };
+  const offsetSource = new BridgeGPUSource(
+    makeRawMockDevice(encodeFrame(update)),
+    makeBridge(),
+    "raw",
+    { stagingBufferCount: 2 },
+  );
+  assert(
+    offsetSource.scheduleFieldReadback("payload", dummySrcBuffer, captureEncoder, { srcOffset: 0 }),
+    "field readback with source offset override schedules",
+  );
+  assertEq(copies.length, 1, "one WebGPU copy was encoded");
+  assertEq(copies[0]!.srcOffset, 0, "source offset override is passed through");
+  assertEq(copies[0]!.dstOffset, 8, "destination offset remains the schema field offset");
+  assertEq(copies[0]!.byteLength, 16, "copy size remains the field byte length");
+  offsetSource.destroy();
+
+  ok("9. field-level dirty readback helpers derive layout offsets and support source-offset override");
+}
+
 async function main(): Promise<void> {
   await testRawDispatchPushesFrame();
   await testRawRingFullDrops();
@@ -386,6 +442,7 @@ async function main(): Promise<void> {
   testRawCompatibilityFactory();
   await testPartialRawReadbackMergesDirtyRegion();
   await testPartialClosureReadbackReceivesMergedFrame();
+  await testFieldReadbackHelpers();
   console.log("\nAll BridgeGPUSource.raw.test.ts pins passed.");
 }
 

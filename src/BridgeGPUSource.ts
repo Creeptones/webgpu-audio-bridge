@@ -123,7 +123,7 @@
  * are exercised without a real GPU).
  */
 
-import { describeSchemaLayout, type FieldsObject, type FrameFor, type Schema } from "./schema.js";
+import { describeSchemaLayout, kindByteSize, type FieldsObject, type FrameFor, type Schema } from "./schema.js";
 import type { Bridge } from "./Bridge.js";
 import type { BridgeProducer } from "./BridgeProducer.js";
 import { computeWgslLayout } from "./emitWgslStruct.js";
@@ -269,6 +269,19 @@ export interface RawReadbackCompatibility {
 }
 
 export type PartialReadbackInitialFrame = ArrayBuffer | ArrayBufferView;
+
+export interface FieldReadbackOptions {
+  /** Source byte offset in the GPU buffer. Defaults to the field/range offset
+   *  in the bridge frame, which matches `emitWgslStruct(schema)` layouts. Use
+   *  `0` when the source buffer contains only the selected field/range. */
+  readonly srcOffset?: number;
+}
+
+export interface FieldReadbackRange {
+  readonly fields: ReadonlyArray<string>;
+  readonly dstOffset: number;
+  readonly byteLength: number;
+}
 
 /**
  * Strategy interface for moving bytes from a producer-side GPU buffer
@@ -957,6 +970,82 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     slot.dstOffset = dstOffset;
     slot.byteLength = byteLength;
     return true;
+  }
+
+  /** Return the dirty byte range covering one or more schema fields.
+   *
+   * For multiple fields this returns the smallest contiguous range that spans
+   * every requested field. That may include unchanged bytes between fields, but
+   * it schedules one readback and one publish instead of publishing once per
+   * field. */
+  fieldReadbackRange(
+    fieldNames: readonly (Extract<keyof FrameFor<S>, string>)[],
+  ): FieldReadbackRange {
+    if (fieldNames.length === 0) {
+      throw new Error("BridgeGPUSource: fieldReadbackRange requires at least one field");
+    }
+    const desc = describeSchemaLayout(this.bridge.schema);
+    let start = Infinity;
+    let end = -Infinity;
+    const names: string[] = [];
+    for (const fieldName of fieldNames) {
+      const field = desc.fields[fieldName];
+      if (!field) {
+        throw new Error(`BridgeGPUSource: unknown schema field '${fieldName}'`);
+      }
+      const byteOffset = field.byteOffset;
+      const byteLength = kindByteSize(field.kind) * (field.length ?? 1);
+      start = Math.min(start, byteOffset);
+      end = Math.max(end, byteOffset + byteLength);
+      names.push(fieldName);
+    }
+    return Object.freeze({
+      fields: Object.freeze(names),
+      dstOffset: start,
+      byteLength: end - start,
+    });
+  }
+
+  /** Schedule a dirty-region readback for one schema field.
+   *
+   * The destination offset and byte length are derived from the schema layout.
+   * `opts.srcOffset` defaults to the same byte offset, which matches a GPU
+   * source buffer laid out with `emitWgslStruct(schema)`. */
+  scheduleFieldReadback(
+    fieldName: Extract<keyof FrameFor<S>, string>,
+    srcBuffer: GpuBufferLike,
+    encoder: GpuCommandEncoderLike,
+    opts: FieldReadbackOptions = {},
+  ): boolean {
+    const range = this.fieldReadbackRange([fieldName]);
+    return this.scheduleReadback(
+      srcBuffer,
+      encoder,
+      opts.srcOffset ?? range.dstOffset,
+      range.byteLength,
+      range.dstOffset,
+    );
+  }
+
+  /** Schedule one dirty-region readback spanning multiple schema fields.
+   *
+   * The helper copies the minimal contiguous byte range covering the requested
+   * fields. For non-contiguous fields this intentionally reads intervening
+   * bytes too, so the bridge publishes once with a coherent retained frame. */
+  scheduleFieldsReadback(
+    fieldNames: readonly (Extract<keyof FrameFor<S>, string>)[],
+    srcBuffer: GpuBufferLike,
+    encoder: GpuCommandEncoderLike,
+    opts: FieldReadbackOptions = {},
+  ): boolean {
+    const range = this.fieldReadbackRange(fieldNames);
+    return this.scheduleReadback(
+      srcBuffer,
+      encoder,
+      opts.srcOffset ?? range.dstOffset,
+      range.byteLength,
+      range.dstOffset,
+    );
   }
 
   /**

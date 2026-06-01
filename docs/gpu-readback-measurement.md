@@ -130,6 +130,34 @@ Diagnostics:
 console.log(source.partialReadbackCount(), source.partialBytesCopied());
 ```
 
+### Field-level helpers
+
+When the GPU buffer uses the same layout as `emitWgslStruct(schema)`, schedule
+dirty fields by name:
+
+```ts
+source.scheduleFieldReadback("payload", srcBuffer, encoder);
+source.scheduleFieldsReadback(["cutoff", "res"], srcBuffer, encoder);
+```
+
+The helper derives `dstOffset` and `byteLength` from the schema. For multiple
+fields, it copies the smallest contiguous byte span covering all requested
+fields, so non-contiguous requests may read intervening bytes.
+
+If the source GPU buffer contains only the field payload rather than a full
+frame-shaped struct, override the source offset:
+
+```ts
+source.scheduleFieldReadback("payload", srcBuffer, encoder, { srcOffset: 0 });
+```
+
+For diagnostics or custom schedulers:
+
+```ts
+const range = source.fieldReadbackRange(["payload"]);
+console.log(range.dstOffset, range.byteLength);
+```
+
 ## Raw fast path selection
 
 Manual raw mode is still available:

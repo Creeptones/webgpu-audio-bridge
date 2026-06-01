@@ -107,6 +107,8 @@ before staging saturates and to trigger producer-side quality reduction.
 
 For large frames, `scheduleReadback(src, encoder, srcOffset, byteLength, dstOffset)`
 can copy only a dirty byte range and merge it into a retained full-frame image.
+Use `scheduleFieldReadback("field", src, encoder)` when the source buffer uses
+the schema/WGSL frame layout.
 
 Use `BridgeGPUSource.rawIfCompatible(device, bridge, decoder)` to select the
 zero-decode `pushRaw` path only when the schema's WGSL layout is byte-compatible;
