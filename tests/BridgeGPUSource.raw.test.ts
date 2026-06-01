@@ -33,7 +33,9 @@ import {
   BridgeGPUSource,
   RING_HEADER_BYTES,
   defineSchema,
+  f32,
   f64Array,
+  u8,
   u64,
   type GpuBufferLike,
   type GpuCommandEncoderLike,
@@ -267,12 +269,123 @@ async function testClosureModeUnaffected(): Promise<void> {
   ok("5. closure decoder mode is unaffected by the raw-mode branch");
 }
 
+function testRawCompatibilityFactory(): void {
+  const compatible = BridgeGPUSource.rawCompatibility(schema);
+  assertEq(compatible.compatible, true, "main raw schema is WGSL-compatible");
+  assertEq(compatible.reason, "compatible", "compatible report reason");
+  assertEq(compatible.frameByteSize, FRAME_BYTES, "report carries frameByteSize");
+  assertEq(compatible.structSize, FRAME_BYTES, "report carries matching structSize");
+
+  const compatibleBridge = makeBridge();
+  const compatibleSrc = BridgeGPUSource.rawIfCompatible(
+    makeRawMockDevice(encodeFrame({ seq: 1n, payload: new Float64Array([0, 0]) })),
+    compatibleBridge,
+    () => {
+      throw new Error("fallback decoder must not run for a raw-compatible schema");
+    },
+    { stagingBufferCount: 2 },
+  );
+  assertEq(compatibleSrc.decoderMode(), "raw", "factory selects raw for compatible schema");
+  compatibleSrc.destroy();
+
+  const tinySchema = defineSchema({ byte: u8() });
+  const incompatible = BridgeGPUSource.rawCompatibility(tinySchema);
+  assertEq(incompatible.compatible, false, "sub-32-bit schema is not raw-compatible");
+  assertEq(incompatible.reason, "wgsl-layout-error", "sub-32-bit schema reports WGSL layout error");
+
+  const { sab, capacity } = Bridge.allocate(2, tinySchema);
+  const tinyBridge = new Bridge(sab, capacity, tinySchema);
+  const fallbackSrc = BridgeGPUSource.rawIfCompatible(
+    makeRawMockDevice(new ArrayBuffer(tinySchema.frameByteSize)),
+    tinyBridge,
+    (_range, frame) => { frame.byte = 7; },
+    { stagingBufferCount: 2 },
+  );
+  assertEq(fallbackSrc.decoderMode(), "closure", "factory falls back to closure for incompatible schema");
+  fallbackSrc.destroy();
+
+  const invariantSchema = defineSchema({ x: f32() }).withInvariant((frame) => frame.x);
+  const invariant = BridgeGPUSource.rawCompatibility(invariantSchema);
+  assertEq(invariant.compatible, false, "invariant schema is not auto-raw by default");
+  assertEq(invariant.reason, "invariant-lane", "invariant lane reports explicit safety reason");
+  const invariantAllowed = BridgeGPUSource.rawCompatibility(invariantSchema, { allowInvariantLane: true });
+  assertEq(invariantAllowed.compatible, true, "allowInvariantLane permits explicit raw compatibility");
+
+  ok("6. rawCompatibility + rawIfCompatible select raw only when byte-safe");
+}
+
+async function testPartialRawReadbackMergesDirtyRegion(): Promise<void> {
+  const initial: Frame = { seq: 10n, payload: new Float64Array([1, 2]) };
+  const update: Frame = { seq: 99n, payload: new Float64Array([7, 8]) };
+  const device = makeRawMockDevice(encodeFrame(update));
+  const bridge = makeBridge();
+  const src = new BridgeGPUSource(device, bridge, "raw", {
+    stagingBufferCount: 2,
+    initialFrameBytes: encodeFrame(initial),
+  });
+
+  assert(src.scheduleReadback(dummySrcBuffer, noopEncoder, 8, 16, 8), "partial payload schedule succeeds");
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed = src.pollCompleted();
+
+  assertEq(pushed, 1, "partial raw readback pushes one merged frame");
+  assertEq(src.partialReadbackCount(), 1, "partial counter increments");
+  assertEq(src.partialBytesCopied(), 16, "partial byte counter tracks dirty bytes");
+
+  const out: Frame = { seq: 0n, payload: new Float64Array(2) };
+  assert(bridge.pull(out), "merged partial frame is readable");
+  assertEq(out.seq, 10n, "unchanged seq remains from initial frame image");
+  assertEq(out.payload[0], 7, "dirty payload[0] updates from readback");
+  assertEq(out.payload[1], 8, "dirty payload[1] updates from readback");
+
+  src.destroy();
+  ok("7. partial raw readback merges dirty bytes into a retained full-frame image");
+}
+
+async function testPartialClosureReadbackReceivesMergedFrame(): Promise<void> {
+  const initial: Frame = { seq: 20n, payload: new Float64Array([3, 4]) };
+  const update: Frame = { seq: 88n, payload: new Float64Array([11, 12]) };
+  const device = makeRawMockDevice(encodeFrame(update));
+  const bridge = makeBridge();
+  const decoder = (range: ArrayBuffer, frame: Frame): void => {
+    const view = new DataView(range);
+    frame.seq = view.getBigUint64(0, true);
+    frame.payload[0] = view.getFloat64(8, true);
+    frame.payload[1] = view.getFloat64(16, true);
+  };
+  const src = new BridgeGPUSource(device, bridge, decoder, {
+    stagingBufferCount: 2,
+    initialFrameBytes: encodeFrame(initial),
+  });
+
+  assert(src.scheduleReadback(dummySrcBuffer, noopEncoder, 8, 16, 8), "partial payload schedule succeeds");
+  src.flushPending();
+  await flushMicrotasks();
+  const pushed = src.pollCompleted();
+
+  assertEq(pushed, 1, "partial closure readback pushes one decoded merged frame");
+  assertEq(src.partialReadbackCount(), 1, "partial counter increments in closure mode");
+
+  const out: Frame = { seq: 0n, payload: new Float64Array(2) };
+  assert(bridge.pull(out), "merged decoded frame is readable");
+  assertEq(out.seq, 20n, "decoder saw retained seq from initial frame image");
+  assertEq(out.payload[0], 11, "decoder saw dirty payload[0]");
+  assertEq(out.payload[1], 12, "decoder saw dirty payload[1]");
+
+  src.destroy();
+  ok("8. partial closure readback passes merged full-frame bytes to the decoder");
+}
+
 async function main(): Promise<void> {
   await testRawDispatchPushesFrame();
   await testRawRingFullDrops();
   await testRawReleaseMapThrowRecovers();
   testRawSizeMismatchThrows();
   await testClosureModeUnaffected();
+  testRawCompatibilityFactory();
+  await testPartialRawReadbackMergesDirtyRegion();
+  await testPartialClosureReadbackReceivesMergedFrame();
   console.log("\nAll BridgeGPUSource.raw.test.ts pins passed.");
 }
 

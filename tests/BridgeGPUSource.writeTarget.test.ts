@@ -430,6 +430,37 @@ function testLatestOnlyCoalescesScheduledSlots(): void {
   ok("latest-only backpressure coalesces scheduled slots but never in-flight slots");
 }
 
+function testAdaptivePacingDeclinesBeforeSaturation(): void {
+  const adaptiveDevice = makeMockDevice();
+  const adaptive = new BridgeGPUSource(adaptiveDevice, makeBridge(), noopDecoder, {
+    stagingBufferCount: 3,
+    pacing: "adaptive",
+  });
+  assertEq(adaptive.recommendedReadbackAction(), "dispatch", "adaptive starts in dispatch state");
+  assert(adaptive.scheduleReadback(dummySrcBuffer, noopEncoder), "adaptive schedule 1");
+  assert(adaptive.scheduleReadback(dummySrcBuffer, noopEncoder), "adaptive schedule 2");
+  assertEq(adaptive.recommendedReadbackAction(), "skip-readback", "adaptive preserves one free staging slot");
+  assertEq(adaptive.scheduleReadback(dummySrcBuffer, noopEncoder), false, "adaptive declines before full saturation");
+  assertEq(adaptive.pacingDeclinedCount(), 1, "decline counter increments");
+  const pressure = adaptive.readbackPressure();
+  assertEq(pressure.pacing, "adaptive", "pressure reports adaptive mode");
+  assertEq(pressure.action, "skip-readback", "pressure reports skip action");
+  assertEq(pressure.inFlight, 2, "pressure reports current in-flight count");
+  assertEq(pressure.capacity, 3, "pressure reports staging capacity");
+  adaptive.destroy();
+
+  const manual = new BridgeGPUSource(makeMockDevice(), makeBridge(), noopDecoder, {
+    stagingBufferCount: 3,
+  });
+  assert(manual.scheduleReadback(dummySrcBuffer, noopEncoder), "manual schedule 1");
+  assert(manual.scheduleReadback(dummySrcBuffer, noopEncoder), "manual schedule 2");
+  assert(manual.scheduleReadback(dummySrcBuffer, noopEncoder), "manual schedule 3 still fills the ring");
+  assertEq(manual.pacingDeclinedCount(), 0, "manual mode never uses pacing decline counter");
+  manual.destroy();
+
+  ok("adaptive pacing declines before staging saturation while manual mode remains unchanged");
+}
+
 /** Drain pending microtasks. `await Promise.resolve()` once per hop;
  *  three hops cover the rejection handler chain (`p.then(...)` → user
  *  callback) plus a small safety margin. */
@@ -705,6 +736,7 @@ async function main(): Promise<void> {
   testValidationBeforeWriteTargetBuild();
   testEnvReportWebgpuZeroCopyFalse();
   testLatestOnlyCoalescesScheduledSlots();
+  testAdaptivePacingDeclinesBeforeSaturation();
   await testOnErrorTransient();
   await testOnErrorFatal();
   await testNoOnErrorSilent();

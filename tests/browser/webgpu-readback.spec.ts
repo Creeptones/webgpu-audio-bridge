@@ -192,6 +192,10 @@ test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, 
       pushed: source.pushedCount(),
       dropped: source.droppedCount(),
       coalesced: source.coalescedCount(),
+      partialReadbacks: source.partialReadbackCount(),
+      partialBytesCopied: source.partialBytesCopied(),
+      pacingDeclined: source.pacingDeclinedCount(),
+      pressure: source.readbackPressure(),
       inFlight: source.inFlightCount(),
       userAgent: navigator.userAgent,
       adapterInfo: "info" in adapter ? JSON.parse(JSON.stringify(adapter.info ?? null)) : null,
@@ -217,6 +221,10 @@ test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, 
     pushed: number;
     dropped: number;
     coalesced: number;
+    partialReadbacks: number;
+    partialBytesCopied: number;
+    pacingDeclined: number;
+    pressure: unknown;
     inFlight: number;
     userAgent: string;
     adapterInfo: unknown;

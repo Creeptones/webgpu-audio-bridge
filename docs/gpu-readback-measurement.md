@@ -49,6 +49,117 @@ Use `source.coalescedCount()` to see how many stale scheduled readbacks were
 replaced. This mode is useful when the freshest control state matters more than
 delivering every intermediate GPU frame.
 
+## Adaptive pacing
+
+Manual pacing remains the default. Opt in when the producer should avoid filling
+every staging slot under pressure:
+
+```ts
+const source = new BridgeGPUSource(device, bridge, decoder, {
+  pacing: "adaptive",
+  readbackBudgetMs: 8,
+});
+```
+
+Adaptive mode preserves one free staging slot. When pressure reaches that limit,
+`scheduleReadback()` returns `false` before the ring fully saturates.
+
+Use the pressure snapshot to connect readback pressure to producer behavior:
+
+```ts
+const pressure = source.readbackPressure();
+if (pressure.action === "reduce-quality") {
+  // Reduce workgroup count, particle count, readback cadence, or payload size.
+}
+```
+
+Actions:
+
+- `dispatch`: schedule normally;
+- `skip-readback`: staging pressure is high, skip this readback;
+- `reduce-quality`: p95/p99 exceeds the configured budget, reduce GPU workload
+  but keep occasional samples flowing.
+
+Benchmark:
+
+```bash
+npm run bench:gpu-readback-pacing
+```
+
+## Dirty-region readback
+
+Full-frame readback remains the default:
+
+```ts
+source.scheduleReadback(srcBuffer, encoder);
+```
+
+For large frames where only one field changed, schedule a byte range:
+
+```ts
+source.scheduleReadback(
+  srcBuffer,
+  encoder,
+  fieldSourceOffset,
+  fieldByteLength,
+  fieldFrameOffset,
+);
+```
+
+The range arguments follow WebGPU copy rules and must be 4-byte aligned:
+
+- `srcOffset`: byte offset in the GPU source buffer;
+- `byteLength`: number of bytes to copy;
+- `dstOffset`: byte offset in the staged bridge frame.
+
+When the copy is partial, `BridgeGPUSource` merges the mapped dirty bytes into a
+retained full-frame image before publishing. Raw mode pushes that retained image
+with `pushRaw`; closure mode receives the merged full-frame bytes in the decoder.
+
+Seed the retained image when unchanged fields need known initial values:
+
+```ts
+const source = new BridgeGPUSource(device, bridge, "raw", {
+  initialFrameBytes,
+});
+```
+
+Diagnostics:
+
+```ts
+console.log(source.partialReadbackCount(), source.partialBytesCopied());
+```
+
+## Raw fast path selection
+
+Manual raw mode is still available:
+
+```ts
+const source = new BridgeGPUSource(device, bridge, "raw");
+```
+
+Use the compatibility helper when you want the fast path without guessing:
+
+```ts
+const source = BridgeGPUSource.rawIfCompatible(device, bridge, decoder, {
+  stagingBufferCount: 3,
+});
+
+console.log(source.decoderMode()); // "raw" or "closure"
+```
+
+`rawIfCompatible()` selects `"raw"` only when the schema's generated WGSL layout
+is byte-compatible with the bridge frame. If the schema uses sub-32-bit fields
+or has an invariant lane, it falls back to the supplied decoder closure by
+default.
+
+For diagnostics:
+
+```ts
+const report = BridgeGPUSource.rawCompatibility(schema);
+console.log(report.compatible, report.reason);
+```
+
 ## Browser CI modes
 
 The normal Playwright browser matrix runs `tests/browser/webgpu-readback.spec.ts`

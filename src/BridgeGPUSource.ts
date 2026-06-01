@@ -123,9 +123,10 @@
  * are exercised without a real GPU).
  */
 
-import type { FieldsObject, FrameFor, Schema } from "./schema.js";
+import { describeSchemaLayout, type FieldsObject, type FrameFor, type Schema } from "./schema.js";
 import type { Bridge } from "./Bridge.js";
 import type { BridgeProducer } from "./BridgeProducer.js";
+import { computeWgslLayout } from "./emitWgslStruct.js";
 
 // ── Minimal structural interfaces matching WebGPU's surface ──────────────
 
@@ -207,6 +208,27 @@ export type WriteTargetKind = "auto" | "map-async" | "shared";
  *     data. In-flight `mapAsync` slots are never touched. */
 export type ReadbackBackpressureMode = "reject" | "latest-only";
 
+export type ReadbackPacingMode = "manual" | "adaptive";
+export type ReadbackAction = "dispatch" | "skip-readback" | "reduce-quality";
+
+export interface ReadbackPressureSnapshot {
+  readonly pacing: ReadbackPacingMode;
+  readonly budgetUs: number;
+  readonly action: ReadbackAction;
+  readonly inFlight: number;
+  readonly capacity: number;
+  readonly pushed: number;
+  readonly dropped: number;
+  readonly coalesced: number;
+  readonly pacingDeclined: number;
+  readonly partialReadbacks: number;
+  readonly partialBytesCopied: number;
+  readonly lastUs: number;
+  readonly p50Us: number;
+  readonly p95Us: number;
+  readonly p99Us: number;
+}
+
 /** Rolling latency snapshot for real GPU readback measurement (0.9.945).
  *
  * Values are microseconds measured from `flushPending()` starting `mapAsync`
@@ -224,6 +246,29 @@ export interface ReadbackLatencyStats {
   readonly p95Us: number;
   readonly p99Us: number;
 }
+
+export type RawReadbackCompatibilityReason =
+  | "compatible"
+  | "invariant-lane"
+  | "wgsl-layout-error"
+  | "struct-size-mismatch";
+
+export interface RawReadbackCompatibilityOptions {
+  /** Allow auto-raw on schemas with a hidden invariant lane. Default false.
+   *  Only enable this when the GPU producer writes the invariant lane bytes
+   *  exactly as the bridge expects. */
+  readonly allowInvariantLane?: boolean;
+}
+
+export interface RawReadbackCompatibility {
+  readonly compatible: boolean;
+  readonly reason: RawReadbackCompatibilityReason;
+  readonly frameByteSize: number;
+  readonly structSize: number;
+  readonly message: string;
+}
+
+export type PartialReadbackInitialFrame = ArrayBuffer | ArrayBufferView;
 
 /**
  * Strategy interface for moving bytes from a producer-side GPU buffer
@@ -257,6 +302,8 @@ export interface WriteTarget {
     slotIndex: number,
     src: GpuBufferLike,
     srcOffset: number,
+    byteLength: number,
+    dstOffset: number,
     encoder: GpuCommandEncoderLike,
   ): void;
   /** Begin the async wait for the slot's bytes to be CPU-readable.
@@ -309,14 +356,16 @@ class MapAsyncWriteTarget implements WriteTarget {
     slotIndex: number,
     src: GpuBufferLike,
     srcOffset: number,
+    byteLength: number,
+    dstOffset: number,
     encoder: GpuCommandEncoderLike,
   ): void {
     encoder.copyBufferToBuffer(
       src,
       srcOffset,
       this.buffers[slotIndex]!,
-      0,
-      this.slotByteSize,
+      dstOffset,
+      byteLength,
     );
   }
 
@@ -399,6 +448,40 @@ function buildWriteTarget(
   );
 }
 
+function viewInitialFrameBytes(bytes: PartialReadbackInitialFrame): Uint8Array {
+  if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+function validateCopyRange(
+  slotByteSize: number,
+  srcOffset: number,
+  byteLength: number,
+  dstOffset: number,
+): void {
+  for (const [name, value] of [
+    ["srcOffset", srcOffset],
+    ["byteLength", byteLength],
+    ["dstOffset", dstOffset],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`BridgeGPUSource: ${name} must be a non-negative integer (got ${String(value)})`);
+    }
+    if ((value & 3) !== 0) {
+      throw new Error(`BridgeGPUSource: ${name} must be 4-byte aligned for copyBufferToBuffer (got ${value})`);
+    }
+  }
+  if (byteLength === 0) {
+    throw new Error("BridgeGPUSource: byteLength must be greater than 0");
+  }
+  if (dstOffset + byteLength > slotByteSize) {
+    throw new Error(
+      `BridgeGPUSource: dstOffset + byteLength (${dstOffset + byteLength}) ` +
+        `exceeds stagingBufferSize (${slotByteSize})`,
+    );
+  }
+}
+
 /** Per-slot state machine. See class header lifecycle. */
 type StagingState = "idle" | "scheduled" | "in-flight" | "ready";
 
@@ -407,6 +490,11 @@ interface StagingSlot {
   /** Monotonic schedule order used by `"latest-only"` coalescing to replace
    *  the most recently scheduled slot, independent of slot index reuse. */
   scheduledAt: number;
+  /** Byte range copied into the staging frame for this readback. A full-frame
+   *  readback is `{ dstOffset: 0, byteLength: slotByteSize }`; a dirty-region
+   *  readback updates only that subrange of the retained frame image. */
+  dstOffset: number;
+  byteLength: number;
   /** Set when `beginMap` resolves. Cleared in `pollCompleted` after
    *  the decoder runs. */
   mapped: boolean;
@@ -441,6 +529,20 @@ export interface BridgeGPUSourceOptions {
    *  replaces a not-yet-flushed scheduled slot with the newest copy, reducing
    *  stale readback buildup under bursty producers. */
   readonly backpressureMode?: ReadbackBackpressureMode;
+  /** Optional pacing controller. Default `"manual"` preserves the old behavior.
+   *  `"adaptive"` makes `scheduleReadback()` decline new work before the staging
+   *  ring saturates, and exposes a pressure snapshot for producer-side quality
+   *  control. */
+  readonly pacing?: ReadbackPacingMode;
+  /** Target p95 readback budget in milliseconds for adaptive pressure
+   *  recommendations. Default 8 ms. */
+  readonly readbackBudgetMs?: number;
+  /** Optional initial full-frame image for dirty-region readback. When
+   *  `scheduleReadback()` is called with `byteLength < stagingBufferSize` or a
+   *  non-zero `dstOffset`, the helper merges the mapped bytes into a retained
+   *  full-frame image before publishing. If omitted, the retained image starts
+   *  zero-filled and is updated by subsequent full or partial readbacks. */
+  readonly initialFrameBytes?: PartialReadbackInitialFrame;
   /** Override for the staging buffer size in bytes. Defaults to the
    *  bridge's `frameByteSize` (one full frame per readback). Set
    *  larger if your source buffer's `copyBufferToBuffer` size is
@@ -601,11 +703,100 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
   private _coalescedCount: number = 0;
   /** Monotonic schedule serial. Heap-only; wraps only after 2^53 schedules. */
   private _scheduleSerial: number = 0;
+  /** Retained full-frame byte image for dirty-region readback. Lazily created
+   *  when a partial readback is scheduled unless seeded by initialFrameBytes. */
+  private _partialFrameBytes: Uint8Array | null = null;
+  /** Count of partial readbacks merged into the retained full-frame image. */
+  private _partialReadbackCount: number = 0;
+  /** Total dirty-region bytes copied into the retained full-frame image. */
+  private _partialBytesCopied: number = 0;
+  /** Pacing policy and budget. Manual mode never declines based on pressure. */
+  private readonly _pacingMode: ReadbackPacingMode;
+  private readonly _readbackBudgetUs: number;
+  private _pacingDeclinedCount: number = 0;
 
   /** Set by `destroy()`. A microtask scheduled before `destroy()` but firing
    *  after it must NOT touch the now-destroyed staging buffers; the auto-drain
    *  guard bails when this is set. */
   private _destroyed: boolean = false;
+
+  /** Report whether a schema can safely use the `"raw"` GPU readback fast path.
+   *
+   * Compatible means `computeWgslLayout(schema).structSize` equals
+   * `schema.frameByteSize` and, by default, the schema has no hidden invariant
+   * lane that the GPU would need to write exactly. Sub-32-bit fields return an
+   * incompatible report because WGSL storage buffers cannot represent them
+   * portably. */
+  static rawCompatibility<S extends Schema<FieldsObject, any>>(
+    schema: S,
+    opts: RawReadbackCompatibilityOptions = {},
+  ): RawReadbackCompatibility {
+    const desc = describeSchemaLayout(schema);
+    if (desc.invariantByteOffset !== null && opts.allowInvariantLane !== true) {
+      return {
+        compatible: false,
+        reason: "invariant-lane",
+        frameByteSize: desc.frameByteSize,
+        structSize: 0,
+        message:
+          "Schema has a hidden invariant lane. Auto-raw is disabled unless " +
+          "allowInvariantLane is true and the GPU producer writes invariant bytes exactly.",
+      };
+    }
+    try {
+      const layout = computeWgslLayout(schema);
+      if (layout.structSize !== desc.frameByteSize) {
+        return {
+          compatible: false,
+          reason: "struct-size-mismatch",
+          frameByteSize: desc.frameByteSize,
+          structSize: layout.structSize,
+          message:
+            `WGSL struct size ${layout.structSize} does not match frameByteSize ` +
+            `${desc.frameByteSize}. Use a decoder closure instead of raw mode.`,
+        };
+      }
+      return {
+        compatible: true,
+        reason: "compatible",
+        frameByteSize: desc.frameByteSize,
+        structSize: layout.structSize,
+        message: "Schema WGSL layout is byte-compatible with Bridge raw readback.",
+      };
+    } catch (err) {
+      return {
+        compatible: false,
+        reason: "wgsl-layout-error",
+        frameByteSize: desc.frameByteSize,
+        structSize: 0,
+        message:
+          err instanceof Error
+            ? err.message
+            : "Schema cannot be represented as a byte-compatible WGSL layout.",
+      };
+    }
+  }
+
+  /** Construct a GPU source that selects the raw fast path when safe, otherwise
+   *  falls back to the supplied decoder closure.
+   *
+   * This helper is the ergonomic path for code generated from
+   * `emitWgslStruct(schema)`: compatible 32-/64-bit schemas use `pushRaw`,
+   * while sub-32-bit or invariant-lane schemas keep the normal decoder path. */
+  static rawIfCompatible<S extends Schema<FieldsObject, any>>(
+    device: GpuDeviceLike,
+    bridge: Bridge<S> | BridgeProducer<S>,
+    fallbackDecoder: GpuReadbackDecoder<S>,
+    opts: BridgeGPUSourceOptions & RawReadbackCompatibilityOptions = {},
+  ): BridgeGPUSource<S> {
+    const report = BridgeGPUSource.rawCompatibility(bridge.schema, opts);
+    return new BridgeGPUSource(
+      device,
+      bridge,
+      report.compatible ? "raw" : fallbackDecoder,
+      opts,
+    );
+  }
 
   constructor(
     device: GpuDeviceLike,
@@ -624,6 +815,20 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       throw new Error(
         `BridgeGPUSource: backpressureMode must be 'reject' or 'latest-only' ` +
           `(got ${String(backpressureMode)})`,
+      );
+    }
+    const pacingMode = opts.pacing ?? "manual";
+    if (pacingMode !== "manual" && pacingMode !== "adaptive") {
+      throw new Error(
+        `BridgeGPUSource: pacing must be 'manual' or 'adaptive' ` +
+          `(got ${String(pacingMode)})`,
+      );
+    }
+    const readbackBudgetMs = opts.readbackBudgetMs ?? 8;
+    if (!Number.isFinite(readbackBudgetMs) || readbackBudgetMs <= 0) {
+      throw new Error(
+        `BridgeGPUSource: readbackBudgetMs must be a positive finite number ` +
+          `(got ${String(readbackBudgetMs)})`,
       );
     }
     const size = opts.stagingBufferSize ?? bridge.schema.frameByteSize;
@@ -664,9 +869,22 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     this.bridge = bridge;
     this._autoDrain = autoPoll === "microtask";
     this._backpressureMode = backpressureMode;
+    this._pacingMode = pacingMode;
+    this._readbackBudgetUs = readbackBudgetMs * 1000;
     this._rawMode = rawMode;
     this.decoder = rawMode ? null : (decoder as GpuReadbackDecoder<S>);
     this._readbackLatencySamples = new Float64Array(sampleCount);
+    if (opts.initialFrameBytes !== undefined) {
+      const initial = viewInitialFrameBytes(opts.initialFrameBytes);
+      if (initial.byteLength !== size) {
+        throw new Error(
+          `BridgeGPUSource: initialFrameBytes must be exactly stagingBufferSize ` +
+            `bytes (${size}); got ${initial.byteLength}`,
+        );
+      }
+      this._partialFrameBytes = new Uint8Array(size);
+      this._partialFrameBytes.set(initial);
+    }
     const labelPrefix = opts.bufferLabelPrefix ?? "BridgeGPUSource";
     // Build the strategy AFTER validation so a `stagingBufferCount: 1`
     // or `stagingBufferSize: 0` rejection doesn't leak partial
@@ -692,6 +910,8 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       this.slots[i] = {
         state: "idle",
         scheduledAt: 0,
+        dstOffset: 0,
+        byteLength: size,
         mapped: false,
         pending: null,
         mapStartedAtMs: 0,
@@ -715,7 +935,14 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     srcBuffer: GpuBufferLike,
     encoder: GpuCommandEncoderLike,
     srcOffset: number = 0,
+    byteLength: number = this.writeTarget.slotByteSize,
+    dstOffset: number = 0,
   ): boolean {
+    validateCopyRange(this.writeTarget.slotByteSize, srcOffset, byteLength, dstOffset);
+    if (this._pacingMode === "adaptive" && this.recommendedReadbackAction() === "skip-readback") {
+      this._pacingDeclinedCount = (this._pacingDeclinedCount + 1) | 0;
+      return false;
+    }
     let slotIndex = this._acquireIdleSlotIndex();
     if (slotIndex < 0) {
       if (this._backpressureMode !== "latest-only") return false;
@@ -723,10 +950,12 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (slotIndex < 0) return false;
       this._coalescedCount = (this._coalescedCount + 1) | 0;
     }
-    this.writeTarget.encodeCopy(slotIndex, srcBuffer, srcOffset, encoder);
+    this.writeTarget.encodeCopy(slotIndex, srcBuffer, srcOffset, byteLength, dstOffset, encoder);
     const slot = this.slots[slotIndex]!;
     slot.state = "scheduled";
     slot.scheduledAt = ++this._scheduleSerial;
+    slot.dstOffset = dstOffset;
+    slot.byteLength = byteLength;
     return true;
   }
 
@@ -852,6 +1081,8 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       }
       slot.state = "idle";
       slot.scheduledAt = 0;
+      slot.dstOffset = 0;
+      slot.byteLength = this.writeTarget.slotByteSize;
       slot.mapped = false;
       slot.pending = null;
       slot.mapStartedAtMs = 0;
@@ -869,7 +1100,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         // the error; the releaseMap + slot reset below recycle the slot on every
         // outcome, exactly as in the closure path.
         try {
-          const range = this.writeTarget.readMapped(i);
+          const range = this._readMappedFrameBytes(i, slot);
           if (this.bridge.pushRaw(range)) {
             this._pushedCount = (this._pushedCount + 1) | 0;
             pushed = 1;
@@ -903,7 +1134,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
           // to this, a single decoder throw stranded the slot in "in-flight"
           // with its GPU buffer still mapped, eventually starving the pipeline.
           try {
-            const range = this.writeTarget.readMapped(i);
+            const range = this._readMappedFrameBytes(i, slot);
             this.decoder!(range, frame);
             this.bridge.commitPush();
             this._pushedCount = (this._pushedCount + 1) | 0;
@@ -924,6 +1155,24 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
             }
           }
         } else {
+          if (
+            this._partialFrameBytes !== null ||
+            slot.dstOffset !== 0 ||
+            slot.byteLength !== this.writeTarget.slotByteSize
+          ) {
+            try {
+              this._readMappedFrameBytes(i, slot);
+            } catch (err) {
+              if (this._onError) {
+                const kind = this._deviceLost ? "fatal" : "transient";
+                try {
+                  this._onError(err, kind);
+                } catch {
+                  // Misbehaving user handler — swallow.
+                }
+              }
+            }
+          }
           // Bridge full — drop the readback. The push policy on the
           // bridge already accounted for whatever policy-driven drop
           // semantics are active; we just observe the failure here.
@@ -961,12 +1210,39 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       } finally {
         slot.state = "idle";
         slot.scheduledAt = 0;
+        slot.dstOffset = 0;
+        slot.byteLength = this.writeTarget.slotByteSize;
         slot.mapped = false;
         slot.pending = null;
         slot.mapStartedAtMs = 0;
       }
     }
     return pushed;
+  }
+
+  /** Read one mapped slot as a full frame. Full readbacks return the mapped
+   *  range directly unless a retained dirty-region image already exists. Partial
+   *  readbacks copy only the scheduled byte range into the retained full-frame
+   *  image, then return that image for raw push or decoder input. */
+  private _readMappedFrameBytes(i: number, slot: StagingSlot): ArrayBuffer {
+    const range = this.writeTarget.readMapped(i);
+    const isFullFrame =
+      slot.dstOffset === 0 && slot.byteLength === this.writeTarget.slotByteSize;
+    if (isFullFrame && this._partialFrameBytes === null) return range;
+
+    if (this._partialFrameBytes === null) {
+      this._partialFrameBytes = new Uint8Array(this.writeTarget.slotByteSize);
+    }
+    const mapped = new Uint8Array(range);
+    this._partialFrameBytes.set(
+      mapped.subarray(slot.dstOffset, slot.dstOffset + slot.byteLength),
+      slot.dstOffset,
+    );
+    if (!isFullFrame) {
+      this._partialReadbackCount = (this._partialReadbackCount + 1) | 0;
+      this._partialBytesCopied += slot.byteLength;
+    }
+    return this._partialFrameBytes.buffer as ArrayBuffer;
   }
 
   /**
@@ -1137,6 +1413,66 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  `"latest-only"` coalescing (0.9.946). */
   coalescedCount(): number {
     return this._coalescedCount;
+  }
+
+  /** Count of dirty-region readbacks merged into the retained full-frame image. */
+  partialReadbackCount(): number {
+    return this._partialReadbackCount;
+  }
+
+  /** Total bytes copied from dirty-region readbacks into the retained image. */
+  partialBytesCopied(): number {
+    return this._partialBytesCopied;
+  }
+
+  /** Recommended producer action from current readback pressure.
+   *
+   * `skip-readback` is reserved for staging saturation and is the only action
+   * adaptive `scheduleReadback()` enforces. `reduce-quality` is advisory: the
+   * producer should lower GPU workload or readback frequency, but a schedule
+   * call is still allowed so the system can keep collecting latency samples. */
+  recommendedReadbackAction(): ReadbackAction {
+    const inFlight = this.inFlight();
+    if (this._pacingMode === "adaptive" && inFlight >= Math.max(1, this.slots.length - 1)) {
+      return "skip-readback";
+    }
+    const stats = this.readbackLatencyStats();
+    if (stats.samples > 0 && (stats.p95Us > this._readbackBudgetUs || stats.p99Us > this._readbackBudgetUs * 2)) {
+      return "reduce-quality";
+    }
+    return "dispatch";
+  }
+
+  /** True when the current pacing policy recommends scheduling another readback. */
+  shouldScheduleReadback(): boolean {
+    return this.recommendedReadbackAction() === "dispatch";
+  }
+
+  /** Compact telemetry snapshot for dashboards and adaptive producer loops. */
+  readbackPressure(): ReadbackPressureSnapshot {
+    const stats = this.readbackLatencyStats();
+    return {
+      pacing: this._pacingMode,
+      budgetUs: this._readbackBudgetUs,
+      action: this.recommendedReadbackAction(),
+      inFlight: this.inFlight(),
+      capacity: this.slots.length,
+      pushed: this._pushedCount,
+      dropped: this._droppedCount,
+      coalesced: this._coalescedCount,
+      pacingDeclined: this._pacingDeclinedCount,
+      partialReadbacks: this._partialReadbackCount,
+      partialBytesCopied: this._partialBytesCopied,
+      lastUs: stats.lastUs,
+      p50Us: stats.p50Us,
+      p95Us: stats.p95Us,
+      p99Us: stats.p99Us,
+    };
+  }
+
+  /** Number of readbacks declined by adaptive pacing before scheduling. */
+  pacingDeclinedCount(): number {
+    return this._pacingDeclinedCount;
   }
 
   /** Record one completed mapAsync→drain cycle into the bounded latency

@@ -61,6 +61,7 @@
     "bench:jit-probe": "node bench/jit-probe.mjs",
     "bench:decode-path-comparator": "node bench/decode-path-comparator/serve.mjs",
     "bench:graceful-degradation": "tsx bench/graceful-degradation.bench.ts",
+    "bench:gpu-readback-pacing": "tsx bench/gpu-readback-pacing.bench.ts",
     "bench:e2e": "node bench/e2e-latency/serve.mjs",
     "bench:notify-cost": "node bench/notify-cost-browser/serve.mjs",
     "check:release-metadata": "node scripts/check-release-metadata.mjs",

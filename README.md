@@ -102,6 +102,16 @@ For bursty control-rate producers, `backpressureMode: "latest-only"` replaces a
 not-yet-flushed scheduled readback with the newest copy instead of preserving
 stale intermediate frames.
 
+Use `pacing: "adaptive"` plus `source.readbackPressure()` to skip readbacks
+before staging saturates and to trigger producer-side quality reduction.
+
+For large frames, `scheduleReadback(src, encoder, srcOffset, byteLength, dstOffset)`
+can copy only a dirty byte range and merge it into a retained full-frame image.
+
+Use `BridgeGPUSource.rawIfCompatible(device, bridge, decoder)` to select the
+zero-decode `pushRaw` path only when the schema's WGSL layout is byte-compatible;
+otherwise it falls back to the decoder closure.
+
 Write targets:
 
 - `auto`: resolves to `map-async` today
