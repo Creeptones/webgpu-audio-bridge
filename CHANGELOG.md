@@ -4,6 +4,97 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.939] — 2026-05-31
+
+### Added — Apollo Frontier 3, DAG Stage 2: cross-thread multi-node stress — **the MPMC-audio-DAG frontier headline is complete**
+
+DAG Stage 1 (`0.9.938`) proved the four wait-free edges are composable in ONE
+process. Stage 2 proves the composition holds **across real threads** and
+witnesses the one property the per-edge concurrent tests cannot — a
+*composition* property. With it, the four edges are not just individually proven
+but composable across threads, and the **"MPMC audio DAGs" frontier headline is
+complete**.
+
+- **`tests/connectGraph.concurrent.test.ts`** — a real `worker_threads` stress over
+  a multi-node graph built by `connectGraph()`, using all four edge kinds at once:
+  `p0,p1 ─(mpmc fan-in)→ mixer ─(spsc)→ fx ─(spmc broadcast)→ sinkA,sinkB` plus
+  `w0,w1 ─(mpmc-wq)→ wk0,wk1`. **`mixer` runs on its OWN worker** — a real
+  intermediate node that consumes one ring (the fan-in, `MpmcRing` consumer) and
+  produces another (the SPSC edge, `SpscRing` drop-oldest producer) every quantum,
+  the genuine consume-one-ring-produce-another hazard. `fx` is the main-thread
+  driver (real `mountGraph` facades: a `BridgeConsumer` of the SPSC edge + a real
+  `SpmcRing` broadcast producer), which also mounts the work-queue facade to drive
+  `close()` / `isDrained()` and read the leg-2 observers.
+- **The §5 witness — `sourceStalls === 0`.** Every DAG edge is wait-free on the push
+  side, so a slow sink can never wedge a real-time source through a multi-hop path.
+  The test instruments every source (`p0`,`p1`,`w0`,`w1`) AND the intermediate
+  `mixer` and asserts none ever parked, even with a deliberately-throttled `sinkA`.
+  This is the property the per-edge tests cannot show — it only emerges from the
+  *composition* of wait-free-push edges across nodes, and is the reason Stage 2
+  exists.
+- **Fidelity decision (the repo's proven pattern).** `eval:true` workers cannot
+  import the real `src/` ring classes, so each worker reimplements the protocol(s)
+  of the edges it touches BYTE-FAITHFULLY over the raw SAB, keyed off the handle's
+  SAB + `describeLayout()`/header-byte offsets shipped in `workerData`. The snippets
+  are cribbed verbatim from the existing per-edge concurrent tests (the MpmcRing
+  producer/consumer, the SPSC drop-oldest producer, the SpmcRing seqlock consumer,
+  the work-queue held-claim producer/consumer) and reuse `tests/_mpmcStress.ts`'s
+  payload helpers so producer + consumer agree bit-for-bit; the main thread uses the
+  real facades to drive/observe.
+
+### Why
+
+Stage 1 shipped the wiring; the open question was whether the per-edge proofs
+actually *compose* once a real intermediate node sits on its own thread between a
+source and a sink. The non-trivial worry is stall propagation: if any node could
+block, a slow sink would wedge the whole path back to the source. Stage 2 is the
+end-to-end witness that it cannot — `mixer` pumps inbound→outbound each quantum,
+the sources blast at a fixed rate, and the run terminates with bit-exactness +
+broadcast-completeness + zero source back-pressure. After Stage 2 there is no
+remaining DAG stage; the frontier headline is closed out.
+
+### Wire compatibility
+
+No wire change. Stage 2 is tests-only — it touches no ring, no `.tla`/fuzzer, and
+not `src/connectGraph.ts`. Every ring's wire format is bit-identically untouched;
+the SPSC / MP→SC / SP→MC / MP→MC suites stay green. **Patch** bump under the
+versioning policy.
+
+### Tests
+
+- **`tests/connectGraph.concurrent.test.ts`** (registered in `test` +
+  `test:concurrent`). The Stage-2 contract:
+  - **(a) Leg-1 path bit-exactness + broadcast-completeness.** The fan-in and SPSC
+    rings are sized to hold the whole leg-1 budget (`2·L1_COUNT < capacity`), so the
+    3-hop path is **deterministically lossless** — every source frame survives all
+    three cross-thread hops and reaches BOTH sinks bit-exact (per-frame verification
+    runs inside each sink worker), with the two sinks proven to have seen the
+    IDENTICAL ordered set via an order-sensitive FNV hash + count equality
+    (broadcast-completeness). `fx` paces the broadcast to the no-lap regime
+    (zero broadcast drops).
+  - **(b) Leg-2 partition** (run alongside on its own SAB): conservation `consumed
+    === pushedOk`, `consumed + dropped === attempted`, `strandedClaims ≤
+    consumerCount − 1`, `tornGuarded === 0`, every frame to EXACTLY one consumer (an
+    `Atomics.exchange` no-duplicate flag), driven by the real `close()`/`isDrained()`
+    end-of-stream protocol — the lossy wait-free drop paths stressed under real
+    pressure.
+  - **(c) `sourceStalls === 0`** across `p0,p1,w0,w1,mixer` (the §5 witness).
+  - **(d) No deadlock** — a deadline watchdog bounds the run; reaching the joins is
+    the no-hang proof.
+  - **(e) Structural gate** — each edge's `handle.sab.byteLength` equals its ring's
+    `byteLength(...)` (the wiring did not drift from the primitive layout).
+- Sources are open-loop paced (≤ N frames/ms via a `Date.now()` spin — NOT an
+  `Atomics.wait`, so `parked` stays 0) so the CPU-shared consumers keep up and both
+  legs run over meaningful frame counts. Full `npm test`, `npm run test:concurrent`,
+  and `npm run bench` (core push/pull/pullLatest within the ~1.20 μs budget) stay
+  green.
+
+### Documentation
+
+- The `examples/audio-dag/` browser smoke (Stage 2 deliverable B) remains **deferred**
+  — matching the fan-out and work-queue arcs, which also shipped headless-only. The
+  build plan lives in `docs/frontier3-dag-stage2-handoff.md`.
+
 ## [0.9.938] — 2026-05-31
 
 ### Added — Apollo Frontier 3, DAG Stage 1: `connectGraph()` / `mountGraph()` — the MPMC audio-DAG topology constructor
