@@ -589,6 +589,15 @@ export interface TelemetrySnapshot {
    *  One increment per recovery event (NOT one per normal observation
    *  after recovery). Heap-side, consumer-thread. */
   readonly stallRecoveries: number;
+  /** Cumulative cycle slips across all circular (angular) lanes in the
+   *  schema (0.9.935). One increment per smoothed angular element whose
+   *  endpoints spanned more than half a period the naive way — a branch-cut
+   *  crossing, i.e. the discrete monodromy event. Zero on schemas with no
+   *  `f64Phase` / `f64Circular` lanes. A nonzero, growing count on a lane you
+   *  didn't expect to spin signals the producer's phase is aliasing
+   *  (advancing > half a period per frame ⇒ under-sampled). Heap-side,
+   *  consumer-thread; cumulative across `resetSmoother`. */
+  readonly cycleSlips: number;
   /** Current consumer→producer adaptive backpressure hint, in
    *  [0.5, 2.0]. Same value `flowScaleHint()` returns. */
   readonly flowScale: number;
@@ -2331,6 +2340,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       // 0.7.3 — heap-side counters, consumer-thread.
       softFrames: this._softFrames,
       stallRecoveries: this.pll.stallRecoveries,
+      // 0.9.935 — angular monodromy counter from the circular-aware smoother.
+      cycleSlips: this.smoother.cycleSlips,
       flowScale: this.ring.flowScaleHint(),
       available: this.ring.available(),
       capacity: this.capacity,

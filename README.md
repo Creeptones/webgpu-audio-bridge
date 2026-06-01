@@ -503,6 +503,7 @@ The full set of field constructors:
 | `u8()`  / `i8()`  | `number` | `u8Array(n)`  / `i8Array(n)`  | `Uint8Array`  / `Int8Array`  |
 | `f64()` / `f32()` | `number` | `f64Array(n)` / `f32Array(n)` | `Float64Array` / `Float32Array` |
 | — | — | `f64TrajectoryArray(n, { order })` / `f32TrajectoryArray(n, { order })` | `Float64Array` / `Float32Array` (length `n × order`) |
+| `f64Phase()` / `f64Circular({ period })` | `number` (angular) | `f64PhaseArray(n)` / `f64CircularArray(n, { period })` | `Float64Array` (angular); `f32` variants too |
 
 `defineSchema({ ... })` validates field names (must be valid JS identifiers, no duplicates), groups fields internally by alignment class (8-aligned first, then 4, then 2, then 1; stable within class) so SAB-backed typed-array views land at legal byte offsets, and pads the frame size up to 8.
 
@@ -624,6 +625,40 @@ The union is **closed at 1.0**. The original 0.8.10 note deferred quintic-Hermit
 The higher orders aren't just *continuous* — they're measurably *quieter*. `tests/Bridge.phaseLock.test.ts` carries an FFT spectral pin (0.9.85) that reconstructs a 14.65 Hz signal three ways (cubic / quintic / septic) in the interpolation regime and measures the >30 Hz producer-image band: **cubic −44 dB → quintic −78 dB → septic −111 dB** relative to the signal bin — each higher order rolls the seam-image energy off ~34 dB further (the `f^-3 → f^-4 → f^-5` Fourier-envelope step that the C¹ → C² → C³ continuity buys). That is the "kills the FM/zipper click" claim made spectral, not just finite-difference-continuous.
 
 Hear it: [`examples/hermite-orders/`](./examples/hermite-orders/) (`npm run dev:hermite-orders`, http://localhost:5182) drives an aggressive FM control trajectory through a `Bridge<S>` and lets you **toggle cubic / quintic / septic live** while a spectrum shows the high-sideband spray thin out with each order. Drop the control-rate slider toward 24–30 Hz to make the cubic seam buzz audible. (The demo reconstructs the *completed* segment one frame behind newest — interior `t` — rather than `pullHermiteLatest`, whose [0,1]-clamped freshest-interpolation pins `t` to the boundary where all orders agree; see `worklet.js` for the full reasoning.)
+
+#### Circular (angular) lanes — phase fields that wrap (0.9.935)
+
+Declare a lane whose value lives on the circle ℝ/Pℤ (period `P`, default 2π) instead of the real line. The motivating case is a **wavefunction** ψ = r·e^{iθ} shipped to an additive / phase-vocoder synth as amplitude + phase — the phase lane is angular, and a flat-ℝ smoother corrupts it across the ±π wrap:
+
+```ts
+import {
+  defineSchema, u64, f64, f64Phase, f64PhaseArray, f64Circular,
+  wrapSymmetric, shortestArcDelta, circularLerp, CircularUnwrapper,
+  evaluateCircularTrajectoryInto, evaluateCircularHermiteTrajectoryInto,
+} from "webgpu-audio-bridge";
+
+const schema = defineSchema({
+  seq:   u64(),
+  amp:   f64Array(64),          // ordinary lane (magnitude r)
+  theta: f64PhaseArray(64),     // angular lane (phase θ ∈ ℝ/2πℤ)
+  pan:   f64Circular({ period: 1 }), // normalized [0,1) circular scalar
+});
+```
+
+Why it matters: blending θ_prev ≈ +π with θ_curr ≈ −π in flat ℝ swings the **6-rad long way through 0** — a full-amplitude click at the frame seam — instead of the **0.28-rad short way**. A circular lane tells `pullSmoothed` / `pullLatestSmoothed` to blend along the **shorter arc** (`circularLerp`) and re-wrap, while every non-circular lane stays bit-exact. The fix is the Riemann-surface move: lift to the covering space (unwrap), operate, project back (wrap).
+
+| Constructor | Meaning |
+| --- | --- |
+| `f64Phase()` / `f32Phase()` | scalar phase, period 2π |
+| `f64Circular({ period })` / `f32Circular(…)` | scalar circular, any finite period (`1` normalized, `360` degrees, `12` pitch classes) |
+| `f64PhaseArray(n)` / `f64CircularArray(n, { period })` | array variants (+ `f32`) |
+| `f64CircularTrajectoryArray(n, { order, period })` | angular position lanes + ordinary derivative (rate) lanes |
+
+The math core is exported directly: `wrapSymmetric(x, P)` (project onto `[−P/2, +P/2)`), `shortestArcDelta(a, b, P)` (signed shorter-arc difference), `circularLerp(a, b, α, P)` (geodesic blend), and `CircularUnwrapper` (lift a wrapped stream onto continuous ℝ, tracking winding number + cycle slips). The circular extrapolators `evaluateCircularTrajectoryInto` (Taylor, wrapped) and `evaluateCircularHermiteTrajectoryInto` (short-arc cubic Hermite, wrapped) mirror the flat family.
+
+**Cycle slips = a built-in aliasing diagnostic.** `Bridge.telemetry().cycleSlips` counts frames whose phase increment crossed the branch cut — the discrete **monodromy** event. A growing count on a lane you didn't expect to spin means the producer's phase is advancing > P/2 per frame, i.e. it's **Nyquist-undersampled** at the frame rate. It's the angular sibling of the PLL's `outliersRejected` / `stallRecoveries`.
+
+Wire-compatible: a circular lane is byte-identical to the plain f64/f32 field of the same length — the tag is consumer-side metadata only, so a pre-0.9.935 peer interoperates transparently. See [`docs/topological-lanes-design.md`](./docs/topological-lanes-design.md) for the full design.
 
 **Click-free crossfade — `crossfadeWeight(order)` + `crossfadeInto(a, b, w, out, opts?)` (0.9.87).** The same Hermite basis that smooths the *interior* also makes a live **hot-swap** seamless. To blend signal A → B over a window `s ∈ [0,1]` with no click, the blend weight `w(s)` must hit `w(0)=0`, `w(1)=1` and have its first *k* derivatives vanish at both ends — which is exactly the position-to-position Hermite basis:
 

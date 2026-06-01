@@ -22,6 +22,21 @@
  *       typed numeric fields in float then `Math.round` back. See 0.6.4 for
  *       the trajectory-aware fix and Bridge.ts file header "Smoothed pulls"
  *       for the rationale.
+ *
+ *     - Circular (angular) lanes (0.9.935): a field declared via `f64Phase` /
+ *       `f64Circular` / their array + trajectory variants carries a
+ *       `circular: { period }` tag. Such lanes are blended along the SHORTER
+ *       ARC of the circle ℝ/periodℤ — `out_i ← circularLerp(prev_i, curr_i, α)`
+ *       — instead of the flat-ℝ one-pole, so a blend across the ±period/2
+ *       branch cut (e.g. prev ≈ +π, curr ≈ −π) takes the 0.28-rad short way
+ *       rather than swinging the long way through 0. The flat-ℝ path is
+ *       preserved BIT-EXACT for every non-circular lane (the dispatch is a
+ *       precomputed per-field period table; 0 ⇒ flat path). On a circular
+ *       trajectory lane only the angular POSITION lanes go through the arc
+ *       blend; the derivative (rate) lanes copy verbatim exactly as before.
+ *       Each shorter-arc blend whose span exceeds half a period bumps a
+ *       cumulative `cycleSlips` counter (the angular monodromy diagnostic,
+ *       surfaced in `Bridge.telemetry().cycleSlips`).
  *     - Precomputed per-field classification tables: `scalarIsBigInt`,
  *       `scalarIsInteger`, `arrayIsBigInt`, `arrayIsInteger`,
  *       `arrayTrajectoryOrder`. Built at construction in scalar/array layout
@@ -64,6 +79,7 @@ import {
   type FrameFor,
   type Schema,
 } from "./schema.js";
+import { circularLerp } from "./circular.js";
 
 /** Frame view used internally — opaque to the smoother (only walks fields). */
 type FrameRecord = Record<string, unknown>;
@@ -98,6 +114,14 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
    *  the dispatch — no per-call branch on field metadata. See Bridge.ts
    *  file header "Smoothed pulls" for the rationale. */
   private readonly arrayTrajectoryOrder: ReadonlyArray<number>;
+  /** Per-scalar-field circular period. 0 ⇒ ordinary (flat-ℝ one-pole blend,
+   *  bit-exact preserved); > 0 ⇒ angular lane, blended along the shorter arc
+   *  of the circle of that period via `circularLerp`. (0.9.935) */
+  private readonly scalarCircularPeriod: ReadonlyArray<number>;
+  /** Per-array-field circular period — same semantics as the scalar table.
+   *  On a circular TRAJECTORY lane this applies to the position lanes only;
+   *  derivative (rate) lanes are copied verbatim regardless. (0.9.935) */
+  private readonly arrayCircularPeriod: ReadonlyArray<number>;
 
   /** Factory for the lazily-allocated `prev` buffer. Typically
    *  `bridge.scratchFrame.bind(bridge)` so the smoother and the rest of the
@@ -109,6 +133,13 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
    *  allocated, the buffer is reused for the lifetime of the smoother. */
   private prev: FrameFor<S> | null = null;
   private prevValid: boolean = false;
+
+  /** Cumulative cycle slips across all circular lanes (0.9.935): one increment
+   *  per blended angular element whose shorter-arc span exceeded half a period
+   *  (a branch-cut crossing — the discrete monodromy event). Heap-only,
+   *  cumulative across `reset()` (a diagnostic, like the PLL's
+   *  `outliersRejected`). Surfaced via `Bridge.telemetry().cycleSlips`. */
+  private _cycleSlips: number = 0;
 
   constructor(schema: S, allocateFrame: () => FrameFor<S>) {
     this.allocateFrame = allocateFrame;
@@ -150,6 +181,25 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
         const order = f.trajectory?.order ?? 0;
         return order >= 2 ? order : 0;
       }),
+    );
+    // Circular period per field. 0 ⇒ ordinary lane (flat-ℝ blend, bit-exact
+    // preserved). > 0 ⇒ angular lane, blended along the shorter arc. BigInt
+    // and integer kinds are never circular (the constructors only produce
+    // f64/f32), but we guard anyway so a hand-built FieldSpec can't route an
+    // integer lane through the float arc blend.
+    this.scalarCircularPeriod = Object.freeze(
+      scalars.map((f, i) =>
+        f.circular && !this.scalarIsBigInt[i] && !this.scalarIsInteger[i]
+          ? f.circular.period
+          : 0,
+      ),
+    );
+    this.arrayCircularPeriod = Object.freeze(
+      arrays.map((f, i) =>
+        f.circular && !this.arrayIsBigInt[i] && !this.arrayIsInteger[i]
+          ? f.circular.period
+          : 0,
+      ),
     );
   }
 
@@ -199,6 +249,7 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
     const sl = this.scalarLayout;
     const sbi = this.scalarIsBigInt;
     const sii = this.scalarIsInteger;
+    const scp = this.scalarCircularPeriod;
     for (let i = 0; i < sl.length; i++) {
       const name = sl[i]!.name;
       if (sbi[i]) {
@@ -207,8 +258,15 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
       } else {
         const curr = out[name] as number;
         const p = prev[name] as number;
-        let blended = alpha * curr + oneMinusAlpha * p;
-        if (sii[i]) blended = Math.round(blended);
+        const period = scp[i]!;
+        let blended: number;
+        if (period > 0) {
+          // Angular lane: blend along the shorter arc of the circle.
+          blended = this._circularBlend(p, curr, alpha, period);
+        } else {
+          blended = alpha * curr + oneMinusAlpha * p;
+          if (sii[i]) blended = Math.round(blended);
+        }
         out[name] = blended;
         prev[name] = blended;
       }
@@ -218,6 +276,7 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
     const abi = this.arrayIsBigInt;
     const aii = this.arrayIsInteger;
     const ato = this.arrayTrajectoryOrder;
+    const acp = this.arrayCircularPeriod;
     for (let i = 0; i < al.length; i++) {
       const name = al[i]!.name;
       if (abi[i]) {
@@ -230,13 +289,21 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
         const isInt = aii[i];
         const L = cA.length;
         const order = ato[i]!;
+        const period = acp[i]!;
         if (order === 0) {
-          // Plain array (or order=1 trajectory): blend every element.
-          for (let j = 0; j < L; j++) {
-            let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
-            if (isInt) b = Math.round(b);
-            cA[j] = b;
-            pA[j] = b;
+          // Plain array (or order=1 trajectory): blend every element. A
+          // circular plain array blends every element along the shorter arc.
+          if (period > 0) {
+            for (let j = 0; j < L; j++) {
+              cA[j] = pA[j] = this._circularBlend(pA[j]!, cA[j]!, alpha, period);
+            }
+          } else {
+            for (let j = 0; j < L; j++) {
+              let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+              if (isInt) b = Math.round(b);
+              cA[j] = b;
+              pA[j] = b;
+            }
           }
         } else {
           // Trajectory order=2 or order=3. Layout is interleaved:
@@ -245,12 +312,18 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
           // verbatim from curr. Velocity and acceleration are snapshots of
           // the producer's instantaneous state — time-averaging them across
           // frames corrupts the very signal the trajectory ships to preserve.
+          // On a CIRCULAR trajectory the position lanes are angular (shorter-
+          // arc blend); the derivative (rate) lanes stay ordinary copies.
           for (let j = 0; j < L; j++) {
             if ((j % order) === 0) {
-              let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
-              if (isInt) b = Math.round(b);
-              cA[j] = b;
-              pA[j] = b;
+              if (period > 0) {
+                cA[j] = pA[j] = this._circularBlend(pA[j]!, cA[j]!, alpha, period);
+              } else {
+                let b = alpha * cA[j]! + oneMinusAlpha * pA[j]!;
+                if (isInt) b = Math.round(b);
+                cA[j] = b;
+                pA[j] = b;
+              }
             } else {
               // Derivative slot: out already holds curr; sync prev to match.
               pA[j] = cA[j]!;
@@ -259,6 +332,33 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
         }
       }
     }
+  }
+
+  /** Shorter-arc one-pole blend of two angular samples on the circle of the
+   *  given period, counting a cycle slip when the span crosses the branch cut
+   *  (|shorter arc| > period/2 is impossible by construction, so the slip
+   *  test is on the FULL span `curr − prev` reduced — a span whose magnitude
+   *  exceeds half a period means the naive linear blend would have gone the
+   *  wrong way). Allocation-free; one `circularLerp` plus the slip test. */
+  private _circularBlend(prevV: number, currV: number, alpha: number, period: number): number {
+    // A slip is "the two endpoints are more than half a period apart the naive
+    // way" — exactly when the shorter arc disagrees in direction with the raw
+    // difference. Detect via |raw| > period/2 on the raw (un-wrapped) span.
+    const raw = currV - prevV;
+    const absRaw = raw < 0 ? -raw : raw;
+    if (absRaw > 0.5 * period) {
+      this._cycleSlips = (this._cycleSlips + 1) | 0;
+    }
+    return circularLerp(prevV, currV, alpha, period);
+  }
+
+  /** Cumulative cycle slips across all circular lanes since construction
+   *  (0.9.935). One increment per blended angular element whose endpoints
+   *  spanned more than half a period the naive way (a branch-cut crossing).
+   *  Cumulative across `reset()` — a diagnostic, like the PLL's
+   *  `outliersRejected`. Surfaced via `Bridge.telemetry().cycleSlips`. */
+  get cycleSlips(): number {
+    return this._cycleSlips;
   }
 
   /**

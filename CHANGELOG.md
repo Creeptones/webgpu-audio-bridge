@@ -4,6 +4,92 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.935] — 2026-05-31
+
+### Added — Topological Lanes: angular (circular) fields end-to-end
+
+A schema lane can now be declared **circular** — its value lives on the circle
+ℝ/Pℤ (period `P`, default 2π) instead of the real line — and the whole consumer-
+side reconstruction stack is made topology-aware. The motivating producer is a
+**wavefunction** ψ = r·e^{iθ} shipped to an additive / phase-vocoder synth as
+amplitude + phase: the phase lane is angular, and every flat-ℝ operation the
+bridge applied to it (the α-smoother's one-pole blend, the Taylor/Hermite
+extrapolators) silently corrupted it across the ±π branch cut. Blending θ_prev ≈
++π with θ_curr ≈ −π linearly swings the **6-rad long way through 0** — a full-
+amplitude click at the frame seam — instead of the **0.28-rad short way**. The
+fix is the Riemann-surface move: lift to the covering space (unwrap), operate
+there, project back (wrap).
+
+- **`src/circular.ts` — the dependency-free math core.** `wrapSymmetric(x, P)`
+  (project onto `[−P/2, +P/2)`), `shortestArcDelta(a, b, P)` (signed shorter-arc
+  difference, magnitude ≤ P/2 — the angular "b − a"), `circularLerp(a, b, α, P)`
+  (geodesic blend; the SLERP analog for a 1-D circle), and `CircularUnwrapper`
+  (lifts a wrapped stream onto the continuous covering space ℝ, tracking the
+  **winding number** and counting **cycle slips**). All pure, allocation-free,
+  any finite `period > 0`. The documented antipode tie-break resolves the exact
+  ±P/2 ambiguity deterministically.
+- **Schema DSL.** `f64Phase()` / `f32Phase()` (scalar, period 2π) +
+  `f64Circular({ period })` / `f32Circular(…)` (any period) + the array variants
+  `f{32,64}PhaseArray(n)` / `f{32,64}CircularArray(n, { period })` + the
+  trajectory composition `f{32,64}CircularTrajectoryArray(n, { order, period })`.
+  Each attaches a `circular: { period }` tag (`CircularSpec`) propagating onto
+  `FieldSpec` → `CompiledField` → `SchemaLayoutFieldDescription`.
+- **`FrameSmoother` circular blend.** Precomputed per-field period tables drive
+  the dispatch: ordinary lanes take the **bit-exact** pre-feature flat path;
+  circular lanes blend along the shorter arc via `circularLerp`. On a circular
+  trajectory only the angular *position* lanes arc-blend — derivative (rate)
+  lanes copy verbatim exactly as before.
+- **Circular extrapolators.** `evaluateCircularTrajectoryInto` (Taylor sum on
+  the cover, wrapped at output) and `evaluateCircularHermiteTrajectoryInto`
+  (endpoints unwrapped to one sheet via `shortestArcDelta`, cubic Hermite, then
+  wrapped — C¹ across the seam *and* the short way).
+- **Telemetry.** `Bridge.telemetry().cycleSlips` surfaces the cumulative
+  cycle-slip count — the discrete **monodromy** diagnostic (a frame whose phase
+  increment crossed the branch cut). A growing count on a lane you didn't expect
+  to spin flags producer-side phase **aliasing** (advancing > P/2 per frame ⇒
+  Nyquist-undersampled). The angular sibling of the PLL's `outliersRejected` /
+  `stallRecoveries`.
+
+### Why
+
+The bridge's flagship consumer ships complex-valued wavefunction state; the
+bandwidth-efficient amplitude+phase encoding makes the phase lane angular, and
+the existing smoother/extrapolator stack had a structural blind spot there —
+flat-ℝ math glitches a phase at every wrap. This closes that gap with the
+standard covering-space treatment, and the cycle-slip counter turns the
+monodromy structure into a production aliasing diagnostic.
+
+### Wire compatibility
+
+Additive, descriptive-only — like trajectories and timestamps. A circular lane
+is **byte-identical** to the plain f64/f32 field of the same flat length; the
+tag lives on the consumer's `Schema` object, never in the SAB. A pre-0.9.935
+peer and a 0.9.935 peer interoperate transparently. No frame-size change, no new
+active lanes, no public-API break → **patch** bump under the versioning policy.
+The non-circular smoother path is preserved bit-exact (the period-0 dispatch is
+structural).
+
+### Tests
+
+- **`tests/circular.test.ts`** (8 groups, registered in `test` / `test:unit`
+  after `schema.test.ts`) — `wrapSymmetric` band + antipode + custom period;
+  `shortestArcDelta` branch-cut case + magnitude bound; `circularLerp` endpoints
+  + short-way midpoint + flat agreement off-cut; `CircularUnwrapper` continuity +
+  winding + slip count + sticky-reset; schema tag propagation + byte-identity +
+  period validation; the **headline** smoother test (a phase array blends the
+  short way where a plain `f64Array` swings long, `telemetry().cycleSlips` counts
+  the crossings); a non-circular bit-exact guard; and the circular Taylor /
+  Hermite evaluators (short way + flat agreement off-cut).
+
+### Documentation
+
+- **`docs/topological-lanes-design.md`** — the full design: the branch-cut
+  problem, the three primitives + the antipode tie-break, cycle-slips-as-
+  monodromy, the schema/smoother/extrapolator integration, and the deferred
+  scope (circular Kalman, higher-order circular Hermite, SLERP crossfade, set
+  lanes).
+- README API-reference + roadmap mirror.
+
 ## [0.9.934] — 2026-05-31
 
 ### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 1: `MpmcWorkQueue` (the wait-free competing-consumer work queue)

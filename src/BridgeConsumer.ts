@@ -350,6 +350,8 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
       tornFrames: this.ring.tornFrameCount(),
       softFrames: this._softFrames,
       stallRecoveries: this.pll === null ? 0 : this.pll.stallRecoveries,
+      // 0.9.935 — angular monodromy counter; 0 when the smoother is opted out.
+      cycleSlips: this.smoother === null ? 0 : this.smoother.cycleSlips,
       flowScale: this.ring.flowScaleHint(),
       available: this.ring.available(),
       capacity: this.capacity,

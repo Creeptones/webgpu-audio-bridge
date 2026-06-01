@@ -258,6 +258,10 @@ export {
   u8Array, i8Array, f64Array, f32Array,
   // Trajectory array constructors (0.6.1 — Pillar 1 scaffolding)
   f64TrajectoryArray, f32TrajectoryArray,
+  // Circular (angular) field constructors (0.9.935 — Topological Lanes)
+  f64Phase, f32Phase, f64Circular, f32Circular,
+  f64PhaseArray, f32PhaseArray, f64CircularArray, f32CircularArray,
+  f64CircularTrajectoryArray, f32CircularTrajectoryArray,
 } from "./schema.js";
 
 export type {
@@ -276,6 +280,10 @@ export type {
   TrajectoryInterpolationMode,
   TrajectoryArrayOptions,
   WithInvariantOptions,
+  // Circular lanes (0.9.935)
+  CircularSpec,
+  CircularOptions,
+  CircularTrajectoryArrayOptions,
 } from "./schema.js";
 
 export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
@@ -290,7 +298,27 @@ export {
   evaluateHermiteTrajectoryInto,
   evaluateQuinticHermiteTrajectoryInto,
   evaluateSepticHermiteTrajectoryInto,
+  // Circular (angular) evaluators — shorter-arc Taylor + cubic Hermite over a
+  // phase lane, re-wrapped at output. 0.9.935 (Topological Lanes).
+  evaluateCircularTrajectoryInto,
+  evaluateCircularHermiteTrajectoryInto,
 } from "./trajectory.js";
+
+// ── Circular (angular) lane math (0.9.935 — Topological Lanes) ─────────────
+//
+// The dependency-free topological core under `f64Phase` / `f64Circular`:
+// `wrapSymmetric` (project onto [−P/2, +P/2)), `shortestArcDelta` (signed
+// shorter-arc difference), `circularLerp` (geodesic blend), and
+// `CircularUnwrapper` (lift a wrapped stream onto the covering space ℝ,
+// tracking the winding number + counting cycle slips — the angular monodromy
+// diagnostic). See src/circular.ts + docs/topological-lanes-design.md.
+export {
+  wrapSymmetric,
+  shortestArcDelta,
+  circularLerp,
+  CircularUnwrapper,
+  TWO_PI,
+} from "./circular.js";
 
 // ── Click-free crossfade primitive (0.9.87 — God-Node Stage 1) ─────────────
 //

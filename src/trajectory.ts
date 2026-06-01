@@ -85,6 +85,7 @@
  */
 
 import type { TrajectorySpec } from "./schema.js";
+import { wrapSymmetric, shortestArcDelta, TWO_PI } from "./circular.js";
 
 /** Does this spec carry any per-sample safety clamp? Used to select the
  *  fast path (no clamps, 0.6.6 bit-exact) vs the clamped path. */
@@ -697,5 +698,206 @@ export function evaluateSepticHermiteTrajectoryInto(
     out[i] =
       h0 * p0 + h1s * v0 + h2s * a0 + h3s * j0 +
       h4 * p1 + h5s * v1 + h6s * a1 + h7s * j1;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Circular (angular) trajectory evaluation (0.9.935 — Topological Lanes)
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * The evaluators above all operate in flat ℝ: a position lane is just a real
+ * number, extrapolated as `p + v·dt + …` and interpolated as a Hermite blend
+ * of endpoint positions. For an ANGULAR position lane (a `f64Phase` /
+ * `f64CircularArray` field — value lives on the circle ℝ/periodℤ) that is
+ * WRONG across the ±period/2 branch cut: linearly blending p0 ≈ +π with
+ * p1 ≈ −π interpolates the long way through 0, a full-amplitude swing exactly
+ * at the frame seam. The fix mirrors the Riemann-surface move — lift to the
+ * covering space, operate there, project back:
+ *
+ *   - Circular TAYLOR. Position is angular, but the derivative lanes
+ *     (velocity, acceleration, jerk) are ordinary RATES (radians per unit
+ *     time), and the increment `v·dt + ½a·dt² + …` is a genuine real
+ *     displacement on the cover. So the body is the SAME Taylor sum as the
+ *     flat path; only the final result is projected back with
+ *     `wrapSymmetric(·, period)`. (For order=1 the "extrapolation" is a hold,
+ *     so circular order-1 just wraps the stored position.)
+ *
+ *   - Circular HERMITE. The two endpoint positions p0, p1 are angular. We
+ *     UNWRAP p1 relative to p0 — replace it with `p0 + shortestArcDelta(p0,p1)`
+ *     so the pair is adjacent on the cover (never more than half a period
+ *     apart) — run the ordinary Hermite basis on the unwrapped endpoints
+ *     (endpoint velocities are rates, used as-is), and `wrapSymmetric` the
+ *     output. The C¹ continuity of the underlying basis is preserved on the
+ *     cover, and wrapping is a (locally) isometry, so the reconstructed phase
+ *     is C¹ across the seam AND takes the short way around.
+ *
+ * `period` defaults to 2π (audio phase). Both evaluators are allocation-free
+ * and bit-exact-equal to their flat counterparts whenever the signal never
+ * approaches the branch cut (the wrap is then a no-op and the unwrap delta
+ * equals the raw difference). f64/f32 dispatch via the same typed-array
+ * element-write truncation as the flat paths. */
+
+/** Circular Taylor extrapolation: like `evaluateTrajectoryInto` but the
+ *  position lanes are angular — the Taylor sum is computed in flat ℝ (the
+ *  derivative lanes are ordinary rates) and the result is wrapped into
+ *  `[−period/2, +period/2)`. `period` defaults to 2π. Safety clamps are not
+ *  consulted on this path (they target unbounded linear excursion; a wrapped
+ *  angle is bounded by construction) — pass a clamp-free spec. */
+export function evaluateCircularTrajectoryInto(
+  flat: Float64Array,
+  spec: TrajectorySpec,
+  dt: number,
+  out: Float64Array,
+  period?: number,
+): void;
+export function evaluateCircularTrajectoryInto(
+  flat: Float32Array,
+  spec: TrajectorySpec,
+  dt: number,
+  out: Float32Array,
+  period?: number,
+): void;
+export function evaluateCircularTrajectoryInto(
+  flat: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  dt: number,
+  out: Float64Array | Float32Array,
+  period: number = TWO_PI,
+): void {
+  const { order, sampleCount } = spec;
+  if (!Number.isFinite(period) || period <= 0) {
+    throw new Error(`evaluateCircularTrajectoryInto: period must be finite positive, got ${period}`);
+  }
+  if (out.length < sampleCount) {
+    throw new Error(
+      `evaluateCircularTrajectoryInto: out length ${out.length} < sampleCount ${sampleCount}`,
+    );
+  }
+  const required = sampleCount * order;
+  if (flat.length < required) {
+    throw new Error(
+      `evaluateCircularTrajectoryInto: flat length ${flat.length} < sampleCount * order (${required})`,
+    );
+  }
+  switch (order) {
+    case 1: {
+      for (let i = 0; i < sampleCount; i++) out[i] = wrapSymmetric(flat[i]!, period);
+      return;
+    }
+    case 2: {
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 2;
+        out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt, period);
+      }
+      return;
+    }
+    case 3: {
+      const halfDt2 = 0.5 * dt * dt;
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 3;
+        out[i] = wrapSymmetric(flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2, period);
+      }
+      return;
+    }
+    case 4: {
+      const halfDt2 = 0.5 * dt * dt;
+      const sixthDt3 = (1 / 6) * dt * dt * dt;
+      for (let i = 0; i < sampleCount; i++) {
+        const j = i * 4;
+        out[i] = wrapSymmetric(
+          flat[j]! + flat[j + 1]! * dt + flat[j + 2]! * halfDt2 + flat[j + 3]! * sixthDt3,
+          period,
+        );
+      }
+      return;
+    }
+  }
+}
+
+/** Circular cubic Hermite (C¹) reconstruction between two consecutive angular
+ *  trajectory frames. Like `evaluateHermiteTrajectoryInto` but each sample's
+ *  endpoint positions are UNWRAPPED relative to each other (shorter arc)
+ *  before the cubic blend, and the result is wrapped into
+ *  `[−period/2, +period/2)`. Requires `spec.order >= 2`. `period` defaults to
+ *  2π. The endpoint velocities are ordinary rates (radians per
+ *  `segmentSeconds`-unit), used as the spline tangents exactly as in the flat
+ *  path. */
+export function evaluateCircularHermiteTrajectoryInto(
+  flatPrev: Float64Array,
+  flatCurr: Float64Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array,
+  period?: number,
+): void;
+export function evaluateCircularHermiteTrajectoryInto(
+  flatPrev: Float32Array,
+  flatCurr: Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float32Array,
+  period?: number,
+): void;
+export function evaluateCircularHermiteTrajectoryInto(
+  flatPrev: Float64Array | Float32Array,
+  flatCurr: Float64Array | Float32Array,
+  spec: TrajectorySpec,
+  t: number,
+  segmentSeconds: number,
+  out: Float64Array | Float32Array,
+  period: number = TWO_PI,
+): void {
+  const { order, sampleCount } = spec;
+  if (order < 2) {
+    throw new Error(
+      `evaluateCircularHermiteTrajectoryInto: spec.order must be >= 2 (need endpoint velocities), got order=${order}`,
+    );
+  }
+  if (!Number.isFinite(period) || period <= 0) {
+    throw new Error(`evaluateCircularHermiteTrajectoryInto: period must be finite positive, got ${period}`);
+  }
+  if (!Number.isFinite(t)) {
+    throw new Error(`evaluateCircularHermiteTrajectoryInto: t must be finite, got ${t}`);
+  }
+  if (!Number.isFinite(segmentSeconds)) {
+    throw new Error(
+      `evaluateCircularHermiteTrajectoryInto: segmentSeconds must be finite, got ${segmentSeconds}`,
+    );
+  }
+  if (out.length < sampleCount) {
+    throw new Error(
+      `evaluateCircularHermiteTrajectoryInto: out length ${out.length} < sampleCount ${sampleCount}`,
+    );
+  }
+  const required = sampleCount * order;
+  if (flatPrev.length < required || flatCurr.length < required) {
+    throw new Error(
+      `evaluateCircularHermiteTrajectoryInto: flat length < sampleCount * order (${required})`,
+    );
+  }
+
+  // Resolve the cubic basis once per call (signal-independent), matching the
+  // flat path exactly.
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h00 = 2 * t3 - 3 * t2 + 1;
+  const h10 = t3 - 2 * t2 + t;
+  const h01 = -2 * t3 + 3 * t2;
+  const h11 = t3 - t2;
+  const h10s = h10 * segmentSeconds;
+  const h11s = h11 * segmentSeconds;
+
+  const stride = order;
+  for (let i = 0; i < sampleCount; i++) {
+    const j = i * stride;
+    const p0 = flatPrev[j]!;
+    const m0 = flatPrev[j + 1]!;
+    // Unwrap p1 onto the same sheet as p0 (shorter arc), so the cubic blend
+    // never traverses the long way around the circle.
+    const p1 = p0 + shortestArcDelta(p0, flatCurr[j]!, period);
+    const m1 = flatCurr[j + 1]!;
+    out[i] = wrapSymmetric(h00 * p0 + h10s * m0 + h01 * p1 + h11s * m1, period);
   }
 }

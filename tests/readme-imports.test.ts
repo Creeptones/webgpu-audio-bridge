@@ -73,6 +73,16 @@ import {
   f64TrajectoryArray,
   // Trajectory evaluator (0.6.1 / 0.7.3)
   evaluateTrajectoryInto,
+  // Circular (angular) lanes (0.9.935)
+  f64Phase,
+  f64Circular,
+  f64PhaseArray,
+  wrapSymmetric,
+  shortestArcDelta,
+  circularLerp,
+  CircularUnwrapper,
+  evaluateCircularTrajectoryInto,
+  evaluateCircularHermiteTrajectoryInto,
   // Canonical schema (post-0.9.0; legacy variant removed)
   physicsControlFrameSchema,
 } from "../src/index.js";
@@ -106,6 +116,9 @@ function main(): void {
     f64Array, f32Array,
     f64TrajectoryArray,
     evaluateTrajectoryInto,
+    f64Phase, f64Circular, f64PhaseArray,
+    wrapSymmetric, shortestArcDelta, circularLerp, CircularUnwrapper,
+    evaluateCircularTrajectoryInto, evaluateCircularHermiteTrajectoryInto,
     physicsControlFrameSchema,
   };
   for (const [name, value] of Object.entries(valueExports)) {

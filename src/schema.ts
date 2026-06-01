@@ -164,7 +164,32 @@
  * frame byte layout — they label existing fields. A 0.6.4 peer and a
  * 0.6.5 peer share a SAB transparently; the timestamps spec lives on
  * the consumer's `Schema` object (heap), never in the SAB header.
+ *
+ * ─── Circular (angular) lanes (0.9.935) ────────────────────────────────────
+ *
+ * `f64Phase()` / `f32Phase()` (scalar) and `f64PhaseArray(n)` /
+ * `f32PhaseArray(n)` (array) declare a field whose value(s) live on the
+ * circle ℝ/2πℤ — audio phase. `f{32,64}Circular({ period })` and
+ * `f{32,64}CircularArray(n, { period })` generalize to any finite positive
+ * period (1 for normalized [0,1) phase, 360 for degrees, 12 for pitch
+ * classes). `f{32,64}CircularTrajectoryArray(n, { order, period })` composes
+ * an angular position lane with ordinary derivative lanes.
+ *
+ * These attach a `circular: { period }` tag (see `CircularSpec`) and are
+ * byte-identical to the plain f64/f32 field of the same flat length. The tag
+ * tells topology-aware consumers — `FrameSmoother`'s geodesic blend and the
+ * circular Taylor / Hermite evaluators — to operate along the SHORTER ARC of
+ * the circle and re-wrap at output, instead of blending/extrapolating in flat
+ * ℝ (which corrupts the lane whenever it crosses the ±period/2 branch cut).
+ * See src/circular.ts for the math and docs/topological-lanes-design.md.
+ *
+ * Wire compatibility: descriptive only, like trajectories and timestamps. A
+ * circular lane and its plain f64/f32 twin produce identical SAB bytes; a
+ * pre-0.9.935 peer and a 0.9.935 peer interoperate transparently. Only the
+ * consumer-side reconstruction differs.
  */
+
+import { TWO_PI } from "./circular.js";
 
 export type FieldKind =
   | "u64" | "i64"
@@ -294,6 +319,27 @@ export interface TrajectorySpec {
   readonly interpolationMode?: TrajectoryInterpolationMode;
 }
 
+/** Descriptive metadata attached to fields built via the circular
+ *  constructors (`f{32,64}Phase` / `f{32,64}Circular` and their `*Array`
+ *  variants, 0.9.935). Marks the field's value(s) as living on the circle
+ *  ℝ/`period`ℤ rather than the real line, so topology-aware consumers
+ *  (FrameSmoother's geodesic blend, the circular Taylor / Hermite
+ *  evaluators) operate along the shorter arc and re-wrap at output instead
+ *  of corrupting the lane across the ±period/2 branch cut.
+ *
+ *  Wire-compatible: pure schema metadata, identical SAB bytes to the plain
+ *  f64/f32 array of the same flat length. A circular lane and its plain twin
+ *  interoperate transparently; only the consumer-side interpretation differs.
+ *  Composes with `trajectory` — a `f64CircularTrajectoryArray` carries BOTH
+ *  tags (the position lanes are angular; the derivative lanes are ordinary
+ *  rates, blended/copied as usual). */
+export interface CircularSpec {
+  /** The circle's period. A full turn. Default `2π` (`f64Phase`); any finite
+   *  positive value is allowed (`1` for a normalized [0,1) phase, `360` for
+   *  degrees, `12` for pitch classes). */
+  readonly period: number;
+}
+
 export interface FieldSpec<T = unknown> {
   readonly kind: FieldKind;
   /** Omitted = scalar; positive integer = fixed-length array. */
@@ -304,6 +350,10 @@ export interface FieldSpec<T = unknown> {
   readonly _t?: T;
   /** Present iff this field was built via `f{32,64}TrajectoryArray`. */
   readonly trajectory?: TrajectorySpec;
+  /** Present iff this field was built via a circular constructor
+   *  (`f{32,64}Phase` / `f{32,64}Circular` / their array + trajectory
+   *  variants). Marks the value(s) as angular — see `CircularSpec`. */
+  readonly circular?: CircularSpec;
 }
 
 // ─── Scalar field constructors ─────────────────────────────────────────────
@@ -486,6 +536,115 @@ export const f32TrajectoryArray = (
 ): FieldSpec<Float32Array> =>
   trajectoryArray<Float32Array>("f32", n, opts);
 
+// ─── Circular (angular) field constructors (0.9.935) ───────────────────────
+//
+// Byte-wise identical to the plain f64/f32 scalar/array of the same flat
+// length; the `circular` tag marks the value(s) as living on the circle
+// ℝ/periodℤ so topology-aware consumers blend along the shorter arc and
+// re-wrap at output. `f{32,64}Phase` fixes period = 2π (the audio-phase
+// case); `f{32,64}Circular({ period })` lets the caller pick any finite
+// positive period. See src/circular.ts for the math and
+// docs/topological-lanes-design.md for the design.
+
+/** Options for the general circular constructors. `period` defaults to 2π. */
+export interface CircularOptions {
+  /** The circle's period (a full turn). Default `2π`. Must be finite > 0. */
+  readonly period?: number;
+}
+
+function resolvePeriod(period: number | undefined, label: string): number {
+  const p = period ?? TWO_PI;
+  if (typeof p !== "number" || !Number.isFinite(p) || p <= 0) {
+    throw new Error(`Schema: ${label} period must be a finite positive number, got ${String(p)}`);
+  }
+  return p;
+}
+
+function circularScalar<T>(kind: "f64" | "f32", period: number): FieldSpec<T> {
+  return Object.freeze({
+    kind,
+    byteSize: kindByteSize(kind),
+    circular: Object.freeze({ period }),
+  }) as FieldSpec<T>;
+}
+
+function circularArray<T>(kind: "f64" | "f32", n: number, period: number): FieldSpec<T> {
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`Schema: circular array length must be a positive integer, got ${n}`);
+  }
+  return Object.freeze({
+    kind,
+    length: n,
+    byteSize: kindByteSize(kind) * n,
+    circular: Object.freeze({ period }),
+  }) as FieldSpec<T>;
+}
+
+/** Scalar audio phase: a circular f64 with period 2π. */
+export const f64Phase = (): FieldSpec<number> => circularScalar<number>("f64", TWO_PI);
+/** Scalar audio phase: a circular f32 with period 2π. */
+export const f32Phase = (): FieldSpec<number> => circularScalar<number>("f32", TWO_PI);
+/** Scalar circular f64 with a caller-chosen period (default 2π). */
+export const f64Circular = (opts: CircularOptions = {}): FieldSpec<number> =>
+  circularScalar<number>("f64", resolvePeriod(opts.period, "f64Circular"));
+/** Scalar circular f32 with a caller-chosen period (default 2π). */
+export const f32Circular = (opts: CircularOptions = {}): FieldSpec<number> =>
+  circularScalar<number>("f32", resolvePeriod(opts.period, "f32Circular"));
+
+/** Array of audio phases: circular f64 array, period 2π. */
+export const f64PhaseArray = (n: number): FieldSpec<Float64Array> =>
+  circularArray<Float64Array>("f64", n, TWO_PI);
+/** Array of audio phases: circular f32 array, period 2π. */
+export const f32PhaseArray = (n: number): FieldSpec<Float32Array> =>
+  circularArray<Float32Array>("f32", n, TWO_PI);
+/** Array of circular f64 values with a caller-chosen period (default 2π). */
+export const f64CircularArray = (n: number, opts: CircularOptions = {}): FieldSpec<Float64Array> =>
+  circularArray<Float64Array>("f64", n, resolvePeriod(opts.period, "f64CircularArray"));
+/** Array of circular f32 values with a caller-chosen period (default 2π). */
+export const f32CircularArray = (n: number, opts: CircularOptions = {}): FieldSpec<Float32Array> =>
+  circularArray<Float32Array>("f32", n, resolvePeriod(opts.period, "f32CircularArray"));
+
+// Circular trajectory arrays — the composition of an angular position lane
+// with ordinary derivative lanes. Position lanes (`j % order === 0`) are
+// angular (shorter-arc blend / unwrap-extrapolate-rewrap); velocity /
+// acceleration / jerk lanes are ordinary RATES (radians per unit time), blended
+// and extrapolated linearly as usual. Carries BOTH the `trajectory` and
+// `circular` tags. Byte-identical to the plain trajectory array of the same
+// (n, order).
+
+/** Options for the circular trajectory constructors: the trajectory options
+ *  plus a `period` (default 2π) for the angular position lanes. */
+export interface CircularTrajectoryArrayOptions extends TrajectoryArrayOptions {
+  /** Period of the angular position lanes. Default `2π`. Must be finite > 0. */
+  readonly period?: number;
+}
+
+function circularTrajectoryArray<T>(
+  kind: "f64" | "f32",
+  n: number,
+  opts: CircularTrajectoryArrayOptions,
+): FieldSpec<T> {
+  const period = resolvePeriod(opts.period, `${kind}CircularTrajectoryArray`);
+  const base = trajectoryArray<T>(kind, n, opts);
+  return Object.freeze({
+    kind: base.kind,
+    length: base.length,
+    byteSize: base.byteSize,
+    trajectory: base.trajectory,
+    circular: Object.freeze({ period }),
+  }) as FieldSpec<T>;
+}
+
+export const f64CircularTrajectoryArray = (
+  n: number,
+  opts: CircularTrajectoryArrayOptions,
+): FieldSpec<Float64Array> => circularTrajectoryArray<Float64Array>("f64", n, opts);
+
+export const f32CircularTrajectoryArray = (
+  n: number,
+  opts: CircularTrajectoryArrayOptions,
+): FieldSpec<Float32Array> => circularTrajectoryArray<Float32Array>("f32", n, opts);
+
 // ─── Schema container + inference ──────────────────────────────────────────
 
 export type FieldsObject = Record<string, FieldSpec<unknown>>;
@@ -503,6 +662,9 @@ export interface CompiledField {
   /** Present iff this field was built via `f{32,64}TrajectoryArray`.
    *  Descriptive only — does not affect SAB byte layout. */
   readonly trajectory?: TrajectorySpec;
+  /** Present iff this field was built via a circular constructor (0.9.935).
+   *  Descriptive only — does not affect SAB byte layout. */
+  readonly circular?: CircularSpec;
 }
 
 export interface CompiledLayout {
@@ -663,6 +825,9 @@ export interface SchemaLayoutFieldDescription {
    *  the FieldSpec so worklet-side inliners can do the same (p, v, [a])
    *  interpretation as the main-thread Bridge. */
   readonly trajectory?: TrajectorySpec;
+  /** Present iff the field was declared circular (0.9.935). Carried over so
+   *  worklet-side inliners apply the same angular shorter-arc handling. */
+  readonly circular?: CircularSpec;
 }
 
 export interface SchemaLayoutDescription {
@@ -740,6 +905,7 @@ function compileLayout(
         isArray,
         byteOffset: offset,
         ...(spec.trajectory ? { trajectory: spec.trajectory } : {}),
+        ...(spec.circular ? { circular: spec.circular } : {}),
       }),
     );
     typesPresentSet.add(spec.kind);
@@ -1009,9 +1175,8 @@ export function describeSchemaLayout(
     const base: SchemaLayoutFieldDescription = f.isArray
       ? { kind: f.kind, byteOffset: f.byteOffset, length: f.length }
       : { kind: f.kind, byteOffset: f.byteOffset };
-    fields[f.name] = f.trajectory
-      ? { ...base, trajectory: f.trajectory }
-      : base;
+    const withTraj = f.trajectory ? { ...base, trajectory: f.trajectory } : base;
+    fields[f.name] = f.circular ? { ...withTraj, circular: f.circular } : withTraj;
   }
   return Object.freeze({
     headerBytes: 32,
