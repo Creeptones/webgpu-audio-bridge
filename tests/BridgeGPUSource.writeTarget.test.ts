@@ -395,6 +395,41 @@ const noopEncoder: GpuCommandEncoderLike = {
   copyBufferToBuffer(_s, _so, _d, _do, _size) { /* no-op */ },
 };
 
+// ── 0.9.946 latest-only coalescing ─────────────────────────────────────────
+function testLatestOnlyCoalescesScheduledSlots(): void {
+  const device = makeMockDevice();
+  const bridge = makeBridge();
+  const copiedDestinations: GpuBufferLike[] = [];
+  const encoder: GpuCommandEncoderLike = {
+    copyBufferToBuffer(_s, _so, destination, _do, _size) {
+      copiedDestinations.push(destination);
+    },
+  };
+  const src = new BridgeGPUSource(device, bridge, noopDecoder, {
+    stagingBufferCount: 2,
+    backpressureMode: "latest-only",
+  });
+
+  assertEq(src.backpressureMode(), "latest-only", "mode reports latest-only");
+  assert(src.scheduleReadback(dummySrcBuffer, encoder), "first schedule uses slot 0");
+  assert(src.scheduleReadback(dummySrcBuffer, encoder), "second schedule uses slot 1");
+  assert(src.scheduleReadback(dummySrcBuffer, encoder), "third schedule coalesces into newest scheduled slot");
+  assertEq(src.coalescedCount(), 1, "one stale scheduled readback was replaced");
+  assertEq(copiedDestinations.length, 3, "three copies were encoded");
+  assertEq(copiedDestinations[2], copiedDestinations[1], "third copy reused the newest scheduled destination");
+
+  src.flushPending();
+  assertEq(
+    src.scheduleReadback(dummySrcBuffer, encoder),
+    false,
+    "latest-only never reuses in-flight mapAsync slots",
+  );
+  assertEq(src.coalescedCount(), 1, "in-flight rejection does not increment coalescedCount");
+
+  src.destroy();
+  ok("latest-only backpressure coalesces scheduled slots but never in-flight slots");
+}
+
 /** Drain pending microtasks. `await Promise.resolve()` once per hop;
  *  three hops cover the rejection handler chain (`p.then(...)` → user
  *  callback) plus a small safety margin. */
@@ -669,6 +704,7 @@ async function main(): Promise<void> {
   testExplicitSharedThrows();
   testValidationBeforeWriteTargetBuild();
   testEnvReportWebgpuZeroCopyFalse();
+  testLatestOnlyCoalescesScheduledSlots();
   await testOnErrorTransient();
   await testOnErrorFatal();
   await testNoOnErrorSilent();

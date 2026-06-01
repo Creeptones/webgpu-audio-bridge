@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REQUIRE_WEBGPU_READBACK: "0"
+      WEBGPU_READBACK_BASELINE_ID: ""
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

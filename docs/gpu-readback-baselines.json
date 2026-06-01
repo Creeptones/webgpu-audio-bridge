@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "units": "us",
+  "description": "Policy and measured-baseline registry for BridgeGPUSource real WebGPU readback runs. Baseline stats must come from tests/browser/webgpu-readback.spec.ts artifacts on real hardware. Do not add synthetic numbers.",
+  "policy": {
+    "minSamples": 24,
+    "absoluteCaps": {
+      "p95FailUs": 50000,
+      "p99FailUs": 100000
+    },
+    "regression": {
+      "p95WarnRatio": 1.3,
+      "p95FailRatio": 1.75,
+      "p99WarnRatio": 1.5,
+      "p99FailRatio": 2
+    }
+  },
+  "baselines": []
+}

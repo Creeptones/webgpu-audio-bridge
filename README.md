@@ -98,6 +98,10 @@ const stats = source.readbackLatencyStats();
 console.log(stats.p50Us, stats.p95Us, stats.p99Us);
 ```
 
+For bursty control-rate producers, `backpressureMode: "latest-only"` replaces a
+not-yet-flushed scheduled readback with the newest copy instead of preserving
+stale intermediate frames.
+
 Write targets:
 
 - `auto`: resolves to `map-async` today
@@ -191,6 +195,11 @@ PowerShell:
 $env:REQUIRE_WEBGPU_READBACK = "1"
 npm run test:browser:webgpu
 ```
+
+Readback threshold policy:
+
+- [GPU readback measurement](./docs/gpu-readback-measurement.md)
+- [GPU readback baselines](./docs/gpu-readback-baselines.json)
 
 ## Docs map
 

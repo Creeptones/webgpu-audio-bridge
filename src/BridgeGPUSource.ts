@@ -195,6 +195,18 @@ const GPU_MAP_MODE_READ = 0x0001;
  */
 export type WriteTargetKind = "auto" | "map-async" | "shared";
 
+/** Back-pressure policy for `scheduleReadback()` when no idle staging slot
+ *  is available.
+ *
+ *   - `"reject"` is the historical behavior: return `false` and let the
+ *     producer decide whether to skip, slow down, or retry.
+ *
+ *   - `"latest-only"` coalesces bursts before `flushPending()`: if all idle
+ *     slots are gone but at least one slot is still only `scheduled`, encode
+ *     the new copy into the newest scheduled slot instead of queueing stale
+ *     data. In-flight `mapAsync` slots are never touched. */
+export type ReadbackBackpressureMode = "reject" | "latest-only";
+
 /** Rolling latency snapshot for real GPU readback measurement (0.9.945).
  *
  * Values are microseconds measured from `flushPending()` starting `mapAsync`
@@ -372,12 +384,12 @@ function buildWriteTarget(
   }
   if (resolved === "shared") {
     throw new Error(
-      "BridgeGPUSource: writeTarget 'shared' is not available in this build. " +
-        "The W3C zero-copy / shared-memory readback interface has not shipped " +
-        "in any browser as of 2026-06; once it lands, this library will ship a " +
-        "SharedMemoryWriteTarget implementation. Use 'map-async' (or the default " +
-        "'auto', which resolves to 'map-async' today). Inspect " +
-        "getEnvironmentReport().webgpuZeroCopy for the platform capability sniff.",
+      "BridgeGPUSource: writeTarget 'shared' is future-only and is not " +
+        "implemented in this package. No browser-supported zero-copy " +
+        "GPU-to-SharedArrayBuffer readback path is available to this library " +
+        "today; use 'map-async' or the default 'auto', which resolves to " +
+        "'map-async'. getEnvironmentReport().webgpuZeroCopy is only a " +
+        "capability sniff, not proof that this package can bypass mapAsync.",
     );
   }
   // Defensive: TypeScript narrows `resolved` to never here, but the
@@ -392,6 +404,9 @@ type StagingState = "idle" | "scheduled" | "in-flight" | "ready";
 
 interface StagingSlot {
   state: StagingState;
+  /** Monotonic schedule order used by `"latest-only"` coalescing to replace
+   *  the most recently scheduled slot, independent of slot index reuse. */
+  scheduledAt: number;
   /** Set when `beginMap` resolves. Cleared in `pollCompleted` after
    *  the decoder runs. */
   mapped: boolean;
@@ -421,6 +436,11 @@ export interface BridgeGPUSourceOptions {
    *  GPU pipelining at the cost of `frameByteSize × count` of GPU
    *  memory. */
   readonly stagingBufferCount?: number;
+  /** Policy when `scheduleReadback()` finds no idle staging slot.
+   *  Default `"reject"` preserves pre-0.9.946 behavior. `"latest-only"`
+   *  replaces a not-yet-flushed scheduled slot with the newest copy, reducing
+   *  stale readback buildup under bursty producers. */
+  readonly backpressureMode?: ReadbackBackpressureMode;
   /** Override for the staging buffer size in bytes. Defaults to the
    *  bridge's `frameByteSize` (one full frame per readback). Set
    *  larger if your source buffer's `copyBufferToBuffer` size is
@@ -572,6 +592,16 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  in the resolving microtask instead of waiting for `pollCompleted()`. */
   private readonly _autoDrain: boolean;
 
+  /** Readback pressure policy (0.9.946). Default `"reject"` preserves the old
+   *  return-false contract. `"latest-only"` may reuse a `scheduled` slot before
+   *  mapAsync begins, so bursts keep the newest copy instead of stale copies. */
+  private readonly _backpressureMode: ReadbackBackpressureMode;
+
+  /** Count of scheduled readbacks replaced by `"latest-only"` coalescing. */
+  private _coalescedCount: number = 0;
+  /** Monotonic schedule serial. Heap-only; wraps only after 2^53 schedules. */
+  private _scheduleSerial: number = 0;
+
   /** Set by `destroy()`. A microtask scheduled before `destroy()` but firing
    *  after it must NOT touch the now-destroyed staging buffers; the auto-drain
    *  guard bails when this is set. */
@@ -587,6 +617,13 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     if (!Number.isFinite(count) || count < 2 || count !== Math.floor(count)) {
       throw new Error(
         `BridgeGPUSource: stagingBufferCount must be an integer ≥ 2 (got ${count})`,
+      );
+    }
+    const backpressureMode = opts.backpressureMode ?? "reject";
+    if (backpressureMode !== "reject" && backpressureMode !== "latest-only") {
+      throw new Error(
+        `BridgeGPUSource: backpressureMode must be 'reject' or 'latest-only' ` +
+          `(got ${String(backpressureMode)})`,
       );
     }
     const size = opts.stagingBufferSize ?? bridge.schema.frameByteSize;
@@ -626,6 +663,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     }
     this.bridge = bridge;
     this._autoDrain = autoPoll === "microtask";
+    this._backpressureMode = backpressureMode;
     this._rawMode = rawMode;
     this.decoder = rawMode ? null : (decoder as GpuReadbackDecoder<S>);
     this._readbackLatencySamples = new Float64Array(sampleCount);
@@ -653,6 +691,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     for (let i = 0; i < count; i++) {
       this.slots[i] = {
         state: "idle",
+        scheduledAt: 0,
         mapped: false,
         pending: null,
         mapStartedAtMs: 0,
@@ -677,10 +716,17 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     encoder: GpuCommandEncoderLike,
     srcOffset: number = 0,
   ): boolean {
-    const slotIndex = this._acquireIdleSlotIndex();
-    if (slotIndex < 0) return false;
+    let slotIndex = this._acquireIdleSlotIndex();
+    if (slotIndex < 0) {
+      if (this._backpressureMode !== "latest-only") return false;
+      slotIndex = this._acquireScheduledSlotIndex();
+      if (slotIndex < 0) return false;
+      this._coalescedCount = (this._coalescedCount + 1) | 0;
+    }
     this.writeTarget.encodeCopy(slotIndex, srcBuffer, srcOffset, encoder);
-    this.slots[slotIndex]!.state = "scheduled";
+    const slot = this.slots[slotIndex]!;
+    slot.state = "scheduled";
+    slot.scheduledAt = ++this._scheduleSerial;
     return true;
   }
 
@@ -699,6 +745,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       const slot = this.slots[i]!;
       if (slot.state === "scheduled") {
         slot.state = "in-flight";
+        slot.scheduledAt = 0;
         slot.mapped = false;
         // 0.7.3 — capture the mapAsync start timestamp. `performance.now()`
         // is available in all the host environments this library targets
@@ -804,6 +851,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         this._recordReadbackUs((performance.now() - slot.mapStartedAtMs) * 1000);
       }
       slot.state = "idle";
+      slot.scheduledAt = 0;
       slot.mapped = false;
       slot.pending = null;
       slot.mapStartedAtMs = 0;
@@ -912,6 +960,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
         }
       } finally {
         slot.state = "idle";
+        slot.scheduledAt = 0;
         slot.mapped = false;
         slot.pending = null;
         slot.mapStartedAtMs = 0;
@@ -1079,6 +1128,17 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     return this._rawMode ? "raw" : "closure";
   }
 
+  /** Back-pressure policy selected for `scheduleReadback()` (0.9.946). */
+  backpressureMode(): ReadbackBackpressureMode {
+    return this._backpressureMode;
+  }
+
+  /** Number of not-yet-flushed scheduled readbacks replaced by
+   *  `"latest-only"` coalescing (0.9.946). */
+  coalescedCount(): number {
+    return this._coalescedCount;
+  }
+
   /** Record one completed mapAsync→drain cycle into the bounded latency
    *  window. Allocation-free; stats are computed lazily on demand. */
   private _recordReadbackUs(us: number): void {
@@ -1107,5 +1167,21 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
       if (this.slots[i]!.state === "idle") return i;
     }
     return -1;
+  }
+
+  /** Internal: find the newest slot that is still only scheduled. These slots
+   *  have not started mapAsync, so `"latest-only"` can safely encode a newer
+   *  copy into the same staging destination. In-flight slots are never reused. */
+  private _acquireScheduledSlotIndex(): number {
+    let newestIndex = -1;
+    let newestSerial = -1;
+    for (let i = 0; i < this.slots.length; i++) {
+      const slot = this.slots[i]!;
+      if (slot.state === "scheduled" && slot.scheduledAt > newestSerial) {
+        newestIndex = i;
+        newestSerial = slot.scheduledAt;
+      }
+    }
+    return newestIndex;
   }
 }

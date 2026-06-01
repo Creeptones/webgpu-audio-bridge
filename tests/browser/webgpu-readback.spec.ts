@@ -7,8 +7,92 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const REQUIRE_WEBGPU = process.env.REQUIRE_WEBGPU_READBACK === "1";
+const BASELINE_ID = process.env.WEBGPU_READBACK_BASELINE_ID ?? "";
+
+interface ReadbackBaselinePolicy {
+  version: number;
+  units: "us";
+  policy: {
+    minSamples: number;
+    absoluteCaps: {
+      p95FailUs: number;
+      p99FailUs: number;
+    };
+    regression: {
+      p95WarnRatio: number;
+      p95FailRatio: number;
+      p99WarnRatio: number;
+      p99FailRatio: number;
+    };
+  };
+  baselines: Array<{
+    id: string;
+    measured: boolean;
+    stats?: {
+      p50Us: number;
+      p95Us: number;
+      p99Us: number;
+    };
+  }>;
+}
+
+function loadBaselinePolicy(): ReadbackBaselinePolicy {
+  return JSON.parse(
+    readFileSync(new URL("../../docs/gpu-readback-baselines.json", import.meta.url), "utf8"),
+  ) as ReadbackBaselinePolicy;
+}
+
+function evaluatePolicy(
+  policy: ReadbackBaselinePolicy,
+  stats: { samples: number; p50Us: number; p95Us: number; p99Us: number },
+): { warnings: string[]; failures: string[]; baselineId: string } {
+  const warnings: string[] = [];
+  const failures: string[] = [];
+  const caps = policy.policy.absoluteCaps;
+
+  if (stats.samples < policy.policy.minSamples) {
+    failures.push(`sample count ${stats.samples} is below policy minimum ${policy.policy.minSamples}`);
+  }
+  if (stats.p95Us > caps.p95FailUs) {
+    failures.push(`p95 ${stats.p95Us.toFixed(0)}us exceeds absolute cap ${caps.p95FailUs}us`);
+  }
+  if (stats.p99Us > caps.p99FailUs) {
+    failures.push(`p99 ${stats.p99Us.toFixed(0)}us exceeds absolute cap ${caps.p99FailUs}us`);
+  }
+
+  if (!BASELINE_ID) return { warnings, failures, baselineId: "" };
+
+  const baseline = policy.baselines.find((entry) => entry.id === BASELINE_ID);
+  if (!baseline) {
+    failures.push(`WEBGPU_READBACK_BASELINE_ID '${BASELINE_ID}' was not found in docs/gpu-readback-baselines.json`);
+    return { warnings, failures, baselineId: BASELINE_ID };
+  }
+  if (!baseline.measured || !baseline.stats) {
+    failures.push(`baseline '${BASELINE_ID}' is not a measured baseline`);
+    return { warnings, failures, baselineId: BASELINE_ID };
+  }
+
+  const regression = policy.policy.regression;
+  const p95Ratio = stats.p95Us / baseline.stats.p95Us;
+  const p99Ratio = stats.p99Us / baseline.stats.p99Us;
+
+  if (p95Ratio > regression.p95FailRatio) {
+    failures.push(`p95 regression ${p95Ratio.toFixed(2)}x exceeds fail ratio ${regression.p95FailRatio}x`);
+  } else if (p95Ratio > regression.p95WarnRatio) {
+    warnings.push(`p95 regression ${p95Ratio.toFixed(2)}x exceeds warn ratio ${regression.p95WarnRatio}x`);
+  }
+
+  if (p99Ratio > regression.p99FailRatio) {
+    failures.push(`p99 regression ${p99Ratio.toFixed(2)}x exceeds fail ratio ${regression.p99FailRatio}x`);
+  } else if (p99Ratio > regression.p99WarnRatio) {
+    warnings.push(`p99 regression ${p99Ratio.toFixed(2)}x exceeds warn ratio ${regression.p99WarnRatio}x`);
+  }
+
+  return { warnings, failures, baselineId: BASELINE_ID };
+}
 
 test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, testInfo) => {
   const consoleErrors: string[] = [];
@@ -107,9 +191,15 @@ test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, 
       stats,
       pushed: source.pushedCount(),
       dropped: source.droppedCount(),
+      coalesced: source.coalescedCount(),
       inFlight: source.inFlightCount(),
       userAgent: navigator.userAgent,
-      adapterInfo: "info" in adapter ? String(adapter.info) : "",
+      adapterInfo: "info" in adapter ? JSON.parse(JSON.stringify(adapter.info ?? null)) : null,
+      mode: {
+        writeTarget: source.writeTargetKind(),
+        decoder: source.decoderMode(),
+        autoPoll: source.autoPollMode(),
+      },
     };
     source.destroy();
     src.destroy();
@@ -126,15 +216,38 @@ test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, 
     stats: { samples: number; p50Us: number; p95Us: number; p99Us: number; maxUs: number };
     pushed: number;
     dropped: number;
+    coalesced: number;
     inFlight: number;
     userAgent: string;
-    adapterInfo: string;
+    adapterInfo: unknown;
+    mode: { writeTarget: string; decoder: string; autoPoll: string };
   };
+  const policy = loadBaselinePolicy();
+  const policyResult = evaluatePolicy(policy, r.stats);
+  const report = {
+    ...r,
+    thresholdPolicy: {
+      baselineId: policyResult.baselineId,
+      warnings: policyResult.warnings,
+      failures: policyResult.failures,
+      absoluteCaps: policy.policy.absoluteCaps,
+      regression: policy.policy.regression,
+    },
+  };
+  mkdirSync("test-results/webgpu-readback", { recursive: true });
+  writeFileSync(
+    "test-results/webgpu-readback/webgpu-readback-report.json",
+    JSON.stringify(report, null, 2),
+    "utf8",
+  );
 
   await testInfo.attach("webgpu-readback-report.json", {
-    body: JSON.stringify(r, null, 2),
+    body: JSON.stringify(report, null, 2),
     contentType: "application/json",
   });
+  for (const warning of policyResult.warnings) {
+    testInfo.annotations.push({ type: "webgpu-readback-warning", description: warning });
+  }
 
   expect(r.pushed).toBe(24);
   expect(r.dropped).toBe(0);
@@ -144,5 +257,8 @@ test("BridgeGPUSource real WebGPU readback latency histogram", async ({ page }, 
   expect(r.stats.p95Us).toBeGreaterThanOrEqual(r.stats.p50Us);
   expect(r.stats.p99Us).toBeGreaterThanOrEqual(r.stats.p95Us);
   expect(r.stats.maxUs).toBeGreaterThanOrEqual(r.stats.p99Us);
+  if (REQUIRE_WEBGPU) {
+    expect(policyResult.failures, policyResult.failures.join("\n")).toEqual([]);
+  }
   expect(consoleErrors, consoleErrors.join("\n")).toEqual([]);
 });
