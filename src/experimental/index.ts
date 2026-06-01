@@ -107,6 +107,30 @@ export type { SpmcRingOptions } from "../SpmcRing.js";
 export { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../MpmcWorkQueue.js";
 export type { MpmcWorkQueueOptions } from "../MpmcWorkQueue.js";
 
+// ── connectWorkQueue/mountWorkQueue (0.9.937) ───────────────────────────────
+//
+// Apollo Frontier 3, MP→MC Work-Queue Stage 3: the `connect()`-style MP→MC
+// work-queue topology constructor over `MpmcWorkQueue` — the third sibling of
+// `connectFanIn` (MP→SC) and `connectFanOut` (SP→MC). Allocate + `initLayout` the
+// shared SAB ONCE → a clone-safe handle; every producer + every competing consumer
+// `mountWorkQueue` an `MpmcWorkQueue` over it. Turbo-ONLY (a non-isolated env
+// throws `ConnectUnsupportedError('isolation-required')`; no MessageChannel
+// fallback). The KEY asymmetry vs `connectFanOut`: `producerCount` sizes the SAB
+// (SLACK = producerCount − 1) but `consumerCount` does NOT (anonymous consumers,
+// no per-consumer lane) — it is carried only for close-coordination + strand
+// accounting. The end-of-stream protocol that releases the bounded teardown strand
+// lives in `MpmcWorkQueue.close()`/`isDrained()`. `@experimental` until
+// `MpmcWorkQueue` promotes. See docs/mpmc-workqueue-design.md.
+export { connectWorkQueue, mountWorkQueue } from "../connectWorkQueue.js";
+export type {
+  ConnectWorkQueueSpec,
+  WorkQueueHandle,
+  WorkQueueTopology,
+  WorkQueueSizing,
+  WorkQueueRole,
+  MountWorkQueueOptions,
+} from "../connectWorkQueue.js";
+
 // ── connectFanOut/mountFanOut (0.9.928) ─────────────────────────────────────
 //
 // Apollo Frontier 3, Stage 4.3: the `connect()`-style SP→MC broadcast topology

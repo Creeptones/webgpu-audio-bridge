@@ -4,6 +4,98 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.937] — 2026-05-31
+
+### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 3: `connectWorkQueue()` + the end-of-stream protocol
+
+Stage 2 (0.9.936) characterized the primitive's perf; Stage 3 wires it into the
+declarative `connect()` family and closes the one open loose end — the teardown
+strand — with a first-class end-of-stream signal. With this, all THREE
+single-edge primitives (MP→SC fan-in, SP→MC broadcast, MP→MC work queue) are
+proven AND integrated.
+
+- **The end-of-stream protocol, in the primitive (`src/MpmcWorkQueue.ts`).** A
+  new header lane 6 `closed` (the experimental wire format's spare lane) + three
+  methods. `close()` is a plain release-store on the `closed` lane, called ONCE by
+  the producer coordinator **after every producer is quiescent** (no more push,
+  every in-flight publish complete) — after which `enqueueTicket` is final.
+  **Soundness fact:** every ticket `< enqueueTicket` was claimed by a producer and
+  a claimed ticket is always published, so every `D < enqueueTicket` will deliver →
+  **only `D ≥ enqueueTicket` is a strand.** In `pull`'s `d < 0` ride branch a
+  consumer decides locally: `closed && SignedDiff(D, enqueueTicket) ≥ 0` ⇒ release
+  the strand (`strandedClaims++`, clear held, ride no more); a held
+  `D < enqueueTicket` keeps riding (guaranteed to publish). `isDrained()`
+  (`closed && available() === 0 && !holding`) is the first-class termination signal
+  — a poll, never an `Atomics.wait` — that replaces the control-SAB
+  `consumedTotal >= totalPushed` hack the Stage-1 cross-thread test used. `close()`
+  / `isClosed()` / `isDrained()` are all wait-free; `strandedClaims` (lane 4) is now
+  populated (it was reserved-0 through Stage 1).
+- **`src/connectWorkQueue.ts` — the `connect()`-style constructor.** The third
+  sibling of `connectFanIn` (MP→SC) and `connectFanOut` (SP→MC).
+  `connectWorkQueue(spec) → WorkQueueTopology` allocates + `initLayout`s the shared
+  SAB once (a `kind: "mpmc-wq"` handle); `mountWorkQueue(handle, {role})`
+  reconstructs an `MpmcWorkQueue` per peer via the bare ctor (no re-init); both
+  roles return the raw queue. **The key asymmetry vs `connectFanOut`:**
+  `producerCount` sizes the SAB (`SLACK = producerCount − 1`,
+  `usableDepth = capacity − SLACK`, `capacity = nextPow2(max(backlog + SLACK,
+  producerCount + 1))` — the fan-in envelope) but `consumerCount` does NOT
+  (consumers are anonymous — there is no per-consumer lane, the genuine difference
+  from fan-out where `consumerCount` sized the per-consumer cursor region); it is
+  carried in the handle only for close-coordination + strand accounting. Role is
+  advisory (no `consumerIndex`). Turbo-ONLY (`ConnectUnsupportedError(
+  'isolation-required')`, no MessageChannel fallback); self-contained (never opens
+  `connect.ts` — the SPSC bit-exact gate stays structural). Exported from
+  `webgpu-audio-bridge/experimental`, NOT root, until `MpmcWorkQueue` promotes.
+
+### Why
+
+A characterized primitive is only useful once an app can stand it up in one call;
+`connectWorkQueue()` is the declarative front door. And the work queue's one
+residual — the bounded teardown strand (up to `consumerCount − 1` consumers
+holding a claim production never reached) — needed a way for a consumer to learn
+production ended; without it a consumer polls a never-arriving frame forever. The
+`closed` lane + the `D ≥ enqueueTicket` local decision releases exactly the
+strands and never a deliverable frame, and `isDrained()` gives consumer loops a
+clean, wait-free termination condition.
+
+### Wire compatibility
+
+Additive within the experimental MP→MC wire format. The `closed` flag repurposes a
+previously-reserved header lane (lane 6); the format is explicitly outside the 1.0
+stability contract pre-promotion, so this is a patch-safe change. No other ring's
+wire format is touched. The SPSC / MP→SC / SP→MC paths are bit-identically green;
+`connectWorkQueue` is a new opt-in surface on the experimental subpath. **Patch**
+bump under the versioning policy.
+
+### Tests
+
+- **`tests/connectWorkQueue.test.ts`** (10 single-thread pins, registered in
+  `test` / `test:unit`) — Turbo-only env gate, producerCount + consumerCount
+  validation, the SLACK sizing, the allocate-once / mount-many PARTITION bit-exact
+  round-trip, `consumerCount`-does-not-size-the-SAB, initLayout-not-re-called, the
+  layout-skew guard, LatencyBudget sizing, mount symmetry, the advisory role
+  (anonymous consumers — no `consumerIndex`), and the Stage-3 `close()` /
+  `isClosed()` / `isDrained()` drain loop (every frame delivered, no hang).
+- **`tests/connectWorkQueue.concurrent.test.ts`** (registered in `test` /
+  `test:concurrent`) — a 0.8 M-frame partition stress THROUGH the wiring with the
+  real `close()`/`isDrained()` end-of-stream protocol (NOT the control-SAB hack):
+  the coordinator quiesces every producer then `close()`s; consumers release
+  strands + terminate on `isDrained()`. Asserts conservation (Σ delivered ===
+  Σ pushed; delivered + dropped === attempted), each frame bit-exact + a
+  no-duplicate `Atomics.exchange` flag, `strandedClaims ≤ consumerCount − 1`,
+  `tornGuarded === 0`, and no consumer hang (a deadline watchdog).
+- **`tests/MpmcWorkQueue.test.ts`** gains pin 9 (close/isClosed/isDrained + the
+  sub-`enqueueTicket` held claim keeps riding, never falsely stranded).
+- **`tests/MpmcWorkQueue.interleaving.test.ts`** gains the close-release pin: the
+  `D ≥ enqueueTicket` decision fires on EXACTLY the exhaustively-enumerated
+  teardown strands and never on a deliverable claim.
+
+### Documentation
+
+- `docs/mpmc-workqueue-design.md` §8 Shipped postscript (Stage 2 + Stage 3).
+- CHANGELOG + ROADMAP row + CLAUDE.md file inventory (`connectWorkQueue.ts` + the
+  end-of-stream additions to `MpmcWorkQueue.ts`).
+
 ## [0.9.936] — 2026-05-31
 
 ### Added — Apollo Frontier 3, MP→MC Work-Queue Stage 2: the characterization bench

@@ -110,7 +110,11 @@ interface ExploreResult {
   stateCount: number;
   violations: Array<{ msg: string; trace: string[] }>;
   orphans: Array<{ msg: string; trace: string[] }>;
-  strands: Array<{ c: number; D: number }>;
+  /** Teardown strands found at terminal states. `W` is the terminal
+   *  `enqueueTicket` (FINAL at close); the Stage-3 close-release decision is
+   *  `signedDiff(D, W) >= 0` — captured here so a pin can verify the decision
+   *  fires on EXACTLY the enumerated strands and never on a deliverable claim. */
+  strands: Array<{ c: number; D: number; W: number }>;
   maxInFlight: number;
   maxConsumerSteps: number;
   maxProducerStep: number;
@@ -401,7 +405,9 @@ function explore(opts: ExploreOpts): ExploreResult {
       // was NEVER published (production ended first). Not a lost frame.
       for (let c = 0; c < NC; c++) {
         const h = s.consHeld[c]!;
-        if (h !== -1 && !(s.published & (1 << h))) strands.push({ c, D: h });
+        if (h !== -1 && !(s.published & (1 << h))) {
+          strands.push({ c, D: h, W: s.enqueueTicket });
+        }
       }
       continue;
     }
@@ -521,6 +527,44 @@ function pinUngatedTears(): void {
   pass("negative: ungated producer tears (per-slot free gate load-bearing)");
 }
 
+// Pin 6 — STAGE 3 (end-of-stream): the close-release decision `D ≥ enqueueTicket`
+// fires on EXACTLY the enumerated teardown strands and NEVER on a deliverable
+// claim. At a terminal state the producer claim cursor `enqueueTicket` is final
+// (== close's frozen value) and every CLAIMED ticket (D < enqueueTicket) is
+// published (all producers DONE) — so the existing zero-orphan invariant means a
+// held D < enqueueTicket can never be a terminal strand (it would have a DELIVER
+// successor). This pin verifies the dual fact the Stage-3 protocol relies on:
+// every strand the exhaustive DFS finds satisfies `signedDiff(D, enqueueTicket) ≥
+// 0`, i.e. `close()` would release it (and ONLY it), never dropping a frame that
+// was produced. (The real cross-thread release + the < consumerCount bound are
+// pinned end-to-end in connectWorkQueue.concurrent.test.ts.)
+function pinCloseReleaseSound(): void {
+  const cfgs = [
+    { P: 1, C: 2, NC: 2, M: 16, MAXFRAMES: 1 },
+    { P: 1, C: 2, NC: 3, M: 16, MAXFRAMES: 2 },
+    { P: 2, C: 4, NC: 3, M: 16, MAXFRAMES: 2 },
+  ];
+  let totalStrands = 0;
+  for (const cfg of cfgs) {
+    const r = explore({ ...cfg, consumer: "held", producer: "gated" });
+    const tag = `close-release P=${cfg.P} C=${cfg.C} NC=${cfg.NC} frames=${cfg.MAXFRAMES}`;
+    // No produced frame is lost (the close-release never has to touch a published
+    // frame — they are all delivered).
+    assertEq(r.orphans.length, 0, `${tag}: zero produced frames lost`);
+    // Every enumerated strand is a D ≥ final enqueueTicket → the close-release
+    // condition fires on it, and only on it (no deliverable claim strands).
+    for (const s of r.strands) {
+      assert(
+        signedDiff(s.D, s.W, cfg.M) >= 0,
+        `${tag}: strand C${s.c} D=${s.D} must satisfy D ≥ enqueueTicket(${s.W}) (close-release fires)`,
+      );
+    }
+    totalStrands += r.strands.length;
+    pass(tag);
+  }
+  assert(totalStrands > 0, "close-release: at least one strand exercised the decision");
+}
+
 function main(): void {
   console.log("MpmcWorkQueue.interleaving — exhaustive MP→MC work-queue fuzzer (mechanism 1)");
   pinSound();
@@ -528,6 +572,7 @@ function main(): void {
   pinPeekDoubleDelivers();
   pinSkipOrphans();
   pinUngatedTears();
+  pinCloseReleaseSound();
   console.log(`\nMpmcWorkQueue.interleaving: ${passed} pins passed.`);
 }
 

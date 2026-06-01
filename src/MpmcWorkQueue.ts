@@ -92,13 +92,19 @@
  *     lane 3  droppedFrames    producer drop-newest-when-full counter (the reuse
  *                              envelope drop; multiple producers contend).
  *     lane 4  strandedClaims    teardown-strand accounting (a consumer holding a
- *                              claim production never reached). Stage 1 leaves it
- *                              0 — only the Stage-3 end-of-stream protocol knows
- *                              production has ended and can release/count strands.
+ *                              claim production never reached). Populated by the
+ *                              Stage-3 end-of-stream protocol (`close()` →
+ *                              `pull` releases a held claim ≥ enqueueTicket and
+ *                              counts it here). 0 until close.
  *     lane 5  tornGuarded       consumer defense-in-depth counter for the
  *                              "impossible under the envelope" d>0 case (a held
  *                              slot found reused). 0 == healthy.
- *     lanes 6..7               reserved (zero).
+ *     lane 6  closed            end-of-stream flag (Stage 3). 0 == open; set to 1
+ *                              by `close()` once ALL producers are quiescent (no
+ *                              more push, every in-flight publish complete), after
+ *                              which `enqueueTicket` is final. A consumer reads it
+ *                              to release teardown strands + report `isDrained()`.
+ *     lane 7                   reserved (zero).
  *
  *   Generation region (Int32 array at byte 32, one Int32 per slot, 8-padded):
  *     gen[s] = the per-slot sequence stamp above. Init Free(s) = s | 0.
@@ -196,14 +202,40 @@
  * between quanta). Both enqueue and dequeue are a bounded, fixed number of steps
  * with no retry loop → hard wait-free.
  *
- * ─── The teardown strand (the one residual) ───────────────────────────────
+ * ─── The teardown strand + the end-of-stream protocol (Stage 3) ───────────
  *
  * The consumer's emptiness pre-check and its fetch-add are necessarily separate
  * atomics, so the claim can overshoot the producer frontier by < consumerCount:
  * at end-of-production up to consumerCount − 1 consumers may hold a claim for a
  * ticket no producer ever fills. This strands a CONSUMER, it never loses a
  * produced FRAME (the frame was never produced). It is confined to stream
- * teardown and resolved by an end-of-stream protocol (a Stage-3 concern).
+ * teardown and resolved by the end-of-stream protocol below.
+ *
+ *   close()  — called ONCE, by the producer coordinator / topology, after every
+ *              producer is quiescent (no more push AND every in-flight push has
+ *              completed its publish): `Atomics.store(closed, 1)`. After close,
+ *              `enqueueTicket` is FINAL. **close() must happen-after every
+ *              producer's final publish** — the topology contract guarantees it
+ *              (join/quiesce the producers first). A premature close while a
+ *              producer is mid-write of ticket T < enqueueTicket is still sound
+ *              (T was already claimed → it delivers); only a close that let a
+ *              consumer release a claim the producer is ABOUT to publish would
+ *              lose a frame — the `D ≥ enqueueTicket` test below prevents that
+ *              precisely because enqueueTicket is final at close.
+ *
+ *   Soundness fact: every ticket `< enqueueTicket` was CLAIMED by a producer (the
+ *   enqueue fetch-add) and a claimed ticket is ALWAYS published (producers drop
+ *   only BEFORE claiming, never after) → every `D < enqueueTicket` will deliver.
+ *   So ONLY `D ≥ enqueueTicket` is a strand. In `pull`'s `d < 0` ride branch, a
+ *   consumer holding D decides LOCALLY: if `closed && SignedDiff(D, enqueueTicket)
+ *   ≥ 0`, its claim is a strand → release it (`strandedClaims++`, clear held); a
+ *   held `D < enqueueTicket` keeps riding (it is guaranteed to publish).
+ *
+ *   isDrained() — `closed && available() === 0 && !holding` — the first-class
+ *              termination signal (a poll, never an Atomics.wait). A consumer
+ *              loop runs `while (!q.isDrained()) { if (q.pull(out)) handle(); }`;
+ *              the strand-release inside `pull` guarantees a held strand clears so
+ *              `isDrained()` eventually returns true for every consumer.
  *
  * ─── Coercions (must match the model + the other rings exactly) ───────────
  *
@@ -236,6 +268,7 @@ const FRONTIER_LANE = 2;
 const DROPPED_LANE = 3;
 const STRANDED_LANE = 4;
 const TORN_GUARDED_LANE = 5;
+const CLOSED_LANE = 6;
 
 /** Stamps run in plain ticket units (the live span is ≈ CAPACITY); cap CAPACITY
  *  so SignedDiff stays well clear of the ±2^31 boundary. */
@@ -610,6 +643,18 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
 
     // d < 0: my claimed frame is not Complete yet (Free(D) or an older lap) →
     // HOLD and ride to the next quantum. Do NOT skip (skipping orphans it).
+    // End-of-stream (Stage 3): once closed, enqueueTicket is final. A held claim
+    // D ≥ enqueueTicket is a teardown strand (no producer will ever fill it) —
+    // release it and count it so the consumer stops riding forever. A held D <
+    // enqueueTicket WAS claimed by a producer and is guaranteed to publish (close
+    // happens-after every producer's final publish), so keep riding.
+    if (Atomics.load(header, CLOSED_LANE) !== 0) {
+      const W = Atomics.load(header, ENQUEUE_TICKET_LANE); // final after close
+      if (signedDiff(D, W) >= 0) {
+        Atomics.add(header, STRANDED_LANE, 1);
+        this.hasHeld = false;
+      }
+    }
     return false;
   }
 
@@ -618,6 +663,48 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
    *  observer; the held claim lives on this instance only. */
   isHolding(): boolean {
     return this.hasHeld;
+  }
+
+  // ─── End-of-stream (Stage 3) ─────────────────────────────────────────────
+
+  /**
+   * Mark the stream closed (end-of-production). Idempotent. Call EXACTLY once,
+   * from the producer coordinator / topology, **after every producer is
+   * quiescent** — no more `push` AND every in-flight `push` has completed its
+   * publish (release-store of `Complete(ticket)`). After close `enqueueTicket` is
+   * final, which is what makes the consumer's `D ≥ enqueueTicket` strand test in
+   * `pull` sound (see the class header). Calling close while a producer is still
+   * mid-write of an ALREADY-CLAIMED ticket is still safe (that ticket delivers);
+   * the contract is only that no producer will CLAIM a new ticket after close.
+   *
+   * A plain release-store on the shared `closed` lane — wait-free, no notify.
+   */
+  close(): void {
+    Atomics.store(this.header, CLOSED_LANE, 1);
+  }
+
+  /** True once `close()` has been called (the stream is ended; `enqueueTicket`
+   *  is final). Pure observer. */
+  isClosed(): boolean {
+    return Atomics.load(this.header, CLOSED_LANE) !== 0;
+  }
+
+  /**
+   * The first-class end-of-stream termination signal for a consumer loop:
+   * `closed && nothing left to claim && this instance holds no claim`. When true,
+   * this consumer will never deliver another frame and can stop polling. A poll,
+   * never an `Atomics.wait`.
+   *
+   * Usage: `while (!q.isDrained()) { if (q.pull(out)) handle(out); }`. The
+   * strand-release inside `pull` guarantees a held teardown strand (a claim ≥ the
+   * final `enqueueTicket`) clears, so `isDrained()` eventually returns true for
+   * every consumer — no consumer hangs. A held claim `D < enqueueTicket` keeps
+   * `isDrained()` false until that guaranteed-to-publish frame is delivered.
+   */
+  isDrained(): boolean {
+    if (this.hasHeld) return false;
+    if (Atomics.load(this.header, CLOSED_LANE) === 0) return false;
+    return this.available() === 0;
   }
 
   // ─── Observers ─────────────────────────────────────────────────────────────
@@ -645,9 +732,10 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     return Atomics.load(this.header, DROPPED_LANE) >>> 0;
   }
 
-  /** Teardown-strand count. Stage 1 leaves this 0 — only the Stage-3
-   *  end-of-stream protocol can identify and count a strand (a consumer holding a
-   *  claim production never reached). Reserved so the wire layout is stable. */
+  /** Teardown-strand count (Stage 3). Incremented when a consumer, after
+   *  `close()`, releases a held claim `D ≥ enqueueTicket` (a ticket no producer
+   *  ever filled). Bounded by `< consumerCount`. 0 before close; never indicates
+   *  a lost frame (a strand is a consumer holding a never-produced ticket). */
   strandedClaims(): number {
     return Atomics.load(this.header, STRANDED_LANE) >>> 0;
   }

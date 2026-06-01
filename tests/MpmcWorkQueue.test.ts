@@ -19,6 +19,10 @@
  *   7.  two competing consumers PARTITION the stream: every frame to exactly one
  *       consumer, union == the producer stream, no duplicate.
  *   8.  producerCount > 1 reserves SLACK (usable depth = CAPACITY − SLACK).
+ *   9.  Stage-3 end-of-stream: close()/isClosed()/isDrained() + a held claim
+ *       D < enqueueTicket KEEPS riding after close (never falsely stranded). The
+ *       genuine strand-release (D ≥ enqueueTicket) is a multi-consumer race, so
+ *       it is proven in the interleaving fuzzer + the concurrent test, not here.
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -279,6 +283,61 @@ function pin8_slackReserve(): void {
   pass("pin8: producerCount reserves SLACK");
 }
 
+// Pin 9 — Stage-3 end-of-stream: close()/isClosed()/isDrained() + the sub-W ride.
+// White-box: two phantom producers CLAIMED tickets 0 and 1 (enqueueTicket=2) but
+// have not published. A consumer claims D=0 → its slot is Free(0) → it HOLDS and
+// rides. After close(), D=0 < enqueueTicket=2 ⇒ a guaranteed-to-publish claim, NOT
+// a strand → it keeps riding (strandedClaims stays 0). Once ticket 0 publishes it
+// delivers; once both tickets drain the consumer reports isDrained(). (A genuine
+// strand needs D ≥ enqueueTicket, a multi-consumer stale-read race — proven in the
+// interleaving fuzzer's close-release pin + the concurrent test.)
+function pin9_endOfStream(): void {
+  const cap = 4;
+  const { queue, sab } = MpmcWorkQueue.create(allKinds, cap, { producerCount: 2 });
+  const header = new Int32Array(sab, 0, 8);
+  const gen = new Int32Array(sab, MPMC_WQ_HEADER_BYTES, cap);
+  const out = queue.createFrame();
+
+  assert(!queue.isClosed(), "fresh queue is open");
+  assert(!queue.isDrained(), "open queue with no claim is not drained");
+
+  // Phantom producers claim tickets 0 and 1 (enqueueTicket=2); neither published
+  // (gen[0]=Free(0)=0, gen[1]=Free(1)=1 from initLayout).
+  Atomics.store(header, 0, 2);
+  assertEq(gen[0], 0, "slot 0 Free(0)");
+  assertEq(gen[1], 1, "slot 1 Free(1)");
+
+  // Consumer claims D=0 → unpublished → HOLD + ride.
+  assert(!queue.pull(out), "D=0 unpublished → rides (false)");
+  assert(queue.isHolding(), "holding D=0");
+
+  // Close the stream. enqueueTicket (=2) is now final.
+  queue.close();
+  assert(queue.isClosed(), "isClosed() true after close()");
+  assert(!queue.isDrained(), "not drained while holding a claim");
+
+  // D=0 < enqueueTicket=2 → a claimed-and-will-publish ticket, NOT a strand. The
+  // closed pull must KEEP riding, not release.
+  assert(!queue.pull(out), "closed: sub-enqueueTicket held claim keeps riding");
+  assert(queue.isHolding(), "still holding D=0 (not stranded)");
+  assertEq(queue.strandedClaims(), 0, "no strand released for a D < enqueueTicket");
+
+  // Publish ticket 0 → the held claim delivers.
+  Atomics.store(gen, 0, 1); // Complete(0)
+  assert(queue.pull(out), "held D=0 delivers once published");
+  assert(!queue.isHolding(), "not holding after delivery");
+  assert(!queue.isDrained(), "ticket 1 still claimable → not drained");
+  assertEq(queue.available(), 1, "one claimable (ticket 1)");
+
+  // Publish + drain ticket 1; then the consumer is fully drained.
+  Atomics.store(gen, 1, 2); // Complete(1)
+  assert(queue.pull(out), "delivers ticket 1");
+  assert(queue.isDrained(), "closed + nothing claimable + not holding → drained");
+  assertEq(queue.strandedClaims(), 0, "no strands in the single-consumer path");
+  assertEq(queue.tornGuarded(), 0, "no torn-guard");
+  pass("pin9: close()/isClosed()/isDrained() + sub-enqueueTicket ride");
+}
+
 function main(): void {
   console.log("MpmcWorkQueue — single-thread API pins");
   pin1_layout();
@@ -289,6 +348,7 @@ function main(): void {
   pin6_heldClaim();
   pin7_partition();
   pin8_slackReserve();
+  pin9_endOfStream();
   console.warn = realWarn;
   console.log(`\nMpmcWorkQueue: ${passed} pins passed.`);
 }
