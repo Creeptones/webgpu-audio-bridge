@@ -4,6 +4,78 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.940] — 2026-06-01
+
+### Added — Apollo Frontier 3, DAG Stage 2 deliverable B: the `examples/audio-dag/` browser smoke
+
+Stage 2's headless cross-thread proof (`0.9.939`) shipped the correctness; this
+patch makes the topology **audible** — the optional browser smoke the Stage-2
+handoff flagged. It is the first time `connectGraph` runs across real
+worker **and** AudioWorklet realms in a browser (the concurrent test only covers
+`worker_threads`).
+
+- **`examples/audio-dag/`** (`npm run dev:audio-dag`, port 5189) — one
+  `connectGraph()` call on the page allocates a whole DAG using three of the four
+  edge kinds:
+
+  ```
+  osc0,osc1 ─(mpmc fan-in)→ mixer ─(spsc)→ fx ─(spmc broadcast)→ { speaker, meter }
+  ```
+
+  Each node runs in its **own realm** and `mountGraph(handle, { node })`s only its
+  incident edges: two oscillator **Workers** (fan-in producers), a **mixer** Worker
+  and an **fx** Worker — two real intermediate nodes, each consuming one edge and
+  producing the next every tick — an **AudioWorklet** `speaker` (broadcast consumer
+  0, the audio sink) and a **meter** Worker (broadcast consumer 1, its index
+  *derived* by `mountGraph` from its position in the edge's `to[]`). The HUD shows
+  per-node throughput, **broadcast-completeness** (`speaker.consumed` tracks
+  `meter.consumed` — both sinks see every frame), `tornGuarded === 0` everywhere, a
+  live **FX gain** slider (an audible transform applied in the `fx` node and heard
+  at the speaker + seen at the meter), and a **Flood** button that overruns the
+  fan-in to show graceful counted drop-newest with the audio never stalling (the §5
+  witness, live).
+- **Browser realms import the REAL `dist` facades.** Unlike the Node concurrent
+  test's `eval:true` workers (which must reimplement each protocol byte-faithfully),
+  every realm here `import`s `mountGraph` and uses the genuine ring facades. To
+  avoid the JIT's transitive bare `acorn` import (which has no browser resolution),
+  the demo imports from `../../dist/connectGraph.js` directly, NOT the experimental
+  barrel — so no specifier rewrite / acorn vendoring is needed.
+- New `dev:audio-dag` script + `examples/audio-dag/serve.mjs` (COOP/COEP headers,
+  port 5189), mirroring `examples/mpmc-fan-in/serve.mjs`. The whole DAG is
+  Turbo-only, so the isolation headers are mandatory.
+
+### Why
+
+The headline ("MPMC audio DAGs") was *proven* at 0.9.939 but only headless. A
+browser smoke makes it tangible — you can hear two voices fan in, watch two
+intermediate nodes pump on their own threads, see one broadcast reach both an audio
+thread and a meter, and confirm by ear that flooding the sources or dragging the
+gain never glitches the audio. It is the same precedent the fan-out / work-queue
+arcs deferred; closing it here completes Stage 2's two-deliverable scope.
+
+### Wire compatibility
+
+No wire change, no `src` change — examples + one `dev:` script only. Every ring's
+wire format is bit-identically untouched. **Patch** bump (browser demos take a
+patch, like `examples/kernel-palette`@0.9.920).
+
+### Tests
+
+- Verified in a real cross-origin-isolated browser: `crossOriginIsolated === true`,
+  all six nodes flowing, broadcast-complete (`speaker.consumed === meter.consumed`),
+  `tornGuarded === 0` / fan-in `torn === 0` throughout, Flood drives graceful
+  drop-newest at the sources (hundreds of thousands of counted drops, zero tears,
+  audio uninterrupted), and the FX gain slider propagates page → fx worker → audio.
+  Screenshot at `examples/audio-dag/verify-audio-dag.png`. (No new automated suite —
+  browser smokes are manual, matching the other `examples/`.)
+- `src`/tests untouched since 0.9.939, so the full `npm test` + `npm run
+  test:concurrent` + `npm run bench` gates carry over green.
+
+### Documentation
+
+- `README.md`, `ROADMAP.md`, and `CLAUDE.md` updated: the Stage-2 browser smoke is
+  now **shipped**, not deferred.
+
 ## [0.9.939] — 2026-05-31
 
 ### Added — Apollo Frontier 3, DAG Stage 2: cross-thread multi-node stress — **the MPMC-audio-DAG frontier headline is complete**

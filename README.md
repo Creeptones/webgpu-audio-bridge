@@ -2274,7 +2274,9 @@ me.outbound.link.push(frame); // the SPSC producer end (a BridgeProducer)
 
 The composition is proven **across real threads** (0.9.939): `tests/connectGraph.concurrent.test.ts` runs a multi-node graph over all four edge kinds with a real **intermediate node on its own worker** (consuming the fan-in, producing the SPSC edge each quantum) and witnesses the property that only emerges from the composition of wait-free-push edges — **`sourceStalls === 0`**: a slow sink can never wedge a real-time source through a multi-hop path. It also pins leg-1 end-to-end bit-exactness + broadcast-completeness and leg-2 partition conservation. With it, the four edges are not just individually proven but **composable across threads** — the MPMC-audio-DAG layer is complete.
 
-> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectGraph`/`mountGraph` may break across PATCH releases until the four edge rings promote to the root. (A browser smoke is deferred, matching the headless-only fan-out / work-queue arcs.)
+A runnable browser demo makes it audible (0.9.940): **`npm run dev:audio-dag`** (port 5189) wires `osc0,osc1 ─fan-in→ mixer ─spsc→ fx ─broadcast→ {speaker, meter}` with each node in its own realm (Workers + an AudioWorklet), a live FX-gain slider, and a Flood button that overruns the fan-in to show graceful drop-newest with the audio never stalling.
+
+> **Experimental, opt-in.** Like the other `webgpu-audio-bridge/experimental` entries, `connectGraph`/`mountGraph` may break across PATCH releases until the four edge rings promote to the root.
 
 ### Experimental — The Autonomous JIT — `connectJit()` (0.9.917)
 

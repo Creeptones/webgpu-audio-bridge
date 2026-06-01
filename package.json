@@ -1,6 +1,6 @@
 {
   "name": "webgpu-audio-bridge",
-  "version": "0.9.939",
+  "version": "0.9.940",
   "description": "Reference bridge architecture for browser audio. Provides schema-driven lock-free lanes for WebGPU macro state, realtime input events, and additive GPU residual blocks into AudioWorklets.",
   "type": "module",
   "main": "./dist/index.js",
@@ -72,6 +72,7 @@
     "dev:kernel-palette": "node examples/kernel-palette/serve.mjs",
     "dev:kernel-generative": "node examples/kernel-generative/serve.mjs",
     "dev:poly-synth": "node examples/poly-synth/serve.mjs",
+    "dev:audio-dag": "node examples/audio-dag/serve.mjs",
     "bench:hybrid-residual": "node bench/hybrid-residual/serve.mjs",
     "bench:comparator": "node bench/audio-pipeline-comparator/serve.mjs",
     "bench:render-size-hint": "node bench/render-size-hint/serve.mjs",
