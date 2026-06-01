@@ -23,6 +23,13 @@
  *       D < enqueueTicket KEEPS riding after close (never falsely stranded). The
  *       genuine strand-release (D ≥ enqueueTicket) is a multi-consumer race, so
  *       it is proven in the interleaving fuzzer + the concurrent test, not here.
+ *  10.  flow_scale lane (0.9.942, DAG back-pressure Stage 1b): seeded 1.0 before
+ *       any pull; sustained-full occupancy (W − F ≈ capacity) drives the hint
+ *       below 0.5 (only reachable with the WIDENED DAG clamp); sustained-low
+ *       occupancy drives it toward 2.0; every sample stays in
+ *       [DAG_FLOW_SCALE_MIN, 2.0]; the side channel never tears the protocol.
+ *       The multi-consumer last-writer-wins property is sanity-checked in the
+ *       concurrent test (this pin drives the REAL single-consumer pull path).
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -32,6 +39,7 @@ import {
   f64Array, i32Array,
 } from "../src/index.js";
 import { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../src/MpmcWorkQueue.js";
+import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 
 // Silence (and capture) the one-shot experimental warning so it doesn't pollute
 // the suite output, while still pinning that it fires.
@@ -338,6 +346,60 @@ function pin9_endOfStream(): void {
   pass("pin9: close()/isClosed()/isDrained() + sub-enqueueTicket ride");
 }
 
+// Pin 10 — flow_scale lane (DAG back-pressure Stage 1b). Deterministic, drives
+// the REAL consumer pull path (no white-box poking of lane 7) so the
+// AdaptiveFlowController runs exactly as it will in production. Occupancy is the
+// UNDELIVERED depth (W − F), not available()'s claimable gap.
+function pin10_flowScale(): void {
+  const cap = 16;
+  const f = makeFrame();
+  // The encode is Q16.16 floor, so a decoded value can sit up to one quantum
+  // (1/65536 ≈ 1.5e-5) BELOW the controller's clamped real value — e.g. the
+  // 0.05 floor decodes to floor(0.05·65536)/65536 = 0.049987… Allow one quantum
+  // of slack on the bounds check.
+  const Q_EPS = 1 / 65536 + 1e-9;
+  const inBounds = (x: number) =>
+    x >= DAG_FLOW_SCALE_MIN - Q_EPS && x <= 2.0 + Q_EPS;
+
+  // (a) Seeded neutral 1.0 before any pull → a producer reading the hint early
+  //     sees "go at nominal rate", not the 0 a bare zero-fill would leave.
+  const { queue } = MpmcWorkQueue.create(allKinds, cap, { producerCount: 1 });
+  const out = queue.createFrame();
+  assertEq(queue.flowScaleHint(), 1.0, "flow_scale seeded 1.0 (nominal) before first pull");
+
+  // (b) Sustained-FULL occupancy → hint DOWN past 0.5. Fill to capacity, then
+  //     steady pull-one/refill-one so each pull ticks the controller at
+  //     occupancy ≈ 1.0 (W − F ≈ capacity). Crossing below 0.5 is only reachable
+  //     with the WIDENED DAG clamp — the inherited [0.5, 2.0] would pin at 0.5.
+  for (let i = 0; i < cap; i++) assert(queue.push(f as any), `fill ${i}`);
+  for (let i = 0; i < 200; i++) {
+    assert(queue.pull(out), "steady pull");
+    assert(inBounds(queue.flowScaleHint()), "hint in [MIN, 2.0] while draining full");
+    assert(queue.push(f as any), "steady refill");
+  }
+  const fullHint = queue.flowScaleHint();
+  assert(fullHint < 0.5, `sustained-full drives hint below 0.5 (widened clamp active): got ${fullHint}`);
+  assert(fullHint >= DAG_FLOW_SCALE_MIN - Q_EPS, `hint never below the widened floor: got ${fullHint}`);
+  while (queue.pull(out)) { /* drain */ }
+  assertEq(queue.tornGuarded(), 0, "full-occupancy run never tears");
+  assertEq(queue.strandedClaims(), 0, "full-occupancy run no strands");
+
+  // (c) Sustained-LOW occupancy (push one / pull one) → hint UP toward 2.0.
+  const { queue: q2 } = MpmcWorkQueue.create(allKinds, cap, { producerCount: 1 });
+  const out2 = q2.createFrame();
+  for (let i = 0; i < 200; i++) {
+    assert(q2.push(f as any), "push one");
+    assert(q2.pull(out2), "pull one (low occupancy)");
+    assert(inBounds(q2.flowScaleHint()), "hint in [MIN, 2.0] at low occupancy");
+  }
+  const lowHint = q2.flowScaleHint();
+  assert(lowHint > 1.0, `sustained-low occupancy drives hint above 1.0: got ${lowHint}`);
+  assertEq(q2.tornGuarded(), 0, "side channel never tears the protocol");
+  assertEq(q2.droppedFrames(), 0, "low-occupancy run no drops");
+
+  pass("pin10: flow_scale lane (seed 1.0, widened clamp < 0.5, bounds, side-channel)");
+}
+
 function main(): void {
   console.log("MpmcWorkQueue — single-thread API pins");
   pin1_layout();
@@ -349,6 +411,7 @@ function main(): void {
   pin7_partition();
   pin8_slackReserve();
   pin9_endOfStream();
+  pin10_flowScale();
   console.warn = realWarn;
   console.log(`\nMpmcWorkQueue: ${passed} pins passed.`);
 }

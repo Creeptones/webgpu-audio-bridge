@@ -4,6 +4,94 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.942] — 2026-06-01
+
+### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1b: the `MpmcWorkQueue` `flow_scale` lane
+
+The second cut of the consumer→producer `flow_scale` hint (Stage 1a shipped it on
+`MpmcRing` at 0.9.941). This patch cuts the same lane into `MpmcWorkQueue` (MP→MC
+competing-consumer work queue) — the genuinely-new piece is that there is **no
+single consumer** to own the controller.
+
+- **`MpmcWorkQueue` reserved header lane 7 is now `flow_scale`** (Q16.16, the same
+  encoding as `MpmcRing` lane 5 / SPSC lane 2). Each of the M competing consumers
+  runs one `AdaptiveFlowController.tick(buffered, capacity)` on each *successful*
+  `pull` and release-stores the encoded scale; a held/empty pull skips the tick so
+  the controller never sees a misleading sample (mirrors
+  `MpmcRing._updateFlowScale`). No header resize — lane 7 was the one free reserved
+  lane (lanes 0–6 are `enqueueTicket`/`dequeueTicket`/`committedFrontier`/`dropped`/
+  `stranded`/`tornGuarded`/`closed`). Seeded `1.0` at `initLayout`.
+- **Occupancy is the UNDELIVERED depth `(enqueueTicket − committedFrontier)`**, NOT
+  `available()`. `available()` is the *claimable* gap `(enqueueTicket −
+  dequeueTicket)`, which shrinks as consumers claim before frames are delivered;
+  the back-pressure signal wants how much work is in flight but not yet delivered.
+- **The multi-writer-soft-hint property (the one real difference from Stage 1a).**
+  `MpmcWorkQueue` is MP→**M**C, so the lane has **M concurrent writers** — each
+  consumer owns its own `AdaptiveFlowController` instance (its own heap-side PI
+  integral) and last-writer-wins on lane 7. This is sound because the hint is
+  **soft + self-correcting**: all M consumers observe the *same* global occupancy
+  `(W − F)`, so their independent integrals converge to the same neighborhood and
+  the lane just carries the most recent; a stale/slightly-divergent read is
+  harmless by construction (it self-corrects on the next tick). Documented in the
+  `MpmcWorkQueue` file header (lane 7 + the `flowController` field) and design note
+  §2/§5. (The rejected alternative — a producer-side tick in `advanceFrontier` —
+  has the same N-instance multi-integral shape AND runs on the lazy bounded scan,
+  off-cadence with actual delivery → noisier.)
+- **New `MpmcWorkQueue.flowScaleHint(): number`** — the producer-side read,
+  decoding lane 7 to `[DAG_FLOW_SCALE_MIN, 2.0]`. All N producers read the one
+  lane. **Advisory only** — `push()` stays the lossy, wait-free, never-blocking
+  push §5 mandates; a producer *chooses* to pace, so no stall can ever propagate.
+- **The widened DAG output clamp is REUSED verbatim** — `DAG_FLOW_SCALE_MIN = 0.05`
+  is imported from `AdaptiveFlowController` (locked at Stage 1a), not re-derived.
+  `SpscRing`'s frozen `[0.5, 2.0]` authority is untouched.
+
+### Why
+
+A `connectWorkQueue` edge in a DAG is §5-safe but lossy: a slow pool of consumers
+back-pressures producers only via a post-hoc drop count. Extending the
+`flow_scale` hint to the work queue gives producers live feedback (how deep the
+undelivered backlog is) without ever introducing a blocking path. `MpmcWorkQueue`
+is the second fan ring to gain the lane; with `SpmcRing` (Stage 1c) the three fan
+edges plus the SPSC edge will all carry the same signal, so a node can compute
+`effectiveScale = min(outbound flowScaleHints)` and pace the whole graph (Stage 2).
+
+### Wire compatibility
+
+`MpmcWorkQueue` is `@experimental`, internal-first, not exported from
+`src/index.ts`; its wire format is explicitly outside the 1.0 contract (the
+one-shot construction warning covers it). The new lane lands in **already-reserved**
+header space (lane 7 was zero), so no header resize, no frozen wire-format change,
+no public TS surface change → **patch**. The SPSC core and `MpmcRing` are untouched.
+Were `MpmcWorkQueue` promoted, a new active lane would be a minor-bump trigger;
+pre-promotion it is a patch with this wire-compat note (design note §5).
+
+### Tests
+
+- **`tests/MpmcWorkQueue.test.ts` pin 10** (new) — the `flow_scale` lane,
+  deterministic through the **real** `pull` path (no white-box poking of lane 7):
+  seeded `1.0` before the first pull; sustained-full occupancy `(W − F) ≈ capacity`
+  drives the hint **below 0.5** (only reachable with the widened clamp — a default
+  `[0.5, 2.0]` controller would pin at the floor); sustained-low occupancy drives
+  it up toward `2.0`; every sample stays in `[DAG_FLOW_SCALE_MIN, 2.0]` (one Q16.16
+  quantum of slack on the floor); the lane never tears the protocol or strands.
+- **`tests/MpmcWorkQueue.concurrent.test.ts`** — the 1.0 M-frame both-ends-contended
+  partition stress now has each of the M consumer workers run its own (byte-faithful)
+  controller tick on every successful delivery and store to lane 7, then pins that
+  the M independent multi-writers kept `flowScaleHint()` a finite, in-range value
+  *and* moved it off the seeded default (the lane is live cross-thread). The
+  partition/conservation/`tornGuarded=0`/no-duplicate assertions already cover
+  non-interference. The behavioral "drops collapse" is the Stage-0 probe's
+  deliverable (same controller), not re-proven flakily cross-thread.
+- No interleaving-fuzzer change — the lane is a side channel with no protocol
+  interaction. Full `npm test` + `npm run bench` green; `push` median 1.20 μs.
+
+### Documentation
+
+- `docs/dag-backpressure-design.md` records the Stage-1b ship + the M-consumer
+  multi-writer-soft-hint property. `CLAUDE.md`'s `MpmcWorkQueue` bullet notes the
+  lane. `docs/frontier3-dag-backpressure-handoff.md` marks Stage 1b shipped and
+  arms Stage 1c (`SpmcRing` per-consumer `flowScale[c]` + producer min-reduce).
+
 ## [0.9.941] — 2026-06-01
 
 ### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1a: the `MpmcRing` `flow_scale` lane

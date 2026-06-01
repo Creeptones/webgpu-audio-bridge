@@ -104,7 +104,18 @@
  *                              more push, every in-flight publish complete), after
  *                              which `enqueueTicket` is final. A consumer reads it
  *                              to release teardown strands + report `isDrained()`.
- *     lane 7                   reserved (zero).
+ *     lane 7  flow_scale        Q16.16 consumer→producer soft pacing hint (0.9.942,
+ *                              DAG back-pressure Stage 1b). Each of the M competing
+ *                              consumers ticks its OWN PI controller on the SHARED
+ *                              global occupancy (W − F)/CAPACITY on each successful
+ *                              pull and release-stores the encoded scale here;
+ *                              producers read it via `flowScaleHint()`. MULTI-WRITER
+ *                              last-writer-wins — sound because the hint is SOFT +
+ *                              self-correcting (every consumer sees the same
+ *                              occupancy ⇒ independent integrals converge; a stale
+ *                              read self-corrects on the next tick). Advisory only —
+ *                              `push()` never blocks (§5-safe). Widened DAG output
+ *                              clamp (floor `DAG_FLOW_SCALE_MIN`).
  *
  *   Generation region (Int32 array at byte 32, one Int32 per slot, 8-padded):
  *     gen[s] = the per-slot sequence stamp above. Init Free(s) = s | 0.
@@ -255,6 +266,10 @@ import {
   type Schema,
   type SchemaLayoutDescription,
 } from "./schema.js";
+import {
+  AdaptiveFlowController,
+  DAG_FLOW_SCALE_MIN,
+} from "./AdaptiveFlowController.js";
 
 /** Header size in bytes (8 Int32 lanes). 8-aligned, so the generation region
  *  that follows at byte 32 keeps the payload base 8-aligned. */
@@ -269,6 +284,22 @@ const DROPPED_LANE = 3;
 const STRANDED_LANE = 4;
 const TORN_GUARDED_LANE = 5;
 const CLOSED_LANE = 6;
+// lane 7 — flow_scale (Q16.16 consumer→producer soft pacing hint; 0.9.942,
+// Apollo Frontier 3 DAG back-pressure Stage 1b). Each of the M competing
+// consumers runs its OWN AdaptiveFlowController on each successful pull over the
+// SHARED global occupancy (W − F) and release-stores the encoded scale here;
+// all N producers read it via flowScaleHint(). MULTI-WRITER, last-writer-wins —
+// sound because the hint is SOFT + self-correcting (every consumer observes the
+// same occupancy so their independent integrals converge to the same
+// neighborhood; a stale/slightly-divergent lane read is harmless, design note
+// §2/§5). An independent side-channel cell — relaxed load/store, no
+// happens-before with any cursor/ticket/frontier/generation lane.
+const FLOW_SCALE_LANE = 7;
+
+/** Q16.16 quantum for the flow_scale lane decode. Mirrors MpmcRing's local copy
+ *  (the controller owns the encode; the producer-side decode needs only the
+ *  quantum). */
+const FLOW_SCALE_Q = AdaptiveFlowController.Q;
 
 /** Stamps run in plain ticket units (the live span is ≈ CAPACITY); cap CAPACITY
  *  so SignedDiff stays well clear of the ±2^31 boundary. */
@@ -381,6 +412,22 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
 
   /** Declared concurrent producer count (SLACK = producerCount − 1). */
   public readonly producerCount: number;
+
+  /** This consumer instance's flow_scale PI controller (lane 7; 0.9.942).
+   *  Composed with the WIDENED DAG output clamp (floor = DAG_FLOW_SCALE_MIN) so a
+   *  single hop can pace below 0.5 — see the class header "lane 7". Driven on
+   *  each successful `pull`. Unlike MpmcRing (one consumer → one controller),
+   *  MpmcWorkQueue is MP→MC: EACH of the M competing consumers owns its OWN
+   *  instance (its own heap-side PI integral) and last-writer-wins on lane 7.
+   *  This is the one real difference from Stage 1a — sound because all M
+   *  consumers observe the SAME global occupancy `(W − F)`, so their independent
+   *  integrals converge to the same neighborhood and the lane just carries the
+   *  most recent (a SOFT, self-correcting hint; a stale/slightly-divergent read
+   *  is harmless by construction). Producer instances never call `pull`, so
+   *  their controller sits unused (cheap, no SAB). */
+  private readonly flowController = new AdaptiveFlowController({
+    minScale: DAG_FLOW_SCALE_MIN,
+  });
 
   /** Total SAB byte length for `capacity` slots of `schema` under this layout.
    *  Static so callers size the SAB before constructing the queue. */
@@ -521,6 +568,10 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     for (let lane = 0; lane < MPMC_WQ_HEADER_INT32_LANES; lane++) {
       Atomics.store(this.header, lane, 0);
     }
+    // Seed flow_scale = 1.0 so any producer that reads flowScaleHint() before a
+    // consumer has run a single tick sees "go at nominal rate" rather than the 0
+    // the zero-fill above would otherwise leave (which decodes to 0.0).
+    Atomics.store(this.header, FLOW_SCALE_LANE, AdaptiveFlowController.DEFAULT_Q);
     const cap = this.capacity;
     for (let s = 0; s < cap; s++) {
       Atomics.store(this.gen, s, s | 0); // Free(s)
@@ -589,6 +640,28 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     }
   }
 
+  /**
+   * Producer-side soft pacing hint (0.9.942, DAG back-pressure Stage 1b).
+   * Returns the most recent consumer→producer `flow_scale` (Q16.16-decoded from
+   * lane 7) in `[DAG_FLOW_SCALE_MIN, 2.0]`; `1.0` means "go at nominal rate",
+   * `< 1` means "the queue is backed up — slow down", `> 1` means "the consumers
+   * are starved — speed up".
+   *
+   * **Advisory only.** `push()` never blocks on this — it stays the lossy,
+   * wait-free, never-blocking push §5 mandates. A producer *chooses* to pace (or,
+   * for a clock-locked source, to degrade earlier); nothing forces it to wait, so
+   * no stall can propagate (§5-safe soft back-pressure). All N producers read the
+   * same lane. A relaxed `Atomics.load`; the lane is MULTI-WRITER (each of the M
+   * competing consumers stores its own controller's output, last-writer-wins) but
+   * every consumer ticks over the SAME global occupancy `(W − F)`, so the value
+   * is a stable soft hint and a stale/slightly-divergent read self-corrects on
+   * the next tick. Returns 1.0 before any consumer has run a single pull (the
+   * seeded default). See `docs/dag-backpressure-design.md`.
+   */
+  flowScaleHint(): number {
+    return (Atomics.load(this.header, FLOW_SCALE_LANE) | 0) / FLOW_SCALE_Q;
+  }
+
   // ─── Consumer ──────────────────────────────────────────────────────────────
 
   /**
@@ -628,6 +701,14 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
       // Free the slot for the next lap (ticket D + CAPACITY).
       Atomics.store(this.gen, slot, (D + this.capacity) | 0); // release
       this.hasHeld = false;
+      // Soft back-pressure (Stage 1b): run one PI cycle on the SHARED global
+      // in-flight occupancy and publish the encoded scale on lane 7. Only on the
+      // successful branch — a held/empty pull must not feed the controller a
+      // misleading sample. Occupancy is the UNDELIVERED depth (W − F), NOT
+      // `available()` (which is the CLAIMABLE gap (W − R) that shrinks as
+      // consumers claim before frames are delivered). Each consumer ticks its
+      // own controller over this same observable; last-writer-wins on lane 7.
+      this._updateFlowScale();
       return true;
     }
 
@@ -656,6 +737,30 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
       }
     }
     return false;
+  }
+
+  /**
+   * Run one PI cycle on this consumer's view of the SHARED global in-flight
+   * occupancy and release-store the Q16.16-encoded `flow_scale` into lane 7
+   * (0.9.942). Called inline from `pull` on the successful-delivery branch only.
+   *
+   * `buffered = signedDiff(W, F)` is the wrap-correct UNDELIVERED depth (`W` =
+   * enqueueTicket, `F` = committedFrontier) — the back-pressure signal wants the
+   * undelivered frames, NOT `available()`'s claimable gap `(W − R)`, which shrinks
+   * as consumers claim before delivery. The controller computes occupancy =
+   * buffered / capacity internally. A pure side-channel store — no happens-before
+   * edge with the payload or any protocol lane. Mirrors `MpmcRing._updateFlowScale`
+   * but reads `(W − F)` (no single consumer cursor here) and is one of M
+   * concurrent last-writer-wins writers (see the class header lane 7 + the
+   * `flowController` field doc for the multi-writer-soft-hint argument).
+   */
+  private _updateFlowScale(): void {
+    const header = this.header;
+    const W = Atomics.load(header, ENQUEUE_TICKET_LANE);
+    const F = Atomics.load(header, FRONTIER_LANE);
+    const buffered = signedDiff(W, F);
+    const encoded = this.flowController.tick(buffered, this.capacity);
+    Atomics.store(header, FLOW_SCALE_LANE, encoded);
   }
 
   /** True while this consumer instance is holding a claim awaiting publication

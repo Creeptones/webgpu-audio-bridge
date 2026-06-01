@@ -48,6 +48,7 @@
 import { Worker } from "node:worker_threads";
 import { assert, assertEq } from "./_assert.js";
 import { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../src/MpmcWorkQueue.js";
+import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 import { stressSchema, STRESS_N } from "./_mpmcStress.js";
 
 const NPROD = 2;
@@ -128,7 +129,7 @@ const { workerData, parentPort } = require("node:worker_threads");
 const wd = workerData;
 const { sab, ctrlSab, flagSab, capacity, consumerIndex, nprod, count, n,
         genByteOffset, payloadByteOffset, payloadBytes,
-        frameF64, frameU32, off, watchdogMs } = wd;
+        frameF64, frameU32, off, watchdogMs, flowMinScale } = wd;
 const mask = capacity - 1;
 const header = new Int32Array(sab, 0, 8);
 const gen = new Int32Array(sab, genByteOffset, capacity);
@@ -145,6 +146,30 @@ function checksumOf(pid, seq, m) {
 }
 function done() {
   return Atomics.load(ctrl, 0) === 0 && ((Atomics.load(ctrl, 2) - Atomics.load(ctrl, 1)) | 0) >= 0;
+}
+
+// flow_scale (Stage 1b): this consumer's OWN PI controller (byte-faithful to
+// src/AdaptiveFlowController.ts with the widened DAG clamp). Each of the M
+// consumers owns its own integral and last-writer-wins on lane 7 over the SAME
+// global occupancy (W − F). Ticked on every successful delivery; stored to
+// header lane 7. The end-of-run assertion proves M independent writers keep the
+// lane finite + in [flowMinScale, 2.0].
+let flowIntegral = 0;
+const FLOW_Q = 65536, FLOW_KP = 0.5, FLOW_KI = 0.05, FLOW_INT_LIMIT = 20, FLOW_MAX = 2.0;
+function updateFlowScale() {
+  const W = Atomics.load(header, 0);
+  const F = Atomics.load(header, 2);
+  const buffered = (W - F) | 0;
+  const occupancy = buffered / capacity;
+  const errv = occupancy - 0.5;
+  let integral = flowIntegral + errv;
+  if (integral > FLOW_INT_LIMIT) integral = FLOW_INT_LIMIT;
+  else if (integral < -FLOW_INT_LIMIT) integral = -FLOW_INT_LIMIT;
+  flowIntegral = integral;
+  let scale = 1 - FLOW_KP * errv - FLOW_KI * integral;
+  if (scale < flowMinScale) scale = flowMinScale;
+  else if (scale > FLOW_MAX) scale = FLOW_MAX;
+  Atomics.store(header, 7, Math.floor(scale * FLOW_Q));
 }
 
 let held = -1, hasHeld = false, delivered = 0, err = null;
@@ -195,6 +220,7 @@ for (;;) {
     if (prev !== 0) { err = "DOUBLE DELIVER c=" + consumerIndex + " pid=" + pid + " seq=" + seq; break; }
     delivered++;
     Atomics.add(ctrl, 2, 1); // consumedTotal
+    updateFlowScale(); // soft back-pressure tick on the successful branch only
   } else if (d > 0) {
     // Unreachable under the envelope (defense-in-depth): held slot relapped.
     Atomics.add(header, 5, 1); // tornGuarded
@@ -277,7 +303,7 @@ async function main(): Promise<void> {
         sab, ctrlSab, flagSab, capacity: CAPACITY, consumerIndex: c, nprod: NPROD,
         count: COUNT, n: STRESS_N, genByteOffset, payloadByteOffset, payloadBytes,
         frameF64: frameByteSize / 8, frameU32: frameByteSize / 4, off,
-        watchdogMs: WATCHDOG_MS,
+        watchdogMs: WATCHDOG_MS, flowMinScale: DAG_FLOW_SCALE_MIN,
       },
     });
     w.on("message", (m: typeof conResults[number]) => {
@@ -335,6 +361,25 @@ async function main(): Promise<void> {
   assertEq(consumed + dropped, attempted, "conservation: delivered + dropped === attempted");
   assertEq(queue.tornGuarded(), 0, "zero torn-guard under real parallelism (envelope held)");
   assert(consumed > 0, "consumers actually received frames");
+
+  // flow_scale side channel (0.9.942, Stage 1b): M competing consumers each ran
+  // their OWN AdaptiveFlowController tick on every successful delivery under
+  // genuine cross-thread contention, last-writer-wins on lane 7 over the SAME
+  // global occupancy (W − F). The conservation/no-duplicate/tornGuarded
+  // assertions above already cover non-interference; here we pin that M
+  // independent multi-writers never drove the published hint out of the finite,
+  // in-range Q16.16 window (a corrupt/torn lane or a divergent integral would
+  // show here). Direction is unconstrained — the convergence-to-bottleneck
+  // behavior is the Stage-0 probe's deliverable, not this stress's.
+  const hint = queue.flowScaleHint();
+  console.log(`  flowScaleHint=${hint.toFixed(4)} (multi-writer, last-writer-wins)`);
+  assert(Number.isFinite(hint), "flow_scale hint is finite under M-consumer multi-writer contention");
+  const qEps = 1 / 65536 + 1e-9;
+  assert(
+    hint >= DAG_FLOW_SCALE_MIN - qEps && hint <= 2.0 + qEps,
+    `flow_scale hint stayed in [${DAG_FLOW_SCALE_MIN}, 2.0] (got ${hint})`,
+  );
+  assert(hint !== 1.0, "consumers moved the hint off the seeded default (lane is live cross-thread)");
 
   console.log(
     `\nMpmcWorkQueue.concurrent: OK (${consumed} frames partitioned across ${NCON} consumers, verified bit-exact + no duplicate).`,
