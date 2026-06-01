@@ -684,6 +684,34 @@ export function evaluateSepticHermiteTrajectoryInto(
   const h3s = h3 * T3;
   const h7s = h7 * T3;
 
+  const useF32FastPath = flatPrev instanceof Float32Array
+    && flatCurr instanceof Float32Array
+    && out instanceof Float32Array;
+  if (useF32FastPath) {
+    // Algebraically equivalent for Float32 outputs:
+    // h0*p0 + h4*p1 == p1 + h0*(p0 - p1), since h0 + h4 == 1.
+    // This removes one multiply on the point pair and matches
+    // `Math.fround`-to-`Float32` outputs across the existing septic f32
+    // truncation tests. Keep the f64 path unchanged to preserve strict bit
+    // exactness against the documented reference expression.
+    for (let i = 0; i < sampleCount; i++) {
+      const j = i * 4;
+      const p0 = flatPrev[j]!;
+      const v0 = flatPrev[j + 1]!;
+      const a0 = flatPrev[j + 2]!;
+      const j0 = flatPrev[j + 3]!;
+      const p1 = flatCurr[j]!;
+      const v1 = flatCurr[j + 1]!;
+      const a1 = flatCurr[j + 2]!;
+      const j1 = flatCurr[j + 3]!;
+      out[i] =
+        h0 * (p0 - p1) + p1 +
+        h1s * v0 + h5s * v1 +
+        h2s * a0 + h6s * a1 + h3s * j0 + h7s * j1;
+    }
+    return;
+  }
+
   // stride = 4 (p, v, a, j).
   for (let i = 0; i < sampleCount; i++) {
     const j = i * 4;
