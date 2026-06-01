@@ -4,6 +4,85 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.944] - 2026-06-01
+
+### Added - Apollo Frontier 7, JS-source stateful kernel authoring
+
+The missing front-half for stateful JS kernels is now shipped. The foundational
+stateful IR/runtime/gate machinery already existed; this patch lets ordinary JS
+source produce that IR through a conservative syntax:
+
+```js
+function k(n, out, x, c) {
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    const y = (1 - c) * x[i] + c * s;
+    out[i] = y;
+    s = y;
+  }
+}
+```
+
+- **`lower.ts` accepts finite numeric pre-loop `let` declarations as state registers.**
+  The function body may contain zero or more `let state = <finite numeric literal>`
+  declarations before the single counted loop. No arbitrary pre-loop statements,
+  no `const`/`var`, no parameter shadowing, and no post-loop statements are allowed.
+- **State identifiers lower explicitly.** Reads of declared state names inside the
+  loop become `readState`; assignments to those names become `stateStores`, with
+  at most one write per register per iteration.
+- **Simultaneous semantics are preserved.** The lowerer rejects same-iteration
+  read-after-state-write patterns (`s = x[i]; out[i] = s;`) with `E_LOOP_CARRY`
+  and a diagnostic that tells the author to compute from old state into a temp,
+  then assign the next state. Safe textbook filters (`const y = ... old state ...;
+  out[i] = y; s = y;`) lower cleanly.
+- **Output-array reads remain forbidden.** Loop-carried state flows only through
+  explicit state registers/buffers, not through `out[i - 1]` or output reads.
+
+### Why
+
+Frontier 7 had settled and implemented simultaneous state-space semantics for the
+IR/token path, but `compileKernel(source)` was still effectively stateless because
+the JS lowerer rejected all pre-loop declarations. That left the ergonomic
+authoring path unable to express the one-pole/biquad family even though the backend,
+gate, scalar runtime, persistent slabs, delay-line layout, and voice-SIMD machinery
+were already in place. This patch closes that gap without admitting real JS
+sequential mutation semantics into the IR.
+
+### Wire compatibility
+
+Patch-level, experimental-subpath only. No frozen public wire format changes. The
+new state shape is internal JIT metadata (`stateDecls`/`stateStores`) already used
+by the Frontier 7 token path; stateless JS kernels keep the same state-free
+`kernelHash`/`kernelKey` path and still compile to time-axis SIMD with
+`accepted.voices === 1`.
+
+For `connectJit({ kernel })`, an in-subset stateful JS kernel is now lowered at
+construction time so the worklet can reserve the right persistent state slab. The
+worklet JS fallback is the IR-emitted simultaneous-state fallback, not the raw
+pre-loop-`let` source, because the raw local variable would not persist across
+quanta. Out-of-subset JS kernels still degrade through the existing async
+`rejected-source` compile verdict.
+
+### Tests
+
+- **`tests/stateKernelLower.test.ts`** (new): JS one-pole lowers to the same IR
+  behavior and content hash as the token one-pole; JS biquad compiles, gate-verifies,
+  and matches `evalReference`; unsafe sequential state dependency is rejected with
+  `E_LOOP_CARRY`; `connectJit({ kernel, voices: W })` over a stateful JS kernel
+  routes to voice-SIMD; stateless JS kernels keep the state-free hash/path/behavior.
+- Existing regression pins stayed green: `tests/JitCompiler.test.ts`,
+  `tests/stateKernel.test.ts`, `tests/connectJit.test.ts`, `tests/voiceKernel.test.ts`,
+  plus `tsc --noEmit`.
+
+### Documentation
+
+- `docs/frontier7-statefulness-semantics.md` marks the previously deferred JS
+  authoring follow-up as shipped in `0.9.944`, with the precise syntax and rejection
+  rule.
+- `CLAUDE.md` notes the `0.9.944` JS-source stateful authoring patch under the
+  Frontier 7 JIT guidance, and the version follows the late-`0.9.x` three-digit
+  patch policy (`0.9.943 -> 0.9.944`).
+
 ## [0.9.943] — 2026-06-01
 
 ### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1c: the `SpmcRing` per-consumer `flow_scale` lane + the producer MIN-reduce

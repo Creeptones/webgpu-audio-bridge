@@ -134,10 +134,10 @@ export function compileKernel(
     throw err;
   }
 
-  // The user's source is the gate's THIRD oracle on this (JS) path only. (The JS
-  // authoring path is stateless in v1 — `lower.ts` statefulness is deferred — so
-  // `voices` here is inert unless a future stateful lowering lands; threaded for
-  // completeness.)
+  // The user's source is the gate's THIRD oracle on the stateless JS path. Stateful
+  // JS now lowers to the same explicit register IR as the token path; that route is
+  // gated scalar/voice WASM against `evalReference(ir)`, so the JS oracle is bypassed
+  // by the scalarOnly/voice gates exactly as it is for token-authored state.
   return compileIr(ir, {
     compileWat: opts.compileWat,
     exportName,

@@ -73,12 +73,15 @@
 
 import {
   type KernelSignature, type LaneWidth, type IrStateDecl, type IrStateBufferDecl,
-  ELEM_BYTES, LANES, signatureWidth, paramsByRole, stateLayout,
+  ELEM_BYTES, LANES, signatureWidth, paramsByRole, stateLayout, isStateful,
 } from "./ir.js";
 import { compileKernel, compileTokens, type CompileResult } from "./compileKernel.js";
 import { emitJsKernel } from "./emitJsKernel.js";
 import { tokensToKernel, type KernelToken } from "./kernelGrammar.js";
 import { type CompileWat, type GateReport } from "./gate.js";
+import { parseProgram } from "./parse.js";
+import { lowerKernel } from "./lower.js";
+import { JitRejection } from "./diagnostics.js";
 import {
   JitKernelConsumer, MAX_STATE_REGISTERS, type JitJsKernel, type JitProcessResult,
 } from "./JitKernelConsumer.js";
@@ -133,11 +136,11 @@ export interface ConnectJitSpec {
   /** Override the SIMD lane width for the compile (default: `signature.width`). */
   readonly width?: LaneWidth;
   /** Polyphonic voice batch (Apollo Frontier 7, Stage 4). Default 1 (single voice).
-   *  When `> 1` (a multiple of the lane width `W`) and the kernel is STATEFUL (the
-   *  token path), `connectJit` compiles a voice-SIMD kernel (W independent voices per
-   *  v128) and the worklet runs the voice-batched runtime: voice-interleaved I/O +
-   *  per-voice scalars (see `JitKernelConsumer.process`). Ignored for a stateless
-   *  kernel (time-axis SIMD). */
+   *  When `> 1` (a multiple of the lane width `W`) and the kernel lowers to STATEFUL
+   *  IR (token or JS-source path), `connectJit` compiles a voice-SIMD kernel (W
+   *  independent voices per v128) and the worklet runs the voice-batched runtime:
+   *  voice-interleaved I/O + per-voice scalars (see `JitKernelConsumer.process`).
+   *  Ignored for a stateless kernel (time-axis SIMD). */
   readonly voices?: number;
 }
 
@@ -379,28 +382,46 @@ export function connectJit(spec: ConnectJitSpec): JitConnection {
   // kernel. The gate, not this, is the equivalence boundary.
   let kernelSource: string;
   let compileRequest: JitCompileRequest;
-  // The kernel's declared state registers (Frontier 7). On the token path they
-  // ride in the validated IR (the JS fallback + the SIMD kernel are both derived
-  // from it, so their state shapes always match — the consumer relies on that). On
-  // the JS-source path `lower.ts` statefulness is a deferred follow-up, so a
-  // `kernel`-function kernel is always stateless here.
+  // The kernel's declared state registers (Frontier 7). When the source can be
+  // lowered at construction time (token path always, JS path for in-subset source)
+  // the JS fallback + compiled kernel share the same state shape. If a JS source is
+  // out-of-subset, construction stays non-throwing and the compile worker returns
+  // the fallback verdict later, preserving the original graceful-degrade contract.
   let stateDecls: ReadonlyArray<IrStateDecl> = [];
   let stateBuffers: ReadonlyArray<IrStateBufferDecl> = [];
   // Voice-SIMD (Frontier 7, Stage 4) is for STATEFUL kernels only; for a stateless
-  // kernel (or the JS-source path, which is stateless in v1) `voices` collapses to 1
-  // (time-axis SIMD). Derived after the token IR reveals statefulness.
+  // kernel `voices` collapses to 1 (time-axis SIMD). Derived after lowering reveals
+  // statefulness.
   let voices = 1;
   if (hasTokens) {
     const tokens = spec.tokens!;
     const ir = tokensToKernel(tokens);
     stateDecls = ir.stateDecls ?? [];
     stateBuffers = ir.stateBuffers ?? [];
-    voices = requestedVoices > 1 && (stateDecls.length > 0 || stateBuffers.length > 0) ? requestedVoices : 1;
+    voices = requestedVoices > 1 && isStateful(ir) ? requestedVoices : 1;
     kernelSource = emitJsKernel(ir);
     compileRequest = { type: "jit-compile", kind: "tokens", tokens, signature, width, exportName, voices };
   } else {
-    kernelSource = spec.kernel!.toString();
-    compileRequest = { type: "jit-compile", kind: "js", source: kernelSource, signature, width, exportName, voices };
+    const source = spec.kernel!.toString();
+    kernelSource = source;
+    try {
+      const ir = lowerKernel(parseProgram(source), signature);
+      stateDecls = ir.stateDecls ?? [];
+      stateBuffers = ir.stateBuffers ?? [];
+      if (isStateful(ir)) {
+        voices = requestedVoices > 1 ? requestedVoices : 1;
+        // The authored JS state syntax (`let s = 0` before the loop) is a source
+        // declaration, not a persistent runtime slab. Once it lowers successfully,
+        // use the IR-derived fallback so the worklet JS path shares the same
+        // persistent simultaneous-state semantics as WASM and the token path.
+        kernelSource = emitJsKernel(ir);
+      }
+    } catch (err) {
+      if (!(err instanceof JitRejection)) throw err;
+      // Keep the original source and stateless sizing; runJitCompile will surface
+      // the precise rejected-source verdict asynchronously.
+    }
+    compileRequest = { type: "jit-compile", kind: "js", source, signature, width, exportName, voices };
   }
 
   // Allocate the working memory unless the caller adopts one. Shared when the host

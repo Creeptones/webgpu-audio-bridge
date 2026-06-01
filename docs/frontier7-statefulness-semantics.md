@@ -5,6 +5,12 @@
 > **What this is.** The Stage-0 design note the kickoff handoff (`docs/frontier7-statefulness-handoff.md` §7.2) asks for: it settles the §5 open questions, states the recurrence theorem the architecture must bend to (not around), and pins the sub-language the Stage-1 compiler is gated against. Formal/design only — the runnable half is `bench/state-probe.mjs`. No production code lands with this note.
 >
 > **Read the handoff first** for the *why* and the staging table; this note is the *what exactly*.
+>
+> **0.9.944 shipped follow-up.** The JS-source authoring path that this note originally
+> deferred is now implemented: finite numeric pre-loop `let` declarations lower to
+> state registers, in-loop reads lower to `readState`, in-loop assignments lower to
+> `stateStores`, and read-after-state-write patterns are rejected so the lowered IR
+> keeps the simultaneous semantics below.
 
 ---
 
@@ -108,7 +114,7 @@ The probe runs from **zero initial state** (the honest "what does it sound like 
 | # | Question | Decision |
 |---|---|---|
 | 1 | `z⁻¹` ordering | **Simultaneous (state-space)**, §2.2. At most one `writeState` per register per iteration; all reads in an iteration see the previous committed value; writes commit at iteration end. Deviates from the handoff's sequential recommendation, for the reasons in §2.2. |
-| 2 | JS authoring syntax | **Deferred past Stage 1.** Stage 1 ships the **token/IR path** (the model-emittable surface the whole Frontier 6/7 grammar targets) and `compileTokens`/`compileIr`. The `lower.ts` JS-source relaxations (a `let s = <literal>;` before the loop ⇒ a register; `s = expr;` ⇒ its `writeState`) are a clean follow-up patch — they carry a real-JS-is-sequential vs IR-is-simultaneous reconciliation that is safest to land on a proven IR/gate base. Filters are single-write-at-end, so the two coincide; the follow-up just has to *enforce* that class. The token grammar (§2.2, simultaneous) is fully settled now. |
+| 2 | JS authoring syntax | **Shipped in 0.9.944.** `lower.ts` now accepts conservative JS-source state: finite numeric pre-loop `let s = <literal>;` declarations become registers; reads of `s` inside the loop become `readState`; `s = expr;` becomes a `stateStore`. To reconcile real JS's sequential assignment with the IR's simultaneous semantics, the lowerer accepts only the safe class where expressions read old state and compute next state into temps before assignment, and rejects same-iteration read-after-state-write patterns with `E_LOOP_CARRY`. The token grammar (§2.2, simultaneous) remains the canonical semantic contract. |
 | 3 | Probe length / growth check | **Both**, stateful-only (§3): probe length `4096`, plus a second-half/first-half RMS growth-ratio check with an `8×` margin. Stateless verdicts unchanged. |
 | 4 | Shared temps / CSE | **Defer.** v1 recomputes; correct, engine usually CSEs. A `dup`/named-temp grammar+IR feature is a later perf lane. |
 | 5 | Bumpless transfer | **Defer.** The state-shape-match predicate that would gate it: *identical ordered `(name, init)` register lists* (same topology) between the outgoing and incoming kernel. Until built, every freshly-installed stateful kernel starts cold (zero/init state); the crossfade masks the transient (Stage 2). |
@@ -143,4 +149,4 @@ The scalar WASM (`$reg` loaded pre-loop, `$next` computed in-loop, committed at 
 - `acousticGate` stateful stability (longer probe + growth check); `emitJsKernel` faithful simultaneous-state JS.
 - `tests/stateKernel.test.ts`: one-pole lowpass + biquad **gate-verified**, a **marginally unstable** filter **rejected** by the stability gate, the **stateless SIMD bytes unchanged** frontier pin, the `kernelHash(gain)` regression pin, and `emitJsKernel` behavioral faithfulness (run the emitted JS, compare to `evalReference`).
 
-**Out of Stage 1 (documented follow-ups):** `lower.ts` JS authoring (§5.2), the Stage-2 persistent runtime slab + crossfade, Stage-3 delay lines, Stage-4 voice-axis SIMD, Stage-5 surface/demo.
+**Follow-up status:** `lower.ts` JS authoring (§5.2) shipped in **0.9.944**; Stage-2 persistent runtime slab + crossfade, Stage-3 delay lines, and Stage-4 voice-axis SIMD have also landed. Stage-5 surface/demo remains the broader product-surface follow-up.

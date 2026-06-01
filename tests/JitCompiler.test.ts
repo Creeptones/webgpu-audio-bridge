@@ -160,7 +160,7 @@ async function main(): Promise<void> {
       ["E_REASSIGN", "function k(out,x,y,n){ for(let i=0;i<n;i++){ out[i] += x[i]; } }", sBase],
       ["E_NONFINITE_LITERAL", "function k(out,x,y,n){ for(let i=0;i<n;i++){ out[i] = x[i] + Infinity; } }", sBase],
       ["E_DYNAMIC", "function k(out,x,y,n){ for(let i=0;i<n;i++){ out[i] = x[i] + n; } }", sBase],
-      ["E_SHAPE", "function k(out,x,y,n){ let z = 0; for(let i=0;i<n;i++){ out[i] = x[i]; } }", sBase],
+      ["E_SHAPE", "function k(out,x,y,n){ const z = 0; for(let i=0;i<n;i++){ out[i] = x[i]; } }", sBase],
       ["E_PARSE", "function k(out,x,y,n){ for(let i=0;i<n;i++ { out[i] = x[i]; } }", sBase],
     ];
     const seen = new Set<string>();

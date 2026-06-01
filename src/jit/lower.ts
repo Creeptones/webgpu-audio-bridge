@@ -20,7 +20,8 @@
 import type { EsNode } from "./parse.js";
 import { reject, JitRejection, type Diagnostic } from "./diagnostics.js";
 import {
-  type IrKernel, type IrNode, type IrStore, type LoopBound, type KernelSignature,
+  type IrKernel, type IrNode, type IrStore, type IrStateDecl, type IrStateStore,
+  type LoopBound, type KernelSignature,
   type BinaryOp, type UnaryOp, signatureWidth, paramsByRole, lengthParamName,
 } from "./ir.js";
 
@@ -32,6 +33,18 @@ interface Ctx {
   readonly lengthName: string | null;
   readonly loopVar: string;
   readonly temps: Map<string, IrNode>;
+  readonly states: Set<string>;
+  readonly writtenStates: Set<string>;
+}
+
+interface FunctionShape {
+  readonly forStmt: EsNode;
+  readonly stateDecls: ReadonlyArray<IrStateDecl>;
+}
+
+interface LoweredLoopBody {
+  readonly stores: IrStore[];
+  readonly stateStores: IrStateStore[];
 }
 
 const n = (x: unknown): EsNode => x as EsNode;
@@ -43,8 +56,12 @@ export function lowerKernel(program: EsNode, sig: KernelSignature): IrKernel {
   const fn = findFunction(program);
   checkParams(fn, sig);
 
-  const loopVar = readForHeaderLoopVar(getSingleFor(fn));
-  const forStmt = getSingleFor(fn);
+  const shape = getFunctionShape(fn, sig);
+  const forStmt = shape.forStmt;
+  const loopVar = readForHeaderLoopVar(forStmt);
+  if (shape.stateDecls.some((d) => d.name === loopVar)) {
+    reject("E_REASSIGN", `state register "${loopVar}" conflicts with the loop variable`, forStmt);
+  }
   const ctx: Ctx = {
     sig,
     inputs: new Set(paramsByRole(sig, "input").map((p) => p.name)),
@@ -53,12 +70,17 @@ export function lowerKernel(program: EsNode, sig: KernelSignature): IrKernel {
     lengthName: lengthParamName(sig),
     loopVar,
     temps: new Map(),
+    states: new Set(shape.stateDecls.map((d) => d.name)),
+    writtenStates: new Set(),
   };
   const bound = readForBound(forStmt, ctx);
-  const stores = lowerLoopBody(forStmt, ctx);
+  const { stores, stateStores } = lowerLoopBody(forStmt, ctx);
   if (stores.length === 0) reject("E_SHAPE", "kernel loop body writes no output", forStmt);
 
-  return { width: signatureWidth(sig), bound, stores, signature: sig };
+  const base = { width: signatureWidth(sig), bound, stores, signature: sig };
+  return shape.stateDecls.length > 0 || stateStores.length > 0
+    ? { ...base, stateDecls: shape.stateDecls, stateStores }
+    : base;
 }
 
 /** Validation-only wrapper: returns the first diagnostic, or null if acceptable. */
@@ -115,14 +137,60 @@ function getFunctionBody(fn: EsNode): EsNode {
   return body;
 }
 
-function getSingleFor(fn: EsNode): EsNode {
+function getFunctionShape(fn: EsNode, sig: KernelSignature): FunctionShape {
   const block = getFunctionBody(fn);
   const stmts = (block.body as EsNode[]) ?? [];
-  const fors = stmts.filter((s) => isType(s, "ForStatement"));
-  if (stmts.length !== 1 || fors.length !== 1) {
-    reject("E_SHAPE", "kernel body must be exactly one for-loop (no statements before/after, no accumulators)", block);
+  const paramNames = new Set(sig.params.map((p) => p.name));
+  const stateDecls: IrStateDecl[] = [];
+  let forStmt: EsNode | null = null;
+  for (const raw of stmts) {
+    const stmt = n(raw);
+    if (forStmt) {
+      reject("E_SHAPE", "kernel body may not contain statements after the single for-loop", stmt);
+    }
+    if (isType(stmt, "ForStatement")) {
+      forStmt = stmt;
+      continue;
+    }
+    if (!isType(stmt, "VariableDeclaration")) {
+      reject("E_SHAPE", "kernel body may only contain finite numeric `let` state declarations before the single for-loop", stmt);
+    }
+    stateDecls.push(readStateDecl(stmt, paramNames, new Set(stateDecls.map((d) => d.name))));
   }
-  return n(fors[0]);
+  if (!forStmt) {
+    reject("E_SHAPE", "kernel body must contain exactly one for-loop after optional state declarations", block);
+  }
+  return { forStmt, stateDecls };
+}
+
+function readStateDecl(stmt: EsNode, paramNames: ReadonlySet<string>, stateNames: ReadonlySet<string>): IrStateDecl {
+  if ((stmt.kind as string) !== "let") {
+    reject("E_SHAPE", "pre-loop state declarations must use `let name = <finite numeric literal>`", stmt);
+  }
+  const decls = (stmt.declarations as EsNode[]) ?? [];
+  if (decls.length !== 1) reject("E_SHAPE", "declare one state register per pre-loop `let` statement", stmt);
+  const d = n(decls[0]);
+  const id = n(d.id);
+  if (!isType(id, "Identifier")) reject("E_DYNAMIC", "state register must be a plain identifier (no destructuring)", id);
+  const name = id.name as string;
+  if (paramNames.has(name)) reject("E_REASSIGN", `state register "${name}" shadows a parameter`, id);
+  if (stateNames.has(name)) reject("E_REASSIGN", `state register "${name}" is declared more than once`, id);
+  if (!d.init) reject("E_SHAPE", `state register "${name}" must be initialized`, id);
+  return { name, init: readFiniteNumericInit(n(d.init), name) };
+}
+
+function readFiniteNumericInit(init: EsNode, name: string): number {
+  if (isType(init, "Literal") && typeof init.value === "number" && Number.isFinite(init.value)) {
+    return init.value as number;
+  }
+  if (isType(init, "UnaryExpression") && ((init.operator as string) === "-" || (init.operator as string) === "+")) {
+    const arg = n(init.argument);
+    if (isType(arg, "Literal") && typeof arg.value === "number") {
+      const v = (init.operator as string) === "-" ? -(arg.value as number) : (arg.value as number);
+      if (Number.isFinite(v)) return v;
+    }
+  }
+  reject("E_NONFINITE_LITERAL", `state register "${name}" init must be a finite numeric literal`, init);
 }
 
 // ── for-header ────────────────────────────────────────────────────────────────
@@ -172,16 +240,19 @@ function readForBound(forStmt: EsNode, ctx: Ctx): LoopBound {
 
 // ── body: statements → stores (with SSA-temp inlining) ───────────────────────
 
-function lowerLoopBody(forStmt: EsNode, ctx: Ctx): IrStore[] {
+function lowerLoopBody(forStmt: EsNode, ctx: Ctx): LoweredLoopBody {
   const body = n(forStmt.body);
   if (!isType(body, "BlockStatement")) reject("E_SHAPE", "loop body must be a block { … }", body);
   const stores: IrStore[] = [];
+  const stateStores: IrStateStore[] = [];
   for (const raw of (body.body as EsNode[]) ?? []) {
     const stmt = n(raw);
     if (isType(stmt, "VariableDeclaration")) {
       lowerTempDecl(stmt, ctx);
     } else if (isType(stmt, "ExpressionStatement")) {
-      stores.push(lowerStore(n(stmt.expression), ctx));
+      const lowered = lowerStore(n(stmt.expression), ctx);
+      if ("array" in lowered) stores.push(lowered);
+      else stateStores.push(lowered);
     } else {
       // nested loops / if / while / break / return live here:
       if (isType(stmt, "IfStatement") || isType(stmt, "SwitchStatement")) reject("E_BRANCH", "branches are not allowed in a kernel loop", stmt);
@@ -190,7 +261,7 @@ function lowerLoopBody(forStmt: EsNode, ctx: Ctx): IrStore[] {
       reject("E_DYNAMIC", `unsupported statement: ${stmt.type}`, stmt);
     }
   }
-  return stores;
+  return { stores, stateStores };
 }
 
 function lowerTempDecl(stmt: EsNode, ctx: Ctx): void {
@@ -203,22 +274,31 @@ function lowerTempDecl(stmt: EsNode, ctx: Ctx): void {
   if (!isType(id, "Identifier")) reject("E_DYNAMIC", "temp must be a plain identifier (no destructuring)", id);
   const name = id.name as string;
   if (ctx.temps.has(name)) reject("E_REASSIGN", `temp "${name}" is re-declared (SSA temps are single-assignment)`, id);
-  if (ctx.scalars.has(name) || ctx.inputs.has(name) || ctx.outputs.has(name) || name === ctx.loopVar || name === ctx.lengthName) {
+  if (ctx.scalars.has(name) || ctx.inputs.has(name) || ctx.outputs.has(name) || ctx.states.has(name) || name === ctx.loopVar || name === ctx.lengthName) {
     reject("E_REASSIGN", `temp "${name}" shadows a parameter`, id);
   }
   if (!d.init) reject("E_SHAPE", `temp "${name}" must be initialized`, id);
   ctx.temps.set(name, lowerExpr(n(d.init), ctx));
 }
 
-function lowerStore(expr: EsNode, ctx: Ctx): IrStore {
+function lowerStore(expr: EsNode, ctx: Ctx): IrStore | IrStateStore {
   if (!isType(expr, "AssignmentExpression")) {
     if (isType(expr, "UpdateExpression")) reject("E_REASSIGN", "++/-- is not allowed", expr);
-    reject("E_SHAPE", "loop body statements must be `out[idx] = expr` or `let t = expr`", expr);
+    reject("E_SHAPE", "loop body statements must be `out[idx] = expr`, `state = expr`, or `let t = expr`", expr);
   }
   if ((expr.operator as string) !== "=") reject("E_REASSIGN", `compound assignment "${expr.operator as string}" is not allowed (would read the output → loop-carry)`, expr);
   const left = n(expr.left);
+  const stateName = identName(left);
+  if (stateName && ctx.states.has(stateName)) {
+    if (ctx.writtenStates.has(stateName)) {
+      reject("E_REASSIGN", `state register "${stateName}" is written more than once per iteration`, left);
+    }
+    const value = lowerExpr(n(expr.right), ctx);
+    ctx.writtenStates.add(stateName);
+    return { name: stateName, value };
+  }
   if (!isType(left, "MemberExpression") || !(left.computed as boolean)) {
-    reject("E_REASSIGN", "kernel may only assign to an output array element `out[idx]`", left);
+    reject("E_REASSIGN", "kernel may only assign to an output array element `out[idx]` or a declared state register", left);
   }
   const arrName = identName(n(left.object));
   if (!arrName || !ctx.outputs.has(arrName)) reject("E_SHAPE", `store target must be a declared output array (got "${arrName ?? "?"}")`, left);
@@ -242,6 +322,16 @@ function lowerExpr(node: EsNode, ctx: Ctx): IrNode {
       // `Infinity` / `NaN` are GLOBAL IDENTIFIERS in JS, not numeric literals.
       if (name === "Infinity" || name === "NaN") reject("E_NONFINITE_LITERAL", `${name} is not allowed in a kernel`, node);
       if (ctx.temps.has(name)) return ctx.temps.get(name)!; // inline the SSA subtree
+      if (ctx.states.has(name)) {
+        if (ctx.writtenStates.has(name)) {
+          reject(
+            "E_LOOP_CARRY",
+            `state register "${name}" is read after being assigned in the same iteration; compute from the old state into a temp, then assign the next state`,
+            node,
+          );
+        }
+        return { kind: "readState", name };
+      }
       if (ctx.scalars.has(name)) return { kind: "scalar", name };
       if (name === ctx.loopVar) reject("E_DYNAMIC", "the loop variable may only appear inside an array index, not as a value", node);
       if (ctx.inputs.has(name) || ctx.outputs.has(name)) reject("E_DYNAMIC", `array "${name}" must be indexed (e.g. ${name}[i])`, node);
