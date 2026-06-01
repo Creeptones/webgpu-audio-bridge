@@ -4,6 +4,101 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.943] — 2026-06-01
+
+### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1c: the `SpmcRing` per-consumer `flow_scale` lane + the producer MIN-reduce
+
+The third and final fan-ring cut of the consumer→producer `flow_scale` hint (Stage
+1a shipped `MpmcRing`, 1b `MpmcWorkQueue`). `SpmcRing` (SP→MC broadcast) is the one
+ring where the signal is genuinely new in shape — the producer broadcasts to ALL
+consumers, so it must pace to the **slowest** one. This patch adds a per-consumer
+lane and the **MIN-reduce** that reads it — the one genuinely-new wait-free
+operation in the whole arc.
+
+- **`SpmcRing` gains a 4th per-consumer lane `flowScale[c]`** (Q16.16) — the per-
+  consumer region grew from 3 lanes (`dequeuePos`/`dropped`/`tornGuarded`) to 4.
+  Each consumer runs its OWN `AdaptiveFlowController.tick(buffered, capacity)` on
+  each *successful* `pull` (occupancy from its own backlog `(writeTicket −
+  dequeuePos[c])`, capped at `capacity` by the overload net) and release-stores the
+  encoded scale into ITS OWN cell. A ride/guard-discard skips the tick.
+- **No multi-writer race — the OPPOSITE of Stage 1b.** Where `MpmcWorkQueue` had M
+  consumers contending on one shared lane (last-writer-wins), `SpmcRing` already
+  gives each consumer its own lane region, so each consumer is the sole writer of
+  its `flowScale[c]` cell (the same single-writer discipline as `dequeuePos[c]`).
+  The per-consumer controller is heap state keyed by consumer index (lazily created
+  on first pull; in practice one per instance).
+- **New `SpmcRing.flowScaleHint(): number` — the producer-side MIN-reduce (the one
+  genuinely-new operation).** It does an O(consumerCount ≤ 64) **min** over the N
+  per-consumer `flowScale[c]` cells via relaxed `Atomics.load` and returns the
+  decoded minimum in `[DAG_FLOW_SCALE_MIN, 2.0]`. Because the single producer
+  broadcasts to every consumer, `min` is the correct compose: one overfull consumer
+  (`< 1`) pulls the producer's pacing down regardless of how starved the others are
+  (`> 1`) — the producer paces to the slowest leg. Bounded, no retry, no wait →
+  **wait-free**. **Advisory only** — `push()` laps freely and never reads the lane
+  (§5-safe); a source merely *chooses* to pace. Every cell is seeded `1.0`, so the
+  min reads "nominal" before any consumer has pulled.
+- **The widened DAG clamp is REUSED verbatim** — `DAG_FLOW_SCALE_MIN = 0.05`
+  imported from `AdaptiveFlowController` (locked at Stage 1a), not re-derived.
+  `SpscRing`'s frozen `[0.5, 2.0]` is untouched.
+
+### Why
+
+`SpmcRing` is the broadcast edge: a slow consumer can't back-pressure the producer
+(it laps freely, §5), so the only signal is a per-consumer drop count. The
+per-consumer `flow_scale` lane plus the producer min-reduce gives the producer one
+number — "how fast can my slowest consumer keep up" — to pace on, without ever
+blocking. With this, all three fan rings (`MpmcRing`/`MpmcWorkQueue`/`SpmcRing`)
+plus the SPSC edge carry the same hint, so the upcoming Stage 2 `connectGraph`
+contract can have a node compute `effectiveScale = min(outbound flowScaleHints)`
+and pace the whole graph to its slowest sink with no central coordinator.
+
+### Wire compatibility
+
+`SpmcRing` is `@experimental`, internal-first, not exported from `src/index.ts`;
+its wire format is explicitly outside the 1.0 contract (the one-shot construction
+warning covers it). Unlike 1a/1b (which landed in already-reserved header lanes),
+the 4th per-consumer lane **grows the per-consumer region → the SAB layout changes
+for this ring** (gen + payload regions shift; `SpmcRing.byteLength` is larger). It
+is still a **patch**: pre-promotion experimental, no public TS surface change, no
+frozen wire-format touched (SPSC core, `MpmcRing`, `MpmcWorkQueue` all untouched).
+Were `SpmcRing` promoted, the layout growth would be a minor-bump trigger;
+pre-promotion it is a patch with this wire-compat note.
+
+### Tests
+
+- **`tests/SpmcRing.test.ts` pin 11** (new) — the per-consumer lane + the MIN-reduce,
+  deterministic: seeded `1.0`; a maintained-full-backlog consumer drives its OWN
+  `flowScale[c]` **below 0.5** (widened clamp) while a non-pulling consumer's cell
+  stays seeded (proving per-consumer isolation, no shared race); `flowScaleHint()`
+  returns the **min** == the backed-up consumer's value; white-box stores prove the
+  reduction is a true min, order-independent, in `[DAG_FLOW_SCALE_MIN, 2.0]`; a
+  sustained-low consumer drives its cell up toward `2.0`. No tear/drop on the side
+  channel.
+- **`tests/SpmcRing.concurrent.test.ts` / `tests/connectFanOut.concurrent.test.ts`** —
+  the 3 M-frame broadcast stresses now have each consumer worker run a byte-faithful
+  controller tick on every delivery and write its own `flowScale[c]`; the end pins
+  the producer's real `flowScaleHint()` min-reduce stayed finite + in-range under
+  real cross-thread contention (the lane is live, the reduction reads N live cells).
+- **Byte-faithful worker offsets updated** for the grown per-consumer region
+  (`PER_CONSUMER_LANES` 3→4) across `tests/SpmcRing.concurrent.test.ts`,
+  `tests/connectFanOut.concurrent.test.ts`, `tests/connectGraph.concurrent.test.ts`,
+  and the `tests/SpmcRing.test.ts` layout pin — the SAB-size assertions are the
+  structural gate that the workers agree with the real `SpmcRing` layout.
+- **No interleaving-fuzzer change** — the lane is a side channel with no protocol
+  interaction, and the min-reduce is a read-only reduction over per-consumer cells
+  (its order-independence + bounds are proven deterministically by pin 11). This
+  matches the Stage-1a/1b decision (side channels don't add DFS states). Full
+  `npm test` + `npm run bench` green; `push` median 1.20 μs.
+
+### Documentation
+
+- `docs/dag-backpressure-design.md` §6 records the Stage-1c ship (per-consumer lane,
+  the min-reduce, the no-multi-writer-race contrast with 1b, the SAB-growth note).
+  `CLAUDE.md`'s `SpmcRing` bullet notes the lane + min-reduce.
+  `docs/frontier3-dag-backpressure-handoff.md` marks Stage 1c shipped and arms
+  Stage 2 (`connectGraph` compose contract + `topology.flowScaleHint(node)` roll-up
+  + `ResidualQualityController` tie-in + the `examples/audio-dag/` HUD).
+
 ## [0.9.942] — 2026-06-01
 
 ### Added — Apollo Frontier 3, DAG-wide back-pressure Stage 1b: the `MpmcWorkQueue` `flow_scale` lane

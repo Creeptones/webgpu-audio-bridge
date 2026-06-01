@@ -45,6 +45,7 @@
 import { Worker } from "node:worker_threads";
 import { assert, assertEq } from "./_assert.js";
 import { SpmcRing, SPMC_HEADER_BYTES } from "../src/SpmcRing.js";
+import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 import { stressSchema, fillValue, checksumOf, STRESS_N } from "./_mpmcStress.js";
 
 const NCON = 3;
@@ -62,16 +63,19 @@ const { workerData, parentPort } = require("node:worker_threads");
 const wd = workerData;
 const { sab, capacity, consumerCount, consumerIndex,
         consumerByteOffset, genByteOffset, payloadByteOffset, payloadBytes,
-        frameF64, frameU32, off, count, n, watchdogMs } = wd;
+        frameF64, frameU32, off, count, n, watchdogMs, flowMinScale } = wd;
 const mask = capacity - 1;
 const header = new Int32Array(sab, 0, 8);
-const cl = new Int32Array(sab, consumerByteOffset, consumerCount * 3);
+// PER_CONSUMER_LANES = 4 (dequeuePos/dropped/tornGuarded/flowScale; lane 3 added
+// at 0.9.943, DAG back-pressure Stage 1c).
+const cl = new Int32Array(sab, consumerByteOffset, consumerCount * 4);
 const gen = new Int32Array(sab, genByteOffset, capacity);
 const f64 = new Float64Array(sab, payloadByteOffset, payloadBytes / 8);
 const u32 = new Uint32Array(sab, payloadByteOffset, payloadBytes / 4);
-const dqIdx = consumerIndex * 3 + 0;
-const drIdx = consumerIndex * 3 + 1;
-const tgIdx = consumerIndex * 3 + 2;
+const dqIdx = consumerIndex * 4 + 0;
+const drIdx = consumerIndex * 4 + 1;
+const tgIdx = consumerIndex * 4 + 2;
+const fsIdx = consumerIndex * 4 + 3;
 
 function fillValue(pid, seq, i) { return pid * 1000003 + seq * 7 + i * 0.25; }
 function checksumOf(pid, seq, m) {
@@ -80,6 +84,27 @@ function checksumOf(pid, seq, m) {
   return s;
 }
 function signedDiff(a, b) { return (a - b) | 0; }
+
+// flow_scale (Stage 1c): this consumer's OWN PI controller (byte-faithful to
+// src/AdaptiveFlowController.ts with the widened DAG clamp). Each consumer writes
+// ONLY its own flowScale[c] cell (no multi-writer race — the opposite of the
+// work queue). Ticked on every successful delivery over this consumer's own
+// backlog (W − D).
+let flowIntegral = 0;
+const FLOW_Q = 65536, FLOW_KP = 0.5, FLOW_KI = 0.05, FLOW_INT_LIMIT = 20, FLOW_MAX = 2.0;
+function updateFlowScale(W, D) {
+  const buffered = signedDiff(W, D);
+  const occupancy = buffered / capacity;
+  const errv = occupancy - 0.5;
+  let integral = flowIntegral + errv;
+  if (integral > FLOW_INT_LIMIT) integral = FLOW_INT_LIMIT;
+  else if (integral < -FLOW_INT_LIMIT) integral = -FLOW_INT_LIMIT;
+  flowIntegral = integral;
+  let scale = 1 - FLOW_KP * errv - FLOW_KI * integral;
+  if (scale < flowMinScale) scale = flowMinScale;
+  else if (scale > FLOW_MAX) scale = FLOW_MAX;
+  Atomics.store(cl, fsIdx, Math.floor(scale * FLOW_Q));
+}
 
 let delivered = 0;
 let lastSeq = -1;
@@ -134,6 +159,7 @@ while (delivered + Atomics.load(cl, drIdx) < count) {
       lastSeq = seq;
       delivered++;
       Atomics.store(cl, dqIdx, (D + 1) | 0);
+      updateFlowScale(W, D); // soft back-pressure tick on the successful branch only
     }
   } else if (d >= 2) {
     Atomics.add(cl, drIdx, 1);
@@ -180,7 +206,8 @@ async function main(): Promise<void> {
 
   const frameByteSize = schema.frameByteSize;
   const consumerByteOffset = SPMC_HEADER_BYTES;
-  const genByteOffset = SPMC_HEADER_BYTES + align8(NCON * 3 * 4);
+  // PER_CONSUMER_LANES = 4 (Stage 1c added flowScale[c]) → the gen region shifts.
+  const genByteOffset = SPMC_HEADER_BYTES + align8(NCON * 4 * 4);
   const payloadByteOffset = genByteOffset + align8(CAPACITY * 4);
   const payloadBytes = CAPACITY * frameByteSize;
 
@@ -211,6 +238,7 @@ async function main(): Promise<void> {
         count: COUNT,
         n: STRESS_N,
         watchdogMs: WATCHDOG_MS,
+        flowMinScale: DAG_FLOW_SCALE_MIN,
       },
     });
     w.on("message", (m: typeof results[number]) => {
@@ -287,6 +315,25 @@ async function main(): Promise<void> {
     assertEq(r.dropped, 0, `consumer ${r.consumerIndex}: no drops in the keep-up regime`);
     assertEq(r.tornGuarded, 0, `consumer ${r.consumerIndex}: no torn candidate (no-lap regime)`);
   }
+
+  // flow_scale side channel (0.9.943, Stage 1c): each consumer ran its OWN
+  // AdaptiveFlowController tick on every delivery and wrote ITS OWN flowScale[c]
+  // cell (no multi-writer race) under real cross-thread contention. The producer's
+  // flowScaleHint() MIN-reduces the N cells — the one genuinely-new operation. The
+  // bit-exact/tornGuarded assertions above cover non-interference; here we pin the
+  // reduction returned a finite, in-range Q16.16 value (a corrupt cell or an
+  // out-of-clamp integral would show here). Direction is unconstrained — both
+  // consumers were paced to keep up, so they sit near-empty and the min trends
+  // high; the convergence-to-the-slowest behavior is the deterministic single-
+  // thread pin's job (tests/SpmcRing.test.ts) + the Stage-0 probe's, not this stress's.
+  const hint = ring.flowScaleHint();
+  console.log(`  producer flowScaleHint=${hint.toFixed(4)} (min over ${NCON} per-consumer lanes)`);
+  assert(Number.isFinite(hint), "producer min-reduce is finite under real parallelism");
+  const qEps = 1 / 65536 + 1e-9;
+  assert(
+    hint >= DAG_FLOW_SCALE_MIN - qEps && hint <= 2.0 + qEps,
+    `producer min-reduce stayed in [${DAG_FLOW_SCALE_MIN}, 2.0] (got ${hint})`,
+  );
 
   console.log(
     `\nSpmcRing.concurrent: OK (${NCON} consumers × ${COUNT} frames verified bit-exact).`,

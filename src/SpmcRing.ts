@@ -72,7 +72,7 @@
  *     lane 1  consumerCount  stored at allocation so late mounts can validate.
  *     lanes 2..7             reserved (zero).
  *
- *   Per-consumer region (Int32 lanes at byte 32, 3 lanes per consumer, 8-padded):
+ *   Per-consumer region (Int32 lanes at byte 32, 4 lanes per consumer, 8-padded):
  *     for consumer c ∈ [0, consumerCount):
  *       dequeuePos[c]   the consumer's read cursor (ticket units; release-store
  *                       on advance). Each consumer writes ONLY its own lane.
@@ -81,6 +81,17 @@
  *       tornGuarded[c]  the seqlock guard's counted-discard lane (a torn
  *                       candidate the re-read caught; 0 == the ring stayed within
  *                       the no-lap regime for this consumer).
+ *       flowScale[c]    Q16.16 consumer→producer soft pacing hint (0.9.943, DAG
+ *                       back-pressure Stage 1c). Consumer c runs its OWN
+ *                       AdaptiveFlowController (widened DAG clamp) on each
+ *                       successful pull over its OWN backlog (W − dequeuePos[c])
+ *                       and release-stores the encoded scale into its OWN cell —
+ *                       NO multi-writer race (the OPPOSITE of MpmcWorkQueue's
+ *                       shared lane). The single producer's flowScaleHint() does
+ *                       an O(consumerCount ≤ 64) MIN over these N cells via
+ *                       relaxed loads (bounded, no retry → wait-free), so it
+ *                       paces to the SLOWEST consumer. Advisory only — push()
+ *                       laps freely and never blocks (§5-safe). Seeded 1.0.
  *
  *   Generation region (Int32 array, one per slot, 8-padded):
  *     slot s's generation is the SEQLOCK publish/visibility flag. Initialized to
@@ -162,6 +173,10 @@ import {
   type Schema,
   type SchemaLayoutDescription,
 } from "./schema.js";
+import {
+  AdaptiveFlowController,
+  DAG_FLOW_SCALE_MIN,
+} from "./AdaptiveFlowController.js";
 
 /** Header size in bytes (8 Int32 lanes). 8-aligned. The per-consumer region
  *  follows at byte 32. */
@@ -172,11 +187,26 @@ const SPMC_HEADER_INT32_LANES = 8;
 const WRITE_TICKET_LANE = 0;
 const CONSUMER_COUNT_LANE = 1;
 
-// Per-consumer region: 3 Int32 lanes per consumer.
-const PER_CONSUMER_LANES = 3;
+// Per-consumer region: 4 Int32 lanes per consumer (lane 3 = flow_scale, added at
+// 0.9.943, DAG back-pressure Stage 1c — see FLOW_SCALE_OFF below).
+const PER_CONSUMER_LANES = 4;
 const DEQUEUE_POS_OFF = 0;
 const DROPPED_OFF = 1;
 const TORN_GUARDED_OFF = 2;
+// Per-consumer flow_scale (Q16.16 consumer→producer soft pacing hint; 0.9.943,
+// DAG back-pressure Stage 1c). Each consumer writes ONLY its own cell on each
+// successful pull (no contention — same single-writer discipline as dequeuePos/
+// dropped/tornGuarded; the OPPOSITE of MpmcWorkQueue's shared last-writer-wins
+// lane). The single producer's flowScaleHint() does an O(consumerCount) MIN
+// over these N cells → it paces to the SLOWEST consumer. An independent
+// side-channel cell — relaxed load/store, no happens-before with any
+// cursor/generation lane.
+const FLOW_SCALE_OFF = 3;
+
+/** Q16.16 quantum for the flow_scale lane decode. Mirrors MpmcRing/MpmcWorkQueue
+ *  (the controller owns the encode; the producer-side decode needs only the
+ *  quantum). */
+const FLOW_SCALE_Q = AdaptiveFlowController.Q;
 
 /** The seqlock doubles generations (2·ticket, +1 busy), halving the unambiguous
  *  signed-wrap window vs MpmcRing. Cap CAPACITY so the live generation span
@@ -302,6 +332,17 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
   public readonly consumerCount: number;
   /** This instance's bound consumer index, or −1 if unbound (the producer). */
   public readonly consumerIndex: number;
+
+  /** Per-consumer-index flow_scale PI controllers (lane 3; 0.9.943). Heap-side,
+   *  keyed by the consumer index this instance pulls — lazily created on the
+   *  first `pull` for that index, each with the WIDENED DAG output clamp (floor =
+   *  DAG_FLOW_SCALE_MIN). Unlike MpmcWorkQueue's M-writer last-writer-wins lane,
+   *  each consumer owns its OWN `flowScale[c]` cell, so each controller's integral
+   *  is the clean per-consumer state of the one thread that pulls that index (in
+   *  practice one entry per instance — a producer instance never pulls, so the
+   *  map stays empty). The producer's `flowScaleHint()` min-reduces the published
+   *  cells. */
+  private readonly flowControllers = new Map<number, AdaptiveFlowController>();
 
   /** Total SAB byte length for `capacity` slots of `schema` serving
    *  `consumerCount` consumers. Static so callers size the SAB first. */
@@ -474,6 +515,16 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
     for (let i = 0; i < this.layout.consumerLanes; i++) {
       Atomics.store(this.consumerLanesView, i, 0);
     }
+    // Seed every consumer's flow_scale = 1.0 so the producer's min-reduce reads
+    // "go at nominal rate" before any consumer has ticked (a bare zero-fill would
+    // decode to 0.0 and falsely pace the producer to a dead stop).
+    for (let c = 0; c < this.consumerCount; c++) {
+      Atomics.store(
+        this.consumerLanesView,
+        c * PER_CONSUMER_LANES + FLOW_SCALE_OFF,
+        AdaptiveFlowController.DEFAULT_Q,
+      );
+    }
     const cap = this.capacity;
     for (let s = 0; s < cap; s++) {
       // Complete(s − CAPACITY) = (2·(s − CAPACITY)) | 0.
@@ -506,6 +557,33 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
     Atomics.store(this.gen, slot, (2 * T) | 0); // RELEASE: Complete(T)
     // 4. Advance the high-water cursor (plain — single writer).
     Atomics.store(header, WRITE_TICKET_LANE, (T + 1) | 0); // RELEASE
+  }
+
+  /**
+   * Producer-side soft pacing hint (0.9.943, DAG back-pressure Stage 1c). Returns
+   * the **MIN** of every consumer's most recent `flow_scale` (Q16.16-decoded from
+   * its per-consumer `flowScale[c]` cell) in `[DAG_FLOW_SCALE_MIN, 2.0]`. Because
+   * the single producer broadcasts to ALL consumers, it must pace to the SLOWEST:
+   * `min` over the N cells means one overfull consumer (`flowScale[c] < 1`) pulls
+   * the producer down regardless of how starved the others are (`> 1`). `1.0`
+   * means "all consumers keep up — go at nominal rate".
+   *
+   * **The one genuinely-new operation in the DAG back-pressure arc:** an
+   * O(consumerCount ≤ 64) reduction over the per-consumer lanes via relaxed
+   * `Atomics.load`. Bounded, no retry, no wait → **wait-free** (and the producer
+   * `push` never reads it — it laps freely, §5-safe; a source merely *chooses* to
+   * pace on this hint). A relaxed read; a stale per-consumer cell is harmless (its
+   * owner self-corrects on the next pull). Returns 1.0 before any consumer has
+   * pulled (every cell seeded to the default). See `docs/dag-backpressure-design.md`.
+   */
+  flowScaleHint(): number {
+    const cl = this.consumerLanesView;
+    let minEncoded = Infinity;
+    for (let c = 0; c < this.consumerCount; c++) {
+      const enc = Atomics.load(cl, c * PER_CONSUMER_LANES + FLOW_SCALE_OFF) | 0;
+      if (enc < minEncoded) minEncoded = enc;
+    }
+    return minEncoded / FLOW_SCALE_Q;
   }
 
   // ─── Consumer ──────────────────────────────────────────────────────────────
@@ -567,6 +645,14 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
       }
       // Generation unchanged across the read → un-torn, exactly ticket D's bytes.
       Atomics.store(cl, dqIdx, (D + 1) | 0); // release
+      // Soft back-pressure (Stage 1c): run one PI cycle on THIS consumer's own
+      // pre-pull backlog and publish the encoded scale into its OWN flowScale[c]
+      // cell. Only on the successful branch — a ride/guard-discard must not feed
+      // the controller a misleading sample. `D` is the (post-overload-net)
+      // cursor, `W` the write ticket loaded at entry → buffered = how far this
+      // consumer was behind the producer when it arrived (clamped to capacity by
+      // the overload net, so a lapped consumer reads occupancy 1.0 → hint → floor).
+      this._updateFlowScale(c, W, D);
       return true;
     }
 
@@ -582,6 +668,34 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
     // written): genuine empty → ride. Persist any overload catch-up advance.
     if (D !== startD) Atomics.store(cl, dqIdx, D);
     return false;
+  }
+
+  /**
+   * Run one PI cycle on consumer `c`'s own pre-pull backlog and release-store the
+   * Q16.16-encoded `flow_scale` into ITS OWN `flowScale[c]` cell (0.9.943). Called
+   * inline from `pull` on the successful-delivery branch only.
+   *
+   * `buffered = signedDiff(W, D)` is this consumer's wrap-correct backlog (`W` =
+   * writeTicket at pull entry, `D` = the post-overload-net cursor) — capped at
+   * `capacity` by the overload net, so a lapped consumer reads occupancy 1.0 and
+   * its controller drives the hint toward the floor. The controller is per
+   * consumer index (heap state, lazily created here) — no cross-consumer integral
+   * mixing, and no multi-writer race on the cell. A pure side-channel store — no
+   * happens-before edge with the payload or any cursor/generation lane.
+   */
+  private _updateFlowScale(c: number, W: number, D: number): void {
+    let ctl = this.flowControllers.get(c);
+    if (ctl === undefined) {
+      ctl = new AdaptiveFlowController({ minScale: DAG_FLOW_SCALE_MIN });
+      this.flowControllers.set(c, ctl);
+    }
+    const buffered = signedDiff(W, D);
+    const encoded = ctl.tick(buffered, this.capacity);
+    Atomics.store(
+      this.consumerLanesView,
+      c * PER_CONSUMER_LANES + FLOW_SCALE_OFF,
+      encoded,
+    );
   }
 
   // ─── Observers ─────────────────────────────────────────────────────────────

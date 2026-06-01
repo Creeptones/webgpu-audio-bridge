@@ -290,12 +290,16 @@ const { sab, ctrlSab, capacity, consumerCount, consumerIndex,
         frameF64, frameU32, off, nprod, l1count, n, watchdogMs, slowSpin, slowEvery } = workerData;
 const mask = capacity - 1;
 const header = new Int32Array(sab, 0, 8);
-const cl = new Int32Array(sab, consumerByteOffset, consumerCount * 3);
+// PER_CONSUMER_LANES = 4 (dequeuePos/dropped/tornGuarded/flowScale; lane 3 added
+// at 0.9.943, DAG back-pressure Stage 1c). This broadcast leg doesn't tick the
+// flow_scale lane (the graph producer doesn't read flowScaleHint here) — it only
+// needs the correct stride so the gen/payload regions line up.
+const cl = new Int32Array(sab, consumerByteOffset, consumerCount * 4);
 const gen = new Int32Array(sab, genByteOffset, capacity);
 const f64 = new Float64Array(sab, payloadByteOffset, payloadBytes / 8);
 const u32 = new Uint32Array(sab, payloadByteOffset, payloadBytes / 4);
 const ctrl = new Int32Array(ctrlSab, 0, 8);
-const dqIdx = consumerIndex * 3 + 0, drIdx = consumerIndex * 3 + 1, tgIdx = consumerIndex * 3 + 2;
+const dqIdx = consumerIndex * 4 + 0, drIdx = consumerIndex * 4 + 1, tgIdx = consumerIndex * 4 + 2;
 function fillValue(pid, seq, i) { return pid * 1000003 + seq * 7 + i * 0.25; }
 function checksumOf(pid, seq, m) { let s = pid * 0.5 + seq * 0.25; for (let i = 0; i < m; i++) s += fillValue(pid, seq, i) * (i + 1); return s; }
 function signedDiff(a, b) { return (a - b) | 0; }
@@ -532,7 +536,8 @@ async function main(): Promise<void> {
   const linkPayloadByteOffset = RING_HEADER_BYTES;
   const linkPayloadBytes = LINK_CAP * frameByteSize;
   const bcastConsumerByteOffset = SPMC_HEADER_BYTES;
-  const bcastGenByteOffset = SPMC_HEADER_BYTES + align8(2 * 3 * 4);
+  // PER_CONSUMER_LANES = 4 (Stage 1c added flowScale[c]); 2 broadcast consumers.
+  const bcastGenByteOffset = SPMC_HEADER_BYTES + align8(2 * 4 * 4);
   const bcastPayloadByteOffset = bcastGenByteOffset + align8(BCAST_CAP * 4);
   const bcastPayloadBytes = BCAST_CAP * frameByteSize;
   const workGenByteOffset = MPMC_WQ_HEADER_BYTES;

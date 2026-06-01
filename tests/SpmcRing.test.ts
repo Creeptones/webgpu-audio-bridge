@@ -21,6 +21,12 @@
  *       producer peer pushed (initLayout-not-re-called discipline).
  *  10.  observers: per-consumer available/dropped/tornGuarded + out-of-range
  *       consumerIndex throws; consumerIndex bound via ctor is the pull default.
+ *  11.  flow_scale per-consumer lane + producer MIN-reduce (0.9.943, DAG
+ *       back-pressure Stage 1c): seeded 1.0; a high-occupancy consumer drives its
+ *       OWN flowScale[c] below 0.5 (widened clamp) while another's stays seeded;
+ *       flowScaleHint() returns the MIN over the cells (the one genuinely-new
+ *       op), order-independent + in [DAG_FLOW_SCALE_MIN, 2.0]; a low-occupancy
+ *       consumer drives its cell up toward 2.0. No tear/drop on the side channel.
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -30,6 +36,7 @@ import {
   f64Array, i32Array,
 } from "../src/index.js";
 import { SpmcRing, SPMC_HEADER_BYTES } from "../src/SpmcRing.js";
+import { AdaptiveFlowController, DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
 
 // Silence (and capture) the one-shot experimental warning so it doesn't pollute
 // the suite output, while still pinning that it fires.
@@ -53,9 +60,12 @@ const allKinds = defineSchema({
 });
 
 const HEADER_LANES = 8;
+// PER_CONSUMER_LANES = 4 (dequeuePos/dropped/tornGuarded/flowScale; lane 3 added
+// at 0.9.943, DAG back-pressure Stage 1c).
+const PER_CONSUMER_LANES = 4;
 function align8(b: number): number { return (b + 7) & ~7; }
 function genByteOffset(consumerCount: number): number {
-  return SPMC_HEADER_BYTES + align8(consumerCount * 3 * 4);
+  return SPMC_HEADER_BYTES + align8(consumerCount * PER_CONSUMER_LANES * 4);
 }
 
 let passed = 0;
@@ -77,8 +87,8 @@ function pin1_layout(): void {
   const cap = 8;
   const nc = 3;
   const len = SpmcRing.byteLength(allKinds, cap, nc);
-  // header(32) + consumer(align8(nc*3*4)) + gen(align8(cap*4)) + payload
-  const consumerBytes = align8(nc * 3 * 4);
+  // header(32) + consumer(align8(nc*PER_CONSUMER_LANES*4)) + gen(align8(cap*4)) + payload
+  const consumerBytes = align8(nc * PER_CONSUMER_LANES * 4);
   const genBytes = align8(cap * 4);
   const expected = 32 + consumerBytes + genBytes + cap * allKinds.frameByteSize;
   assertEq(len, expected, "byteLength matches documented layout");
@@ -343,6 +353,85 @@ function pin10_observers(): void {
   pass("pin10: observers + bound default + out-of-range guards");
 }
 
+// Pin 11 — flow_scale per-consumer lane + producer MIN-reduce (DAG back-pressure
+// Stage 1c). Deterministic; drives the REAL pull path for the lane writes and
+// exercises the real flowScaleHint() min-reduce. Reads the raw per-consumer cells
+// (no public per-consumer reader) only to assert each consumer wrote its OWN cell.
+function pin11_flowScaleMinReduce(): void {
+  const cap = 16;
+  const Q = AdaptiveFlowController.Q; // 65536
+  const Q_EPS = 1 / Q + 1e-9;
+  const inBounds = (x: number) => x >= DAG_FLOW_SCALE_MIN - Q_EPS && x <= 2.0 + Q_EPS;
+  const f = makeFrame();
+
+  // Raw per-consumer flowScale[c] reader (lane 3 of 4). Decodes Q16.16.
+  const rawScale = (sab: SharedArrayBuffer, c: number): number => {
+    const cl = new Int32Array(sab, SPMC_HEADER_BYTES, 2 * PER_CONSUMER_LANES);
+    return (cl[c * PER_CONSUMER_LANES + 3]! | 0) / Q;
+  };
+
+  // (a) Seeded neutral 1.0 → the producer's min-reduce reads "go at nominal rate"
+  //     before any consumer has pulled (a bare zero-fill would decode to 0.0).
+  const { ring, sab } = SpmcRing.create(allKinds, cap, { consumerCount: 2 });
+  const out = ring.createFrame();
+  assertEq(ring.flowScaleHint(), 1.0, "producer min-reduce seeded 1.0 before any pull");
+  assertEq(rawScale(sab, 0), 1.0, "flowScale[0] seeded 1.0");
+  assertEq(rawScale(sab, 1), 1.0, "flowScale[1] seeded 1.0");
+
+  // (b) Sustained-FULL occupancy on consumer 0 only → its OWN cell DOWN past 0.5
+  //     (only reachable with the widened DAG clamp). Maintain backlog == capacity:
+  //     fill the ring, then steady pull-one(c0)/push-one so each c0 pull sees
+  //     (W − D0) == capacity (occupancy 1.0). Consumer 1 never pulls → its cell
+  //     stays seeded 1.0. The producer min must then track consumer 0.
+  for (let i = 0; i < cap; i++) ring.push(f as any);
+  for (let i = 0; i < 200; i++) {
+    assert(ring.pull(out, 0), "steady c0 pull (full backlog)");
+    assert(inBounds(rawScale(sab, 0)), "flowScale[0] in bounds while full");
+    ring.push(f as any); // refill → keep c0's backlog at capacity
+  }
+  const c0Hint = rawScale(sab, 0);
+  assert(c0Hint < 0.5, `sustained-full drives flowScale[0] below 0.5 (widened clamp): got ${c0Hint}`);
+  assert(c0Hint >= DAG_FLOW_SCALE_MIN - Q_EPS, `flowScale[0] never below the floor: got ${c0Hint}`);
+  assertEq(rawScale(sab, 1), 1.0, "consumer 1 never pulled → its cell untouched (per-consumer, no shared race)");
+  // The producer MIN-reduce picks the lower of the two cells == consumer 0's.
+  assert(Math.abs(ring.flowScaleHint() - c0Hint) < Q_EPS, `flowScaleHint() == min == flowScale[0] (${ring.flowScaleHint()} vs ${c0Hint})`);
+  assert(ring.flowScaleHint() < 0.5, "producer paces to the backed-up consumer (min < 0.5)");
+  assertEq(ring.tornGuarded(0), 0, "no torn candidate on the full consumer");
+  assertEq(ring.dropped(0), 0, "no drop on the maintained-backlog consumer");
+
+  // (c) The MIN-reduce is a true min over the cells, order-independent + bounded.
+  //     White-box stores into the raw cells (the reduction reads live atomics).
+  const cl = new Int32Array(sab, SPMC_HEADER_BYTES, 2 * PER_CONSUMER_LANES);
+  const enc = (x: number) => Math.floor(x * Q);
+  cl[0 * PER_CONSUMER_LANES + 3] = enc(2.0);
+  cl[1 * PER_CONSUMER_LANES + 3] = enc(0.3);
+  assert(Math.abs(ring.flowScaleHint() - 0.3) < 1e-4, `min(2.0, 0.3) = 0.3, got ${ring.flowScaleHint()}`);
+  cl[0 * PER_CONSUMER_LANES + 3] = enc(0.3); // swap → order-independent
+  cl[1 * PER_CONSUMER_LANES + 3] = enc(2.0);
+  assert(Math.abs(ring.flowScaleHint() - 0.3) < 1e-4, `min is order-independent, got ${ring.flowScaleHint()}`);
+  cl[0 * PER_CONSUMER_LANES + 3] = enc(1.5);
+  cl[1 * PER_CONSUMER_LANES + 3] = enc(1.5);
+  assert(Math.abs(ring.flowScaleHint() - 1.5) < 1e-4, `min(1.5, 1.5) = 1.5, got ${ring.flowScaleHint()}`);
+  assert(inBounds(ring.flowScaleHint()), "min-reduce in bounds");
+
+  // (d) Sustained-LOW occupancy on a fresh ring drives a consumer's cell UP toward
+  //     2.0 (push-one/pull-one keeps backlog == 1). The min stays bounded.
+  const { ring: r2, sab: sab2 } = SpmcRing.create(allKinds, cap, { consumerCount: 2 });
+  const out2 = r2.createFrame();
+  for (let i = 0; i < 200; i++) {
+    r2.push(f as any);
+    assert(r2.pull(out2, 0), "c0 pull (low occupancy)");
+    assert(inBounds(rawScale(sab2, 0)), "flowScale[0] in bounds at low occupancy");
+  }
+  const lowHint = rawScale(sab2, 0);
+  assert(lowHint > 1.0, `sustained-low occupancy drives flowScale[0] above 1.0: got ${lowHint}`);
+  // min(high c0, seeded-1.0 c1) == 1.0 (consumer 1 still the floor of the two).
+  assert(Math.abs(r2.flowScaleHint() - 1.0) < Q_EPS, `min picks the seeded consumer 1: got ${r2.flowScaleHint()}`);
+  assertEq(r2.tornGuarded(0), 0, "side channel never tears the protocol");
+
+  pass("pin11: flow_scale per-consumer lane + producer MIN-reduce (widened clamp, order-independent, bounds)");
+}
+
 function main(): void {
   console.log("SpmcRing — single-thread API pins");
   pin1_layout();
@@ -355,6 +444,7 @@ function main(): void {
   pin8_lappedSkip();
   pin9_peerMount();
   pin10_observers();
+  pin11_flowScaleMinReduce();
   console.warn = realWarn;
   console.log(`\nSpmcRing: ${passed} pins passed.`);
 }
