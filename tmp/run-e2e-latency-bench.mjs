@@ -89,6 +89,39 @@ function median(values) {
   return (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+function confidenceInterval95(values) {
+  const n = values.length;
+  if (!n) return {
+    n: 0,
+    mean: Number.NaN,
+    halfWidth: Number.NaN,
+    lower: Number.NaN,
+    upper: Number.NaN,
+  };
+  const mu = mean(values);
+  if (!Number.isFinite(mu) || n === 1) return {
+    n,
+    mean: mu,
+    halfWidth: Number.NaN,
+    lower: Number.NaN,
+    upper: Number.NaN,
+  };
+  let variance = 0;
+  for (const v of values) {
+    variance += (v - mu) * (v - mu);
+  }
+  variance /= (n - 1);
+  const sd = Math.sqrt(variance);
+  const halfWidth = 1.96 * sd / Math.sqrt(n);
+  return {
+    n,
+    mean: mu,
+    halfWidth,
+    lower: mu - halfWidth,
+    upper: mu + halfWidth,
+  };
+}
+
 function summarizeRuns(runs) {
   const totals = { count: 0, p99: 0, spread: 0, skipped: 0, missRate: 0, samples: 0 };
   for (const run of runs) {
@@ -158,6 +191,30 @@ function axisSummary(results, key, label) {
     const aV = Number.isFinite(a.p99MeanMs) ? a.p99MeanMs : Number.POSITIVE_INFINITY;
     const bV = Number.isFinite(b.p99MeanMs) ? b.p99MeanMs : Number.POSITIVE_INFINITY;
     return aV - bV;
+  });
+}
+
+function axisConfidenceSummaries(results, key, label) {
+  return axisSummary(results, key, label).map((row) => {
+    const p99Ci = confidenceInterval95(row.p99.map((value) => value / 1e6));
+    const spreadCi = confidenceInterval95(row.spread.map((value) => value / 1e6));
+    return {
+      [label]: row[label],
+      sampleCount: row.valid,
+      p99MeanMs: row.p99MeanMs,
+      p99Ci: {
+        lower: p99Ci.lower,
+        upper: p99Ci.upper,
+        halfWidth: p99Ci.halfWidth,
+      },
+      spreadMeanMs: row.spreadMeanMs,
+      spreadCi: {
+        lower: spreadCi.lower,
+        upper: spreadCi.upper,
+        halfWidth: spreadCi.halfWidth,
+      },
+      invalidRate: row.invalidRate,
+    };
   });
 }
 
@@ -313,6 +370,24 @@ async function main() {
     runAxis("LOAD_SUMMARY", loadSummaries, "load");
     runAxis("N_SUMMARY", nSummaries, "n");
     runAxis("CAPACITY_SUMMARY", capacitySummaries, "capacity");
+
+    const modeCi = axisConfidenceSummaries(results ?? [], "consumerMode", "consumerMode");
+    const notifyCi = axisConfidenceSummaries(results ?? [], "notifyMode", "notifyMode");
+    const pushCi = axisConfidenceSummaries(results ?? [], "producerPushMode", "producerPushMode");
+    const tickCi = axisConfidenceSummaries(results ?? [], "producerTickHz", "producerTickHz");
+    const backendCi = axisConfidenceSummaries(results ?? [], "backend", "backend");
+    const loadCi = axisConfidenceSummaries(results ?? [], "load", "load");
+    const nCi = axisConfidenceSummaries(results ?? [], "n", "n");
+    const capacityCi = axisConfidenceSummaries(results ?? [], "capacity", "capacity");
+
+    console.log("AREA_P99_CI_MODE=" + JSON.stringify(modeCi));
+    console.log("AREA_P99_CI_NOTIFY=" + JSON.stringify(notifyCi));
+    console.log("AREA_P99_CI_PUSH=" + JSON.stringify(pushCi));
+    console.log("AREA_P99_CI_TICK=" + JSON.stringify(tickCi));
+    console.log("AREA_P99_CI_BACKEND=" + JSON.stringify(backendCi));
+    console.log("AREA_P99_CI_LOAD=" + JSON.stringify(loadCi));
+    console.log("AREA_P99_CI_N=" + JSON.stringify(nCi));
+    console.log("AREA_P99_CI_CAPACITY=" + JSON.stringify(capacityCi));
 
     console.log("BEST_AGGREGATE=" + JSON.stringify(modeStats));
     console.log("BEST_P99_MEDIAN_MS=" + JSON.stringify(globalP99MedianMs));
