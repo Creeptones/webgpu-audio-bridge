@@ -78,6 +78,17 @@ function mean(values) {
   return values.reduce((acc, v) => acc + v, 0) / values.length;
 }
 
+function median(values) {
+  const sorted = values
+    .map((v) => v)
+    .filter((v) => Number.isFinite(v))
+    .sort((a, b) => a - b);
+  if (!sorted.length) return Number.NaN;
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 function summarizeRuns(runs) {
   const totals = { count: 0, p99: 0, spread: 0, skipped: 0, missRate: 0, samples: 0 };
   for (const run of runs) {
@@ -136,6 +147,7 @@ function axisSummary(results, key, label) {
       valid: bucket.total - bucket.invalid,
       invalidRate: bucket.total > 0 ? bucket.invalid / bucket.total : 0,
       p99MeanMs: mean(bucket.p99) / 1e6,
+      p99MedianMs: median(bucket.p99) / 1e6,
       spreadMeanMs: mean(bucket.spread) / 1e6,
       meanSkipped: mean(bucket.skipped),
       missRateMean: mean(bucket.missRate),
@@ -147,6 +159,35 @@ function axisSummary(results, key, label) {
     const bV = Number.isFinite(b.p99MeanMs) ? b.p99MeanMs : Number.POSITIVE_INFINITY;
     return aV - bV;
   });
+}
+
+function bestConfigByArea(results, axisDefs, globalP99MedianMs) {
+  const out = [];
+  for (const { key, label } of axisDefs) {
+    const rows = axisSummary(results, key, label).filter((row) =>
+      Number.isFinite(row.p99MeanMs),
+    );
+    if (!rows.length) continue;
+    const best = rows[0];
+    const deltaMs = Number.isFinite(best.p99MeanMs) && Number.isFinite(globalP99MedianMs)
+      ? best.p99MeanMs - globalP99MedianMs
+      : Number.NaN;
+    out.push({
+      area: key,
+      key: best[label],
+      bestP99MeanMs: best.p99MeanMs,
+      p99MedianMs: best.p99MedianMs,
+      spreadMeanMs: best.spreadMeanMs,
+      valid: best.valid,
+      invalidRate: best.invalidRate,
+      deltaToGlobalMedianMs: deltaMs,
+      deltaToGlobalMedianPct: Number.isFinite(deltaMs) && Number.isFinite(globalP99MedianMs) && globalP99MedianMs !== 0
+        ? (deltaMs / globalP99MedianMs) * 100
+        : Number.NaN,
+      sampleMean: best.sampleMean,
+    });
+  }
+  return out;
 }
 
 function topByCombo(validRuns, keys, count) {
@@ -251,6 +292,18 @@ async function main() {
       "n",
       "capacity",
     ], 30);
+    const p99Values = valid.map((run) => run.p99Ns).filter(Number.isFinite);
+    const globalP99MedianMs = median(p99Values) / 1_000_000;
+    const bestByArea = bestConfigByArea(valid, [
+      { key: "consumerMode", label: "consumerMode" },
+      { key: "notifyMode", label: "notifyMode" },
+      { key: "producerPushMode", label: "producerPushMode" },
+      { key: "producerTickHz", label: "producerTickHz" },
+      { key: "backend", label: "backend" },
+      { key: "load", label: "load" },
+      { key: "n", label: "n" },
+      { key: "capacity", label: "capacity" },
+    ], globalP99MedianMs);
 
     runAxis("MODE_SUMMARY", modeSummaries, "consumerMode");
     runAxis("NOTIFY_SUMMARY", notifySummaries, "notifyMode");
@@ -262,6 +315,8 @@ async function main() {
     runAxis("CAPACITY_SUMMARY", capacitySummaries, "capacity");
 
     console.log("BEST_AGGREGATE=" + JSON.stringify(modeStats));
+    console.log("BEST_P99_MEDIAN_MS=" + JSON.stringify(globalP99MedianMs));
+    console.log("BEST_CONFIG_BY_AREA=" + JSON.stringify(bestByArea));
     console.log("BEST_MODE=" + JSON.stringify(modeSummaries[0] || null));
     console.log("TOP20_COMBOS_BY_P99=" + JSON.stringify(topCombos));
     console.log("COUNTS=" + JSON.stringify({ all: total, valid: valid.length, invalid }));
