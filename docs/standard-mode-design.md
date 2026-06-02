@@ -292,3 +292,26 @@ Other deviations from the design analysis above:
 - **LOC estimate**: shipped at ~390 LOC of class + ~360 LOC of tests + ~180 LOC of doc deltas = ~930 LOC, vs the analysis's ~1180 LOC estimate. The estimate was conservative; the actual implementation came in under budget because the schema DSL did most of the encoding/decoding heavy lifting.
 
 The design analysis above is preserved unchanged as the historical reasoning record. The decision criteria it laid out remain useful for evaluating MVP2 scope expansions when those land.
+
+## connect() Fallback Policy
+
+`connect()` does not silently translate every Turbo backpressure policy to
+Standard mode. Standard mode's MessageChannel transport is freshness-first and
+consumer-side drop-oldest; it has no producer-side blocking or reliable
+producer-side reject signal.
+
+When a non-isolated environment falls back to Standard mode, these policies are
+valid:
+
+- no explicit policy: use the Standard default;
+- `drop-oldest`: request the behavior Standard actually implements.
+
+These policies throw `ConnectUnsupportedError` on fallback instead of degrading:
+
+- `block`;
+- `reject`;
+- `drop-newest`.
+
+This keeps integration code honest. A caller that needs blocking or explicit
+reject semantics must require Turbo mode by passing `allowStandardFallback:
+false` or by surfacing the isolation fix from `ConnectUnsupportedError.report`.

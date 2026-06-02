@@ -194,8 +194,29 @@ Emit a stateful reader holding its own `DataView`. **Rejected for MVP**: the cal
 **Deferred (explicit non-goals for MVP)**:
 - A *writer* codegen (`emitWorkletWriter`) — symmetric but the producer side rarely needs zero-import.
 - `opts.strategy:"typedarray"` umbrella-view variant.
-- Emitting a `pullLatest`-equivalent that does the `read_index` advance (codegen stays a pure peek; advancing the index is the SAB protocol's job and not worklet-codegen's concern).
+- Extending the bare `emitWorkletReader` primitive so it mutates
+  `read_index`. The primitive intentionally stays a pure peek.
 - Big-endian support (the SAB is host-endian; every target is LE — documented assumption, not a runtime branch).
+
+## Processor-module postscript
+
+`emitWorkletProcessorModule()` now layers the missing protocol commit behavior
+on top of the pure reader. Its generated `pullLatest(target?)` helper:
+
+- acquire-loads `write_index`;
+- decodes the newest committed slot into `target` or the preallocated `out`;
+- release-stores `read_index` to the observed `write_index`;
+- notifies one parked producer;
+- returns the number of skipped frames, or `-1` on empty.
+
+When `processorOptions.policy === "drop-oldest"`, the helper uses a
+compare-exchange commit/retry loop before publishing the decoded frame to the
+audio graph. That avoids accepting a slot whose ownership changed while the
+processor was reading it.
+
+The rule of thumb is now simple: use `emitWorkletReader()` for deliberate slot
+peek codegen, and use `emitWorkletProcessorModule()` for AudioWorklet consumers
+that need normal fresh-latest bridge semantics.
 
 ## Risks
 

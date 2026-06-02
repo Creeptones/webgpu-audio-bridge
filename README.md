@@ -68,6 +68,11 @@ if (consumer.pullLatest(out) >= 0) {
 
 In an `AudioWorkletProcessor`, poll with `pullLatest()` or a generated reader. Do not call blocking methods such as `waitForData()` from the audio thread.
 
+Generated worklet modules should use `emitWorkletProcessorModule()` when they
+need fresh-latest reads. Its generated `pullLatest(target?)` helper decodes the
+newest slot and commits `read_index`; bare `emitWorkletReader()` is a pure slot
+peek for custom codegen paths.
+
 ## Standard mode, MessageChannel
 
 No cross-origin isolation required. Not for audio-rate paths.
@@ -82,6 +87,11 @@ const consumer = new MessageChannelBridge(port2, capacity, Schema);
 ```
 
 Use for telemetry, prototypes, embeds, and control messages where 5 to 50 ms latency is acceptable.
+
+`connect()` may fall back to Standard mode when isolation is unavailable. That
+fallback rejects explicit Turbo-only policies (`block`, `reject`,
+`drop-newest`) instead of silently mapping them to MessageChannel drop-oldest
+behavior. Use no policy or `drop-oldest` for Standard fallback.
 
 ## WebGPU readback
 
@@ -176,6 +186,7 @@ npm run check:api-snapshot
 Docs:
 
 - [API boundary](./docs/api-boundary.md)
+- [Integration recipes](./docs/integration-recipes.md)
 - [Stable API manifest](./docs/stable-api-manifest.json)
 - [API snapshots](./docs/api-snapshots/)
 
