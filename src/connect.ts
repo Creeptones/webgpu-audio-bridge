@@ -577,6 +577,23 @@ export function connect<
           "Deploy COOP/COEP for Turbo mode, or drop the invariant. See report.fixes.",
       );
     }
+
+    const unsupportedPolicy =
+      macroRing.policy !== undefined && macroRing.policy !== "drop-oldest"
+        ? { lane: "macro" as const, policy: macroRing.policy }
+        : inputRing && inputRing.policy !== undefined && inputRing.policy !== "drop-oldest"
+        ? { lane: "input" as const, policy: inputRing.policy }
+        : null;
+    if (unsupportedPolicy !== null) {
+      throw new ConnectUnsupportedError(
+        "isolation-required",
+        report,
+        `connect(): the ${unsupportedPolicy.lane} ring requested policy ` +
+          `'${unsupportedPolicy.policy}', but Standard mode only supports its ` +
+          "default consumer-side drop-oldest queue. Deploy COOP/COEP for Turbo " +
+          "mode, use policy: 'drop-oldest', or omit the policy. See report.fixes.",
+      );
+    }
   }
 
   const macroResolved = resolveRing(macroRing, hint, "macro");

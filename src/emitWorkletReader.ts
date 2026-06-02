@@ -47,7 +47,8 @@
  * • PURE PEEK. The emitted reader decodes a slot by index without touching
  *   read_index — unlike `Bridge.pull`, which consumes the slot. Bit-exactness
  *   vs `Bridge.pull` is total (no rounding, no smoothing): the decode is the
- *   inverse of SpscRing's payload write.
+ *   inverse of SpscRing's payload write. Use `emitWorkletProcessorModule` when
+ *   you want the generated code to include a commit-aware `pullLatest` helper.
  *
  * Regenerate-on-drift: this is a build-time codegen. Re-run whenever the
  * schema changes; never hand-edit the emitted output (the banner says so).
@@ -273,9 +274,9 @@ export interface EmitWorkletProcessorOptions extends EmitWorkletReaderOptions {
   /** The per-quantum body. Runs inside `process(inputs, outputs, parameters)`.
    *  In scope when it runs: the emitted reader fn (default `readFrame`), a
    *  reusable `out` frame object (pre-allocated in the ctor — NOT per quantum),
-   *  the `DataView` over the SAB (`this._view`), `this._capacity`, and a
-   *  `slotOf(writeIndexMinus1)` helper. The body returns `true`/`false` like a
-   *  normal processor. */
+   *  the `DataView` over the SAB (`this._view`), `this._capacity`, a
+   *  `slotOf(writeIndexMinus1)` helper, and a commit-aware `pullLatest(target?)`
+   *  helper. The body returns `true`/`false` like a normal processor. */
   readonly processBody: string;
   /** Optional capacity baked into the module as the fallback when
    *  `processorOptions.capacity` is absent. When omitted the ctor requires
@@ -288,8 +289,14 @@ export interface EmitWorkletProcessorOptions extends EmitWorkletReaderOptions {
  * Returns a complete, import-free ES module source string ready for a Blob
  * (`toWorkletModuleURL`) or a build step. The ctor reads the SAB + capacity from
  * `processorOptions` (`new AudioWorkletNode(ctx, name, { processorOptions: {
- * sab, capacity } })`), builds the `DataView`, and pre-allocates the reusable
- * `out` frame (typed arrays for array fields) so `process()` is allocation-free.
+ * sab, capacity, policy? } })`), builds the `DataView`, and pre-allocates the
+ * reusable `out` frame (typed arrays for array fields) so `process()` is
+ * allocation-free. The generated `pullLatest(target?)` helper mirrors the
+ * realtime-safe Bridge hot path: acquire-load `write_index`, decode newest,
+ * release-store `read_index`, notify a parked producer, and return skipped
+ * frames (`-1` on empty). When `processorOptions.policy === "drop-oldest"`, it
+ * uses a CAS commit/retry loop so a producer-side overrun cannot publish a
+ * suspect slot to the audio graph.
  *
  * CSP: the resulting module is loaded via `addModule(blobURL)` which needs
  * `blob:` in `script-src`/`worker-src`, OR written to a file for the build-step
@@ -361,6 +368,7 @@ export function emitWorkletProcessorModule(
     `    const po = (options && options.processorOptions) || {};`,
     `    this._sab = po.sab;`,
     `    this._capacity = po.capacity != null ? po.capacity : ${capacityFallback};`,
+    `    this._policy = po.policy || "reject";`,
     `    if (this._sab == null) {`,
     `      throw new Error(${JSON.stringify(
       `${opts.processorName}: processorOptions.sab (SharedArrayBuffer) is required`,
@@ -372,14 +380,38 @@ export function emitWorkletProcessorModule(
     )});`,
     `    }`,
     `    this._view = new DataView(this._sab);`,
+    `    this._indices = new Int32Array(this._sab, 0, 8);`,
     `    this._out = {`,
     ...allocLines,
+    `    };`,
+    `    this.pullLatest = (target) => {`,
+    `      const frame = target || this._out;`,
+    `      const indices = this._indices;`,
+    `      const cap = this._capacity;`,
+    `      for (let tries = 0; tries <= cap; tries++) {`,
+    `        const readIdx = Atomics.load(indices, 1);`,
+    `        const writeIdx = Atomics.load(indices, 0);`,
+    `        if (writeIdx === readIdx) return -1;`,
+    `        const newestIdx = (writeIdx - 1) | 0;`,
+    `        const skipped = (newestIdx - readIdx) | 0;`,
+    `        const slot = ((newestIdx % cap) + cap) % cap;`,
+    `        ${fnName}(this._view, slot, frame);`,
+    `        if (this._policy === "drop-oldest") {`,
+    `          if (Atomics.compareExchange(indices, 1, readIdx, writeIdx | 0) !== readIdx) continue;`,
+    `        } else {`,
+    `          Atomics.store(indices, 1, writeIdx | 0);`,
+    `        }`,
+    `        Atomics.notify(indices, 1, 1);`,
+    `        return skipped;`,
+    `      }`,
+    `      return -1;`,
     `    };`,
     `  }`,
     `  process(inputs, outputs, parameters) {`,
     `    const out = this._out;`,
     `    const slotOf = (w) => { const c = this._capacity; return ((w % c) + c) % c; };`,
-    `    ${fnName}; out; slotOf;` + ` // keep in scope for the spliced body`,
+    `    const pullLatest = this.pullLatest;`,
+    `    ${fnName}; out; slotOf; pullLatest;` + ` // keep in scope for the spliced body`,
     `${opts.processBody}`,
     `  }`,
     `});`,

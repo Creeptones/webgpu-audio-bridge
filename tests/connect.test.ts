@@ -248,6 +248,42 @@ function testInvariantSchemaRejectedOnStandard(): void {
   ok("101 .withInvariant schema rejected at connect() time on Standard mode");
 }
 
+// ── 110. Standard fallback rejects explicit unsupported ring policies ────────
+
+function testStandardRejectsUnsupportedPolicies(): void {
+  let caught: unknown;
+  try {
+    connect({
+      macro: { schema: macroSchema, policy: "block" },
+      environment: standard(),
+    });
+  } catch (e) {
+    caught = e;
+  }
+  assert(
+    caught instanceof ConnectUnsupportedError,
+    "explicit block policy on Standard mode throws ConnectUnsupportedError",
+  );
+  assertEq(
+    (caught as ConnectUnsupportedError).reason,
+    "isolation-required",
+    "unsupported Standard policy reason is 'isolation-required'",
+  );
+  assert(
+    /policy 'block'/.test((caught as Error).message) &&
+      /drop-oldest/.test((caught as Error).message),
+    "the error names the unsupported policy and the Standard-mode behavior",
+  );
+
+  const okTopo = connect({
+    macro: { schema: macroSchema, policy: "drop-oldest" },
+    environment: standard(),
+  });
+  assertEq(okTopo.mode, "standard", "drop-oldest remains an explicit Standard-compatible policy");
+  okTopo.handle.macro.port?.close();
+  ok("110 Standard fallback rejects unsupported explicit policies instead of silently degrading");
+}
+
 // ── 102. mount schema-mismatch guard ────────────────────────────────────────
 
 function testMountSchemaMismatchThrows(): void {
@@ -411,6 +447,7 @@ function main(): void {
   testCoopCoepGracefulFallback();
   testUnsupportedThrows();
   testInvariantSchemaRejectedOnStandard();
+  testStandardRejectsUnsupportedPolicies();
   testMountSchemaMismatchThrows();
   testLatencyBudgetBlockSchema();
   testLatencyBudgetControlSchema();

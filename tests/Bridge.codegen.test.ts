@@ -356,6 +356,66 @@ function testProcessorModuleShape(): void {
   ok("7 emitWorkletProcessorModule: one registerProcessor, embeds reader, import-free, parses");
 }
 
+// ── 9. generated processor pullLatest helper commits read_index ─────────────
+function testProcessorPullLatestCommits(): void {
+  const schema = makeAllKindsSchema();
+  const { sab, capacity } = Bridge.allocate(8, schema);
+  const bridge = new Bridge(sab, capacity, schema);
+
+  const first = makeAllKindsFrame();
+  const latest = makeAllKindsFrame();
+  latest.a_u64 = 222n;
+  latest.b_i64 = -222n;
+  latest.c_f64 = 22.25;
+  latest.arr_f64 = new Float64Array([9, 8, 7]);
+  assert(bridge.push(first), "first frame push succeeds");
+  assert(bridge.push(latest), "latest frame push succeeds");
+  assertEq(bridge.available(), 2, "two frames queued before generated pullLatest");
+
+  const processorName = "macro-reader-commit";
+  const mod = emitWorkletProcessorModule(schema, {
+    processorName,
+    processBody: "    this._lastSkipped = pullLatest(out); return true;",
+  });
+
+  type GeneratedProcessorCtor = new (
+    options: { processorOptions: { sab: SharedArrayBuffer; capacity: number; policy?: string } },
+  ) => {
+    process: (inputs: unknown, outputs: unknown, parameters: unknown) => boolean;
+    _out: AllKindsFrame;
+    _lastSkipped: number;
+  };
+  let ProcessorCtor: GeneratedProcessorCtor | null = null;
+  const AudioWorkletProcessor = class {
+    constructor() {}
+  };
+  const registerProcessor = (name: string, ctor: GeneratedProcessorCtor): void => {
+    assertEq(name, processorName, "generated module registers the requested processor name");
+    ProcessorCtor = ctor;
+  };
+
+  const runModule = new Function("AudioWorkletProcessor", "registerProcessor", mod);
+  runModule(AudioWorkletProcessor, registerProcessor);
+  assert(ProcessorCtor !== null, "generated module called registerProcessor");
+
+  const Ctor = ProcessorCtor as GeneratedProcessorCtor;
+  const processor = new Ctor({ processorOptions: { sab, capacity } });
+  assertEq(processor.process([], [], {}), true, "generated process returns true");
+  assertEq(processor._lastSkipped, 1, "pullLatest reports one skipped stale frame");
+  assertEq(processor._out.a_u64, latest.a_u64, "generated pullLatest decoded latest u64");
+  assertEq(processor._out.b_i64, latest.b_i64, "generated pullLatest decoded latest i64");
+  assert(Object.is(processor._out.c_f64, latest.c_f64), "generated pullLatest decoded latest f64");
+  for (let i = 0; i < latest.arr_f64.length; i++) {
+    assert(
+      Object.is(processor._out.arr_f64[i], latest.arr_f64[i]),
+      `generated pullLatest decoded arr_f64[${i}]`,
+    );
+  }
+  assertEq(bridge.available(), 0, "generated pullLatest advanced read_index to write_index");
+
+  ok("9 generated processor pullLatest decodes newest frame and commits read_index");
+}
+
 // ── 8. toWorkletModuleURL guard + stubbed happy path ────────────────────────
 function testToWorkletModuleURL(): void {
   const src = "function readFrame(){}";
@@ -416,6 +476,7 @@ function main(): void {
   testCompileWorkletReaderRoundTrip();
   testProcessorModuleShape();
   testToWorkletModuleURL();
+  testProcessorPullLatestCommits();
   console.log("\nAll Bridge.codegen tests passed.");
 }
 
