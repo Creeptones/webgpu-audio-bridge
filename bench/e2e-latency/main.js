@@ -213,10 +213,10 @@ async function start(override = null) {
     REPORT_EL.textContent = "FAIL: page is not crossOriginIsolated. Serve with COOP/COEP.";
     return;
   }
+  const notifyMode = opts.notifyMode === "waiter-flag" ? "waiter-flag" : "always";
 
   lastReport = null;
   const schema = makeSchema(opts.n);
-  const notifyMode = opts.notifyMode === "waiter-flag" ? "waiter-flag" : "always";
   const { sab } = Bridge.allocate(opts.capacity, schema, { notify: notifyMode });
   // Build the ring on main just to extract the layout description we pass to
   // the worklet. The worker creates its own Bridge instance over the same SAB.
@@ -224,9 +224,17 @@ async function start(override = null) {
   const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
   worker.postMessage({ type: "init", sab, ...opts });
   let workerBackend = "starting";
+  let workerNotifyMode = notifyMode;
   worker.onmessage = (e) => {
     if (e.data.type === "ready") {
       workerBackend = e.data.backend;
+      workerNotifyMode = e.data.notifyMode ?? notifyMode;
+      if (workerNotifyMode !== notifyMode) {
+        REPORT_EL.textContent = `FAIL: benchmark ring config mismatch ` +
+          `(producer notify=${workerNotifyMode}, consumer notify=${notifyMode}).`;
+        stop();
+        return;
+      }
       REPORT_EL.textContent = `worker ready: backend=${e.data.backend}\nwaiting for first samples...`;
     } else if (e.data.type === "fatal") {
       REPORT_EL.textContent = `worker fatal: ${e.data.message}`;
@@ -270,6 +278,7 @@ async function start(override = null) {
         backend: workerBackend,
         outputLatencyMs,
         baseLatencyMs,
+        notifyMode: workerNotifyMode,
       };
       renderReport();
     }
@@ -287,7 +296,16 @@ async function start(override = null) {
     }, 16);
   }
 
-  state = { worker, ctx, node, silentGain, loadHandle, opts };
+  state = {
+    worker,
+    ctx,
+    node,
+    silentGain,
+    loadHandle,
+    opts,
+    notifyMode,
+    workerNotifyMode,
+  };
   START_EL.disabled = true;
   SWEEP_EL.disabled = true;
   STOP_EL.disabled = false;
