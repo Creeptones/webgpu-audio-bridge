@@ -19,7 +19,11 @@
 // pluggable, the nervous system is fixed.
 
 import { Bridge } from "../../dist/index.js";
-import { BridgeWebNNSource } from "../../dist/experimental/index.js";
+// Import from the STANDALONE module, not the experimental barrel: the barrel
+// re-exports the JIT, which imports `acorn` as a bare specifier the browser
+// can't resolve in a module worker (it would silently fail the whole worker
+// load). BridgeWebNNSource has no such dependency.
+import { BridgeWebNNSource } from "../../dist/experimental/BridgeWebNNSource.js";
 import { makeSchema } from "./schema.js";
 import { LiquidCell, driveInput, CLOCK_HZ } from "./lnn.js";
 
