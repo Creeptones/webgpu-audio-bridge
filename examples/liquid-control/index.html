@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>webgpu-audio-bridge — Liquid Neural Control (LNN brain → AudioWorklet voice)</title>
+    <style>
+      :root { color-scheme: dark; font-family: ui-monospace, Menlo, Consolas, monospace; }
+      body { background: #0c0d10; color: #d4d7dc; margin: 0; padding: 24px; line-height: 1.5; max-width: 900px; }
+      h1 { font-size: 18px; margin: 0 0 12px; color: #fff; }
+      h2 { font-size: 12px; margin: 22px 0 8px; color: #9aa3ad; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+      p { font-size: 13px; }
+      button { background: #2a6df4; border: 0; color: #fff; padding: 10px 16px; font: inherit; font-size: 13px; border-radius: 6px; cursor: pointer; margin: 0 8px 8px 0; }
+      button:disabled { background: #1f2a3a; color: #5b6878; cursor: default; }
+      button:hover:not(:disabled) { background: #4385ff; }
+      #reseed { background: #7a3df4; } #reseed:hover:not(:disabled) { background: #9355ff; }
+      label { display: block; margin: 10px 0 4px; color: #9aa3ad; font-size: 12px; }
+      label .val { color: #d4d7dc; float: right; }
+      input[type=range] { width: 100%; font: inherit; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 20px; }
+      .status, .panel { background: #15171c; border: 1px solid #21252d; border-radius: 6px; padding: 12px 14px; font-size: 12px; white-space: pre-wrap; }
+      .status .k, .panel .k { color: #9aa3ad; }
+      .status .v, .panel .v { color: #d4d7dc; }
+      .err { color: #ff7a7a; } .ok { color: #6ee69b; } .hot { color: #c79bff; } .dim { color: #6b7280; }
+      .footer { color: #5b6878; font-size: 11px; margin-top: 24px; }
+      a { color: #6ea8ff; } code { background: #15171c; padding: 1px 5px; border-radius: 3px; font-size: 12px; } strong { color: #e7eaee; }
+    </style>
+  </head>
+  <body>
+    <h1>webgpu-audio-bridge — Liquid Neural Control</h1>
+    <p>
+      A small <strong>Liquid Time-Constant network</strong> (an LNN — continuous-time recurrent, input-modulated time
+      constants, no tokens) runs on the <strong>CPU in a Worker</strong> at ~100&nbsp;Hz and streams its 6-value control
+      vector into the audio thread through <code>BridgeWebNNSource.pushFromTypedArray()</code> — the bridge's
+      <strong>neural-model → AudioWorklet</strong> adapter, on its <strong>CPU path (no WebNN runtime)</strong>. A tiny
+      synth voice on the audio thread <code>pullLatest()</code>'s the newest vector each quantum and maps it to pitch,
+      cutoff, amplitude, vibrato, detune, and tone. <strong>The net is the brain; the bridge is the nervous system.</strong>
+      The network here is an <em>untrained random liquid reservoir</em> — the spike asks whether an LNN's continuous
+      dynamics make <em>interesting motion</em> and whether the integration path holds; training a musical objective is the
+      next layer.
+    </p>
+
+    <h2>Run</h2>
+    <button id="start">Start audio</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="reseed" disabled>Reseed network 🎲</button>
+
+    <h2>Drives (LNN inputs)</h2>
+    <div class="grid">
+      <div>
+        <label for="energy">energy <span class="val" id="energy-val"></span></label>
+        <input id="energy" type="range" min="0" max="1" step="0.01" value="0.6" />
+      </div>
+      <div>
+        <label for="mood">mood <span class="val" id="mood-val"></span></label>
+        <input id="mood" type="range" min="-1" max="1" step="0.01" value="0" />
+      </div>
+      <div>
+        <label for="rate">tick rate <span class="val" id="rate-val"></span> Hz</label>
+        <input id="rate" type="range" min="20" max="200" step="1" value="100" />
+      </div>
+    </div>
+
+    <h2>Brain · bridge · voice</h2>
+    <div id="hud" class="panel"></div>
+
+    <h2>Status</h2>
+    <div id="status" class="status">idle.</div>
+
+    <p class="footer">
+      Source: <a href="https://github.com/Creeptones/webgpu-audio-bridge">github.com/Creeptones/webgpu-audio-bridge</a>.
+      Needs <code>crossOriginIsolated === true</code> (served by <code>serve.mjs</code>). The brain is
+      <code>lnn.js</code> (a fused-solver Liquid Time-Constant cell), verified headless by
+      <code>node examples/liquid-control/selftest.mjs</code>. <code>BridgeWebNNSource</code> is experimental
+      (<code>webgpu-audio-bridge/experimental</code>) — the CPU <code>pushFromTypedArray</code> path needs no WebNN.
+      Swap the cell for a trained CfC / ONNX-Runtime-Web / WebNN graph and the transport is unchanged.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
