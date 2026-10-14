@@ -4,6 +4,39 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.947] - 2026-10-14
+
+### Fixed - three concurrency bugs
+
+- **Torn PLL offset read (`readPublishedPllState`)** — the Int64 PLL offset spans two Int32 header lanes (4 = low, 5 = high) and was read with no sequence check, so a read overlapping a publish could pair the new low word with the old high word. Across a 2^32-ns carry that is a ≈ 4.29 s error. The method's doc claimed this could not produce "a synthesis of incompatible halves"; it could. `publishPllState` now brackets its payload stores with a **seqlock counter in status-lane bits 1–30** (previously documented as reserved): odd before the payload stores, even (+ the new locked bit) after. `readPublishedPllState` loads status → payload → status and accepts only an unchanged, even sequence, retrying at most 16 times (wait-free). The cross-thread stress reproduces the tear on the old reader (≈ 9 % of reads torn under a carry-crossing writer) and shows zero on the new one.
+- **One dead `SpmcRing` consumer could pin the producer at 0.05× forever** — `flowScaleHint()` min-reduces every consumer's `flowScale[c]` cell, and only the cell's owner updates it, on `pull`. A crashed or wedged consumer never pulls again, so its last value (possibly the floor) stayed in the min indefinitely, contradicting the "decoupled producer" design. The hint now skips a consumer whose cursor has not moved while the producer wrote more than **`staleAfterFrames`** frames (new `SpmcRingOptions` field, default `capacity`) and that still has a backlog; it rejoins as soon as its cursor moves. If every consumer is stalled the hint returns 1.0. Producer-local heap bookkeeping only, preallocated (the hint stays allocation-free and O(consumerCount)).
+- **`MpmcWorkQueue` / `WasmMpmcWorkQueue` wedged after 2^31 claims** — the `claimTicket()` hook added in `1ca422a` returned `-1` for "empty" and `pull` treated **any negative** return as empty. Tickets are Int32 and go negative after 2^31 claims, so from then on every claim advanced `dequeueTicket` and was dropped: the frame was orphaned, the delivered frontier stalled, and the queue fell into permanent drop-newest. This affected the plain JS queue too, not only the WASM variant. The emptiness pre-check moved into `pull`; the hook is now an **unconditional fetch-add** in both backends (`emitWasmMpmc` / `emitWasmMpmcBytes` emit a single `i32.atomic.rmw.add`), so every Int32 it returns is a real ticket.
+
+### Added
+
+- `readPublishedPllState(out?)` on `SpscRing` and `Bridge` takes an optional reusable **out-param** (allocation-free read), and returns the named type **`PublishedPllState`** (`{ locked, offsetNs, driftPpm, consistent }`, new root type export). `consistent` is `false` only if the bounded retry was exhausted while a publish stayed in progress; it is always `true` against a pre-0.9.947 writer.
+- `SpmcRingOptions.staleAfterFrames` (experimental).
+
+### Why
+
+All three were found in the pre-1.0 audit. The PLL tear is rare but silent and large. The SpmcRing pin and the 2^31 wedge are permanent once triggered, and the wedge is guaranteed for any long-running work queue.
+
+### Wire compatibility
+
+- **PLL status lane:** uses bits 1–30 that were documented as reserved; no layout change. A pre-0.9.947 **reader** masks bit 0 only, so it reads a new writer correctly (without tear protection). A pre-0.9.947 **writer** never sets the sequence bits, so a new reader treats its snapshots as consistent, with the old semantics.
+- **`SpmcRing`:** no SAB change.
+- **`MpmcWorkQueue`:** no SAB change. **WASM claim module contract changed:** a module emitted before 0.9.947 can return `-1` without claiming, so it must not be paired with this release's `WasmMpmcWorkQueue`. `connectWorkQueue` / `connectGraph` emit the module at allocation time and always match. The protected `claimTicket()` override hook no longer returns a sentinel (experimental surface).
+- Public API: additive (`PublishedPllState` type; optional `out` param; `consistent` field on the returned snapshot).
+
+### Tests
+
+- New `tests/Bridge.pllSeqlock.concurrent.test.ts` (in `npm test` + `test:concurrent`): a worker runs the REAL compiled `publishPllState` body (injected via `toString()`, because tsx cannot load the TS sources inside `worker_threads`) and publishes offsets alternating across the 2^32 carry while the main thread reads. SATURATED phase (back-to-back publishes): zero torn among consistent reads, with exhausted reads flagged rather than torn. PACED phase: zero torn and ≥ 99 % consistent (observed ≥ 99.87 %). `PLL_SEQLOCK_LEGACY=1` runs the pre-fix reader and asserts it DOES tear.
+- `tests/Bridge.pll.test.ts` pin 92b: sequence parity per publish, mid-publish → `consistent: false` with no hang, recovery, pre-0.9.947-writer compatibility, out-param identity.
+- `tests/SpmcRing.test.ts` pin 12: stalled consumer excluded after `staleAfterFrames`, re-admitted on progress, 1.0 when all are stalled, option validation. Pin 11(c)'s white-box min-reduce moved to a fresh ring, because its consumer 1 is now (correctly) a stalled consumer.
+- `tests/MpmcWorkQueue.test.ts` pin 11 + `tests/WasmMpmcWorkQueue.test.ts` (shared driver `tests/_mpmcWqWrap.ts`): real push/pull traffic starting 5 tickets below the Int32 wrap: 4×capacity frames FIFO, zero drops, `dequeueTicket` ends negative. Both FAIL on the pre-fix code at ticket −2147483648.
+- `tests/emitWasmMpmc.test.ts`: pins the unconditional-claim contract, including negative tickets and `-1` as a real claim.
+- Benches `bench:wasm-mpmc-wq` / `bench:wasm-mpmc-ticket-storm` moved their emptiness checks into JS to match.
+
 ## [0.9.946] - 2026-10-14
 
 ### Added - acorn-free `webgpu-audio-bridge/experimental/core` subpath

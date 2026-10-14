@@ -24,6 +24,10 @@
  *  78. testPllLanePublicationCrossPeer
  *  79. testPllLanePublicationEncoding
  *  92. testPllPublishBigIntFreeAndBoundaryRoundTrip
+ *  92b. testPllPublishSeqlock (0.9.947) — status-lane sequence parity,
+ *       mid-publish → consistent:false (bounded, no hang), pre-0.9.947
+ *       writer compatibility, out-param reuse. Cross-thread proof:
+ *       tests/Bridge.pllSeqlock.concurrent.test.ts.
  */
 
 import {
@@ -1204,6 +1208,56 @@ function testPllPublishBigIntFreeAndBoundaryRoundTrip(): void {
   ok("pll-publish-bigint-free-boundary-round-trip");
 }
 
+// ── 92b. PLL publish seqlock (0.9.947) ───────────────────────────────────
+function testPllPublishSeqlock(): void {
+  const schema = physicsControlFrameSchema(2);
+  const { sab, capacity } = SpscRing.allocate(16, schema);
+  const ring = new SpscRing(sab, capacity, schema);
+  const lanes = new Int32Array(sab, 0, 8);
+
+  // Each publish advances the status-lane sequence (bits 1-30) by 2 and
+  // leaves it EVEN; bit 0 carries `locked`.
+  ring.publishPllState(1_000, 2.5, true);
+  const s1 = Atomics.load(lanes, 7);
+  assertEq(s1 & 1, 1, "locked bit set");
+  assertEq((s1 >>> 1) & 1, 0, "sequence even after publish");
+  ring.publishPllState(2_000, 2.5, false);
+  const s2 = Atomics.load(lanes, 7);
+  assertEq(s2 & 1, 0, "locked bit cleared");
+  assertEq(((s2 >>> 1) - (s1 >>> 1)) & 0x3fffffff, 2, "sequence advanced by 2 per publish");
+
+  // Out-param reuse: the same object comes back, fields overwritten.
+  const out = { locked: true, offsetNs: -1, driftPpm: -1, consistent: false };
+  const got = ring.readPublishedPllState(out);
+  assert(got === out, "readPublishedPllState(out) returns the caller's object");
+  assertEq(got.offsetNs, 2_000, "offset read");
+  assertEq(got.locked, false, "locked read");
+  assertEq(got.consistent, true, "quiescent read is consistent");
+
+  // Simulated publisher descheduled mid-publish (odd sequence): the reader
+  // must not hang — it gives up after the bounded retry and flags it.
+  Atomics.store(lanes, 7, (((s2 >>> 1) + 1) << 1) | 1);
+  const mid = ring.readPublishedPllState(out);
+  assertEq(mid.consistent, false, "mid-publish read flagged consistent:false");
+  // ...and the next publish recovers (odd → even, no double-odd).
+  ring.publishPllState(3_000, 0, true);
+  const s3 = Atomics.load(lanes, 7);
+  assertEq((s3 >>> 1) & 1, 0, "publish after an interrupted one leaves the sequence even");
+  assertEq(ring.readPublishedPllState(out).consistent, true, "recovered read consistent");
+  assertEq(out.offsetNs, 3_000, "recovered offset");
+
+  // A pre-0.9.947 writer stores just 0/1 in the status lane (sequence 0 —
+  // even): readers treat it as consistent, preserving old behavior.
+  Atomics.store(lanes, 4, 7); Atomics.store(lanes, 5, 0); Atomics.store(lanes, 6, 0);
+  Atomics.store(lanes, 7, 1);
+  const legacy = ring.readPublishedPllState();
+  assertEq(legacy.consistent, true, "legacy writer status reads consistent");
+  assertEq(legacy.locked, true, "legacy locked bit honored");
+  assertEq(legacy.offsetNs, 7, "legacy offset honored");
+
+  ok("pll-publish-seqlock (parity, bounded mid-publish, legacy compat, out-param)");
+}
+
 function main(): void {
   testPllColdStart();
   testPllConvergence();
@@ -1221,6 +1275,7 @@ function main(): void {
   testPllLanePublicationCrossPeer();
   testPllLanePublicationEncoding();
   testPllPublishBigIntFreeAndBoundaryRoundTrip();
+  testPllPublishSeqlock();
   console.log("\nAll Bridge PLL tests passed.");
 }
 

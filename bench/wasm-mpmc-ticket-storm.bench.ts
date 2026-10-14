@@ -58,9 +58,14 @@ const { parentPort, workerData } = require("node:worker_threads");
       n++;
     }
   } else {
+    // 0.9.947: the kernel is an unconditional fetch-add; the emptiness
+    // pre-check (and the miss count) lives here, as in MpmcWorkQueue.pull.
+    const dequeueLane = workerData.dequeueByteOffset / 4;
     while (Atomics.load(control, 1) === 0) {
-      if (claimTicket() >= 0) n++;
-      else miss++;
+      if (((Atomics.load(header, enqueueLane) - Atomics.load(header, dequeueLane)) | 0) > 0) {
+        claimTicket();
+        n++;
+      } else miss++;
     }
   }
 
@@ -129,6 +134,7 @@ async function runOnce(
           control: controlSab,
           wasmBytes,
           enqueueByteOffset: o.enqueue,
+          dequeueByteOffset: o.dequeue,
         },
       });
       workers.push(w);

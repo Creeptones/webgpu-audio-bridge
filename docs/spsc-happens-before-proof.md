@@ -44,9 +44,9 @@ The header (`RING_HEADER_BYTES = 32`, `SpscRing.ts:240`) is an `Int32Array` of 8
 | 1 | `READ_IDX_LANE` | consumer counter | **YES** — release/acquire |
 | 2 | `FLOW_SCALE_LANE` | Q16.16 PI flow hint | no — best-effort independent atomic |
 | 3 | `TORN_FRAME_LANE` | monotonic torn-frame counter | no — best-effort independent atomic |
-| 4–5 | `PLL_OFFSET_LANE_LOW/HIGH` | PLL offset, Int64 ns split | no — best-effort, not a seqlock |
+| 4–5 | `PLL_OFFSET_LANE_LOW/HIGH` | PLL offset, Int64 ns split | no HB vs counters; seqlock-guarded vs lane 7 since 0.9.947 |
 | 6 | `PLL_DRIFT_LANE` | PLL drift, Q16.16 ppm | no — best-effort |
-| 7 | `PLL_STATUS_LANE` | PLL status word (bit 0 = locked) | no — best-effort, status-last/first gate |
+| 7 | `PLL_STATUS_LANE` | PLL status word (bit 0 = locked; bits 1–30 = publish seqlock counter since 0.9.947) | no HB vs counters; seqlock for lanes 4–7 |
 
 **Only lanes 0 and 1 are in scope for this proof.** Lanes 2–7 are explicitly best-effort independent atomics with *no ordering* vs the counter lanes or the payload. They are individually data-race-free (every access is `Atomics.*`), but they carry no happens-before edges and are allowed to be read stale or stitched across two publishes. `available()` (`:1627-1631`) and the telemetry tuple are non-atomic two-load snapshots with ±1 skew and are likewise out of scope.
 
@@ -293,7 +293,7 @@ Each loop is guarded `for (let attempt = 0; attempt <= this.capacity; attempt++)
 
 ## Scope: what this proof does NOT cover
 
-- **Best-effort lanes 2–7.** `flow_scale` (lane 2, stored in `_updateFlowScale:1480`), `torn_frame` (lane 3, `Atomics.add:1652`), and PLL (lanes 4–7, `publishPllState:1721` / `readPublishedPllState:1790`) have no happens-before edge vs the counters or payload. The PLL publish uses a status-last-write / status-first-read one-bit gate (`:1733-1748`, `:1791`) that is explicitly **not** a full seqlock — a reader can stitch a stale offset with a fresh status across two publishes. Modeling these as atomic snapshots would be *unsound*. They are individually data-race-free but semantically lossy by design.
+- **Best-effort lanes 2–7.** `flow_scale` (lane 2, stored in `_updateFlowScale:1480`), `torn_frame` (lane 3, `Atomics.add:1652`), and PLL (lanes 4–7, `publishPllState:1721` / `readPublishedPllState:1790`) have no happens-before edge vs the counters or payload. Before 0.9.947 the PLL publish used a status-last-write / status-first-read one-bit gate that was **not** a full seqlock — a reader could stitch the two offset halves across two publishes (a ≈ 4.29 s error across a 2^32-ns carry). **Since 0.9.947 lanes 4–7 form a seqlock**: the single writer stores an odd sequence into lane 7 bits 1–30 before the payload and an even one (plus the locked bit) after; the reader accepts a snapshot only when two lane-7 loads bracketing the payload loads are equal and even (bounded to 16 attempts, else `consistent: false`). With JS `Atomics` (sequentially consistent), equal-and-even brackets imply no publish overlapped the payload loads, so the tuple comes from one publish. The PLL lanes still have no happens-before edge vs the SPSC counters or payload — they remain outside the ring's correctness argument (proved cross-thread by `tests/Bridge.pllSeqlock.concurrent.test.ts`).
 - **`available()` and telemetry.** `available()` (`:1627-1631`) does two separate atomic loads of `write_index` and `read_index` and is a non-atomic snapshot with ±1 skew. Per-instance heap counters (`droppedFrames`, `pushedFrames`, `skippedFrames`, `maxOccupancyEverSeen`, the `performance.now()` wait-duration timing) are *not* in the SAB — each peer sees only its own.
 - **Liveness beyond no-lost-wakeup.** Theorem 4 proves a parked peer is woken; it does not prove progress under adversarial scheduling (a producer that never pushes leaves a consumer legitimately parked until timeout).
 

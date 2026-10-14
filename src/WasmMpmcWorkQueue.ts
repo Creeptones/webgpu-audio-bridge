@@ -27,7 +27,13 @@ function resolveClaimTicket(source: WasmMpmcClaimSource): WasmMpmcClaimTicket {
 /** Experimental WASM-backed MpmcWorkQueue variant.
  *
  * This class replaces only the contended dequeue claim with a WASM
- * `i32.atomic.rmw.add` kernel. The SAB must be the `.buffer` of the same shared
+ * `i32.atomic.rmw.add` kernel. Since 0.9.947 the kernel is an UNCONDITIONAL
+ * fetch-add (no `-1` "empty" sentinel — every i32 is a valid ticket); the
+ * emptiness pre-check stays in `MpmcWorkQueue.pull`. **Do not pair this class
+ * with a module emitted before 0.9.947**: such a module can return `-1`
+ * WITHOUT claiming (if the queue drains between `pull`'s check and its own),
+ * which this class would treat as a real ticket. `connectWorkQueue` /
+ * `connectGraph` emit the module at allocation time, so they always match. The SAB must be the `.buffer` of the same shared
  * `WebAssembly.Memory` used to instantiate the kernel; allocate it with
  * `allocateWasmSharedMemory(MpmcWorkQueue.byteLength(...))`.
  */

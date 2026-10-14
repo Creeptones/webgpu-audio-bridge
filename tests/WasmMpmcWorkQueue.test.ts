@@ -5,6 +5,8 @@ import { MpmcWorkQueue } from "../src/MpmcWorkQueue.js";
 import { WasmMpmcWorkQueue } from "../src/WasmMpmcWorkQueue.js";
 import { emitWasmMpmc } from "../src/emitWasmMpmc.js";
 import { allocateWasmSharedMemory } from "../src/wasm/memory.js";
+import { MPMC_WQ_HEADER_BYTES } from "../src/MpmcWorkQueue.js";
+import { driveAcrossTicketWrap } from "./_mpmcWqWrap.js";
 
 const schema = defineSchema({
   producerId: u32(),
@@ -38,6 +40,20 @@ async function makeQueue(capacity: number, producerCount: number) {
   );
   queue.initLayout();
   return { queue, sab: alloc.sab, memory: alloc.memory };
+}
+
+async function ticketWrap(): Promise<void> {
+  // 0.9.947 regression: the WASM claim kernel returned -1 for "empty" and
+  // pull() treated any negative claim as empty, so tickets past the 2^31 wrap
+  // were claimed and dropped. Drive real traffic across the wrap.
+  const { queue, sab } = await makeQueue(8, 1);
+  const frame = queue.createFrame() as unknown as Record<string, unknown>;
+  const out = queue.createFrame() as unknown as Record<string, unknown>;
+  driveAcrossTicketWrap(
+    queue as unknown as Parameters<typeof driveAcrossTicketWrap>[0],
+    sab, MPMC_WQ_HEADER_BYTES, frame, out, "seq", "wasm",
+  );
+  console.log("ok: WasmMpmcWorkQueue 2^31 ticket wrap");
 }
 
 async function main(): Promise<void> {
@@ -82,7 +98,7 @@ async function main(): Promise<void> {
   console.log("ok: WasmMpmcWorkQueue API parity");
 }
 
-main().catch((e) => {
+main().then(ticketWrap).catch((e) => {
   console.error(e);
   process.exitCode = 1;
 });

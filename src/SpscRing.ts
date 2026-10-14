@@ -276,7 +276,9 @@ export const RING_HEADER_INT32_LANES = 8;
 //   lane 3:    torn_frame_counter — Int32 monotonic wrap-counter (0.6.0)
 //   lanes 4-5: PLL offset (Int64 ns, atomic via aliased BigInt64Array; 0.6.16)
 //   lane 6:    PLL drift (Q16.16 ppm signed Int32; 0.6.16)
-//   lane 7:    PLL status word (bit 0 = locked, bits 1-31 reserved; 0.6.16)
+//   lane 7:    PLL status word (bit 0 = locked; 0.6.16). Bits 1-30 carry the
+//              PLL publish SEQLOCK counter (0.9.947; previously reserved, so a
+//              pre-0.9.947 writer leaves them 0 and readers stay compatible).
 export const WRITE_IDX_LANE = 0;
 export const READ_IDX_LANE = 1;
 export const FLOW_SCALE_LANE = 2;
@@ -287,6 +289,27 @@ export const PLL_DRIFT_LANE = 6;
 export const PLL_STATUS_LANE = 7;
 // PLL status word bit positions.
 const PLL_STATUS_LOCKED_BIT = 1; // bit 0
+// Seqlock counter in status bits 1-30 (0.9.947). Odd = a publish is in
+// progress; even = quiescent. 30 bits, wraps; only equality + parity matter.
+const PLL_STATUS_SEQ_SHIFT = 1;
+const PLL_STATUS_SEQ_MASK = 0x3fffffff;
+// Bounded retry for the seqlock reader — keeps readPublishedPllState
+// wait-free. A publish is ~6 stores, so one retry virtually always suffices;
+// the bound only matters if the publishing thread is descheduled mid-publish.
+const PLL_READ_MAX_ATTEMPTS = 16;
+
+/** Snapshot returned by `readPublishedPllState` (0.9.947: named + reusable
+ *  as an out-param for an allocation-free read). */
+export interface PublishedPllState {
+  locked: boolean;
+  offsetNs: number;
+  driftPpm: number;
+  /** `true` when the snapshot came from a single publish (seqlock-verified).
+   *  `false` only if the bounded retry was exhausted while a publish stayed in
+   *  progress (publisher descheduled mid-write) — the fields may then mix two
+   *  publishes. Always `true` against a pre-0.9.947 writer (seq stays 0). */
+  consistent: boolean;
+}
 // Q16.16 conversion factor for drift ppm publication. Drift range is
 // effectively ±32768 ppm, which dwarfs any realistic clock drift (≤ 200 ppm).
 const PLL_DRIFT_Q16_16 = 65536;
@@ -2124,6 +2147,19 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     // ±2^53 ns (≈ 104 days).
     const hi = Math.floor(offsetRounded / 0x100000000);
     const lo = (offsetRounded - hi * 0x100000000) | 0;
+    // Seqlock open (0.9.947): bump the status-lane sequence to ODD before
+    // touching the payload lanes, keeping the previous locked bit so a
+    // pre-0.9.947 reader (which masks bit 0 only) still sees a valid status.
+    // The offset spans two Int32 lanes; without this a reader could pair the
+    // new low word with the old high word across a 2^32-ns carry (≈ 4.29 s
+    // error). Single writer (the consumer Bridge), so no CAS is needed.
+    const prevStatus = Atomics.load(this.indices, PLL_STATUS_LANE);
+    const busySeq = ((prevStatus >>> PLL_STATUS_SEQ_SHIFT) & PLL_STATUS_SEQ_MASK) | 1;
+    Atomics.store(
+      this.indices,
+      PLL_STATUS_LANE,
+      (busySeq << PLL_STATUS_SEQ_SHIFT) | (prevStatus & PLL_STATUS_LOCKED_BIT),
+    );
     Atomics.store(this.indices, PLL_OFFSET_LANE_LOW, lo);
     Atomics.store(this.indices, PLL_OFFSET_LANE_HIGH, hi | 0);
     // Drift as signed Q16.16 ppm. Range ±32768 ppm clamped — any
@@ -2135,10 +2171,13 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     if (driftQ > MAX_Q) driftQ = MAX_Q;
     else if (driftQ < MIN_Q) driftQ = MIN_Q;
     Atomics.store(this.indices, PLL_DRIFT_LANE, driftQ);
+    // Seqlock close: EVEN sequence + the new locked bit, stored last (the
+    // status-last order the one-bit lock gate already relied on).
+    const doneSeq = (busySeq + 1) & PLL_STATUS_SEQ_MASK;
     Atomics.store(
       this.indices,
       PLL_STATUS_LANE,
-      locked ? PLL_STATUS_LOCKED_BIT : 0,
+      (doneSeq << PLL_STATUS_SEQ_SHIFT) | (locked ? PLL_STATUS_LOCKED_BIT : 0),
     );
   }
 
@@ -2153,49 +2192,62 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * consumer Bridge is using, and calls this method to inspect the
    * consumer's PLL state without postMessage or other IPC.
    *
-   * ─── Read order contract (0.8.1) ──────────────────────────────────────
+   * ─── Seqlock contract (0.9.947; supersedes the 0.8.1 read order) ──────
    *
-   * The status lane is read FIRST, then offset, then drift. This pairs
-   * with `publishPllState`'s status-last write order to form a one-bit
-   * gate: a reader that observes `locked === false` knows the
-   * offset/drift fields may be stale or zero (no PLL has published yet,
-   * or the producer just reset) and should ignore them; a reader that
-   * observes `locked === true` knows the offset/drift fields belong to a
-   * publish point where the producer had locked. The protocol does NOT
-   * implement a full seqlock — concurrent publish/read interleaving can
-   * still produce a snapshot stitched across two publishes — but the
-   * documented invariants (status changes only on lock/unlock
-   * transitions; offset/drift change every observe) ensure the stitched
-   * snapshot is a valid publish point in practice, not a synthesis of
-   * incompatible halves.
+   * `publishPllState` brackets its payload stores with the status lane's
+   * sequence counter (bits 1-30): ODD before the offset/drift stores, EVEN
+   * (plus the new locked bit) after. This method loads status, the three
+   * payload lanes, then status again, and accepts the snapshot only when both
+   * status loads are identical and even — i.e. no publish overlapped the read.
+   * The tuple (locked, offsetNs, driftPpm) therefore always comes from ONE
+   * publish. Before 0.9.947 there was no sequence: a read overlapping a
+   * publish could pair the new low offset word with the old high word, and
+   * across a 2^32-ns carry that is a ≈ 4.29 s error.
    *
-   * The four lanes (status / offset-low / offset-high / drift) are
-   * individually atomic; the tuple is not mutually atomic. Live observer
-   * activity that needs sample-accurate coherence should instead call
-   * `bridge.telemetry()` on the consumer Bridge directly (same-thread
-   * loads, gated against the heap state). The published-lane path exists
-   * for the cross-thread / cross-process case where direct Bridge access
-   * isn't available.
+   * Wait-free: at most `PLL_READ_MAX_ATTEMPTS` (16) attempts. If every
+   * attempt overlaps a publish (only possible when the publishing thread is
+   * descheduled mid-publish), the last attempt's values are returned with
+   * `consistent: false`.
    *
-   * Four atomic loads + one ppm decode + one offset reconstruction.
-   * Allocation-free (no BigInt boxing; see `publishPllState` for the
-   * 0.8.2 BigInt-free encoding).
+   * Compatibility: a pre-0.9.947 writer never sets the sequence bits, so its
+   * snapshots read as `consistent: true` with the old (unguarded) semantics;
+   * a pre-0.9.947 reader masks bit 0 only and ignores the sequence.
+   *
+   * ─── Allocation ───────────────────────────────────────────────────────
+   *
+   * Pass `out` (a reused `PublishedPllState`) for an allocation-free read;
+   * without it, one result object is allocated per call. No BigInt boxing
+   * either way (see `publishPllState` for the 0.8.2 BigInt-free encoding).
    */
-  readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
-    const status = Atomics.load(this.indices, PLL_STATUS_LANE);
-    const locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
-    // Two Int32 loads + Number reconstruction (0.8.2). Bit-equivalent to
-    // reading the same 8 bytes as a BigInt64 then converting to Number,
-    // but allocation-free on the hot reader path. `(lo >>> 0)` casts the
-    // low half from signed Int32 to its unsigned interpretation; the
-    // signed high half multiplies by 2^32 to reconstruct the full Int64
-    // as a JavaScript Number. Within ±2^53 ns this is exact.
-    const lo = Atomics.load(this.indices, PLL_OFFSET_LANE_LOW);
-    const hi = Atomics.load(this.indices, PLL_OFFSET_LANE_HIGH);
-    const offsetNs = hi * 0x100000000 + (lo >>> 0);
-    const driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
-    const driftPpm = driftQ / PLL_DRIFT_Q16_16;
-    return { locked, offsetNs, driftPpm };
+  readPublishedPllState(out?: PublishedPllState): PublishedPllState {
+    // Seqlock read (0.9.947): status → payload → status; accept when the two
+    // status loads match and the sequence is even (no publish in progress).
+    // Bounded retry keeps this wait-free.
+    let status = 0;
+    let lo = 0;
+    let hi = 0;
+    let driftQ = 0;
+    let consistent = false;
+    for (let attempt = 0; attempt < PLL_READ_MAX_ATTEMPTS; attempt++) {
+      status = Atomics.load(this.indices, PLL_STATUS_LANE);
+      lo = Atomics.load(this.indices, PLL_OFFSET_LANE_LOW);
+      hi = Atomics.load(this.indices, PLL_OFFSET_LANE_HIGH);
+      driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
+      const status2 = Atomics.load(this.indices, PLL_STATUS_LANE);
+      if (status === status2 && ((status >>> PLL_STATUS_SEQ_SHIFT) & 1) === 0) {
+        consistent = true;
+        break;
+      }
+    }
+    // Two Int32 halves + Number reconstruction (0.8.2, BigInt-free).
+    // `(lo >>> 0)` reads the low half unsigned; the signed high half scales
+    // by 2^32. Exact within ±2^53 ns.
+    const o = out ?? { locked: false, offsetNs: 0, driftPpm: 0, consistent: false };
+    o.locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
+    o.offsetNs = hi * 0x100000000 + (lo >>> 0);
+    o.driftPpm = driftQ / PLL_DRIFT_Q16_16;
+    o.consistent = consistent;
+    return o;
   }
 
   /** Current producer counter (unsigned-decoded for telemetry). */

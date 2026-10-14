@@ -261,6 +261,7 @@ import {
   type BridgeAllocation as SpscBridgeAllocation,
   type BackpressurePolicy,
   type SpscRingOptions,
+  type PublishedPllState,
 } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
@@ -1228,11 +1229,12 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * `Bridge` (or `SpscRing`) over the SAME SAB the consumer is using,
    * and calls this method to inspect the consumer's PLL state without
    * postMessage or other IPC. The returned object is a point-in-time
-   * snapshot:
+   * snapshot from a single publish (seqlock-verified since 0.9.947):
    *
-   *   { locked: boolean, offsetNs: number, driftPpm: number }
+   *   { locked: boolean, offsetNs: number, driftPpm: number, consistent: boolean }
    *
-   * Three atomic loads. Allocation-free, safe to call from any thread.
+   * Wait-free, safe to call from any thread. Pass a reused `out` object for
+   * an allocation-free read (0.9.947); see `SpscRing.readPublishedPllState`.
    * If no peer has published since SAB allocation (the SAB is
    * zero-filled by `new SharedArrayBuffer`), returns
    * `{ locked: false, offsetNs: 0, driftPpm: 0 }` — which is also what
@@ -1240,8 +1242,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * indistinguishable to a reader. That's deliberate: a fresh SAB and
    * a freshly-reset PLL both signal "no usable estimate."
    */
-  readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
-    return this.ring.readPublishedPllState();
+  readPublishedPllState(out?: PublishedPllState): PublishedPllState {
+    return this.ring.readPublishedPllState(out);
   }
 
   /**

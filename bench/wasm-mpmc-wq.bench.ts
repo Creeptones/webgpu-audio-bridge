@@ -206,23 +206,16 @@ const { mode, sab, memory, wasmBytes, ctrlSab, capacity, consumerIndex, n,
 
   for (;;) {
     if (!hasHeld) {
-      if (mode === "wasm") {
-        held = claimTicket();
-        if (held < 0) {
-          if (done()) break;
-          if (Date.now() - start > watchdogMs) { err = "watchdog(empty) c=" + consumerIndex; break; }
-          continue;
-        }
-      } else {
-        const R = Atomics.load(header, lanes.dequeue);
-        const W = Atomics.load(header, lanes.enqueue);
-        if (((W - R) | 0) <= 0) {
-          if (done()) break;
-          if (Date.now() - start > watchdogMs) { err = "watchdog(empty) c=" + consumerIndex; break; }
-          continue;
-        }
-        held = Atomics.add(header, lanes.dequeue, 1);
+      // Emptiness pre-check in JS for both modes (0.9.947: the WASM kernel is
+      // an unconditional fetch-add with no "-1 = empty" sentinel).
+      const R = Atomics.load(header, lanes.dequeue);
+      const W = Atomics.load(header, lanes.enqueue);
+      if (((W - R) | 0) <= 0) {
+        if (done()) break;
+        if (Date.now() - start > watchdogMs) { err = "watchdog(empty) c=" + consumerIndex; break; }
+        continue;
       }
+      held = mode === "wasm" ? claimTicket() : Atomics.add(header, lanes.dequeue, 1);
       hasHeld = true;
     }
 

@@ -15,7 +15,7 @@ This is not GPU audio-rate synthesis. It is the practical browser split: GPU for
 
 ## Status
 
-- Version: `0.9.946`
+- Version: `0.9.947`
 - License: MIT
 - Maturity: pre-1.0 by policy. `1.0` means API stability.
 - Stable core: no direct runtime dependencies

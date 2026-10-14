@@ -45,7 +45,7 @@ export type { MessageChannelBridgeAllocation, } from "./MessageChannelBridge.js"
 export { connect, mount, ConnectUnsupportedError, audioFramesPerSlot } from "./connect.js";
 export type { LatencyHint, LatencyBudget, RingSizing, ConnectRingSpec, ConnectSpec, ConnectMode, ConnectRingHandle, ConnectHandle, ConnectRole, MountOptions, MountResult, ConnectTopology, } from "./connect.js";
 export { SpscRing } from "./SpscRing.js";
-export type { SpscPullResult, SpscRingOptions, BackpressurePolicy, } from "./SpscRing.js";
+export type { SpscPullResult, SpscRingOptions, BackpressurePolicy, PublishedPllState, } from "./SpscRing.js";
 export { FrameSmoother } from "./FrameSmoother.js";
 export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 export type { ConsumerClockRecoveryOptions } from "./ConsumerClockRecovery.js";

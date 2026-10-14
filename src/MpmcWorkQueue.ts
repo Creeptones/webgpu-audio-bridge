@@ -679,9 +679,16 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     const header = this.header;
     // Claim a unique ticket if not already holding one.
     if (!this.hasHeld) {
-      const claimed = this.claimTicket();
-      if (claimed < 0) return false; // nothing plausibly to claim
-      this.heldTicket = claimed;
+      // Nothing plausibly to claim → don't claim. This pre-check lives HERE,
+      // not in the claim hook (0.9.947): the hook used to return -1 for
+      // "empty" and this branch treated any NEGATIVE return as empty — but
+      // tickets are Int32 and wrap negative after 2^31 claims, so every later
+      // claim was dropped (frame orphaned, frontier stalled). Now the hook is
+      // a pure fetch-add and every Int32 it returns is a real ticket.
+      const R = Atomics.load(header, DEQUEUE_TICKET_LANE); // acquire
+      const W = Atomics.load(header, ENQUEUE_TICKET_LANE); // acquire
+      if (signedDiff(W, R) <= 0) return false;
+      this.heldTicket = this.claimTicket();
       this.hasHeld = true;
     }
 
@@ -737,17 +744,15 @@ export class MpmcWorkQueue<S extends Schema<FieldsObject, any>> {
     return false;
   }
 
-  /** Claim one dequeue ticket, or `-1` when the queue is empty. Kept as a tiny
-   *  override hook so experimental kernels can replace ONLY the contended claim
-   *  primitive while the proven held-claim/generation/teardown protocol remains
-   *  in `pull`. */
+  /** Claim one dequeue ticket UNCONDITIONALLY: fetch-add `dequeueTicket` and
+   *  return the OLD value. Every Int32 (negative ones included) is a valid
+   *  ticket — there is no "empty" sentinel; `pull` does the emptiness
+   *  pre-check before calling this (0.9.947). Kept as a tiny override hook so
+   *  experimental kernels can replace ONLY the contended claim primitive while
+   *  the proven held-claim/generation/teardown protocol remains in `pull`. */
   protected claimTicket(): number {
-    const header = this.header;
-    const R = Atomics.load(header, DEQUEUE_TICKET_LANE); // acquire
-    const W = Atomics.load(header, ENQUEUE_TICKET_LANE); // acquire
-    if (signedDiff(W, R) <= 0) return -1;
     // Fetch-add → a UNIQUE claim D (wait-free; each consumer a distinct OLD).
-    return Atomics.add(header, DEQUEUE_TICKET_LANE, 1);
+    return Atomics.add(this.header, DEQUEUE_TICKET_LANE, 1);
   }
 
   /**

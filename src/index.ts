@@ -134,6 +134,7 @@ export type {
   SpscPullResult,
   SpscRingOptions,
   BackpressurePolicy,
+  PublishedPllState,
 } from "./SpscRing.js";
 export { FrameSmoother } from "./FrameSmoother.js";
 export { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";

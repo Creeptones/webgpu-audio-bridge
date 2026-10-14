@@ -27,6 +27,9 @@
  *       flowScaleHint() returns the MIN over the cells (the one genuinely-new
  *       op), order-independent + in [DAG_FLOW_SCALE_MIN, 2.0]; a low-occupancy
  *       consumer drives its cell up toward 2.0. No tear/drop on the side channel.
+ *  12.  dead-consumer exclusion (0.9.947): a consumer stalled with a backlog for
+ *       > staleAfterFrames writes leaves the min-reduce (a frozen floor cell no
+ *       longer pins the producer), re-joins on its next pull; all stalled → 1.0.
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -353,6 +356,48 @@ function pin10_observers(): void {
   pass("pin10: observers + bound default + out-of-range guards");
 }
 
+// Pin 12 — dead-consumer exclusion in flowScaleHint (0.9.947). A consumer that
+// stops pulling with a backlog must not pin the producer at its last (floor)
+// cell forever: once the producer has written > staleAfterFrames frames with no
+// cursor movement, the hint drops it from the min; it rejoins when it pulls.
+function pin12_staleConsumerExcluded(): void {
+  const cap = 16;
+  const Q = AdaptiveFlowController.Q;
+  const f = makeFrame();
+  const { ring, sab } = SpmcRing.create(allKinds, cap, { consumerCount: 2 });
+  const out = ring.createFrame();
+  const cl = new Int32Array(sab, SPMC_HEADER_BYTES, 2 * PER_CONSUMER_LANES);
+  // Consumer 1 "crashes" after writing a floor cell; consumer 0 stays healthy.
+  cl[1 * PER_CONSUMER_LANES + 3] = Math.floor(DAG_FLOW_SCALE_MIN * Q);
+  ring.push(f as any);
+  assert(ring.pull(out, 0), "c0 pull");
+  // Within the window the dead consumer still counts (could just be slow).
+  const early = ring.flowScaleHint();
+  assert(Math.abs(early - DAG_FLOW_SCALE_MIN) < 1e-4, `within staleAfterFrames the floor cell still wins (got ${early})`);
+  // The producer keeps writing; c0 keeps up, c1 never moves (backlog grows).
+  for (let i = 0; i < cap + 2; i++) {
+    ring.push(f as any);
+    assert(ring.pull(out, 0), "c0 keeps up");
+  }
+  const late = ring.flowScaleHint();
+  assert(late > DAG_FLOW_SCALE_MIN + 1e-3, `stalled consumer excluded after > capacity writes (got ${late})`);
+  assert(Math.abs(late - (cl[0 * PER_CONSUMER_LANES + 3]! | 0) / Q) < 1e-9, "hint == the live consumer's cell");
+  // The dead consumer revives: its cursor moves, so it rejoins the reduce.
+  assert(ring.pull(out, 1), "c1 revives (overload net skips it forward)");
+  cl[1 * PER_CONSUMER_LANES + 3] = Math.floor(0.2 * Q);
+  assert(Math.abs(ring.flowScaleHint() - 0.2) < 1e-4, "revived consumer rejoins the min-reduce");
+  // Every consumer stalled → nominal 1.0 (no live sink to pace for).
+  for (let i = 0; i < 3 * cap; i++) ring.push(f as any);
+  ring.flowScaleHint(); // first look after the stall
+  for (let i = 0; i < 2 * cap; i++) ring.push(f as any);
+  assertEq(ring.flowScaleHint(), 1.0, "all consumers stalled → nominal 1.0");
+  // Option validation.
+  let threw = false;
+  try { new SpmcRing(sab, allKinds, cap, { consumerCount: 2, staleAfterFrames: 0 }); } catch { threw = true; }
+  assert(threw, "staleAfterFrames must be ≥ 1");
+  pass("pin12: flowScaleHint excludes a stalled consumer after staleAfterFrames, re-admits on progress, 1.0 when all stalled");
+}
+
 // Pin 11 — flow_scale per-consumer lane + producer MIN-reduce (DAG back-pressure
 // Stage 1c). Deterministic; drives the REAL pull path for the lane writes and
 // exercises the real flowScaleHint() min-reduce. Reads the raw per-consumer cells
@@ -401,18 +446,22 @@ function pin11_flowScaleMinReduce(): void {
 
   // (c) The MIN-reduce is a true min over the cells, order-independent + bounded.
   //     White-box stores into the raw cells (the reduction reads live atomics).
-  const cl = new Int32Array(sab, SPMC_HEADER_BYTES, 2 * PER_CONSUMER_LANES);
+  //     Uses a FRESH ring with no backlog: on the (b) ring consumer 1 never
+  //     pulled while 216 frames were written into a 16-slot ring, so since
+  //     0.9.947 it is (correctly) excluded as a stalled consumer — see pin 12.
+  const { ring: r3, sab: sab3 } = SpmcRing.create(allKinds, cap, { consumerCount: 2 });
+  const cl = new Int32Array(sab3, SPMC_HEADER_BYTES, 2 * PER_CONSUMER_LANES);
   const enc = (x: number) => Math.floor(x * Q);
   cl[0 * PER_CONSUMER_LANES + 3] = enc(2.0);
   cl[1 * PER_CONSUMER_LANES + 3] = enc(0.3);
-  assert(Math.abs(ring.flowScaleHint() - 0.3) < 1e-4, `min(2.0, 0.3) = 0.3, got ${ring.flowScaleHint()}`);
+  assert(Math.abs(r3.flowScaleHint() - 0.3) < 1e-4, `min(2.0, 0.3) = 0.3, got ${r3.flowScaleHint()}`);
   cl[0 * PER_CONSUMER_LANES + 3] = enc(0.3); // swap → order-independent
   cl[1 * PER_CONSUMER_LANES + 3] = enc(2.0);
-  assert(Math.abs(ring.flowScaleHint() - 0.3) < 1e-4, `min is order-independent, got ${ring.flowScaleHint()}`);
+  assert(Math.abs(r3.flowScaleHint() - 0.3) < 1e-4, `min is order-independent, got ${r3.flowScaleHint()}`);
   cl[0 * PER_CONSUMER_LANES + 3] = enc(1.5);
   cl[1 * PER_CONSUMER_LANES + 3] = enc(1.5);
-  assert(Math.abs(ring.flowScaleHint() - 1.5) < 1e-4, `min(1.5, 1.5) = 1.5, got ${ring.flowScaleHint()}`);
-  assert(inBounds(ring.flowScaleHint()), "min-reduce in bounds");
+  assert(Math.abs(r3.flowScaleHint() - 1.5) < 1e-4, `min(1.5, 1.5) = 1.5, got ${r3.flowScaleHint()}`);
+  assert(inBounds(r3.flowScaleHint()), "min-reduce in bounds");
 
   // (d) Sustained-LOW occupancy on a fresh ring drives a consumer's cell UP toward
   //     2.0 (push-one/pull-one keeps backlog == 1). The min stays bounded.
@@ -445,6 +494,7 @@ function main(): void {
   pin9_peerMount();
   pin10_observers();
   pin11_flowScaleMinReduce();
+  pin12_staleConsumerExcluded();
   console.warn = realWarn;
   console.log(`\nSpmcRing: ${passed} pins passed.`);
 }

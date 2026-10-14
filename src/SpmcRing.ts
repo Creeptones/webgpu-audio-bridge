@@ -301,6 +301,14 @@ export interface SpmcRingOptions {
    *  instance. Omit for the producer peer (it never reads as a consumer). A
    *  per-call `consumerIndex` argument overrides it. */
   readonly consumerIndex?: number;
+  /** Dead-consumer exclusion for `flowScaleHint()` (0.9.947). A consumer whose
+   *  cursor has not advanced while the producer wrote more than this many
+   *  frames — and that still has a backlog — is treated as stalled and left
+   *  out of the min-reduce, so a crashed or wedged sink cannot pin the
+   *  producer's pacing hint at the floor forever. Producer-local bookkeeping
+   *  only (no SAB change). Default: `capacity` (one full lap — past that the
+   *  stalled consumer is losing frames anyway). Must be a positive integer. */
+  readonly staleAfterFrames?: number;
 }
 
 let _spmcExperimentalWarned = false;
@@ -317,6 +325,12 @@ let _spmcExperimentalWarned = false;
  */
 export class SpmcRing<S extends Schema<FieldsObject, any>> {
   private readonly mask: number;
+  /** `flowScaleHint` dead-consumer exclusion (0.9.947) — producer-local
+   *  heap state, preallocated so the hint stays allocation-free. */
+  private readonly staleAfterFrames: number;
+  private readonly hintLastPos: Int32Array;
+  private readonly hintLastProgressW: Int32Array;
+  private readonly hintSeen: Uint8Array;
   private readonly layout: SpmcLayout;
 
   private header!: Int32Array;
@@ -381,6 +395,16 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
     this.validate(capacity, consumerCount, consumerIndex);
     this.consumerCount = consumerCount;
     this.consumerIndex = consumerIndex;
+    const staleAfter = opts?.staleAfterFrames ?? capacity;
+    if (!Number.isInteger(staleAfter) || staleAfter < 1 || staleAfter > MAX_CAPACITY) {
+      throw new Error(
+        `SpmcRing: staleAfterFrames must be an integer in [1, 2^29], got ${staleAfter}`,
+      );
+    }
+    this.staleAfterFrames = staleAfter;
+    this.hintLastPos = new Int32Array(consumerCount);
+    this.hintLastProgressW = new Int32Array(consumerCount);
+    this.hintSeen = new Uint8Array(consumerCount);
     this.mask = capacity - 1;
     this.layout = layoutOf(schema.frameByteSize, capacity, consumerCount);
     this.buildViews();
@@ -572,18 +596,44 @@ export class SpmcRing<S extends Schema<FieldsObject, any>> {
    * O(consumerCount ≤ 64) reduction over the per-consumer lanes via relaxed
    * `Atomics.load`. Bounded, no retry, no wait → **wait-free** (and the producer
    * `push` never reads it — it laps freely, §5-safe; a source merely *chooses* to
-   * pace on this hint). A relaxed read; a stale per-consumer cell is harmless (its
-   * owner self-corrects on the next pull). Returns 1.0 before any consumer has
-   * pulled (every cell seeded to the default). See `docs/dag-backpressure-design.md`.
+   * pace on this hint). A relaxed read; a stale cell of a LIVE consumer is
+   * harmless (its owner self-corrects on the next pull). A DEAD consumer never
+   * pulls again, so its cell would stay frozen — possibly at the floor — and
+   * pin the producer at 0.05× forever. Since 0.9.947 the hint therefore skips
+   * any consumer whose cursor has not moved while the producer wrote more than
+   * `staleAfterFrames` (default `capacity`) frames and that still has a backlog;
+   * it rejoins the reduce as soon as its cursor moves. The bookkeeping is
+   * producer-local heap state (call the hint from the producer thread for the
+   * intended semantics). Returns 1.0 before any consumer has pulled (every cell
+   * seeded to the default) and when every consumer is stalled. See
+   * `docs/dag-backpressure-design.md`.
    */
   flowScaleHint(): number {
     const cl = this.consumerLanesView;
+    const W = Atomics.load(this.header, WRITE_TICKET_LANE);
     let minEncoded = Infinity;
     for (let c = 0; c < this.consumerCount; c++) {
-      const enc = Atomics.load(cl, c * PER_CONSUMER_LANES + FLOW_SCALE_OFF) | 0;
+      const base = c * PER_CONSUMER_LANES;
+      const D = Atomics.load(cl, base + DEQUEUE_POS_OFF) | 0;
+      if (this.hintSeen[c] === 0 || D !== this.hintLastPos[c]) {
+        // First sighting or the consumer advanced: remember when.
+        this.hintSeen[c] = 1;
+        this.hintLastPos[c] = D;
+        this.hintLastProgressW[c] = W;
+      } else if (
+        ((W - D) | 0) > 0 &&
+        ((W - this.hintLastProgressW[c]!) | 0) > this.staleAfterFrames
+      ) {
+        // Stalled WITH a backlog for more than `staleAfterFrames` writes:
+        // its cell is frozen at whatever it last wrote (possibly the floor),
+        // so it would pin the producer forever. Leave it out.
+        continue;
+      }
+      const enc = Atomics.load(cl, base + FLOW_SCALE_OFF) | 0;
       if (enc < minEncoded) minEncoded = enc;
     }
-    return minEncoded / FLOW_SCALE_Q;
+    // Every consumer stalled → no live sink to pace for: nominal rate.
+    return minEncoded === Infinity ? 1.0 : minEncoded / FLOW_SCALE_Q;
   }
 
   // ─── Consumer ──────────────────────────────────────────────────────────────
