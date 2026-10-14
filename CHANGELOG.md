@@ -4,6 +4,33 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.948] - 2026-10-14
+
+### Changed - the API freeze gate now sees member-level changes
+
+- **Member-level API snapshots.** `docs/api-snapshots/{root,worklet,experimental}.api.txt` replace the old `*.dts.snapshot.txt` files. The new `scripts/_apiSurface.mjs` generates them from the SOURCES with the TypeScript compiler API, so no build is needed. Each snapshot lists every export with its full public shape: class constructors, every public static and instance member with its signature, interface members and index/call signatures, type-alias bodies (comments stripped), function overloads, and `@deprecated` markers. It also covers the **non-exported declarations the public surface reaches**; for example, `Bridge` is a conditional alias over the internal `BridgeImpl`, whose 40+ methods are now snapshotted. Previously the snapshot held only the `export { … } from` lines of `dist/index.d.ts`, so renaming or retyping a `Bridge` method did not change it.
+- **`check:api-snapshot`** reports a stale snapshot with a `-`/`+` member-line diff (multiset-aware, because identical member lines legitimately recur across classes).
+- **Exact root-export accounting.** `docs/stable-api-manifest.json` (format v2) now lists **every** root export by name, values and types alike, in exactly one `rootBuckets` list: `primary` (101), `gpuWorklet` (41), `advanced` (39), `frontierOnRoot` (15) and `deprecatedShims` (16). It also lists the `/worklet` subpath in `workletExports` (23). `check:api-boundary` fails when an export is unclassified, a listed name is no longer exported, a name is in two buckets, or a `deprecatedShims` entry is not a `@deprecated` export. Previously it only checked that a free-text summary list was non-empty.
+- **`frontierOnRoot`** names the frontier-grade APIs that currently ship on the stable root: `StatePredictor*`, `predictiveExtrapolateInto` + `Pll*`/`PredictiveExtrapolation*`, the `DEFAULT_KALMAN_*` constants, `DEFAULT_MAX_LEAD_MS`, and the `Predicted*`/`KalmanPredicted*` pull option/result types. Each must be promoted deliberately or moved behind `/experimental` before 1.0.
+- `npm run check:release` no longer needs `dist/` for the snapshot step (order: metadata → boundary → snapshot → build).
+
+### Why
+
+1.0 is a promise not to break the public surface without a 2.0. The previous gate could not see the change it exists to catch: a renamed method passed silently, and an export could appear on the root without anyone classifying it.
+
+### Wire compatibility
+
+None. Tooling, snapshots and manifest only. No `src/` change.
+
+### Tests
+
+- New `tests/apiSurface.test.ts` (in `npm test` / `test:unit`). It runs the extractor on two fixtures (`tests/fixtures/apiSurface/v1.ts`, `v2.ts`) that differ by one method renamed on a class reachable only through an exported type alias, and pins: (1) the rename changes the snapshot; (2) the internal class behind the alias is captured; (3) private/protected members are excluded and public readonly kept; (4) `@deprecated` members are marked; (5) the real root snapshot lists `BridgeImpl`'s instance methods.
+- Verified by mutation while developing: renaming `Bridge.pullLatestSmoothed` makes `check:api-snapshot` fail with the exact `-`/`+` lines, and adding an unclassified root export makes `check:api-boundary` fail.
+
+### Documentation
+
+`docs/api-boundary.md` (buckets + snapshot semantics), README §API boundary, CLAUDE.md (release gates now include `check:release` and the version-bump checklist).
+
 ## [0.9.947] - 2026-10-14
 
 ### Fixed - three concurrency bugs

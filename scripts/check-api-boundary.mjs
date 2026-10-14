@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { apiSurface } from "./_apiSurface.mjs";
 
 const root = new URL("../", import.meta.url);
 
@@ -77,12 +78,47 @@ for (const needle of experimentalRequired) {
   }
 }
 
-if (!Array.isArray(stableManifest.rootExports) || stableManifest.rootExports.length < 1) {
-  fail("docs/stable-api-manifest.json must list rootExports");
+// ── Exact root-export accounting (0.9.948) ────────────────────────────────
+// Every root export (values AND types) must sit in exactly one manifest bucket,
+// and every bucketed name must still be exported. Until 0.9.947 this only
+// checked that a hand-written summary list was non-empty.
+const ENTRIES = ["src/index.ts", "src/worklet/index.ts", "src/experimental/core.ts"];
+const BUCKETS = ["primary", "gpuWorklet", "advanced", "frontierOnRoot", "deprecatedShims"];
+const buckets = stableManifest.rootBuckets ?? {};
+for (const key of Object.keys(buckets)) {
+  if (!BUCKETS.includes(key)) fail(`unknown root bucket '${key}' in docs/stable-api-manifest.json`);
 }
+const bucketOf = new Map();
+for (const key of BUCKETS) {
+  if (!Array.isArray(buckets[key])) { fail(`manifest rootBuckets.${key} must be an array`); continue; }
+  for (const name of buckets[key]) {
+    if (bucketOf.has(name)) fail(`'${name}' is listed in both rootBuckets.${bucketOf.get(name)} and rootBuckets.${key}`);
+    bucketOf.set(name, key);
+  }
+}
+const rootNames = new Set(apiSurface("src/index.ts", ENTRIES).names);
+for (const name of rootNames) {
+  if (!bucketOf.has(name)) fail(`root export '${name}' is not in any docs/stable-api-manifest.json rootBuckets list — classify it deliberately`);
+}
+for (const name of bucketOf.keys()) {
+  if (!rootNames.has(name)) fail(`manifest lists '${name}' but src/index.ts no longer exports it`);
+}
+const shimSource = readText("src/_deprecatedRootShims.ts");
+for (const name of buckets.deprecatedShims ?? []) {
+  if (!new RegExp(`@deprecated[^\\n]*\\n(export (const|type) ${name}\\b)`).test(shimSource)) {
+    fail(`deprecatedShims entry '${name}' must be a @deprecated export in src/_deprecatedRootShims.ts`);
+  }
+}
+const workletNames = apiSurface("src/worklet/index.ts", ENTRIES).names;
+const workletListed = new Set(stableManifest.workletExports ?? []);
+for (const name of workletNames) if (!workletListed.has(name)) fail(`worklet export '${name}' missing from manifest workletExports`);
+for (const name of workletListed) if (!workletNames.includes(name)) fail(`manifest workletExports lists '${name}' but src/worklet/index.ts no longer exports it`);
 
-if (!stableManifest.experimentalSubpath || stableManifest.experimentalSubpath !== "webgpu-audio-bridge/experimental") {
+if (stableManifest.experimentalSubpath !== "webgpu-audio-bridge/experimental") {
   fail("stable API manifest must name the experimental subpath");
+}
+if (stableManifest.experimentalAcornFreeSubpath !== "webgpu-audio-bridge/experimental/core") {
+  fail("stable API manifest must name the acorn-free experimental subpath");
 }
 
 if (pkg.dependencies && Object.prototype.hasOwnProperty.call(pkg.dependencies, "acorn")) {

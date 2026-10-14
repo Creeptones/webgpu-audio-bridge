@@ -47,10 +47,13 @@ If a session is genuinely unsure whether the change warrants a minor bump under 
 Mandatory before any commit that bumps the version:
 
 ```bash
-npm run typecheck   # tsc --noEmit, must be clean
-npm test            # all 6 suites green (schema / Bridge / Bridge.phaseLock / Bridge.concurrent / Float64RingBuffer / Float64RingBuffer.concurrent)
-npm run bench       # push/pull/pullLatest median sanity-check vs documented baseline (~1.20 μs at N=1000)
+npm run typecheck      # tsc --noEmit, must be clean
+npm test               # every suite registered in package.json `test` green
+npm run check:release  # release metadata (README/CITATION version) + API boundary + member-level API snapshot + build
+npm run bench          # push/pull/pullLatest median sanity-check vs documented baseline (~1.20 μs at N=1000)
 ```
+
+Bumping the version means updating `package.json`, the README `- Version:` line and `CITATION.cff` together (`check:release-metadata` enforces it). **Public-surface changes:** every root export must be classified in `docs/stable-api-manifest.json` `rootBuckets` (`check:api-boundary`), and `docs/api-snapshots/*.api.txt` are member-level snapshots generated from the sources — after an intentional surface change run `npm run api:snapshot` and review the diff like code (0.9.948).
 
 The concurrent test has a known timing-sensitive `emptyWaitTimeouts === 0` assertion that can flake once on a loaded machine; re-run once if it fires, treat as real only if reproducible. Document any new flake patterns in the relevant test file's header.
 

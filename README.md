@@ -15,7 +15,7 @@ This is not GPU audio-rate synthesis. It is the practical browser split: GPU for
 
 ## Status
 
-- Version: `0.9.947`
+- Version: `0.9.948`
 - License: MIT
 - Maturity: pre-1.0 by policy. `1.0` means API stability.
 - Stable core: no direct runtime dependencies
@@ -184,8 +184,8 @@ import { mountFanIn } from "webgpu-audio-bridge/experimental/core";
 Boundary checks:
 
 ```bash
-npm run check:api-boundary
-npm run check:api-snapshot
+npm run check:api-boundary   # every root export classified in docs/stable-api-manifest.json
+npm run check:api-snapshot   # member-level public API snapshot (docs/api-snapshots/*.api.txt)
 ```
 
 Docs:
