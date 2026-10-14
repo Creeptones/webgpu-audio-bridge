@@ -23,7 +23,7 @@
 // is a pure timbre morph — the seam continuity is the only audible variable.
 
 import { Bridge } from "../../dist/index.js";
-import { HotSwapConsumer } from "../../dist/experimental/index.js";
+import { HotSwapConsumer } from "../../dist/experimental/core.js";
 import { makeSchemaA, makeSchemaB, CAP } from "./schema.js";
 
 const TWO_PI = Math.PI * 2;

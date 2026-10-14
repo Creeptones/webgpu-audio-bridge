@@ -15,7 +15,7 @@ This is not GPU audio-rate synthesis. It is the practical browser split: GPU for
 
 ## Status
 
-- Version: `0.9.945`
+- Version: `0.9.946`
 - License: MIT
 - Maturity: pre-1.0 by policy. `1.0` means API stability.
 - Stable core: no direct runtime dependencies
@@ -174,6 +174,12 @@ import { connectJit } from "webgpu-audio-bridge/experimental";
 ```
 
 Experimental includes WebNN, render quantum probes, God-node hot-swap and migration helpers, MPMC/SPMC/work queues, DAG topology, and JIT/kernel grammar.
+
+`webgpu-audio-bridge/experimental` loads the optional `acorn` peer for JS-source JIT compiles. If you do not compile JS-source kernels — fan rings, `connectGraph`, hot-swap, the token-path JIT, or anything inside an `AudioWorklet` / no-bundler module worker — import the same surface from the acorn-free subpath instead:
+
+```ts
+import { mountFanIn } from "webgpu-audio-bridge/experimental/core";
+```
 
 Boundary checks:
 

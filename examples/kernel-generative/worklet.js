@@ -9,7 +9,7 @@
 //
 // CRITICAL: install happens ONLY in `port.onmessage`, never in `process()`.
 
-import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/index.js";
+import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/core.js";
 
 const AMP = 0.28;        // master output gain (outside the timed region)
 const TWO_PI = Math.PI * 2;

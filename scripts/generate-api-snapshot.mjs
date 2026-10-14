@@ -5,7 +5,7 @@ const mode = process.argv.includes("--write") ? "write" : "check";
 
 const targets = [
   ["root", "dist/index.d.ts", "docs/api-snapshots/root.dts.snapshot.txt"],
-  ["experimental", "dist/experimental/index.d.ts", "docs/api-snapshots/experimental.dts.snapshot.txt"],
+  ["experimental", "dist/experimental/core.d.ts", "docs/api-snapshots/experimental.dts.snapshot.txt"],
 ];
 
 function snapshotFor(label, sourcePath) {

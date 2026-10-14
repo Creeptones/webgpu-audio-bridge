@@ -18,7 +18,7 @@
  *  7  the gate REJECTS a deliberately-wrong candidate (negate-all simdWat)
  *  8  determinism — same source ⇒ byte-identical scalar+simd WAT ⇒ same verdict
  *  9  stride-2 (valid language, not v1-emittable) ⇒ unsupported (JS fallback)
- * 10  import-graph guard — the core (src/index.ts) never imports `acorn`
+ * 10  import-graph guard — the core (src/index.ts) and src/experimental/core.ts never import `acorn`
  */
 
 import { assert, assertEq, ok } from "./_assert.js";
@@ -222,9 +222,16 @@ async function main(): Promise<void> {
     const coreReaches = transitiveImports(resolve(repoRoot, "src", "index.ts"));
     const importsAcorn = [...coreReaches].some((f) => fileImports(f, "acorn"));
     assert(!importsAcorn, "src/index.ts transitively imports acorn — the dependency quarantine is broken");
-    // sanity: the JIT parser DOES import acorn (the quarantine is real, not vacuous)
-    assert(fileImports(resolve(repoRoot, "src", "jit", "parse.ts"), "acorn"), "parse.ts should import acorn");
-    ok(`10 import-graph guard: core reaches ${coreReaches.size} files, none import acorn; parse.ts does`);
+    // 0.9.946: the acorn-free experimental subpath never reaches acorn either.
+    const expCoreReaches = transitiveImports(resolve(repoRoot, "src", "experimental", "core.ts"));
+    const expCoreAcorn = [...expCoreReaches].filter((f) => fileImports(f, "acorn"));
+    assert(expCoreAcorn.length === 0, `src/experimental/core.ts transitively imports acorn via ${expCoreAcorn.join(", ")}`);
+    // sanity: the quarantine is real, not vacuous — the full experimental barrel
+    // DOES reach acorn, through exactly one file (the registering side-effect module).
+    const expReaches = transitiveImports(resolve(repoRoot, "src", "experimental", "index.ts"));
+    const expAcorn = [...expReaches].filter((f) => fileImports(f, "acorn")).map((f) => f.replace(/\\/g, "/"));
+    assert(expAcorn.length === 1 && expAcorn[0]!.endsWith("src/jit/acornParser.ts"), `acorn must be imported only by src/jit/acornParser.ts, got ${expAcorn.join(", ")}`);
+    ok(`10 import-graph guard: core (${coreReaches.size} files) + experimental/core (${expCoreReaches.size} files) never reach acorn; only jit/acornParser.ts imports it`);
   }
 
   console.log("\nAll JitCompiler API pins passed.");
@@ -249,7 +256,9 @@ function transitiveImports(entry: string): Set<string> {
 }
 function relativeSpecifiers(text: string): string[] {
   const out: string[] = [];
-  const re = /from\s+["'](\.[^"']+)["']/g;
+  // `from "./x"` plus bare side-effect imports `import "./x"` (0.9.946: the
+  // acorn registration is a side-effect import, so the crawler must follow it).
+  const re = /(?:from|import)\s+["'](\.[^"']+)["']/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) out.push(m[1]!);
   return out;

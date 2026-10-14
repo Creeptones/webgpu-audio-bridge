@@ -4,6 +4,37 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.946] - 2026-10-14
+
+### Added - acorn-free `webgpu-audio-bridge/experimental/core` subpath
+
+- **New package export `./experimental/core`** (`src/experimental/core.ts`): the full experimental surface (fan rings, `connectGraph`, hot-swap, WebNN, renderQuantum, the JIT runtime, the token-path compiler, grammar, masks, cache) WITHOUT importing the optional `acorn` peer. AudioWorklets, no-bundler module workers and bundled apps that never compile JS-source kernels can now use the experimental surface without `acorn` installed or resolvable.
+- **JS-parser injection**: `registerJsParser(parse: JsParseFn)` / `hasJsParser()` (exported from both experimental paths). `src/jit/parse.ts` no longer imports `acorn`; the single `acorn` import moved to `src/jit/acornParser.ts`, a side-effect module that registers `acorn.parse`.
+- `webgpu-audio-bridge/experimental` is now `import "../jit/acornParser.js"` + `export * from "./core.js"` — **unchanged behavior** for every existing import (JS-source `compileKernel` / `connectJit({ kernel })` still work out of the box).
+
+### Fixed
+
+- **`examples/mpmc-fan-in` and `examples/god-node-hotswap` did not load in a browser**: their page, workers and worklet imported the experimental barrel, which pulled a bare `acorn` specifier that browser ESM cannot resolve (the same failure `59986ef` worked around for liquid-control only). They now import `dist/experimental/core.js`; verified in headless Chromium (fan-in: three producers delivering, `tornFrameCount() = 0`; hot-swap: Start → Morph to B completes with the plan applied, no page errors).
+- The JIT demos' AudioWorklets (`jit-vectorize`, `kernel-palette`, `kernel-generative`, `poly-synth`) also import `/experimental/core` now, so the worklet realm no longer depends on each demo server's bare-specifier rewrite.
+
+### Why
+
+`acorn` is an optional peer used only to parse JS-source kernels, but every `/experimental` import loaded it statically, so a fan-ring or hot-swap user paid for (and could be broken by) a dependency they never used. Parser injection keeps the quarantine at exactly one file and makes the acorn-free surface a first-class import path instead of a per-demo workaround.
+
+### Wire compatibility
+
+No SAB/wire change. Public surface: additive (`./experimental/core` export; `registerJsParser`, `hasJsParser`, `JsParseFn` on the experimental paths). Behavior from `webgpu-audio-bridge/experimental` is unchanged. From `/experimental/core`, a JS-source compile without a registered parser returns `rejected-source` with `E_PARSE` (a value, never a throw) whose message names both fixes.
+
+### Tests
+
+- New `tests/jitParserInjection.test.ts` (3 pins, in `npm test` / `test:unit`): the core subpath loads and compiles a token kernel with no parser registered; JS-source without a parser → `rejected-source` `E_PARSE` naming `registerJsParser` + the full barrel; after `registerJsParser(acorn.parse)` the core subpath's compile is byte-identical to the full barrel's.
+- `tests/JitCompiler.test.ts` pin 10 now also asserts `src/experimental/core.ts` never reaches `acorn` and that `src/jit/acornParser.ts` is the only file importing it. Its import crawler now follows bare side-effect imports (`import "./x.js"`).
+- `scripts/check-api-boundary.mjs` expects the `./experimental/core` export and reads markers from `src/experimental/core.ts`; the experimental API snapshot is taken from `dist/experimental/core.d.ts`.
+
+### Documentation
+
+README §API boundary, `docs/api-boundary.md` and CLAUDE.md describe the two experimental paths and the single-file acorn quarantine.
+
 ## [0.9.945] - 2026-10-14
 
 ### Added - consolidated catch-up (GPU readback, perf, API boundary, WASM work queue)

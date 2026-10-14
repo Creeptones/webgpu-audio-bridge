@@ -17,8 +17,8 @@ import {
   toWorkletModuleURL,
 } from "../../dist/index.js";
 // migratePlan is experimental (not on the stable root) — import it from the
-// experimental subpath.
-import { migratePlan } from "../../dist/experimental/index.js";
+// acorn-free experimental subpath.
+import { migratePlan } from "../../dist/experimental/core.js";
 import { makeSchemaA, makeSchemaB, CAP } from "./schema.js";
 
 const $ = (id) => document.getElementById(id);

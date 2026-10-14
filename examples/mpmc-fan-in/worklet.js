@@ -13,7 +13,7 @@
 // `tornFrameCount() === 0` always, and under "Flood" `droppedFrames()` climbs
 // while torn stays 0 — graceful drop-newest, never a torn read.
 
-import { mountFanIn } from "../../dist/experimental/index.js";
+import { mountFanIn } from "../../dist/experimental/core.js";
 import { makeFanInSchema, PRODUCER_COUNT } from "./schema.js";
 
 const TWO_PI = Math.PI * 2;

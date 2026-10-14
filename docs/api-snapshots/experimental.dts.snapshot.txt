@@ -1,8 +1,20 @@
 # experimental public API snapshot
-# Source: dist/experimental/index.d.ts
+# Source: dist/experimental/core.d.ts
 # Generated from built declaration output. Run npm run build first.
 
 /**
+ * webgpu-audio-bridge / experimental/core — the ACORN-FREE opt-in entry point
+ * for APIs that sit OUTSIDE the project's 1.0 stability contract (0.9.946).
+ *
+ * Exports exactly the same surface as `webgpu-audio-bridge/experimental`, but
+ * does not import the optional `acorn` peer. Use this subpath from an
+ * AudioWorklet, a no-bundler module worker, or any app that uses the fan rings,
+ * `connectGraph`, hot-swap, WebNN, or the token-path JIT without the JS-source
+ * compiler. JS-source kernels (`compileKernel(source)`, `connectJit({ kernel })`)
+ * reject with `E_PARSE` here until `registerJsParser(acorn.parse)` is called.
+ *
+ * (Original barrel header follows.)
+ *
  * webgpu-audio-bridge / experimental — opt-in entry point for APIs that
  * sit OUTSIDE the project's 1.0 stability contract.
  *
@@ -49,20 +61,22 @@ export { connectGraph, mountGraph, GraphCycleError, GraphEdgePolicyError } from 
 export type { ConnectGraphSpec, GraphEdgeSpec, GraphEdgeKind, GraphSpscPolicy, GraphHandle, GraphEdgeHandle, SpscEdgeHandle, SpscEdgeSizing, GraphEdgeWiring, NodeIncidence, GraphTopology, MountGraphOptions, GraphSchemas, MountedNode, MountedConsumerEnd, MountedProducerEnd, } from "../connectGraph.js";
 export { connectFanOut, mountFanOut } from "../connectFanOut.js";
 export type { ConnectFanOutSpec, FanOutHandle, FanOutTopology, FanOutSizing, FanOutRole, MountFanOutOptions, } from "../connectFanOut.js";
-export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/index.js";
-export { emitScalarModule, emitSimdModule, emitVoiceSimdModule, paramLayout, voiceParamLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/index.js";
-export { isStateful, stateLayout } from "../jit/index.js";
-export type { CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch, KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore, IrStateDecl, IrStateStore, IrStateBufferDecl, IrStateBufferStore, StateLayout, Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase, } from "../jit/index.js";
-export { JitKernelSwap, JitKernelConsumer } from "../jit/index.js";
-export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum, JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult, } from "../jit/index.js";
-export { connectJit, runJitCompile, forwardCompileResponse, createJitConsumer, handleJitInstallMessage, jitMemoryPages, } from "../jit/index.js";
-export type { ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection, JitWorkletOptions, JitCompileRequest, JitCompileRequestBase, JitCompileResponse, JitInstallMessage, JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions, } from "../jit/index.js";
-export { kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens, } from "../jit/index.js";
-export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/index.js";
-export { legalNextTokens } from "../jit/index.js";
-export type { LegalNextResult } from "../jit/index.js";
-export { compileIr, compileTokens, emitJsKernel, KernelCache } from "../jit/index.js";
-export type { CompileIrOptions, CompileTokensOptions, CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult, } from "../jit/index.js";
-export { acousticGate, evalReference } from "../jit/index.js";
-export type { AcousticProfile, AcousticGateOptions, AcousticGateResult, } from "../jit/index.js";
-//# sourceMappingURL=index.d.ts.map
+export { compileKernel, runGate, vectorize, lowerKernel, validate, parseProgram } from "../jit/core.js";
+export { registerJsParser, hasJsParser } from "../jit/core.js";
+export type { JsParseFn } from "../jit/core.js";
+export { emitScalarModule, emitSimdModule, emitVoiceSimdModule, paramLayout, voiceParamLayout, buildCorpus, CORPUS_N_VALUES } from "../jit/core.js";
+export { isStateful, stateLayout } from "../jit/core.js";
+export type { CompileKernelOptions, CompileResult, CompileWat, GateReport, GateStatus, GateMismatch, KernelSignature, KernelParam, ParamRole, LaneWidth, IrKernel, IrNode, IrStore, IrStateDecl, IrStateStore, IrStateBufferDecl, IrStateBufferStore, StateLayout, Diagnostic, DiagnosticCode, VectorizedKernelPlan, CorpusOptions, CorpusCase, } from "../jit/core.js";
+export { JitKernelSwap, JitKernelConsumer } from "../jit/core.js";
+export type { JitKernelSwapOptions, JitSwapPhase, JitSwapQuantum, JitKernelConsumerOptions, JitJsKernel, JitMemoryRegion, JitProcessResult, } from "../jit/core.js";
+export { connectJit, runJitCompile, forwardCompileResponse, createJitConsumer, handleJitInstallMessage, jitMemoryPages, } from "../jit/core.js";
+export type { ConnectJitSpec, ConnectJitKernel, ConnectJitCallbacks, JitConnection, JitWorkletOptions, JitCompileRequest, JitCompileRequestBase, JitCompileResponse, JitInstallMessage, JitTransport, JitPostTarget, JitMessageSource, JitInstallOutcome, ForwardOptions, } from "../jit/core.js";
+export { kernelToTokens, tokensToKernel, validateTokens, kernelHash, tokensToString, parseTokens, } from "../jit/core.js";
+export type { KernelToken, TokenKind, ValidateResult, ValidateFailure } from "../jit/core.js";
+export { legalNextTokens } from "../jit/core.js";
+export type { LegalNextResult } from "../jit/core.js";
+export { compileIr, compileTokens, emitJsKernel, KernelCache } from "../jit/core.js";
+export type { CompileIrOptions, CompileTokensOptions, CharacterizedKernel, GetOrCompileOptions, GetOrCompileResult, } from "../jit/core.js";
+export { acousticGate, evalReference } from "../jit/core.js";
+export type { AcousticProfile, AcousticGateOptions, AcousticGateResult, } from "../jit/core.js";
+//# sourceMappingURL=core.d.ts.map

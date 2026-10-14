@@ -65,7 +65,7 @@ void _throwLiteralPin;
 // The four God-Node APIs live on the experimental subpath; the root keeps
 // `@deprecated` re-exports for the rest of 0.9.x. Pin that they are the SAME
 // objects (not copies) and that the generic class shim is usable as a type.
-import * as exp from "../src/experimental/index.js";
+import * as exp from "../src/experimental/core.js";
 export type _ShimTypeUsable = libT.HotSwapConsumer<never> | libT.MigratePlan | libT.CrossfadeMode;
 
 // ── Runtime sanity: confirm the removed symbols don't exist as values ────

@@ -33,7 +33,7 @@ function setIsolationHeaders(res) {
 
 // Bare-specifier resolution for the no-build ESM demo. The library's experimental
 // barrel transitively imports `acorn` (the JIT compiler's parser) via
-// dist/jit/parse.js — a BARE specifier raw browser ESM cannot resolve, and import
+// dist/jit/acornParser.js — a BARE specifier raw browser ESM cannot resolve, and import
 // maps are not available in module WORKERS (only Window contexts), so neither the
 // page nor the compile worker could load it. We vendor acorn's ESM build
 // (./vendor/acorn.mjs) and rewrite the single bare `from "acorn"` to that URL as

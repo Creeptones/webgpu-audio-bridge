@@ -9,7 +9,7 @@
 //   3. The HUD proves: three independent push rates, one audio thread, torn=0
 //      always, graceful counted drop under "Flood".
 
-import { connectFanIn } from "../../dist/experimental/index.js";
+import { connectFanIn } from "../../dist/experimental/core.js";
 import {
   makeFanInSchema,
   PRODUCER_COUNT,

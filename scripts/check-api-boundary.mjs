@@ -14,7 +14,7 @@ const rootIndex = readText("src/index.ts").replace(
   /\/\/ ── Deprecated root shims[\s\S]*?from "\.\/_deprecatedRootShims\.js";\n[\s\S]*?from "\.\/_deprecatedRootShims\.js";\n/,
   "",
 );
-const experimentalIndex = readText("src/experimental/index.ts");
+const experimentalIndex = readText("src/experimental/core.ts");
 const stableManifest = JSON.parse(readText("docs/stable-api-manifest.json"));
 
 let failed = false;
@@ -24,7 +24,7 @@ function fail(message) {
   failed = true;
 }
 
-const expectedExports = new Set([".", "./worklet", "./worklet/decoder.wasm", "./experimental"]);
+const expectedExports = new Set([".", "./worklet", "./worklet/decoder.wasm", "./experimental", "./experimental/core"]);
 for (const key of Object.keys(pkg.exports ?? {})) {
   if (!expectedExports.has(key)) fail(`unexpected package export '${key}'`);
 }
@@ -73,7 +73,7 @@ const experimentalRequired = [
 
 for (const needle of experimentalRequired) {
   if (!experimentalIndex.includes(needle)) {
-    fail(`src/experimental/index.ts no longer exposes expected lab marker '${needle}'`);
+    fail(`src/experimental/core.ts no longer exposes expected lab marker '${needle}'`);
   }
 }
 
