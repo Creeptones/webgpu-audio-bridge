@@ -1,4 +1,4 @@
-﻿# webgpu-audio-bridge
+# webgpu-audio-bridge
 
 [![test](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml)
 [![DOI](https://zenodo.org/badge/1249253281.svg)](https://doi.org/10.5281/zenodo.20380886)
@@ -15,7 +15,7 @@ This is not GPU audio-rate synthesis. It is the practical browser split: GPU for
 
 ## Status
 
-- Version: `0.9.944`
+- Version: `0.9.945`
 - License: MIT
 - Maturity: pre-1.0 by policy. `1.0` means API stability.
 - Stable core: no direct runtime dependencies
@@ -179,7 +179,6 @@ Boundary checks:
 
 ```bash
 npm run check:api-boundary
-npm run build
 npm run check:api-snapshot
 ```
 
@@ -199,7 +198,6 @@ npm test
 npm run test:browser
 npm run check:release-metadata
 npm run check:api-boundary
-npm run build
 npm run check:api-snapshot
 ```
 

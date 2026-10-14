@@ -7,8 +7,9 @@ const files = [
   {
     path: "README.md",
     checks: [
-      [`**Version**: ${version}`, "README status version must match package.json"],
-      ["stable core import graph is dependency-free", "README dependency claim must reflect the acorn-backed experimental JIT"],
+      [`- Version: \`${version}\``, "README status version must match package.json"],
+      ["Stable core: no direct runtime dependencies", "README must state the stable core has no runtime dependencies"],
+      ["Experimental JIT: uses `acorn` as an optional peer dependency", "README dependency claim must reflect the acorn-backed experimental JIT"],
     ],
   },
   {

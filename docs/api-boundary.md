@@ -1,4 +1,4 @@
-﻿# API boundary
+# API boundary
 
 This repository contains both the stable bridge track and active lab work. The
 package boundary is intentional:

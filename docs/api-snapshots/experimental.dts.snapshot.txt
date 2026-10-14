@@ -3,7 +3,7 @@
 # Generated from built declaration output. Run npm run build first.
 
 /**
- * webgpu-audio-bridge / experimental â€” opt-in entry point for APIs that
+ * webgpu-audio-bridge / experimental — opt-in entry point for APIs that
  * sit OUTSIDE the project's 1.0 stability contract.
  *
  * The shapes exported here may break across MINOR version bumps as the
@@ -16,7 +16,7 @@
  *
  * Production code that wants pre-construction capability checks should
  * use `getEnvironmentReport()` from the main entry point (the 0.7.17
- * patch adds `webnn` + `mlTensor` capability flags) â€” that report-
+ * patch adds `webnn` + `mlTensor` capability flags) — that report-
  * shape API is stable; the helpers under this subpath are not.
  */
 export { BridgeWebNNSource } from "./BridgeWebNNSource.js";

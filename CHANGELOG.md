@@ -4,6 +4,95 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.945] - 2026-10-14
+
+### Added - consolidated catch-up (GPU readback, perf, API boundary, WASM work queue)
+
+**GPU readback (`BridgeGPUSource`)**
+- **Readback latency stats** (`f0f76f2`): `readbackLatencyStats(): ReadbackLatencyStats` (rolling `samples`/`minUs`/`maxUs`/`meanUs` + p50/p95/p99) with the `readbackLatencySampleCount` option.
+- **Coalescing policy** (`a1b6d62`): new `backpressureMode?: ReadbackBackpressureMode` (`"reject"` default = historical behavior; `"latest-only"` re-encodes a burst into the newest still-`scheduled` slot and never touches in-flight slots). Accessors `backpressureMode()` and `coalescedCount()`.
+- **Adaptive pacing + dirty-region readback** (`a937bf6`): `pacing?: ReadbackPacingMode` (`"manual"` default | `"adaptive"`) with `readbackBudgetMs` (default 8 ms). Adaptive mode declines `scheduleReadback()` before the staging ring saturates. New methods: `recommendedReadbackAction(): ReadbackAction` (`"dispatch" | "skip-readback" | "reduce-quality"`), `shouldScheduleReadback()`, `readbackPressure(): ReadbackPressureSnapshot` and `pacingDeclinedCount()`. `scheduleReadback(src, enc, srcOffset?, byteLength?, dstOffset?)` gains the optional `byteLength`/`dstOffset` params: a partial copy is merged into a retained full-frame image before it is published (`initialFrameBytes?: PartialReadbackInitialFrame`, `partialReadbackCount()`, `partialBytesCopied()`). New static helpers `BridgeGPUSource.rawCompatibility(schema, opts?)` → `RawReadbackCompatibility` (reasons `compatible` / `invariant-lane` / `wgsl-layout-error` / `struct-size-mismatch`) and `BridgeGPUSource.rawIfCompatible(...)`, which picks the `"raw"` fast path only when it is byte-safe.
+- **Field-level helpers** (`f266728`): `fieldReadbackRange(fields)` → `FieldReadbackRange` (smallest contiguous span), plus `scheduleFieldReadback(field, src, enc, opts?)` and `scheduleFieldsReadback(fields, src, enc, opts?)`. These take their offsets from the schema layout, and `FieldReadbackOptions.srcOffset` can override them.
+- **WASM decoder adapter** (`65efe8d`): `BridgeGPUSource.wasmDecoder(schema, opts: WasmReadbackDecoderOptions)` wraps an `emitWasmDecoder(schema)` export (`memory`, `decodeFrame`, `srcByteOffset`/`dstByteOffset`, optional `plan`) as a readback decoder closure.
+- Benches `npm run bench:gpu-readback-pacing` and `npm run bench:gpu-readback-decoder-path` (mock device, bridge-side cost only). Opt-in real-GPU probe `npm run test:browser:webgpu` with the weekly/manual `.github/workflows/webgpu-readback.yml`.
+
+**Trajectory / WASM performance**
+- **Septic f32 fast path** (`7e4995f`): when prev, curr and out are all `Float32Array`, `evaluateSepticHermiteTrajectoryInto` uses `p1 + h0·(p0−p1)` and skips one multiply per point pair. The f64 path is unchanged.
+- **Planar trajectory layout** (`e88906e`): `TrajectoryLayout = "interleaved" | "planar"` on trajectory array specs (`layout?`, default `"interleaved"`). The schema validator, every trajectory evaluator, `FrameSmoother`, `Bridge`'s Kalman ingest and `predictiveExtrapolation` all handle planar planes.
+- **JIT fast-math gating** (`e88906e`, experimental): `fastMath?: boolean` on `compileKernel`/`compileIr`/`compileTokens`, `KernelCache.getOrCompile` and `connectJit`. When true, the f32 SIMD and voice-SIMD emitters may fuse add·mul into `f32x4.relaxed_madd`, and the gate swaps strict ULP for a fast-math band (maxAbs ≤ 1e-3, RMS ≤ 1e-4). The default stays strict and non-fused. Scalar-only (stateful) kernels always gate strict.
+- **f32x4 Kalman WASM path** (`bd59a1a`): `BridgeOptions.kalmanWasm?: { consumer, scratchBuffer, scratchByteOffset?, scratchByteLength? }` routes `pullKalmanPredictedLatest` through four new `wasm/decoder.wat` exports (`kalman_{ingest,predict}_{cv,ca}_f32x4_soa_simd`). They surface on `WorkletConsumer` as `kalmanIngestCvF32x4SoaSimd` / `kalmanPredictCvF32x4SoaSimd` / `kalmanIngestCaF32x4SoaSimd` / `kalmanPredictCaF32x4SoaSimd`. Omitting the option keeps the JS path. `bench:kalman-simd` was extended to cover it.
+
+**CI release gates** (this release)
+- New `release-gates` job in `.github/workflows/test.yml` runs `npm run check:release` on every push/PR. The metadata, boundary and snapshot checks previously ran only inside `prepublishOnly`, which is how the README regression above went unnoticed.
+
+**API boundary guard + snapshots** (`3697864`, `3de1ef5`)
+- `npm run check:api-boundary` (`scripts/check-api-boundary.mjs`) enforces the package `exports` map, a list of markers that must stay out of the root, and the `acorn` dependency split. The machine-readable split lives in `docs/stable-api-manifest.json`.
+- `npm run api:snapshot` / `npm run check:api-snapshot` (`scripts/generate-api-snapshot.mjs`) diff `dist/index.d.ts` and `dist/experimental/index.d.ts` against `docs/api-snapshots/{root,experimental}.dts.snapshot.txt`.
+- `npm run check:release-metadata` (`scripts/check-release-metadata.mjs`, `f0f76f2`) checks that the README status version and `CITATION.cff` match `package.json`.
+
+**Standard fallback / worklet pull hardening** (`cfdfc4c`)
+- `emitWorkletProcessorModule` processors expose a commit-aware `pullLatest(target?)` helper. It acquire-loads `write_index`, decodes the newest frame, release-stores `read_index` (a CAS commit/retry when `processorOptions.policy === "drop-oldest"`), notifies a parked producer and returns the skipped count (`-1` when empty).
+- `connect()` in Standard mode now throws `ConnectUnsupportedError` when the macro or input ring requests a non-`drop-oldest` policy. Previously it degraded silently.
+
+**WASM backend for the MPMC work queue** (`1ca422a`, experimental — previously undocumented)
+- `WasmMpmcWorkQueue` (subclass of `MpmcWorkQueue`) replaces only the contended dequeue claim with a WASM `i32.atomic.rmw.add` kernel through a new protected `MpmcWorkQueue.claimTicket()` hook. The held-claim, generation and teardown protocol is unchanged.
+- `emitWasmMpmc()` / `emitWasmMpmcBytes()` emit the `claim_ticket` module. `allocateWasmSharedMemory(byteLength)` page-rounds a shared `WebAssembly.Memory`.
+- `connectWorkQueue({ backend: "js" | "wasm" })`, `mountWorkQueue(handle, { backend? })`, a per-edge `backend` on `connectGraph` mpmc-wq edges, and `MountGraphOptions.backend`. `"wasm"` is best-effort and falls back to `"js"` when WASM threads are unavailable. `WorkQueueHandle` gains `backend` plus optional `wasmMemory`/`wasmModule`.
+- `npm run test:wasm-mpmc-wq`, `npm run bench:wasm-mpmc-wq` and `npm run bench:wasm-mpmc-ticket-storm`.
+
+**Benchmarks and examples**
+- **SpmcRing Stage 4.2 bench** (`06feea3`): `npm run bench:spmc` (`bench/spmc.bench.ts`). It measures push/pull latency against `consumerCount`, the per-consumer slow-consumer drop curve and broadcast cost against SPSC, with a 10 µs hard budget.
+- **E2E latency sweep** (`2291613`, `47c0f54`, `a6e12ab`, `cc282b2`): `bench/e2e-latency` gains `notifyMode` (`always`/`waiter-flag`), producer push-mode and tick-rate knobs, no-notify pull modes and a matrix sweep. The headless runner is `node tmp/run-e2e-latency-bench.mjs` (Playwright + Chromium, `BENCH_PORT`). It prints `BEST_CONFIG_BY_AREA`, global median deltas and per-axis 95 % CI blocks (`AREA_P99_CI_*`).
+- **`examples/liquid-control/`** (`baa890a`): an untrained Liquid Time-Constant network running on CPU in a Worker drives an AudioWorklet synth through `BridgeWebNNSource.pushFromTypedArray()`. Run it with `npm run dev:liquid-control` (port 5190); `npm run selftest:liquid-control` is a headless bounded/alive/liquid check.
+
+### Fixed
+- **E2E latency notify-mode mismatch** (`2291613`, `47c0f54`): the consumer page now builds its `Bridge` with the same `notify` mode as the producer worker. The worker echoes its mode at startup, and the run reports `FAIL: benchmark ring config mismatch` when the two disagree.
+- **liquid-control worker load** (`59986ef`): `BridgeWebNNSource` is now imported from `dist/experimental/BridgeWebNNSource.js` instead of the experimental barrel. The barrel pulls the JIT's bare `acorn` import, which a browser module worker cannot resolve.
+- **`npm publish` was blocked** (this release): the `3de1ef5` README rewrite changed the status-block wording, so `check:release-metadata` (run by `prepublishOnly`) failed on every commit since. The check now matches the README's current `- Version: \`x.y.z\`` line and its two dependency claims, and the README's duplicate `npm run build` validation line and UTF-8 BOM are gone.
+- **UTF-8 mojibake** (this release): `3de1ef5`/`e88906e` round-tripped files through a non-UTF-8 editor ("—" → "â€”", a BOM on two barrels). Repaired in `src/index.ts`, `src/experimental/index.ts`, `src/jit/compileKernel.ts`, `src/jit/emitKernelWat.ts` (including the emitted WAT header comment strings), the API-boundary docs/scripts/manifest, and the `god-node-hotswap` HUD strings.
+- **`examples/god-node-hotswap` page failed to load** (this release): `main.js` imported `migratePlan` from `dist/index.js`, which `3de1ef5` had stopped exporting. It now imports it from the experimental subpath.
+- **Release metadata drift** (`f0f76f2`): `CITATION.cff` moved from stale `0.9.70` to the current version. The `src/index.ts` Standard-mode marker was corrected from `0.10.0` to `0.9.40`.
+
+### Changed
+- **Root → experimental move, made non-breaking** (`3de1ef5` + this release): `crossfadeWeight`, `crossfadeInto`, `HotSwapConsumer`, `migratePlan` and their types (`Crossfade*`, `HotSwap*`, `Migrate*`) now live on `webgpu-audio-bridge/experimental`. `3de1ef5` had simply deleted them from the root, a breaking public-API change the versioning policy reserves for a minor bump. This release restores them on the root as **`@deprecated` shims** (`src/_deprecatedRootShims.ts`; the very same objects as the experimental exports) so 0.9.x root imports keep compiling. **The shims are removed at 0.10.0** — migrate imports to the experimental subpath.
+- **`acorn` packaging** (`3de1ef5`): `acorn` moved from `dependencies` to an optional `peerDependency` (also kept in `devDependencies`). Users of the experimental JIT's JS-source path must install `acorn` themselves.
+- **`prepublishOnly` order**: now `typecheck → test → check:release`, where the new `npm run check:release` = `check:release-metadata → check:api-boundary → build → check:api-snapshot`. Previously `check:api-snapshot` ran before `build`, so it diffed a stale `dist/` (or failed on a clean checkout).
+
+### Why
+
+These commits shipped to `main` after `0.9.944` (and `1ca422a` just before it) with no per-patch version bump or CHANGELOG entry. This release documents all of them in one entry rather than minting about ten versions after the fact. Source comments that already said `0.9.946` for the readback coalescing work were corrected to `0.9.945`.
+
+### Wire compatibility
+
+- **No SPSC/`Bridge` SAB change.** Ring header lanes, frame layout and `RING_HEADER_BYTES` are unchanged. `MpmcWorkQueue`'s layout is unchanged too: `WasmMpmcWorkQueue` uses the same layout inside a page-padded `WebAssembly.Memory`.
+- **Planar trajectories are opt-in.** Interleaved (the default) frames are byte-identical. A planar field changes the byte order inside that array field only, and `describeSchemaLayout` carries `trajectory.layout`, so full-shape layout matches catch a mismatch between peers.
+- **`decoder.wasm` export contract grew.** `instantiateConsumer` validates every expected export, so a `decoder.wasm` built before this release no longer instantiates against these JS sources. Rebuild with `npm run build:wasm`.
+- **Root API: additive.**
+  - New types: `ReadbackLatencyStats`, `ReadbackBackpressureMode`, `ReadbackPacingMode`, `ReadbackAction`, `ReadbackPressureSnapshot`, `RawReadbackCompatibility`, `RawReadbackCompatibilityOptions`, `RawReadbackCompatibilityReason`, `PartialReadbackInitialFrame`, `FieldReadbackOptions`, `FieldReadbackRange`, `WasmReadbackDecoderOptions`, `TrajectoryLayout`.
+  - New `BridgeGPUSource` statics and methods (listed above) and `BridgeOptions.kalmanWasm`.
+  - `crossfadeWeight` / `crossfadeInto` / `HotSwapConsumer` / `migratePlan` (+ types): moved to `/experimental`, kept on the root as `@deprecated` shims until 0.10.0 — **net: no root removal in this release.**
+- **Experimental subpath:** adds `WasmMpmcWorkQueue`, `emitWasmMpmc`, `emitWasmMpmcBytes`, `allocateWasmSharedMemory` and the types `WasmMpmcClaimSource`, `WasmMpmcClaimTicket`, `EmitWasmMpmcOptions`, `WasmMpmcClaimOffsets`, `WasmSharedMemoryAllocation`, `WorkQueueBackend`, plus the moved hot-swap and migration APIs.
+- **Behavior changes:** Standard-mode `connect()` now throws on a non-`drop-oldest` policy. `WorkletConsumer` has four new required members.
+
+### Tests
+- `tests/BridgeGPUSource.raw.test.ts` 6–10: rawCompatibility/rawIfCompatible, partial raw and closure merge, field helpers, wasmDecoder.
+- `tests/BridgeGPUSource.writeTarget.test.ts`: latest-only coalescing and adaptive pacing.
+- `tests/BridgeGPUSource.autoPoll.test.ts`: latency stats.
+- `tests/browser/webgpu-readback.spec.ts` (new): a real-WebGPU latency histogram. It skips when no adapter is exposed; set `REQUIRE_WEBGPU_READBACK=1` to make that a failure.
+- `tests/browser/latency.spec.ts`: asserts the new e2e worklet miss/underrun counters (`workletMisses`, `underrunEvents`, `maxMissStreak`, `missRate`).
+- `tests/Bridge.codegen.test.ts` 9: the generated `pullLatest` commits `read_index`.
+- `tests/connect.test.ts` 110: Standard mode rejects unsupported policies.
+- `tests/WasmMpmcWorkQueue.test.ts` and `tests/emitWasmMpmc.test.ts` (new in `1ca422a`). **This release registers both in `npm test` / `test:unit`**, so CI now runs them.
+- `tests/connectJit.test.ts` pins E/G/H: replaced the single `setTimeout(0)` wait for the async compile round-trip with a bounded `flushUntil(...)` poll. Pin H flaked once under a full `npm test` run while this release was being validated.
+- `tests/Bridge.properties.test.ts` P2: the convergence slack gains a magnitude-scaled term (`4·ε·max(|curr|,|prev|)`). The old slack scaled only with `|curr − prev|`, so fast-check's random seed occasionally found a legitimate one-ulp rounding step near `|x| ≈ 1e6` and failed the suite.
+- `tests/typecheck-deprecations.test.ts` pin 4: the deprecated root shims are identical (`===`) to the experimental exports, and the generic `HotSwapConsumer<S>` shim is usable as a type. Pin 11 in both `tests/connectWorkQueue.test.ts` and `tests/connectGraph.test.ts` covers the `backend:"wasm"` opt-in and its fallback.
+- No new pins cover planar layout, `fastMath`, the septic f32 path or `kalmanWasm`.
+
+### Documentation
+- `README.md` rewritten from about 2,450 to 259 lines: a status block, the stable/experimental split and dependency claims.
+- New: `docs/api-boundary.md`, `docs/stable-api-manifest.json`, `docs/api-snapshots/*`, `docs/integration-recipes.md`, `docs/gpu-readback-measurement.md`, `docs/gpu-readback-baselines.json`, `website/plans/gpu-readback-hardware-validation.md`, `examples/liquid-control/README.md`.
+- Updated: `docs/standard-mode-design.md`, `docs/emit-worklet-reader-design.md`, `docs/frontier2-classical-predictive-extrapolation-handoff.md`, `bench/e2e-latency/README.md`.
+
 ## [0.9.944] - 2026-06-01
 
 ### Added - Apollo Frontier 7, JS-source stateful kernel authoring

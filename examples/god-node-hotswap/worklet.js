@@ -1,26 +1,26 @@
-﻿// worklet.js â€” the audio-rate consumer that performs the live cross-schema swap.
+// worklet.js — the audio-rate consumer that performs the live cross-schema swap.
 //
-// This is the end-to-end composition of God-Node Stages 1â€“3, running on the
+// This is the end-to-end composition of God-Node Stages 1–3, running on the
 // audio thread:
 //
-//   â€¢ HotSwapConsumer (Stage 2) holds bridge A (old patch) and bridge B (new
+//   • HotSwapConsumer (Stage 2) holds bridge A (old patch) and bridge B (new
 //     patch), reconstructs BOTH per quantum via `pullHermiteLatest`, runs the
-//     idle â†’ priming â†’ fading â†’ complete state machine, and anchors the fade
-//     window to *B-ready* (not arm-time â€” the one critical timing law).
-//   â€¢ Its weight schedule is the Stage-1 `crossfadeWeight` (CÂ² quintic); we read
+//     idle → priming → fading → complete state machine, and anchors the fade
+//     window to *B-ready* (not arm-time — the one critical timing law).
+//   • Its weight schedule is the Stage-1 `crossfadeWeight` (C² quintic); we read
 //     `weightAt(perSampleNs)` PER SAMPLE for a sample-accurate, click-free seam.
-//   â€¢ migratePlan (Stage 3, computed on the main thread, posted in here) tells us
-//     `res` and `detune` are NEW b-only fields â†’ they RAMP IN from their default
+//   • migratePlan (Stage 3, computed on the main thread, posted in here) tells us
+//     `res` and `detune` are NEW b-only fields → they RAMP IN from their default
 //     (0) to B's value across the same window, so B's timbre eases in instead of
 //     popping. This worklet is the first real *executor* of a migration plan.
 //
 // The blend itself is `crossfadeInto`'s equal-power law (A and B are distinct
-// timbres â†’ uncorrelated â†’ cos/sin keeps summed power flat). We inline the two-
+// timbres → uncorrelated → cos/sin keeps summed power flat). We inline the two-
 // MAC law per sample because the weight moves every sample; `crossfadeInto` is
 // the buffer-level form of the exact same math (see src/crossfade.ts).
 //
 // Pitch motion is identical in A and B (same freq trajectory), so what you HEAR
-// is a pure timbre morph â€” the seam continuity is the only audible variable.
+// is a pure timbre morph — the seam continuity is the only audible variable.
 
 import { Bridge } from "../../dist/index.js";
 import { HotSwapConsumer } from "../../dist/experimental/index.js";
@@ -55,7 +55,7 @@ class GodNodeConsumer extends AudioWorkletProcessor {
     this.lastFreqB = 0;
 
     // Ramp-in defaults from the migration plan (filled on "config"). Default 0
-    // until told otherwise â€” the safe "field appears from silence" baseline.
+    // until told otherwise — the safe "field appears from silence" baseline.
     this.rampResFrom = 0;
     this.rampDetuneFrom = 0;
     this.planSummary = "(awaiting plan)";
@@ -81,14 +81,14 @@ class GodNodeConsumer extends AudioWorkletProcessor {
   // Read the ramp-in defaults the plan assigned to B's added fields.
   applyPlan(plan) {
     for (const f of plan.rampIn ?? []) {
-      const d = typeof f.default === "number" ? f.default : 0; // "hold" â†’ start at b
+      const d = typeof f.default === "number" ? f.default : 0; // "hold" → start at b
       if (f.to === "res") this.rampResFrom = d;
       if (f.to === "detune") this.rampDetuneFrom = d;
     }
     const xf = (plan.crossfade ?? []).map((f) => f.to).join(",");
     const ri = (plan.rampIn ?? []).map((f) => `${f.to}:${f.reason}`).join(",");
     const dr = (plan.drop ?? []).map((f) => f.from).join(",");
-    this.planSummary = `crossfade[${xf}] rampIn[${ri}] drop[${dr || "â€”"}]`;
+    this.planSummary = `crossfade[${xf}] rampIn[${ri}] drop[${dr || "—"}]`;
   }
 
   process(_inputs, outputs) {
@@ -110,14 +110,14 @@ class GodNodeConsumer extends AudioWorkletProcessor {
     for (let i = 0; i < n; i++) {
       const w = this.swap.weightAt(baseNs + i * nsPerSample);
 
-      // â”€â”€ A: bare carrier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // ── A: bare carrier ─────────────────────────────────────────────────
       this.phaseA += (TWO_PI * this.lastFreqA) / sr;
       if (this.phaseA > TWO_PI) this.phaseA -= TWO_PI;
       const aSample = Math.sin(this.phaseA) * ampA;
 
-      // â”€â”€ B: richer timbre, with res/detune RAMPED IN per the plan â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // ── B: richer timbre, with res/detune RAMPED IN per the plan ─────────
       // effRes / effDetune fade from the plan's default (0) to B's value as the
-      // window weight w sweeps 0â†’1, so B's extra colour eases in click-free.
+      // window weight w sweeps 0→1, so B's extra colour eases in click-free.
       const effRes = this.rampResFrom + (this.outB.res - this.rampResFrom) * w;
       const effDetune = this.rampDetuneFrom + (this.outB.detune - this.rampDetuneFrom) * w;
 
@@ -132,7 +132,7 @@ class GodNodeConsumer extends AudioWorkletProcessor {
         0.45 * effRes * Math.sin(2 * this.phaseB);
       const bSample = bBase * ampB;
 
-      // â”€â”€ equal-power blend (crossfadeInto law, per-sample) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // ── equal-power blend (crossfadeInto law, per-sample) ────────────────
       let gA, gB;
       if (w <= 0) { gA = 1; gB = 0; }
       else if (w >= 1) { gA = 0; gB = 1; }
@@ -141,8 +141,8 @@ class GodNodeConsumer extends AudioWorkletProcessor {
       out[i] = (gA * aSample + gB * bSample) * AMP;
     }
 
-    // Report ~60Ã—/s while the fade is moving (so the weight bar animates), and
-    // a relaxed ~4Ã—/s otherwise.
+    // Report ~60×/s while the fade is moving (so the weight bar animates), and
+    // a relaxed ~4×/s otherwise.
     this.framesSinceReport += n;
     const reportEvery = r.phase === "fading" ? sr / 60 : sr / 4;
     if (this.framesSinceReport >= reportEvery) {

@@ -1,4 +1,4 @@
-﻿import { readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
 
@@ -7,7 +7,13 @@ function readText(path) {
 }
 
 const pkg = JSON.parse(readText("package.json"));
-const rootIndex = readText("src/index.ts");
+// The 0.9.945 deprecated-root-shim block (removed at 0.10.0) is the one
+// sanctioned place experimental names appear on the root; strip it before the
+// leak check so any OTHER root mention still fails.
+const rootIndex = readText("src/index.ts").replace(
+  /\/\/ ── Deprecated root shims[\s\S]*?from "\.\/_deprecatedRootShims\.js";\n[\s\S]*?from "\.\/_deprecatedRootShims\.js";\n/,
+  "",
+);
 const experimentalIndex = readText("src/experimental/index.ts");
 const stableManifest = JSON.parse(readText("docs/stable-api-manifest.json"));
 

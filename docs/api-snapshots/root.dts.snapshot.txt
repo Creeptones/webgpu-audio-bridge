@@ -6,7 +6,7 @@
  * webgpu-audio-bridge
  *
  * Lock-free SPSC SharedArrayBuffer ring for streaming structured frames from
- * a Web Worker (typically driving WebGPU compute) into an AudioWorklet â€” the
+ * a Web Worker (typically driving WebGPU compute) into an AudioWorklet — the
  * control-rate-GPU / audio-rate-CPU pattern.
  *
  * Two public surfaces:
@@ -22,12 +22,12 @@
  *     composable alternative. `Bridge<S>` continues to work unchanged; the
  *     facades are for users who want explicit control over which primitives
  *     are wired in and which invariant-failure policy is active. Same SAB
- *     protocol â€” a facade-built peer interoperates with a Bridge-built peer.
+ *     protocol — a facade-built peer interoperates with a Bridge-built peer.
  *
  * The 0.9.0 release removed three legacy surfaces (`Float64RingBuffer`, the
  * `legacyPhysicsControlFrameSchema(n)` byte-twin, and the
  * `BridgeBlockConsumer` `underflowPolicy: 'throw'` arm). If you need any
- * of those, pin `webgpu-audio-bridge@0.8.x` â€” see CHANGELOG `[0.9.0]` for
+ * of those, pin `webgpu-audio-bridge@0.8.x` — see CHANGELOG `[0.9.0]` for
  * the migration guide.
  *
  * See README.md for the architectural pattern and use cases.
@@ -71,6 +71,8 @@ export type { FieldKind, FieldSpec, FieldsObject, Schema, CompiledField, Compile
 export { DEFAULT_INVARIANT_ABSOLUTE_EPSILON } from "./schema.js";
 export { evaluateTrajectoryInto, evaluateHermiteTrajectoryInto, evaluateQuinticHermiteTrajectoryInto, evaluateSepticHermiteTrajectoryInto, evaluateCircularTrajectoryInto, evaluateCircularHermiteTrajectoryInto, } from "./trajectory.js";
 export { wrapSymmetric, shortestArcDelta, circularLerp, CircularUnwrapper, TWO_PI, } from "./circular.js";
+export { crossfadeWeight, crossfadeInto, HotSwapConsumer, migratePlan, } from "./_deprecatedRootShims.js";
+export type { CrossfadeContinuity, CrossfadeMode, CrossfadeOptions, HotSwapPhase, HotSwapConsumerOptions, HotSwapPullResult, MigratePlan, MigratePlanOptions, MigrateBlend, MigrateCrossfadeField, MigrateRampInField, MigrateDropField, } from "./_deprecatedRootShims.js";
 export { physicsControlFrameSchema } from "./schemas/physics.js";
 export type { PhysicsControlFrameSchema } from "./schemas/physics.js";
 export { predictiveExtrapolateInto } from "./predictiveExtrapolation.js";

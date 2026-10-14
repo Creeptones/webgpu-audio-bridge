@@ -61,6 +61,13 @@ type _LegacyTypeAlias = libT.LegacyPhysicsControlFrameSchema;
 const _throwLiteralPin: BlockUnderflowPolicy = "throw";
 void _throwLiteralPin;
 
+// ── 4. 0.9.945 deprecated root shims (removed at 0.10.0) ─────────────────
+// The four God-Node APIs live on the experimental subpath; the root keeps
+// `@deprecated` re-exports for the rest of 0.9.x. Pin that they are the SAME
+// objects (not copies) and that the generic class shim is usable as a type.
+import * as exp from "../src/experimental/index.js";
+export type _ShimTypeUsable = libT.HotSwapConsumer<never> | libT.MigratePlan | libT.CrossfadeMode;
+
 // ── Runtime sanity: confirm the removed symbols don't exist as values ────
 function main(): void {
   // value-level lookups should be undefined (the named exports are gone).
@@ -80,6 +87,14 @@ function main(): void {
   ok("2a. legacyPhysicsControlFrameSchema absent at value level + @ts-expect-error active");
   ok("2b. LegacyPhysicsControlFrameSchema absent at type level + @ts-expect-error active");
   ok("3. BlockUnderflowPolicy 'throw' literal absent + @ts-expect-error active");
+  for (const name of ["crossfadeWeight", "crossfadeInto", "HotSwapConsumer", "migratePlan"] as const) {
+    if (libAny[name] !== (exp as unknown as Record<string, unknown>)[name]) {
+      console.error(`FAIL: root shim ${name} is not the experimental export`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  ok("4. 0.9.945 deprecated root shims (crossfade/HotSwapConsumer/migratePlan) === experimental exports");
   console.log("\nAll typecheck-deprecations pins held.");
 }
 

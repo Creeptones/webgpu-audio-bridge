@@ -556,7 +556,7 @@ export interface BridgeGPUSourceOptions {
    *  memory. */
   readonly stagingBufferCount?: number;
   /** Policy when `scheduleReadback()` finds no idle staging slot.
-   *  Default `"reject"` preserves pre-0.9.946 behavior. `"latest-only"`
+   *  Default `"reject"` preserves pre-0.9.945 behavior. `"latest-only"`
    *  replaces a not-yet-flushed scheduled slot with the newest copy, reducing
    *  stale readback buildup under bursty producers. */
   readonly backpressureMode?: ReadbackBackpressureMode;
@@ -763,7 +763,7 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
    *  in the resolving microtask instead of waiting for `pollCompleted()`. */
   private readonly _autoDrain: boolean;
 
-  /** Readback pressure policy (0.9.946). Default `"reject"` preserves the old
+  /** Readback pressure policy (0.9.945). Default `"reject"` preserves the old
    *  return-false contract. `"latest-only"` may reuse a `scheduled` slot before
    *  mapAsync begins, so bursts keep the newest copy instead of stale copies. */
   private readonly _backpressureMode: ReadbackBackpressureMode;
@@ -1611,13 +1611,13 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     return this._rawMode ? "raw" : "closure";
   }
 
-  /** Back-pressure policy selected for `scheduleReadback()` (0.9.946). */
+  /** Back-pressure policy selected for `scheduleReadback()` (0.9.945). */
   backpressureMode(): ReadbackBackpressureMode {
     return this._backpressureMode;
   }
 
   /** Number of not-yet-flushed scheduled readbacks replaced by
-   *  `"latest-only"` coalescing (0.9.946). */
+   *  `"latest-only"` coalescing (0.9.945). */
   coalescedCount(): number {
     return this._coalescedCount;
   }
