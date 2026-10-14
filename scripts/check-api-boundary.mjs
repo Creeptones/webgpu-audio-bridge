@@ -126,6 +126,15 @@ for (const entry of stableManifest.frontierMembers ?? []) {
   }
 }
 
+// deprecatedMembers: must exist AND carry @deprecated in the snapshot.
+for (const entry of stableManifest.deprecatedMembers ?? []) {
+  const [owner, member] = entry.split(".");
+  const block = blocksByOwner.get(owner);
+  if (!block || !new RegExp(`^  (readonly )?${member}[?(:][^\\n]*@deprecated$`, "m").test(block)) {
+    fail(`deprecatedMembers entry '${entry}' must exist and be @deprecated in the member-level root surface`);
+  }
+}
+
 const workletNames = apiSurface("src/worklet/index.ts", ENTRIES).names;
 const workletListed = new Set(stableManifest.workletExports ?? []);
 for (const name of workletNames) if (!workletListed.has(name)) fail(`worklet export '${name}' missing from manifest workletExports`);

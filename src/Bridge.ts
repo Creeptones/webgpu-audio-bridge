@@ -265,6 +265,7 @@ import {
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 import { buildScratchFrame } from "./_heap.js";
+import { buildTelemetrySnapshot } from "./_telemetry.js";
 import {
   INVARIANT_OK_THRESHOLD,
   INVARIANT_SOFT_THRESHOLD,
@@ -1416,55 +1417,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * mutually atomic. For diagnostic / dashboard use only.
    */
   telemetry(): TelemetrySnapshot {
-    return Object.freeze({
-      tornFrames: this.ring.tornFrameCount(),
-      // 0.7.3 — heap-side counters, consumer-thread.
-      softFrames: this._softFrames,
-      stallRecoveries: this.pll.stallRecoveries,
-      // 0.9.935 — angular monodromy counter from the circular-aware smoother.
-      cycleSlips: this.smoother.cycleSlips,
-      flowScale: this.ring.flowScaleHint(),
-      available: this.ring.available(),
-      capacity: this.capacity,
-      writeIndex: this.ring.writeIndexUnsigned(),
-      readIndex: this.ring.readIndexUnsigned(),
-      // These telemetry PLL fields are read from the heap-side composed
-      // ConsumerClockRecovery (as of 0.6.9), so a peer reading their own
-      // Bridge's telemetry() sees their own PLL state. For CROSS-process
-      // PLL observability, 0.6.16 publishes offset/drift/status to SAB
-      // header lanes 4-7 (observeConsumerTime / resetPll → publishPllState);
-      // a peer over the same SAB reads them via readPublishedPllState().
-      pllLocked: this.pll.locked,
-      pllOffsetNs: this.pll.offsetNs,
-      // 0.6.14 — Mahalanobis outlier gate counter. Cumulative since the
-      // bridge's PLL was constructed; the field doc explains the gate
-      // semantics and what counts as a rejection.
-      pllOutliersRejected: this.pll.outliersRejected,
-      // 0.6.15 — drift estimator output, ppm. Always 0 when the
-      // estimator is opt-out (the default). Bridge<S>'s built-in PLL
-      // is constructed with default opts (offset-only); callers that
-      // want drift estimation should use the composable surface and
-      // construct ConsumerClockRecovery with `enableDriftEstimator: true`.
-      pllDriftPpm: this.pll.driftPpm,
-      // 0.6.12 — backpressure policy + heap-side drop counter.
-      policy: this.ring.policy,
-      droppedFrames: this.ring.droppedCount(),
-      // 0.6.13 — observability dashboards. All six fields are per-
-      // instance, heap-side. Two peers over the same SAB each see their
-      // own counters (the producer sees its pushes; the consumer sees
-      // its pulls + wait durations). For cross-process aggregation,
-      // postMessage telemetry across at a sampled cadence — the
-      // overhead is negligible compared to the 16 ms control-rate
-      // budget, and the heap-only design avoids spending scarce SAB
-      // header lanes (only 8; lanes 4-7 already carry PLL state) on a
-      // pure observability concern.
-      pushedFrames: this.ring.pushedCount(),
-      pulledFrames: this.ring.pulledCount(),
-      skippedFrames: this.ring.skippedCount(),
-      lastFullWaitNs: this.ring.lastFullWaitNanos(),
-      lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
-      maxOccupancyEverSeen: this.ring.maxOccupancy(),
-    });
+    // Shared builder (0.9.951) — see src/_telemetry.ts for field semantics.
+    return buildTelemetrySnapshot(this.ring, this._softFrames, this.pll, this.smoother);
   }
 
   /**
@@ -1586,6 +1540,10 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * reflectable" convention — TypeScript would flag a `private` modifier
    * unused since the call site is via a test-only `as unknown as { ... }`
    * cast.
+   *
+   * @deprecated Test seam only — not part of the public API. It is on the
+   * public type surface for historical reasons (the tests drive it through a
+   * cast) and becomes non-public at 0.10.0. (0.9.951)
    */
   _updateFlowScale(writeIdx: number, readIdx: number): void {
     this.ring._updateFlowScale(writeIdx, readIdx);

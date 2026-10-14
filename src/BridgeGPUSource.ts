@@ -1478,7 +1478,9 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     }
   }
 
-  /** Number of staging buffers currently in some non-idle state. */
+  /** Number of staging buffers currently in some non-idle state
+   *  (`scheduled` / `in-flight` / `ready`). Same name as
+   *  `BridgeBlockProducer.inFlight()`. */
   inFlight(): number {
     let n = 0;
     for (let i = 0; i < this.slots.length; i++) {
@@ -1487,12 +1489,10 @@ export class BridgeGPUSource<S extends Schema<FieldsObject, any>> {
     return n;
   }
 
-  /** Naming-parity alias for `inFlight()` (0.7.3). Identical semantics
-   *  — number of staging buffers currently in `scheduled` / `in-flight`
-   *  / `ready` (anything not `idle`). Added as the canonical name for
-   *  the in-page Bridge Inspector pattern that pairs this with
-   *  `Bridge.subscribeTelemetry()`; the original `inFlight()` is
-   *  preserved for back-compat with 0.6.18 callers. */
+  /** Alias for `inFlight()` (0.7.3, added for the in-page Bridge Inspector
+   *  pattern). Identical result.
+   *  @deprecated Use `inFlight()` — the name `BridgeBlockProducer` and the
+   *  examples use. Removed at 0.10.0. (0.9.951) */
   inFlightCount(): number {
     return this.inFlight();
   }

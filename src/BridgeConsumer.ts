@@ -90,6 +90,7 @@ import {
   classifyInvariant,
 } from "./_invariant.js";
 import { buildScratchFrame } from "./_heap.js";
+import { buildTelemetrySnapshot } from "./_telemetry.js";
 
 export type { SmoothedPullOptions };
 
@@ -345,30 +346,8 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
    * dashboard use only.
    */
   telemetry(): TelemetrySnapshot {
-    return Object.freeze({
-      tornFrames: this.ring.tornFrameCount(),
-      softFrames: this._softFrames,
-      stallRecoveries: this.pll === null ? 0 : this.pll.stallRecoveries,
-      // 0.9.935 — angular monodromy counter; 0 when the smoother is opted out.
-      cycleSlips: this.smoother === null ? 0 : this.smoother.cycleSlips,
-      flowScale: this.ring.flowScaleHint(),
-      available: this.ring.available(),
-      capacity: this.capacity,
-      writeIndex: this.ring.writeIndexUnsigned(),
-      readIndex: this.ring.readIndexUnsigned(),
-      pllLocked: this.pll === null ? false : this.pll.locked,
-      pllOffsetNs: this.pll === null ? 0 : this.pll.offsetNs,
-      pllOutliersRejected: this.pll === null ? 0 : this.pll.outliersRejected,
-      pllDriftPpm: this.pll === null ? 0 : this.pll.driftPpm,
-      policy: this.ring.policy,
-      droppedFrames: this.ring.droppedCount(),
-      pushedFrames: this.ring.pushedCount(),
-      pulledFrames: this.ring.pulledCount(),
-      skippedFrames: this.ring.skippedCount(),
-      lastFullWaitNs: this.ring.lastFullWaitNanos(),
-      lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
-      maxOccupancyEverSeen: this.ring.maxOccupancy(),
-    });
+    // Shared builder (0.9.951) — see src/_telemetry.ts for field semantics.
+    return buildTelemetrySnapshot(this.ring, this._softFrames, this.pll, this.smoother);
   }
 
   // ── Invariant classifier + dispatch (mirrors Bridge<S>) ──────────────────

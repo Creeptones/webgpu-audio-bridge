@@ -994,7 +994,7 @@ class BridgeImpl<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
   static readonly INVARIANT_OK_THRESHOLD: 0.001
   static readonly INVARIANT_SOFT_ALPHA_BASE: 0.1
   static readonly INVARIANT_SOFT_THRESHOLD: 1
-  _updateFlowScale(writeIdx: number, readIdx: number) => void
+  _updateFlowScale(writeIdx: number, readIdx: number) => void @deprecated
   abortPush() => void
   available() => number
   beginPush() => FrameFor<S> | null

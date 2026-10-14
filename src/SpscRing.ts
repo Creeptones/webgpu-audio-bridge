@@ -260,7 +260,8 @@ import {
 import { AdaptiveFlowController } from "./AdaptiveFlowController.js";
 import { buildScratchFrame } from "./_heap.js";
 
-export const RING_HEADER_BYTES = 32;
+import { RING_HEADER_BYTES } from "./_ringHeader.js";
+export { RING_HEADER_BYTES };
 /** Active SPSC counter lanes: write_index (Int32 lane 0), read_index (Int32
  *  lane 1). Other active control lanes (flow_scale on lane 2, torn_frame on
  *  lane 3) are accounted for separately — this constant counts only SPSC
@@ -1360,43 +1361,9 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * the classifier; SpscRing itself never inspects the value.
    */
   pull(out: FrameFor<S>): SpscPullResult {
-    if (this._needsOverrunAware) return this._pullOverrunAware(out);
-    const r = this.pullResult;
-    const readIdx = this.indices[READ_IDX_LANE]!;
-    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
-    if (writeIdx === readIdx) {
-      r.ok = false; // empty — exact i32 equality is wrap-correct
-      return r;
-    }
-    const slot = (readIdx >>> 0) & this.mask;
-    const frame = out as unknown as Record<string, unknown>;
-    const sr = this.scalarReaders;
-    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-    const al = this.arrayLayout;
-    const av = this.arrayViews;
-    for (let i = 0; i < al.length; i++) {
-      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-      dst.set(av[i]![slot]!);
-    }
-    // Read stored invariant BEFORE release-store so the slot bytes are still
-    // ours. The classifier on Bridge only touches heap state so it can
-    // safely run AFTER release.
-    const invariantStored = this.invariantView !== null
-      ? this.invariantView[
-          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-        ]!
-      : 0;
-    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
-    this._notifyLane(READ_IDX_LANE);
-    this._updateFlowScale(writeIdx, readIdx);
-    this._recordOccupancy((writeIdx - readIdx) | 0);
-    this.pulledFrames = (this.pulledFrames + 1) | 0;
-    r.ok = true;
-    r.skipped = 0;
-    r.invariantStored = invariantStored;
-    r.preWriteIdx = writeIdx;
-    r.preReadIdx = readIdx;
-    return r;
+    return this._needsOverrunAware
+      ? this._pullOverrunAware(out, true)
+      : this._pullReject(out, true);
   }
 
   /**
@@ -1426,7 +1393,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * miss the wake. Use `pull` (which bundles the notify) for everything
    * else.
    *
-   * Dispatches to `_pullOverrunAwareNoNotify` when `_needsOverrunAware`
+   * Dispatches to `_pullOverrunAware(out, false)` when `_needsOverrunAware`
    * is true (drop-oldest policy) so the no-notify primitive remains
    * correct under every overflow policy. Mirrors the dispatch shape of
    * `pull`.
@@ -1435,15 +1402,39 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * helper in 0.8.2 when `BridgeInputLane.pullAll` adopted it.
    */
   _pullNoNotify(out: FrameFor<S>): SpscPullResult {
-    if (this._needsOverrunAware) return this._pullOverrunAwareNoNotify(out);
-    const r = this.pullResult;
+    return this._needsOverrunAware
+      ? this._pullOverrunAware(out, false)
+      : this._pullReject(out, false);
+  }
+
+  /**
+   * Single-frame pull for the reject / block policies (strict SPSC: only the
+   * consumer writes `read_index`, so a plain index read + release-store
+   * suffice). `notify` is a constant at each call site (`pull` → true,
+   * `_pullNoNotify` → false), so after inlining the branch folds away
+   * (0.9.951 merge of two previously duplicated bodies).
+   */
+  private _pullReject(out: FrameFor<S>, notify: boolean): SpscPullResult {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
     if (writeIdx === readIdx) {
-      r.ok = false;
-      return r;
+      this.pullResult.ok = false; // empty — exact i32 equality is wrap-correct
+      return this.pullResult;
     }
-    const slot = (readIdx >>> 0) & this.mask;
+    // Decode (incl. the stored invariant) BEFORE the release-store so the
+    // slot bytes are still ours. The Bridge-side classifier only touches heap
+    // state, so it can safely run after release.
+    this._decodeSlot((readIdx >>> 0) & this.mask, out);
+    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
+    if (notify) this._notifyLane(READ_IDX_LANE);
+    return this._finishPull(writeIdx, readIdx, 0);
+  }
+
+  /** Decode slot `slot` into `out` (scalars via the precompiled readers,
+   *  arrays via `.set()` from the cached slot views) and stash the slot's
+   *  stored invariant in `pullResult.invariantStored`. Shared by every pull
+   *  variant (0.9.951); must run BEFORE the commit that releases the slot. */
+  private _decodeSlot(slot: number, out: FrameFor<S>): void {
     const frame = out as unknown as Record<string, unknown>;
     const sr = this.scalarReaders;
     for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
@@ -1453,23 +1444,24 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
-    const invariantStored = this.invariantView !== null
+    this.pullResult.invariantStored = this.invariantView !== null
       ? this.invariantView[
           slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
         ]!
       : 0;
-    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
-    // NB: Atomics.notify deliberately omitted — that's the whole point of
-    // this shim. Flow-scale tick still runs so the bench compares like for
-    // like on the post-release work; the occupancy + pulled counters also
-    // stay in sync with the public `pull` path so the bench's stats
-    // surface matches.
+  }
+
+  /** Post-commit bookkeeping shared by every successful pull (0.9.951):
+   *  flow-scale PI tick, occupancy high-water mark, pulled/skipped counters,
+   *  and the reused `pullResult` fields. */
+  private _finishPull(writeIdx: number, readIdx: number, skipped: number): SpscPullResult {
     this._updateFlowScale(writeIdx, readIdx);
     this._recordOccupancy((writeIdx - readIdx) | 0);
     this.pulledFrames = (this.pulledFrames + 1) | 0;
+    if (skipped !== 0) this.skippedFrames = (this.skippedFrames + skipped) | 0;
+    const r = this.pullResult;
     r.ok = true;
-    r.skipped = 0;
-    r.invariantStored = invariantStored;
+    r.skipped = skipped;
     r.preWriteIdx = writeIdx;
     r.preReadIdx = readIdx;
     return r;
@@ -1486,42 +1478,18 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    */
   pullLatest(out: FrameFor<S>): SpscPullResult {
     if (this._needsOverrunAware) return this._pullLatestOverrunAware(out);
-    const r = this.pullResult;
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx === readIdx) {
-      r.ok = false;
-      return r;
+      this.pullResult.ok = false;
+      return this.pullResult;
     }
     const newestIdx = (writeIdx - 1) | 0;
     const skipped = ((newestIdx - readIdx) | 0); // ≥ 0 by the empty-check above
-    const slot = (newestIdx >>> 0) & this.mask;
-    const frame = out as unknown as Record<string, unknown>;
-    const sr = this.scalarReaders;
-    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-    const al = this.arrayLayout;
-    const av = this.arrayViews;
-    for (let i = 0; i < al.length; i++) {
-      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-      dst.set(av[i]![slot]!);
-    }
-    const invariantStored = this.invariantView !== null
-      ? this.invariantView[
-          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-        ]!
-      : 0;
+    this._decodeSlot((newestIdx >>> 0) & this.mask, out);
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
     this._notifyLane(READ_IDX_LANE);
-    this._updateFlowScale(writeIdx, readIdx);
-    this._recordOccupancy((writeIdx - readIdx) | 0);
-    this.pulledFrames = (this.pulledFrames + 1) | 0;
-    this.skippedFrames = (this.skippedFrames + skipped) | 0;
-    r.ok = true;
-    r.skipped = skipped;
-    r.invariantStored = invariantStored;
-    r.preWriteIdx = writeIdx;
-    r.preReadIdx = readIdx;
-    return r;
+    return this._finishPull(writeIdx, readIdx, skipped);
   }
 
   /**
@@ -1569,32 +1537,20 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * Atomics.store becomes a compareExchange). The bench separates
    * this in its 0.7.2 per-policy section.
    */
-  private _pullOverrunAware(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
+  private _pullOverrunAware(out: FrameFor<S>, notify: boolean): SpscPullResult {
     // Bounded retry — see method header. capacity + 1 is the worst-case
     // bound under SPSC; in practice the loop body runs once per pull.
+    // `notify` is constant per call site (0.9.951: `_pullOverrunAwareNoNotify`
+    // folded in — `_pullNoNotify` passes false and its caller issues ONE
+    // trailing `_notifyReadAdvance()` per burst).
     for (let attempt = 0; attempt <= this.capacity; attempt++) {
       const readIdx = Atomics.load(this.indices, READ_IDX_LANE);  // acquire
       const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
       if (writeIdx === readIdx) {
-        r.ok = false; // empty
-        return r;
+        this.pullResult.ok = false; // empty
+        return this.pullResult;
       }
-      const slot = (readIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
+      this._decodeSlot((readIdx >>> 0) & this.mask, out);
       // CAS-commit: claim slot `readIdx` only if no one (i.e. the
       // producer's `_dropOldest`) advanced READ_IDX past us mid-read.
       const prev = Atomics.compareExchange(
@@ -1604,24 +1560,15 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         (readIdx + 1) | 0,
       );
       if (prev !== readIdx) continue; // producer overran — retry whole pull
-      this._notifyLane(READ_IDX_LANE);
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      r.ok = true;
-      r.skipped = 0;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
+      if (notify) this._notifyLane(READ_IDX_LANE);
+      return this._finishPull(writeIdx, readIdx, 0);
     }
     // Unreachable under SPSC for the same reason as `_dropOldest`'s
     // defensive return: the producer cannot infinitely advance
     // `read_index` without the consumer also advancing it. Defensive
     // return surfaces any future protocol change as `ok = false`.
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
+    this.pullResult.ok = false;
+    return this.pullResult;
   }
 
   /**
@@ -1637,31 +1584,16 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * against the new snapshot.
    */
   private _pullLatestOverrunAware(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
     for (let attempt = 0; attempt <= this.capacity; attempt++) {
       const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
       const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
       if (writeIdx === readIdx) {
-        r.ok = false;
-        return r;
+        this.pullResult.ok = false;
+        return this.pullResult;
       }
       const newestIdx = (writeIdx - 1) | 0;
       const skipped = ((newestIdx - readIdx) | 0);
-      const slot = (newestIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
+      this._decodeSlot((newestIdx >>> 0) & this.mask, out);
       // CAS-commit advances READ_IDX from `readIdx` straight to
       // `writeIdx` — drains everything older than the newest in one
       // atomic step, matching the reject-path semantics. On CAS
@@ -1674,86 +1606,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       );
       if (prev !== readIdx) continue;
       this._notifyLane(READ_IDX_LANE);
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      this.skippedFrames = (this.skippedFrames + skipped) | 0;
-      r.ok = true;
-      r.skipped = skipped;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
+      return this._finishPull(writeIdx, readIdx, skipped);
     }
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
-  }
-
-  /**
-   * `_pullNoNotify` variant for the drop-oldest CAS-commit path (0.8.2).
-   * Selected at construction when `policy === 'drop-oldest'` via the same
-   * `_needsOverrunAware` flag that gates `_pullOverrunAware` / `_pullLatestOverrunAware`.
-   *
-   * Identical to `_pullOverrunAware` minus the trailing
-   * `Atomics.notify(READ_IDX_LANE, 1)` — caller (`BridgeInputLane.pullAll`)
-   * issues ONE notify at burst end via `_notifyReadAdvance()` on the
-   * success branch. The CAS-commit retry loop is preserved verbatim from
-   * `_pullOverrunAware`; only the per-frame notify is elided.
-   *
-   * Same correctness pin applies: the concurrent stress test under
-   * drop-oldest (`tests/Bridge.concurrent.test.ts`) asserts every consumed
-   * frame is bit-exact against the producer's recipe. The retry-on-CAS-
-   * failure shape protects against the producer racing the same
-   * `read_index` lane while the consumer is mid-read; the omitted notify
-   * doesn't widen that window — it just defers the wake-up signal.
-   */
-  private _pullOverrunAwareNoNotify(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
-    for (let attempt = 0; attempt <= this.capacity; attempt++) {
-      const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
-      const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
-      if (writeIdx === readIdx) {
-        r.ok = false;
-        return r;
-      }
-      const slot = (readIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
-      const prev = Atomics.compareExchange(
-        this.indices,
-        READ_IDX_LANE,
-        readIdx,
-        (readIdx + 1) | 0,
-      );
-      if (prev !== readIdx) continue;
-      // Notify deliberately omitted — caller pairs N pulls with one
-      // `_notifyReadAdvance()` on the success branch.
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      r.ok = true;
-      r.skipped = 0;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
-    }
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
+    this.pullResult.ok = false;
+    return this.pullResult;
   }
 
   /**

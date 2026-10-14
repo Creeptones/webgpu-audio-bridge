@@ -238,6 +238,11 @@
     "SpscRingOptions.notify",
     "BridgeGPUSourceOptions.writeTarget"
   ],
+  "deprecatedMembers": [
+    "BridgeBlockProducer.inFlightCount",
+    "BridgeGPUSource.inFlightCount",
+    "BridgeImpl._updateFlowScale"
+  ],
   "workletExports": [
     "BenchReport",
     "BenchTimer",
@@ -289,6 +294,7 @@
     "packageExports": "Only '.', './worklet', './worklet/decoder.wasm', './experimental', and './experimental/core' are published subpaths.",
     "dependencies": "The stable core has no direct runtime dependencies. The experimental JIT parser uses acorn as an optional peer dependency and repo devDependency.",
     "snapshots": "docs/api-snapshots/*.api.txt are MEMBER-LEVEL snapshots generated from the sources by scripts/_apiSurface.mjs (TypeScript compiler API): every export plus every public member signature, and the internal declarations the public surface reaches. Any added/removed/renamed/retyped public member changes them.",
-    "frontierMembers": "Members of otherwise-stable root declarations that are frontier-grade: the predicted/Kalman pulls + readback median on Bridge (BridgeImpl), the f32x4 kalmanWasm option, SpscRingOptions.notify ('waiter-flag' is experimental), and BridgeGPUSourceOptions.writeTarget ('shared' is reserved and always throws). They are outside the 1.0 stability contract until deliberately promoted. check:api-boundary verifies each still exists in the member-level root snapshot."
+    "frontierMembers": "Members of otherwise-stable root declarations that are frontier-grade: the predicted/Kalman pulls + readback median on Bridge (BridgeImpl), the f32x4 kalmanWasm option, SpscRingOptions.notify ('waiter-flag' is experimental), and BridgeGPUSourceOptions.writeTarget ('shared' is reserved and always throws). They are outside the 1.0 stability contract until deliberately promoted. check:api-boundary verifies each still exists in the member-level root snapshot.",
+    "deprecatedMembers": "@deprecated members of stable declarations, scheduled for removal (or, for underscore test seams, de-publication) at 0.10.0. check:api-boundary verifies each still exists and is marked @deprecated in the member-level root snapshot."
   }
 }

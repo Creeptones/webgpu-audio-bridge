@@ -62,7 +62,7 @@ class BridgeBlockProducer<S extends Schema<FieldsObject, any>>
   droppedCount() => number
   flushPending() => void
   inFlight() => number
-  inFlightCount() => number
+  inFlightCount() => number @deprecated
   lastReadbackUs() => number
   pollCompleted() => number
   pushedCount() => number
@@ -121,7 +121,7 @@ class BridgeGPUSource<S extends Schema<FieldsObject, any>>
   fieldReadbackRange(fieldNames: readonly Extract<keyof FrameFor<S>, string>[]) => FieldReadbackRange
   flushPending() => void
   inFlight() => number
-  inFlightCount() => number
+  inFlightCount() => number @deprecated
   lastReadbackUs() => number
   pacingDeclinedCount() => number
   partialBytesCopied() => number
@@ -529,7 +529,7 @@ interface MountOptions<Macro extends Schema<FieldsObject, any>, Input extends Sc
   readonly macroSchema: Macro
   readonly role: ConnectRole
 
-type MountResult<Macro extends Schema<FieldsObject, any>, Input extends Schema<FieldsObject, any> = never> = { readonly role: "producer"; readonly mode: ConnectMode; readonly macro: BridgeProducer<Macro> | MessageChannelBridge<Macro>; readonly input?: BridgeInputLane<Input> | MessageChannelBridge<Input>; } | { readonly role: "consumer"; readonly mode: ConnectMode; readonly macro: BridgeConsumer<Macro> | MessageChannelBridge<Macro>; readonly input?: BridgeInputLane<Input> | MessageChannelBridge<Input>; }
+type MountResult<Macro extends Schema<FieldsObject, any>, Input extends Schema<FieldsObject, any> = never> = { readonly role: "producer"; readonly mode: "turbo"; readonly macro: BridgeProducer<Macro>; readonly input?: BridgeInputLane<Input>; } | { readonly role: "producer"; readonly mode: "standard"; readonly macro: MessageChannelBridge<Macro>; readonly input?: MessageChannelBridge<Input>; } | { readonly role: "consumer"; readonly mode: "turbo"; readonly macro: BridgeConsumer<Macro>; readonly input?: BridgeInputLane<Input>; } | { readonly role: "consumer"; readonly mode: "standard"; readonly macro: MessageChannelBridge<Macro>; readonly input?: MessageChannelBridge<Input>; }
 
 type PartialReadbackInitialFrame = ArrayBuffer | ArrayBufferView
 
@@ -1148,7 +1148,7 @@ class BridgeImpl<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
   static readonly INVARIANT_OK_THRESHOLD: 0.001
   static readonly INVARIANT_SOFT_ALPHA_BASE: 0.1
   static readonly INVARIANT_SOFT_THRESHOLD: 1
-  _updateFlowScale(writeIdx: number, readIdx: number) => void
+  _updateFlowScale(writeIdx: number, readIdx: number) => void @deprecated
   abortPush() => void
   available() => number
   beginPush() => FrameFor<S> | null

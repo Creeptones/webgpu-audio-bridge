@@ -51,6 +51,12 @@ declarations as `Owner.member`: `BridgeImpl.pullPredictedLatest`,
 (`'shared'` is reserved and throws). They carry `@experimental` in their JSDoc
 and sit outside the 1.0 contract until promoted. The boundary check verifies
 that each entry still exists in the member-level root surface.
+
+`deprecatedMembers` (0.9.951) lists `@deprecated` members scheduled for removal
+(or, for the underscore test seam, de-publication) at 0.10.0:
+`BridgeGPUSource.inFlightCount` and `BridgeBlockProducer.inFlightCount` (aliases
+of `inFlight()`) and `BridgeImpl._updateFlowScale`. The boundary check requires
+each to exist and to be marked `@deprecated` in the snapshot.
 `npm run check:api-boundary` fails when a root or worklet export is not
 classified, when a listed name is no longer exported, when a name sits in two
 buckets, and when root `src/index.ts` contains known experimental markers outside

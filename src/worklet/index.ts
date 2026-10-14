@@ -56,11 +56,12 @@ export {
   type CaptureComparison,
 } from "./captureProbe.js";
 
-/** Bytes in the SAB ring header preceding slot 0. Mirrors SpscRing's
- *  `RING_HEADER_BYTES` and `SchemaLayoutDescription.headerBytes` (32 = eight
- *  Int32 lanes). Re-declared here so the descriptor math doesn't pull in the
- *  whole SpscRing module on the worklet path. */
-export const RING_HEADER_BYTES = 32;
+/** Bytes in the SAB ring header preceding slot 0 (32 = eight Int32 lanes).
+ *  Shared with SpscRing via the dependency-free `../_ringHeader.ts` leaf
+ *  (0.9.951; previously re-declared here), so the worklet path still does
+ *  not pull in the SpscRing module. */
+import { RING_HEADER_BYTES } from "../_ringHeader.js";
+export { RING_HEADER_BYTES };
 
 /**
  * WebAssembly.Memory pages are 64 KiB each. Exported for callers that

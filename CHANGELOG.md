@@ -4,6 +4,39 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.951] - 2026-10-14
+
+### Changed - duplicated logic removed, type ergonomics
+
+- **SpscRing pull variants deduplicated.** `pull`, `_pullNoNotify`, `pullLatest` and the drop-oldest CAS variants repeated the same slot-decode and post-commit bookkeeping blocks. They now share two helpers, `_decodeSlot` (scalars + arrays + the stored invariant, before the commit) and `_finishPull` (flow-scale tick, occupancy, counters, the reused result). `pull`/`_pullNoNotify` and their CAS forms are each one body with a constant `notify` flag; `_pullOverrunAwareNoNotify` is gone. `SpscRing.ts` shrank by about 145 lines. The memory ordering is unchanged: still decode → release-store/CAS → notify. Performance is unchanged within noise (8 interleaved A/B rounds of 2M push+pull: median `pull` 481 → 474 ns, `pullLatest` 491 → 518 ns, per-variant minimums improved).
+- **One telemetry builder.** `Bridge.telemetry()` and `BridgeConsumer.telemetry()` built the same 21-field frozen literal by hand. Both now call `buildTelemetrySnapshot` in the new `src/_telemetry.ts`, which keeps the key order and values identical.
+- **One `RING_HEADER_BYTES`.** `SpscRing.ts` and `worklet/index.ts` each declared their own `32`. Both now re-export it from the dependency-free leaf `src/_ringHeader.ts`, so the worklet entry still does not import SpscRing.
+- **`MountResult` is discriminated on `role` AND `mode`.** Checking `mode === "turbo"` now narrows `macro` to `BridgeConsumer`/`BridgeProducer` and `input` to `BridgeInputLane` with no cast; `"standard"` narrows both to `MessageChannelBridge`. Previously `macro` stayed a facade-or-MessageChannelBridge union whatever `mode` said. Reading code is unaffected; only hand-constructing a `MountResult` with a non-literal `mode` stops compiling.
+
+### Deprecated (removal at 0.10.0)
+
+- `BridgeGPUSource.inFlightCount()` and `BridgeBlockProducer.inFlightCount()`: pure aliases of `inFlight()`, which is the name `BridgeBlockProducer` and the examples use.
+- `Bridge._updateFlowScale()`: an underscore test seam that sat on the public type surface. It becomes non-public at 0.10.0.
+- These are tracked in the new `deprecatedMembers` list in `docs/stable-api-manifest.json`. `check:api-boundary` requires each entry to exist and be `@deprecated`.
+
+### Why
+
+Duplicated copies drift: the `BridgeFacades` symmetry pin was the only guard on the telemetry literal, and the two header constants had no guard at all. The `MountResult` union made every Turbo-mode caller cast.
+
+### Wire compatibility
+
+None. Public API: `MountResult` narrowed (see above); everything else is additive or a deprecation.
+
+### Tests
+
+- New `tests/surfaceHygiene.test.ts` (4 pins), in `npm test` / `test:unit`:
+  - `RING_HEADER_BYTES`: root ≡ SpscRing ≡ worklet ≡ `layout.headerBytes`.
+  - `MountResult` narrowing: a compile-time no-cast assignment plus runtime `instanceof`, and the standard arm's `macro` is `MessageChannelBridge`.
+  - `Bridge` and `BridgeConsumer` `telemetry()` agree on key order and SAB-backed fields over one SAB.
+  - The deprecated alias returns the same value as `inFlight()`.
+- The full suite passes unchanged, including the SPSC interleaving fuzzer, the 1M-frame concurrent stress, the waiter-flag pins and `BridgeInputLane.pullAll`.
+- `tests/browser/webgpu-readback.spec.ts` now reads `inFlight()`.
+
 ## [0.9.950] - 2026-10-14
 
 ### Changed - per-call garbage removed from the audio-thread pull paths
