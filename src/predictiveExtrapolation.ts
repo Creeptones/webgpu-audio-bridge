@@ -180,7 +180,9 @@ export interface PredictiveExtrapolationConfig {
   readonly confidenceFloor?: number;
 }
 
-/** Diagnostics returned alongside the filled `out` buffer. */
+/** Diagnostics returned alongside the filled `out` buffer. Pass a reused
+ *  instance as `predictiveExtrapolateInto`'s optional last argument (0.9.950)
+ *  to have it filled in place and returned — an allocation-free call. */
 export interface PredictiveExtrapolationResult {
   /** The horizon actually evaluated (= w · |dtReq|), ≤ |dtReq|. */
   readonly dtEffectiveSeconds: number;
@@ -209,6 +211,7 @@ export function predictiveExtrapolateInto(
   out: Float64Array,
   holdScratch: Float64Array,
   config?: PredictiveExtrapolationConfig,
+  result?: PredictiveExtrapolationResult,
 ): PredictiveExtrapolationResult;
 export function predictiveExtrapolateInto(
   flat: Float32Array,
@@ -218,6 +221,7 @@ export function predictiveExtrapolateInto(
   out: Float32Array,
   holdScratch: Float32Array,
   config?: PredictiveExtrapolationConfig,
+  result?: PredictiveExtrapolationResult,
 ): PredictiveExtrapolationResult;
 export function predictiveExtrapolateInto(
   flat: Float64Array | Float32Array,
@@ -227,6 +231,7 @@ export function predictiveExtrapolateInto(
   out: Float64Array | Float32Array,
   holdScratch: Float64Array | Float32Array,
   config?: PredictiveExtrapolationConfig,
+  result?: PredictiveExtrapolationResult,
 ): PredictiveExtrapolationResult {
   const { order, sampleCount } = spec;
   if (!Number.isFinite(dtReqSeconds)) {
@@ -335,6 +340,15 @@ export function predictiveExtrapolateInto(
   // value-uncertainty proxy is 0 (no velocity to propagate). `out` is already
   // correct from evaluateTrajectoryInto.
 
+  if (result !== undefined) {
+    // Allocation-free path (0.9.950): fill the caller's reused object.
+    const r = result as Mutable<PredictiveExtrapolationResult>;
+    r.dtEffectiveSeconds = dtEff;
+    r.confidenceWeight = w;
+    r.valueUncertainty = valueUncertainty;
+    r.clamped = dtEff < dtReqAbs;
+    return result;
+  }
   return {
     dtEffectiveSeconds: dtEff,
     confidenceWeight: w,
@@ -342,3 +356,5 @@ export function predictiveExtrapolateInto(
     clamped: dtEff < dtReqAbs,
   };
 }
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };

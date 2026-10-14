@@ -1102,8 +1102,8 @@ function planWasmDecoder
   (input: EmitWasmDecoderInput, opts?: EmitWasmDecoderOptions) => WasmDecoderPlan
 
 function predictiveExtrapolateInto
-  (flat: Float64Array<ArrayBufferLike>, spec: TrajectorySpec, dtReqSeconds: number, pll: PllUncertainty, out: Float64Array<ArrayBufferLike>, holdScratch: Float64Array<ArrayBufferLike>, config?: PredictiveExtrapolationConfig | undefined) => PredictiveExtrapolationResult
-  (flat: Float32Array<ArrayBufferLike>, spec: TrajectorySpec, dtReqSeconds: number, pll: PllUncertainty, out: Float32Array<ArrayBufferLike>, holdScratch: Float32Array<ArrayBufferLike>, config?: PredictiveExtrapolationConfig | undefined) => PredictiveExtrapolationResult
+  (flat: Float64Array<ArrayBufferLike>, spec: TrajectorySpec, dtReqSeconds: number, pll: PllUncertainty, out: Float64Array<ArrayBufferLike>, holdScratch: Float64Array<ArrayBufferLike>, config?: PredictiveExtrapolationConfig | undefined, result?: PredictiveExtrapolationResult | undefined) => PredictiveExtrapolationResult
+  (flat: Float32Array<ArrayBufferLike>, spec: TrajectorySpec, dtReqSeconds: number, pll: PllUncertainty, out: Float32Array<ArrayBufferLike>, holdScratch: Float32Array<ArrayBufferLike>, config?: PredictiveExtrapolationConfig | undefined, result?: PredictiveExtrapolationResult | undefined) => PredictiveExtrapolationResult
 
 function shortestArcDelta
   (a: number, b: number, period?: number) => number
@@ -1166,10 +1166,10 @@ class BridgeImpl<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
   pull(out: FrameFor<S>) => boolean
   pullEvaluatedLatest(out: FrameFor<S>, baseConsumerNs: number, sampleRate?: number | undefined, opts?: { timestamp?: TimestampRoleOf<S> | undefined; } | undefined) => number
   pullHermiteLatest(out: FrameFor<S>, baseConsumerNs: number, sampleRate?: number | undefined, opts?: { timestamp?: TimestampRoleOf<S> | undefined; } | undefined) => number
-  pullKalmanPredictedLatest(out: FrameFor<S>, opts?: KalmanPredictedPullOptions<S> | undefined) => KalmanPredictedPullResult
+  pullKalmanPredictedLatest(out: FrameFor<S>, opts?: KalmanPredictedPullOptions<S> | undefined, result?: KalmanPredictedPullResult | undefined) => KalmanPredictedPullResult
   pullLatest(out: FrameFor<S>) => number
   pullLatestSmoothed(out: FrameFor<S>, alphaBase: number, opts?: SmoothedPullOptions | undefined) => number
-  pullPredictedLatest(out: FrameFor<S>, opts?: PredictedPullOptions<S> | undefined) => PredictedPullResult
+  pullPredictedLatest(out: FrameFor<S>, opts?: PredictedPullOptions<S> | undefined, result?: PredictedPullResult | undefined) => PredictedPullResult
   pullSmoothed(out: FrameFor<S>, alphaBase: number, _opts?: SmoothedPullOptions | undefined) => boolean
   push(view: FrameFor<S>) => boolean
   pushChecked(view: FrameFor<S>) => boolean

@@ -29,6 +29,7 @@ import type {
 import {
   predictiveExtrapolateInto,
   type PllUncertainty,
+  type PredictiveExtrapolationResult,
 } from "./predictiveExtrapolation.js";
 import { StatePredictor, type StatePredictorModel } from "./StatePredictor.js";
 import { newHeapTypedArray } from "./_heap.js";
@@ -274,8 +275,33 @@ interface BridgeKalmanWasmPlan {
   varr: Float32Array;
 }
 
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 export class BridgePrediction<S extends Schema<FieldsObject, any>> {
   private readonly schema: S;
+
+  /** Per-call scratch reused by `pullPredictedLatest` so the hot path
+   *  allocates nothing (0.9.950): the PLL uncertainty snapshot, the horizon
+   *  config, and the per-field extrapolation result were three fresh objects
+   *  per call (plus one per trajectory field). */
+  private readonly _pllSnap: Mutable<PllUncertainty> = {
+    sigmaEstimateNs: 0,
+    driftPpm: 0,
+    driftEstimatorEnabled: false,
+    locked: false,
+  };
+  private readonly _predConfig: {
+    maxHorizonSeconds: number;
+    trustedHorizonSeconds: number;
+    sigmaFloorNs: number | undefined;
+    confidenceFloor: number | undefined;
+  } = { maxHorizonSeconds: 0, trustedHorizonSeconds: 0, sigmaFloorNs: undefined, confidenceFloor: undefined };
+  private readonly _fieldResult: Mutable<PredictiveExtrapolationResult> = {
+    dtEffectiveSeconds: 0,
+    confidenceWeight: 0,
+    valueUncertainty: 0,
+    clamped: false,
+  };
 
   /** Per-trajectory-field hold scratch for `pullPredictedLatest` (0.9.71).
    *  Lazily allocated on first predicted pull; one buffer per trajectory
@@ -382,6 +408,7 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
   pullPredictedLatest(
     out: FrameFor<S>,
     opts?: PredictedPullOptions<S>,
+    result?: PredictedPullResult,
   ): PredictedPullResult {
     const leadMsRaw = opts?.leadMs ?? 0;
     const maxLeadMs = opts?.maxLeadMs ?? DEFAULT_MAX_LEAD_MS;
@@ -435,29 +462,22 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
       this.ev.valid = true;
     } else if (!this.ev.valid) {
       // Ring empty and nothing cached — nothing to predict from.
-      return {
-        skipped: -1,
-        predicted: false,
-        confidenceWeight: 0,
-        dtEffectiveSeconds: 0,
-        leadSecondsRequested: leadSeconds,
-        valueUncertainty: 0,
-      };
+      return fillPredicted(result, -1, false, 0, 0, leadSeconds, 0);
     }
 
-    // Build the decoupled PLL uncertainty snapshot once (shared across fields).
-    const pllSnap: PllUncertainty = {
-      sigmaEstimateNs: this.host.pll.sigmaEstimateNs,
-      driftPpm: this.host.pll.driftPpm,
-      driftEstimatorEnabled: this.host.pll.driftEstimatorEnabled,
-      locked: this.host.pll.locked,
-    };
-    const config = {
-      maxHorizonSeconds: maxLeadMs * 1e-3,
-      trustedHorizonSeconds: (opts?.trustedLeadMs ?? 0) * 1e-3,
-      sigmaFloorNs: opts?.sigmaFloorNs,
-      confidenceFloor: opts?.confidenceFloor,
-    };
+    // Refresh the decoupled PLL uncertainty snapshot once (shared across
+    // fields). Reused object — allocation-free (0.9.950).
+    const pllSnap = this._pllSnap;
+    pllSnap.sigmaEstimateNs = this.host.pll.sigmaEstimateNs;
+    pllSnap.driftPpm = this.host.pll.driftPpm;
+    pllSnap.driftEstimatorEnabled = this.host.pll.driftEstimatorEnabled;
+    pllSnap.locked = this.host.pll.locked;
+    const config = this._predConfig;
+    config.maxHorizonSeconds = maxLeadMs * 1e-3;
+    config.trustedHorizonSeconds = (opts?.trustedLeadMs ?? 0) * 1e-3;
+    config.sigmaFloorNs = opts?.sigmaFloorNs;
+    config.confidenceFloor = opts?.confidenceFloor;
+    const fieldResult = this._fieldResult;
 
     if (this._predictHoldScratch === null) {
       this._predictHoldScratch = this._buildPredictHoldScratch();
@@ -489,6 +509,7 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
                 dst[name] as Float32Array,
                 holdScratch[name] as Float32Array,
                 config,
+                fieldResult,
               )
             : predictiveExtrapolateInto(
                 src[name] as Float64Array,
@@ -498,6 +519,7 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
                 dst[name] as Float64Array,
                 holdScratch[name] as Float64Array,
                 config,
+                fieldResult,
               );
         confidenceWeight = r.confidenceWeight;
         dtEffectiveSeconds = r.dtEffectiveSeconds;
@@ -513,20 +535,22 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
       }
     }
 
-    return {
+    return fillPredicted(
+      result,
       skipped,
-      predicted: dtEffectiveSeconds > 0,
+      dtEffectiveSeconds > 0,
       confidenceWeight,
       dtEffectiveSeconds,
-      leadSecondsRequested: leadSeconds,
+      leadSeconds,
       valueUncertainty,
-    };
+    );
   }
 
   /** Implementation of `Bridge.pullKalmanPredictedLatest` — see its JSDoc for the contract. */
   pullKalmanPredictedLatest(
     out: FrameFor<S>,
     opts?: KalmanPredictedPullOptions<S>,
+    result?: KalmanPredictedPullResult,
   ): KalmanPredictedPullResult {
     if (this.schema.timestamps === null) {
       throw new Error(
@@ -602,16 +626,7 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
       fresh = true;
     } else if (!this.ev.valid) {
       // Ring empty and nothing cached — nothing to predict from.
-      return {
-        skipped: -1,
-        predicted: false,
-        confidenceWeight: 0,
-        dtEffectiveSeconds: 0,
-        leadSecondsRequested: leadSeconds,
-        valueUncertainty: 0,
-        maxVariance: 0,
-        forwardDistanceSeconds: 0,
-      };
+      return fillKalman(result, -1, false, 0, 0, leadSeconds, 0, 0, 0);
     }
 
     // Horizon confidence taper (clock-independent; matches the Taylor curve).
@@ -798,16 +813,17 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
     }
 
     const dtEffectiveSeconds = headlineWeight * leadSeconds;
-    return {
+    return fillKalman(
+      result,
       skipped,
-      predicted: predictedAny && dtEffectiveSeconds > 0,
-      confidenceWeight: sawTrajectory ? headlineWeight : 0,
+      predictedAny && dtEffectiveSeconds > 0,
+      sawTrajectory ? headlineWeight : 0,
       dtEffectiveSeconds,
-      leadSecondsRequested: leadSeconds,
-      valueUncertainty: resultMaxVar > 0 ? Math.sqrt(resultMaxVar) : 0,
-      maxVariance: resultMaxVar,
-      forwardDistanceSeconds: (targetNs - this.ev.timestampNs) * 1e-9,
-    };
+      leadSeconds,
+      resultMaxVar > 0 ? Math.sqrt(resultMaxVar) : 0,
+      resultMaxVar,
+      (targetNs - this.ev.timestampNs) * 1e-9,
+    );
   }
 
   /** Build one `StatePredictor` + deinterleave/output scratch per trajectory
@@ -962,4 +978,57 @@ export class BridgePrediction<S extends Schema<FieldsObject, any>> {
     }
     return scratch;
   }
+}
+
+/** Fill (or, with no `into`, allocate) a `PredictedPullResult` (0.9.950). */
+function fillPredicted(
+  into: PredictedPullResult | undefined,
+  skipped: number,
+  predicted: boolean,
+  confidenceWeight: number,
+  dtEffectiveSeconds: number,
+  leadSecondsRequested: number,
+  valueUncertainty: number,
+): PredictedPullResult {
+  if (into === undefined) {
+    return { skipped, predicted, confidenceWeight, dtEffectiveSeconds, leadSecondsRequested, valueUncertainty };
+  }
+  const r = into as Mutable<PredictedPullResult>;
+  r.skipped = skipped;
+  r.predicted = predicted;
+  r.confidenceWeight = confidenceWeight;
+  r.dtEffectiveSeconds = dtEffectiveSeconds;
+  r.leadSecondsRequested = leadSecondsRequested;
+  r.valueUncertainty = valueUncertainty;
+  return into;
+}
+
+/** Fill (or, with no `into`, allocate) a `KalmanPredictedPullResult` (0.9.950). */
+function fillKalman(
+  into: KalmanPredictedPullResult | undefined,
+  skipped: number,
+  predicted: boolean,
+  confidenceWeight: number,
+  dtEffectiveSeconds: number,
+  leadSecondsRequested: number,
+  valueUncertainty: number,
+  maxVariance: number,
+  forwardDistanceSeconds: number,
+): KalmanPredictedPullResult {
+  if (into === undefined) {
+    return {
+      skipped, predicted, confidenceWeight, dtEffectiveSeconds, leadSecondsRequested,
+      valueUncertainty, maxVariance, forwardDistanceSeconds,
+    };
+  }
+  const r = into as Mutable<KalmanPredictedPullResult>;
+  r.skipped = skipped;
+  r.predicted = predicted;
+  r.confidenceWeight = confidenceWeight;
+  r.dtEffectiveSeconds = dtEffectiveSeconds;
+  r.leadSecondsRequested = leadSecondsRequested;
+  r.valueUncertainty = valueUncertainty;
+  r.maxVariance = maxVariance;
+  r.forwardDistanceSeconds = forwardDistanceSeconds;
+  return into;
 }

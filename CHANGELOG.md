@@ -4,6 +4,48 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.950] - 2026-10-14
+
+### Changed - per-call garbage removed from the audio-thread pull paths
+
+Measured with the new `npm run bench:alloc` (minor GCs over 400k calls after warm-up; Node 22; the plain-`pullLatest` harness floor is about 2–3):
+
+| path | before | after |
+|---|---|---|
+| `pullPredictedLatest` | ≈ 45 | ≈ 8 |
+| `pullKalmanPredictedLatest` (order-3 CA) | ≈ 50 | ≈ 8 |
+| `pull` on an invariant schema | ≈ 46 | ≈ 12 |
+
+- **Shared, allocation-free invariant classifier.** `classifyInvariant` in the new `src/_invariant.ts` replaces the two byte-identical `_classifyInvariant` copies in `Bridge` and `BridgeConsumer`. Each copy returned a fresh `{ kind, alpha }` object on every pull of an invariant schema. The new function returns a number: the `INVARIANT_CLASS_OK` (2) or `INVARIANT_CLASS_HARD` (−1) sentinel, or the soft α ∈ (0, 1]. `INVARIANT_OK_THRESHOLD` / `INVARIANT_SOFT_THRESHOLD` / `INVARIANT_SOFT_ALPHA_BASE` moved there too and are re-exported from `Bridge.ts` and the root unchanged.
+- **`FrameSmoother.seedFrom` / `fallbackInto`** (run on every OK-band invariant pull) now copy with indexed loops. The `for…of` loops allocated per call (29 → 0 GCs in isolation).
+- **`pullPredictedLatest`** reuses its PLL-uncertainty snapshot, horizon-config and per-field extrapolation-result objects instead of building three objects per call plus one per trajectory field.
+- **`StatePredictor.ingest`** (behind `pullKalmanPredictedLatest`) no longer passes doubles into its non-inlined per-lane helpers. `dt` and the diagonal R are read from typed storage, and the measurement from its array. V8 had been boxing about 7 HeapNumbers per lane per ingest for the CA model (56 → 6 GCs in isolation). The arithmetic and evaluation order are unchanged; the bit-exact StatePredictor WASM-equivalence pins pass. Side effect: the `npm run bench` `pullKalmanPredict` cell (16-lane, order-3 CA) dropped from a ≈ 4.3 µs to a ≈ 3.2 µs median.
+
+### Added
+
+- Optional caller-owned result objects, filled in place and returned, for a fully allocation-free call:
+  - `Bridge.pullPredictedLatest(out, opts?, result?)`
+  - `Bridge.pullKalmanPredictedLatest(out, opts?, result?)`
+  - `predictiveExtrapolateInto(..., config?, result?)`
+
+  Without the argument, each call returns a fresh object, exactly as before.
+- `npm run bench:alloc` (`bench/allocation.bench.ts`) is the GC-count probe used for the table above.
+- Guidance: README §Use (audio-thread allocation), `u64()` / `i64()` JSDoc, QUICKSTART. `u64`/`i64` scalars decode to a new `BigInt` on every read, so keep them off per-quantum worklet paths. The README's main example now uses `u32()` for `seq`.
+
+### Not changed (by design)
+
+- `BridgeBlockConsumer.process*` still throws on a channel-count or `count` misuse. These are deterministic programmer errors that fire on the first call, and failing fast beats rendering wrong audio.
+- `telemetry()` still returns a fresh frozen snapshot (a documented allocating helper).
+- The residual GCs above the floor come from V8 boxing double arguments into large non-inlined helpers, a few 16-byte HeapNumbers per call.
+
+### Wire compatibility
+
+None. Public API is additive (optional trailing parameters). Behavior is bit-identical.
+
+### Tests
+
+- New `tests/Bridge.allocationFree.test.ts` (5 pins): the out-param variants of `pullPredictedLatest` / `pullKalmanPredictedLatest` / `predictiveExtrapolateInto` fill and return the caller's object, bit-identical to the allocating call on a twin Bridge over 40 frames (results and `out` payloads). `classifyInvariant` matches the pre-0.9.950 object-returning classifier over an edge-case grid (±0, subnormals, ±Infinity, NaN, `stored = 0`, eps floors) plus 20k random inputs. `readPublishedPllState(out)` returns `out`.
+
 ## [0.9.949] - 2026-10-14
 
 ### Changed - frontier work moved out of `Bridge.ts` (no public-API change)

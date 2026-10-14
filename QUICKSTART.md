@@ -20,7 +20,7 @@ import { defineSchema, u64, f64, f64Array, Bridge } from "webgpu-audio-bridge";
 
 // Schema = byte layout of one frame. Mix bigint scalars, number scalars, typed arrays.
 const Frame = defineSchema({
-  seq:  u64(),           // bigint
+  seq:  u64(),           // bigint (allocates a BigInt per read — fine here; prefer u32/f64 in worklet-read schemas)
   tMs:  f64(),           // number
   body: f64Array(8),     // Float64Array(8)
 });

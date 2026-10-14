@@ -35,7 +35,7 @@
  *     - α-smoother dispatch (`pullSmoothed` / `pullLatestSmoothed`,
  *       `resetSmoother`) and the named skip policies. The blend itself
  *       lives on the composed `FrameSmoother` (0.6.9).
- *     - Schema-invariant classifier (`_classifyInvariant` + epsilon floor).
+ *     - Schema-invariant classifier (`classifyInvariant` in `./_invariant.ts` + epsilon floor).
  *     - PLL dispatch (`observeConsumerTime`, `phaseLockedTime`,
  *       `resetPll`). The PI loop + offset state live on the composed
  *       `ConsumerClockRecovery` (0.6.9).

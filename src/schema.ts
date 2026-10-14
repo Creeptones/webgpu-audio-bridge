@@ -372,7 +372,12 @@ function scalar<T>(kind: FieldKind): FieldSpec<T> {
   return Object.freeze({ kind, byteSize: kindByteSize(kind) }) as FieldSpec<T>;
 }
 
+/** Unsigned 64-bit scalar, read as `bigint`. Decoding creates a new `BigInt`
+ *  on every pull — avoid on per-quantum AudioWorklet read paths (prefer
+ *  `u32` / `f64`, e.g. an `f64` timestamp in ms or ns). */
 export const u64 = (): FieldSpec<bigint> => scalar<bigint>("u64");
+/** Signed 64-bit scalar, read as `bigint`. Decoding creates a new `BigInt` on
+ *  every pull — avoid on per-quantum AudioWorklet read paths. */
 export const i64 = (): FieldSpec<bigint> => scalar<bigint>("i64");
 export const f64 = (): FieldSpec<number> => scalar<number>("f64");
 export const u32 = (): FieldSpec<number> => scalar<number>("u32");

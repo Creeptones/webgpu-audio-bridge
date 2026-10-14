@@ -39,7 +39,7 @@
  *
  *   - The pull-family methods (`pull`, `pullLatest`, `pullSmoothed`,
  *     `pullLatestSmoothed`) and named skip-policy resolution.
- *   - Schema-invariant classifier (`_classifyInvariant` + epsilon floor)
+ *   - Schema-invariant classifier (`classifyInvariant` in `./_invariant.ts` + epsilon floor)
  *     and the raw / smoothed invariant handlers (which dispatch onto
  *     FrameSmoother).
  *   - PLL dispatch (`observeConsumerTime`, `phaseLockedTime`, `resetPll`).
@@ -265,6 +265,14 @@ import {
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
 import { buildScratchFrame } from "./_heap.js";
+import {
+  INVARIANT_OK_THRESHOLD,
+  INVARIANT_SOFT_THRESHOLD,
+  INVARIANT_SOFT_ALPHA_BASE,
+  INVARIANT_CLASS_OK,
+  INVARIANT_CLASS_HARD,
+  classifyInvariant,
+} from "./_invariant.js";
 import { BridgeEvaluation, type BridgeReadHost } from "./BridgeEvaluation.js";
 import {
   BridgePrediction,
@@ -295,9 +303,12 @@ export type BridgeAllocation<S extends Schema<FieldsObject, any>> = SpscBridgeAl
 // state. `BridgeConsumer` imports the named exports below; previously the
 // same trio was duplicated module-private in `BridgeConsumer.ts`, which
 // was a silent-drift hazard.
-export const INVARIANT_OK_THRESHOLD = 1e-3;
-export const INVARIANT_SOFT_THRESHOLD = 1.0;
-export const INVARIANT_SOFT_ALPHA_BASE = 0.1; // α ≈ INVARIANT_SOFT_ALPHA_BASE / |ratio−1|
+// (0.9.950: defined in ./_invariant.ts next to the shared classifier.)
+export {
+  INVARIANT_OK_THRESHOLD,
+  INVARIANT_SOFT_THRESHOLD,
+  INVARIANT_SOFT_ALPHA_BASE,
+} from "./_invariant.js";
 
 // PLL controller gains + anti-windup constants now live on
 // `ConsumerClockRecovery` (see `./ConsumerClockRecovery.ts`). Bridge holds
@@ -543,7 +554,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *  predicted pulls (0.9.949 extract). See `./BridgePrediction.ts`. */
   private readonly prediction: BridgePrediction<S>;
 
-  /** Lower floor on the classifier's OK band — `_classifyInvariant` uses
+  /** Lower floor on the classifier's OK band — `classifyInvariant` uses
    *  `max(invariantAbsoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`. Set
    *  from `schema.invariant.absoluteEpsilon` at construction (defaulting to
    *  `DEFAULT_INVARIANT_ABSOLUTE_EPSILON` for no-invariant schemas, where it
@@ -1214,6 +1225,11 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * `sampleCount`). Returns a `PredictedPullResult` with the applied weight +
    * effective horizon for observability.
    *
+   * Allocation (0.9.950): the predict path itself allocates nothing per call.
+   * Pass a reused `result` object as the third argument to have it filled in
+   * place and returned — a fully allocation-free call for an AudioWorklet
+   * `process()` loop; without it, one result object is allocated per call.
+   *
    * **Frontier API** — listed under `frontierMembers` in
    * docs/stable-api-manifest.json: shipped on the root for 0.9.x but OUTSIDE
    * the 1.0 stability contract until deliberately promoted (or moved behind
@@ -1224,8 +1240,9 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   pullPredictedLatest(
     out: FrameFor<S>,
     opts?: PredictedPullOptions<S>,
+    result?: PredictedPullResult,
   ): PredictedPullResult {
-    return this.prediction.pullPredictedLatest(out, opts);
+    return this.prediction.pullPredictedLatest(out, opts, result);
   }
 
   /**
@@ -1260,6 +1277,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * known state. Non-trajectory fields pass through from the cached frame verbatim.
    *
    * `out` must be a `scratchEvaluatedFrame()`. Returns a `KalmanPredictedPullResult`.
+   * Pass a reused `result` object as the third argument for an
+   * allocation-free call (0.9.950; filled in place and returned).
    * Use only for **smooth** macro fields, never discontinuous events.
    *
    * **Frontier API** — listed under `frontierMembers` in
@@ -1272,63 +1291,11 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   pullKalmanPredictedLatest(
     out: FrameFor<S>,
     opts?: KalmanPredictedPullOptions<S>,
+    result?: KalmanPredictedPullResult,
   ): KalmanPredictedPullResult {
-    return this.prediction.pullKalmanPredictedLatest(out, opts);
+    return this.prediction.pullKalmanPredictedLatest(out, opts, result);
   }
 
-
-  /**
-   * Classify a stored vs computed invariant ratio into ok / soft / hard +
-   * the soft-recovery α.
-   *
-   * The OK band is `max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`
-   * compared against `|computed − stored|` (0.6.6). For non-trivial `stored`
-   * the relative term dominates and behavior is bit-identical to 0.6.5's
-   * pure-ratio check; the absolute floor only matters when `stored` is
-   * subnormal-tiny or exactly zero.
-   *
-   *   ok:    |computed − stored| < max(absoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)
-   *   soft:  delta < INVARIANT_SOFT_THRESHOLD   (relative; only when stored ≠ 0)
-   *   hard:  otherwise, or NaN/Infinity on either side
-   *
-   * For soft, α = clamp(INVARIANT_SOFT_ALPHA_BASE / delta, 0, 1) — small
-   * deviations get α≈1 (trust curr); deviations near the hard boundary get
-   * α near INVARIANT_SOFT_ALPHA_BASE (trust prev). See file header "Schema
-   * invariants" for the curve rationale.
-   */
-  private _classifyInvariant(
-    computed: number,
-    stored: number,
-  ): { kind: "ok" | "soft" | "hard"; alpha: number } {
-    if (!Number.isFinite(computed) || !Number.isFinite(stored)) {
-      return { kind: "hard", alpha: 0 };
-    }
-    const absErr = Math.abs(computed - stored);
-    // Bit-identical pre-0.6.6 short-circuit: exact equality is always OK,
-    // even under absoluteEpsilon = 0 (which would otherwise collapse the OK
-    // band to a half-open zero-width interval and miss the 0/0 case).
-    if (absErr === 0) return { kind: "ok", alpha: 1 };
-    const eps = this.invariantAbsoluteEpsilon;
-    const absStored = Math.abs(stored);
-    const okBand = eps > INVARIANT_OK_THRESHOLD * absStored
-      ? eps
-      : INVARIANT_OK_THRESHOLD * absStored;
-    if (absErr < okBand) return { kind: "ok", alpha: 1 };
-    if (stored === 0) {
-      // OK band failed and stored is zero — relative-ratio classifier
-      // undefined, so anything outside the absolute floor is hard.
-      return { kind: "hard", alpha: 0 };
-    }
-    const delta = absErr / absStored;
-    if (delta < INVARIANT_SOFT_THRESHOLD) {
-      const alpha = Math.min(
-        1,
-        Math.max(0, INVARIANT_SOFT_ALPHA_BASE / delta),
-      );
-      return { kind: "soft", alpha };
-    }
-    return { kind: "hard", alpha: 0 };
-  }
 
   /**
    * Invariant handler for raw pulls (`pull` / `pullLatest`) under an
@@ -1344,16 +1311,17 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     const inv = this.schema.invariant;
     if (inv === null) return; // defensive — caller already checked.
     const computed = inv.compute(out);
-    const { kind, alpha } = this._classifyInvariant(computed, invariantStored);
-    if (kind === "ok") {
+    // Allocation-free (0.9.950): OK / HARD sentinels, else the soft α.
+    const cls = classifyInvariant(computed, invariantStored, this.invariantAbsoluteEpsilon);
+    if (cls === INVARIANT_CLASS_OK) {
       this.smoother.seedFrom(out);
-    } else if (kind === "soft") {
+    } else if (cls !== INVARIANT_CLASS_HARD) {
       // 0.7.3: count the soft branch. The smoother absorbs the
       // within-threshold deviation; the counter lets a Bridge
       // Inspector visualise "ride-over" events distinctly from
       // hard fallbacks (tornFrames).
       this._softFrames = (this._softFrames + 1) | 0;
-      this.smoother.observe(out, alpha);
+      this.smoother.observe(out, cls);
     } else {
       // hard
       this.ring.incrementTornFrameCount();
@@ -1384,8 +1352,8 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       return;
     }
     const computed = this.schema.invariant.compute(out);
-    const { kind } = this._classifyInvariant(computed, invariantStored);
-    if (kind === "hard") {
+    const cls = classifyInvariant(computed, invariantStored, this.invariantAbsoluteEpsilon);
+    if (cls === INVARIANT_CLASS_HARD) {
       this.ring.incrementTornFrameCount();
       // If prev is valid, replace `out` with the last-known-good frame.
       // If not, pass through unchanged. Either way, don't seed prev with
@@ -1393,7 +1361,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
       this.smoother.fallbackInto(out);
       return;
     }
-    if (kind === "soft") {
+    if (cls !== INVARIANT_CLASS_OK) {
       // 0.7.3: count the soft branch on the smoothed path too, so the
       // counter is unified across pull / pullLatest / pullSmoothed /
       // pullLatestSmoothed. The smoother itself runs at the user's
