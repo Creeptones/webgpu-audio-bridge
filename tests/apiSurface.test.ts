@@ -12,7 +12,9 @@
  *   2. members of a NON-exported class behind an exported alias are captured;
  *   3. private / protected members are excluded, public readonly props kept;
  *   4. @deprecated members/exports are marked;
- *   5. the real root snapshot covers `Bridge`'s instance methods.
+ *   5. the real root snapshot covers `Bridge`'s instance methods;
+ *   6. (0.9.949) types used only INSIDE method/constructor bodies are not
+ *      pulled into the surface (the 0.9.948 walker descended into bodies).
  */
 
 import { assert, ok } from "./_assert.js";
@@ -49,5 +51,9 @@ for (const m of ["pullLatest", "pullHermiteLatest", "readPublishedPllState", "te
   assert(new RegExp(`^class BridgeImpl<[^\\n]*\\n(?:  [^\\n]*\\n)*  ${m}\\(`, "m").test(root.text), `root snapshot lists BridgeImpl.${m}`);
 }
 ok("5 root snapshot covers Bridge's instance methods (via BridgeImpl)");
+
+assert(!/BodyOnly/.test(v1.text), "a type used only inside a method body is not public surface");
+assert(!/BridgeReadHost|BridgeEvaluation \(internal|BridgePrediction \(internal/.test(root.text), "Bridge's private engines are not in the root snapshot");
+ok("6 method/constructor bodies are not walked (no private-body types in the surface)");
 
 console.log("\nAll apiSurface pins passed.");

@@ -169,7 +169,7 @@ class BridgeInputLane<S extends Schema<FieldsObject, any>>
 interface BridgeOptions
   readonly blockTimeoutMs?: number | undefined
   readonly flowController?: boolean | undefined
-  readonly kalmanWasm?: { readonly consumer: WorkletConsumer; readonly scratchBuffer: SharedArrayBuffer; readonly scratchByteOffset?: number | undefined; readonly scratchByteLength?: number | undefined; } | undefined
+  readonly kalmanWasm?: BridgeKalmanWasmOptions | undefined
   readonly notify?: 'always' | 'waiter-flag' | undefined
   readonly policy?: BackpressurePolicy | undefined
   readonly publishPllToSab?: boolean | undefined
@@ -1136,8 +1136,6 @@ interface AdaptiveFlowControllerOptions (internal, src/AdaptiveFlowController.ts
   readonly maxScale?: number | undefined
   readonly minScale?: number | undefined
 
-type AnyTypedArray (internal, src/SpscRing.ts) = Float64Array | Float32Array | Uint32Array | Int32Array | Uint16Array | Int16Array | Uint8Array | Int8Array | BigInt64Array | BigUint64Array
-
 interface BridgeAllocation<S extends Schema<FieldsObject, any>> (internal, src/SpscRing.ts)
   capacity: number
   sab: SharedArrayBuffer
@@ -1192,28 +1190,18 @@ class BridgeImpl<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
   waitForData(timeoutMs?: number | undefined) => 'ok' | 'not-equal' | 'timed-out'
   waitForSpace(timeoutMs?: number | undefined) => 'ok' | 'not-equal' | 'timed-out'
 
+interface BridgeKalmanWasmOptions (internal, src/BridgePrediction.ts)
+  readonly consumer: WorkletConsumer
+  readonly scratchBuffer: SharedArrayBuffer
+  readonly scratchByteLength?: number | undefined
+  readonly scratchByteOffset?: number | undefined
+
 type CrossfadeContinuity (internal, src/crossfade.ts) = "cubic" | "quintic" | "septic"
 
 type CrossfadeMode (internal, src/crossfade.ts) = "amplitude" | "equal-power"
 
 interface CrossfadeOptions (internal, src/crossfade.ts)
   mode?: CrossfadeMode | undefined
-
-interface FeatureFlags (internal, src/environment.ts)
-  readonly atomics: boolean
-  readonly atomicsWaitAsync: boolean
-  readonly audioContext: boolean
-  readonly audioWorklet: boolean
-  readonly crossOriginIsolated: boolean
-  readonly mlTensor: boolean
-  readonly renderSizeHint: boolean
-  readonly secureContext: boolean
-  readonly sharedArrayBuffer: boolean
-  readonly userActivation: boolean
-  readonly webMidi: boolean
-  readonly webgpu: boolean
-  readonly webgpuZeroCopy: boolean
-  readonly webnn: boolean
 
 type FrameRecord (internal, src/FrameSmoother.ts) = Record<string, unknown>
 
@@ -1279,13 +1267,6 @@ interface MigrateRampInField (internal, src/migratePlan.ts)
   readonly reason: 'incompatible' | 'added'
   readonly to: string
   readonly trajectory?: TrajectorySpec | undefined
-
-interface RingPair (internal, src/connect.ts)
-  readonly local: ConnectRingHandle
-  readonly peer: ConnectRingHandle
-  readonly transfer: Transferable[]
-
-type ScalarOp (internal, src/SpscRing.ts) = (slot: number, frame: Record<string, unknown>) => void
 
 interface SchemaInvariantSpec (internal, src/schema.ts)
   readonly absoluteEpsilon: number

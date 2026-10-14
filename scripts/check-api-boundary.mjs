@@ -109,6 +109,23 @@ for (const name of buckets.deprecatedShims ?? []) {
     fail(`deprecatedShims entry '${name}' must be a @deprecated export in src/_deprecatedRootShims.ts`);
   }
 }
+// frontierMembers: "Owner.member" entries must exist in the member-level root
+// snapshot (a renamed/removed frontier member must update the manifest).
+const rootText = apiSurface("src/index.ts", ENTRIES).text;
+const blocksByOwner = new Map();
+for (const block of rootText.split("\n\n")) {
+  const head = block.split("\n")[0];
+  const m = /^(?:class|interface) (\w+)/.exec(head);
+  if (m) blocksByOwner.set(m[1], block);
+}
+for (const entry of stableManifest.frontierMembers ?? []) {
+  const [owner, member] = entry.split(".");
+  const block = blocksByOwner.get(owner);
+  if (!block || !new RegExp(`^  (readonly )?${member}[?(:]`, "m").test(block)) {
+    fail(`frontierMembers entry '${entry}' not found in the member-level root surface`);
+  }
+}
+
 const workletNames = apiSurface("src/worklet/index.ts", ENTRIES).names;
 const workletListed = new Set(stableManifest.workletExports ?? []);
 for (const name of workletNames) if (!workletListed.has(name)) fail(`worklet export '${name}' missing from manifest workletExports`);

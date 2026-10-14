@@ -251,7 +251,6 @@ import {
   type Schema,
   type SchemaLayoutDescription,
   type TimestampRoleOf,
-  type TimestampUnit,
 } from "./schema.js";
 import {
   RING_HEADER_BYTES as SPSC_RING_HEADER_BYTES,
@@ -265,19 +264,16 @@ import {
 } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
+import { buildScratchFrame } from "./_heap.js";
+import { BridgeEvaluation, type BridgeReadHost } from "./BridgeEvaluation.js";
 import {
-  evaluateTrajectoryInto,
-  evaluateHermiteTrajectoryInto,
-  evaluateQuinticHermiteTrajectoryInto,
-  evaluateSepticHermiteTrajectoryInto,
-} from "./trajectory.js";
-import {
-  predictiveExtrapolateInto,
-  type PllUncertainty,
-} from "./predictiveExtrapolation.js";
-import { StatePredictor, type StatePredictorModel } from "./StatePredictor.js";
-import { newHeapTypedArray, buildScratchFrame } from "./_heap.js";
-import type { WorkletConsumer } from "./worklet/index.js";
+  BridgePrediction,
+  type BridgeKalmanWasmOptions,
+  type PredictedPullOptions,
+  type PredictedPullResult,
+  type KalmanPredictedPullOptions,
+  type KalmanPredictedPullResult,
+} from "./BridgePrediction.js";
 
 // Re-export the header constants from SpscRing so existing callers (and
 // tests) that import them from "./Bridge.js" continue to compile. The
@@ -332,214 +328,20 @@ export interface SmoothedPullOptions {
   readonly skipPolicy?: SmootherSkipPolicy;
 }
 
-/** Default ceiling (ms) on the forward lead `pullPredictedLatest` will apply
- *  when `opts.maxLeadMs` is omitted. Matches `predictiveExtrapolation`'s
- *  20 ms default max horizon. (0.9.71) */
-export const DEFAULT_MAX_LEAD_MS = 20;
-
-/** Number of recent readback-latency samples retained for the
- *  `lastReadbackMedianMs()` rolling median. Odd so the median is a single
- *  middle element (no averaging). ~0.5 s of history at a 60 Hz frame
- *  cadence. Heap-side, per-instance. (0.9.71) */
-const READBACK_SAMPLE_WINDOW = 31;
-
-/**
- * Options for `pullPredictedLatest` (0.9.71 — first-class "negative latency"
- * mode). All fields optional; the defaults degrade to a plain `pullLatest`
- * (zero lead ⇒ the freshest frame's stamped state, no forward extrapolation).
- *
- * Use predicted pulls ONLY for smooth macro fields — envelopes, positions,
- * spectra, IR-morph values, physical surfaces — where a confidence-bounded
- * forward step beats rendering a stale frame. Do NOT use it for discontinuous
- * events (note-on, transport jumps, mutes, hard resets): forward-extrapolating
- * a step injects a pre-echo. Those belong on the `BridgeInputLane` fast lane.
- */
-export interface PredictedPullOptions<S extends Schema<FieldsObject, any>> {
-  /** Forward lead in **milliseconds** — how far past the freshest frame's
-   *  stamped state to render each trajectory field. Clamped to `[0, maxLeadMs]`.
-   *  Default `0` (≡ `pullLatest`). Source a sensible value from
-   *  `lastReadbackMedianMs()` so the audio side renders where the macro state
-   *  is *expected to be* once the block is heard, not where the last GPU
-   *  readback left it. */
-  readonly leadMs?: number;
-  /** Hard ceiling (ms) on the lead AND on the predictive horizon taper.
-   *  Default `DEFAULT_MAX_LEAD_MS` (20). A lead at/above this fades fully to
-   *  the hold (no extrapolation past the ceiling). */
-  readonly maxLeadMs?: number;
-  /** Confidence floor in `[0, 1]`. If the computed confidence weight
-   *  `w = c_sigma·c_horizon` is below this, prediction collapses to the pure
-   *  hold for that frame (a hard cliff, not a rescale). Default `0` (no gate).
-   *  Raise it to keep a marginally-locked PLL from leading the signal. */
-  readonly confidenceFloor?: number;
-  /** Forward distance (ms) below which prediction is fully trusted
-   *  (`c_horizon = 1`). Maps to `trustedHorizonSeconds`. Default `0` (every
-   *  forward step sits in the taper). */
-  readonly trustedLeadMs?: number;
-  /** sigma (ns) at/above which the clock is considered untrustworthy
-   *  (`c_sigma = 0`). Maps to `sigmaFloorNs`. Default `2_000_000` (2 ms) from
-   *  the predictive module. */
-  readonly sigmaFloorNs?: number;
-  /** Consumer wall-clock (ns) at the moment of this pull. When provided AND
-   *  the schema has `.withTimestamps(...)`, a fresh pull drives the PLL
-   *  (`observeConsumerTime`) — so a worklet can make `pullPredictedLatest` its
-   *  sole per-quantum call and keep the clock warm. Omit it if you warm the
-   *  PLL elsewhere (e.g. a prior `pullEvaluatedLatest`); prediction then uses
-   *  the PLL's current uncertainty snapshot as-is. */
-  readonly consumerNs?: number;
-  /** Sample rate (Hz) for resolving a `samples`-unit timestamp role on the
-   *  warm path. Falls back to `setSampleRate(rate)`. Unused for ns/us/ms/s
-   *  roles or when `consumerNs` is omitted. */
-  readonly sampleRate?: number;
-  /** Timestamp role to observe on the warm path. Defaults to the schema's
-   *  default role. Unused when `consumerNs` is omitted. */
-  readonly timestamp?: TimestampRoleOf<S>;
-}
-
-/** Diagnostics returned by `pullPredictedLatest` (0.9.71). A fresh small
- *  object per call, matching the `telemetry()` / `SpscPullResult` idiom. */
-export interface PredictedPullResult {
-  /** Frames skipped draining to the newest available frame (0 if a single
-   *  frame was waiting), or `-1` if the ring was empty AND no cached frame
-   *  exists yet (nothing predicted; `out` untouched). When the ring is empty
-   *  but a prior frame is cached, this is `-1`-was-empty but prediction still
-   *  runs off the cache; callers distinguish via `predicted`. */
-  readonly skipped: number;
-  /** True iff a forward step was actually applied (`dtEffectiveSeconds > 0`).
-   *  False when the lead was 0, the PLL was cold/below the floor, or the
-   *  schema has no trajectory fields — in all of which the output equals a
-   *  plain latest-frame hold. */
-  readonly predicted: boolean;
-  /** The confidence weight `w ∈ [0, 1]` applied to every trajectory field
-   *  (identical across fields — it depends only on the clock + horizon, not
-   *  on field values). 0 when cold / gated / no trajectory fields. */
-  readonly confidenceWeight: number;
-  /** The horizon actually evaluated (`= w · leadSeconds`), ≤ the requested
-   *  lead. */
-  readonly dtEffectiveSeconds: number;
-  /** The requested lead in seconds after clamping to `[0, maxLeadMs]`. */
-  readonly leadSecondsRequested: number;
-  /** Largest value-domain uncertainty proxy across the trajectory fields
-   *  (`max_i |v_i| · sigmaDt`). 0 when no order≥2 field was predicted. */
-  readonly valueUncertainty: number;
-}
-
-/** Default process-noise spectral density (`q`) for the per-field `StatePredictor`s
- *  built by `pullKalmanPredictedLatest` (0.9.902). A middling value tuned for the
- *  slow macro fields the predictor targets; raise it for faster-moving controls,
- *  lower it to smooth noisy stamps harder. */
-export const DEFAULT_KALMAN_PROCESS_NOISE = 1e3;
-/** Default position measurement-noise variance (`r_p`, value-units²). */
-export const DEFAULT_KALMAN_MEAS_POS_NOISE = 1e-4;
-/** Default initial covariance seed (`P0`); also the default `varianceFloor` (a
- *  freshly-seeded filter reports variance ≥ P0 ⇒ confidence 0 ⇒ hold, the
- *  cold-safety property). */
-export const DEFAULT_KALMAN_INITIAL_VARIANCE = 1e6;
-const DEFAULT_KALMAN_MEAS_VEL_NOISE = 1e-3;
-const DEFAULT_KALMAN_MEAS_ACC_NOISE = 1e-1;
-
-/**
- * Options for `pullKalmanPredictedLatest` (0.9.902 — history-aware classical
- * prediction, Apollo Frontier 2). The horizon/confidence knobs mirror
- * `PredictedPullOptions`; the `*Noise` / `initialVariance` knobs tune the
- * per-field `StatePredictor` filters and are read **once**, when the filters are
- * lazily constructed on the first call (later changes are ignored — construct a
- * fresh `Bridge` to retune). Requires `.withTimestamps(...)` (the predictor is
- * fundamentally time-based — it needs a producer timestamp per frame to compute
- * the inter-frame `dt`).
- *
- * Same audience as `pullPredictedLatest`: smooth macro fields only.
- */
-export interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>> {
-  /** Forward lead in **milliseconds** past the freshest frame's stamped time.
-   *  Clamped to `[0, maxLeadMs]`. Default `0` (≡ a latest-frame hold). */
-  readonly leadMs?: number;
-  /** Hard ceiling (ms) on the lead AND the horizon taper. Default
-   *  `DEFAULT_MAX_LEAD_MS` (20). A lead at/above this fades fully to the hold. */
-  readonly maxLeadMs?: number;
-  /** Forward distance (ms) below which the horizon is fully trusted
-   *  (`c_horizon = 1`). Default `0` (every step sits in the taper). */
-  readonly trustedLeadMs?: number;
-  /** Confidence floor in `[0, 1]`. If the field weight `w = c_horizon·c_variance`
-   *  is below this, prediction collapses to the pure hold for that frame (a hard
-   *  cliff). Default `0` (no gate). */
-  readonly confidenceFloor?: number;
-  /** Value-domain variance (units²) at/above which the predicted confidence is 0
-   *  (`c_variance = clamp01(1 − maxVar/varianceFloor)`). Default = the resolved
-   *  `initialVariance`, so a cold/under-observed filter (variance ≥ seed) holds
-   *  and prediction fades in as the filter's variance drops below its seed. */
-  readonly varianceFloor?: number;
-  /** Process-noise spectral density (`q`). Default `DEFAULT_KALMAN_PROCESS_NOISE`.
-   *  Read once at filter construction. */
-  readonly processNoise?: number;
-  /** Position measurement-noise variance (`r_p`). Default
-   *  `DEFAULT_KALMAN_MEAS_POS_NOISE`. Read once at filter construction. */
-  readonly measPosNoise?: number;
-  /** Stamped-velocity measurement-noise variance (`r_v`). Read once. */
-  readonly measVelNoise?: number;
-  /** Stamped-acceleration measurement-noise variance (`r_a`, CA only). Read once. */
-  readonly measAccNoise?: number;
-  /** Initial covariance seed (`P0`). Default `DEFAULT_KALMAN_INITIAL_VARIANCE`.
-   *  Read once at filter construction; also the default `varianceFloor`. */
-  readonly initialVariance?: number;
-  /** Consumer wall-clock (ns) at this pull. When provided AND the schema has
-   *  timestamps, a fresh pull warms the PLL (`observeConsumerTime`) so telemetry
-   *  stays live — the Kalman prediction itself does not depend on the PLL. */
-  readonly consumerNs?: number;
-  /** When true AND `consumerNs` is provided AND the PLL is locked, predict at the
-   *  PLL-mapped consumer time + lead (an ADVANCING target) rather than a fixed
-   *  lead off the freshest frame's stamp. During a producer famine the consumer
-   *  clock keeps advancing while the freshest frame's stamp is frozen, so the
-   *  forward horizon — and thus the Kalman covariance — grows, fading the
-   *  prediction to a hold as the stall lengthens (the predictor's headline
-   *  benefit). Default `false` (fixed lead, bit-exact with 0.9.902). Requires the
-   *  caller to pass the REAL consumer wall-clock each quantum (a fixed/stale
-   *  `consumerNs` produces no advance, so the feature is a correct no-op). The
-   *  growing covariance — not the requested-lead horizon taper — drives the fade:
-   *  `c_variance = clamp01(1 − maxVariance/varianceFloor)` falls as variance
-   *  grows ∝ q·dtᵏ (k=3 CV, 5 CA), so a lengthening stall reaches `w = 0` ⇒ an
-   *  exact hold. (0.9.905) */
-  readonly famineAwareHorizon?: boolean;
-  /** Sample rate (Hz) for a `samples`-unit timestamp role. Falls back to
-   *  `setSampleRate(rate)`. */
-  readonly sampleRate?: number;
-  /** Timestamp role to read the producer time from. Defaults to the schema's
-   *  default role. */
-  readonly timestamp?: TimestampRoleOf<S>;
-}
-
-/** Diagnostics returned by `pullKalmanPredictedLatest` (0.9.902). A fresh small
- *  object per call, matching the `PredictedPullResult` idiom. */
-export interface KalmanPredictedPullResult {
-  /** Frames skipped draining to the newest frame (0 if one was waiting), or `-1`
-   *  if the ring was empty AND nothing is cached (nothing predicted; `out`
-   *  untouched). Empty-but-cached still predicts off the cache (distinguish via
-   *  `predicted`). */
-  readonly skipped: number;
-  /** True iff a forward step was actually applied (`dtEffectiveSeconds > 0`).
-   *  False on a cold/under-observed filter, a gated/zero weight, a zero lead, or
-   *  a schema with no trajectory fields — all of which output a latest-frame hold. */
-  readonly predicted: boolean;
-  /** Conservative field confidence weight `w ∈ [0, 1]` (`c_horizon · clamp01(1 −
-   *  maxVariance/varianceFloor)`), the same weight blended per lane this call. */
-  readonly confidenceWeight: number;
-  /** Horizon actually evaluated (`= w · leadSeconds`), ≤ the requested lead. */
-  readonly dtEffectiveSeconds: number;
-  /** Requested lead in seconds after clamping to `[0, maxLeadMs]`. */
-  readonly leadSecondsRequested: number;
-  /** Largest predicted value-domain 1σ uncertainty across trajectory lanes
-   *  (`√maxVariance`), in value-units. 0 when no trajectory field was predicted. */
-  readonly valueUncertainty: number;
-  /** Largest predicted position variance across trajectory lanes (value-units²).
-   *  The first-principles confidence signal driving the fade. */
-  readonly maxVariance: number;
-  /** True forward distance from the freshest frame's stamp to the predict target,
-   *  in seconds (`(targetNs − cachedTimestampNs)·1e−9`). Equals `leadSecondsRequested`
-   *  in the default fixed-lead mode; under `famineAwareHorizon` it ALSO includes the
-   *  staleness the advancing consumer clock adds during a producer famine, so it
-   *  reflects the real horizon the covariance grew over (unlike `dtEffectiveSeconds`,
-   *  which is scaled by the requested lead only). 0 when nothing was predicted. (0.9.905) */
-  readonly forwardDistanceSeconds: number;
-}
+// The predicted-pull option/result types + DEFAULT_* constants moved to
+// ./BridgePrediction.ts at 0.9.949; re-exported here unchanged.
+export {
+  DEFAULT_MAX_LEAD_MS,
+  DEFAULT_KALMAN_PROCESS_NOISE,
+  DEFAULT_KALMAN_MEAS_POS_NOISE,
+  DEFAULT_KALMAN_INITIAL_VARIANCE,
+} from "./BridgePrediction.js";
+export type {
+  PredictedPullOptions,
+  PredictedPullResult,
+  KalmanPredictedPullOptions,
+  KalmanPredictedPullResult,
+} from "./BridgePrediction.js";
 
 /** Optional opts bag accepted by the `Bridge<S>` constructor (0.6.12).
  *  Forwards `policy` / `blockTimeoutMs` / `flowController` directly to the
@@ -556,36 +358,13 @@ export interface BridgeOptions extends SpscRingOptions {
    *  you've measured the cost mattering for your hot path. */
   readonly publishPllToSab?: boolean;
   /** Optional runtime for the f32x4 Wasm SIMD `pullKalmanPredictedLatest`
-   *  path. Omit to force JS-only behavior. */
-  readonly kalmanWasm?: {
-    /** Worklet consumer exports that include the required f32x4 Kalman symbols. */
-    readonly consumer: WorkletConsumer;
-    /** Shared scratch memory window used by per-field Wasm Kalman state. */
-    readonly scratchBuffer: SharedArrayBuffer;
-    /** Start offset in bytes of that scratch window. */
-    readonly scratchByteOffset?: number;
-    /** Window length in bytes. */
-    readonly scratchByteLength?: number;
-  };
+   *  path. Omit to force JS-only behavior.
+   *
+   *  @experimental Frontier option (`frontierMembers` in
+   *  docs/stable-api-manifest.json) — outside the 1.0 stability contract. */
+  readonly kalmanWasm?: BridgeKalmanWasmOptions;
 }
 
-interface BridgeKalmanWasmPlan {
-  model: StatePredictorModel;
-  sampleCount: number;
-  xOff: number;
-  pOff: number;
-  posOff: number;
-  velOff: number;
-  accOff: number;
-  predOff: number;
-  varOff: number;
-  vScratchOff: number;
-  pos: Float32Array;
-  vel: Float32Array;
-  acc: Float32Array | null;
-  pred: Float32Array;
-  varr: Float32Array;
-}
 
 /**
  * Snapshot shape returned by `Bridge<S>.telemetry()` and delivered to
@@ -757,75 +536,12 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *  `./ConsumerClockRecovery.ts`. */
   private readonly pll: ConsumerClockRecovery = new ConsumerClockRecovery();
 
-  /** Cached raw frame for `pullEvaluatedLatest` / `evaluateAtSampleOffset`.
-   *  Lazily allocated on first `pullEvaluatedLatest`. Persists across calls.
-   *  Independent of the FrameSmoother's prev buffer — that has its own
-   *  lifecycle for the α-smoother and invariant fallback. (0.6.5) */
-  private cachedRawFrame: FrameFor<S> | null = null;
-  /** True iff `cachedRawFrame` holds a valid pulled frame and the
-   *  cachedTimestampNs / cachedBaseConsumerNs / cachedSampleRate triple is
-   *  set. */
-  private cachedEvalValid: boolean = false;
-  /** Producer timestamp from the most recent successful `pullEvaluatedLatest`,
-   *  converted to nanoseconds via the active role's unit. */
-  private cachedTimestampNs: number = 0;
-  /** Consumer wall-clock (ns) at the start of the active quantum. */
-  private cachedBaseConsumerNs: number = 0;
-  /** Active sample rate for the current quantum's evaluations. */
-  private cachedSampleRate: number = 0;
-  /** Optional default sample rate registered via `setSampleRate(rate)`. */
-  private defaultSampleRate: number = 0;
-
-  /** Per-trajectory-field hold scratch for `pullPredictedLatest` (0.9.71).
-   *  Lazily allocated on first predicted pull; one buffer per trajectory
-   *  field, sized to its `sampleCount`, matching the field kind (f64/f32).
-   *  Reused across calls — the predictive hot loop allocates nothing. */
-  private _predictHoldScratch: Record<string, Float64Array | Float32Array> | null = null;
-
-  /** Per-trajectory-field `StatePredictor` filters for `pullKalmanPredictedLatest`
-   *  (0.9.902). Lazily built on the first call; one filter per trajectory field,
-   *  model `"ca"` for order ≥3 (stamped accel) else `"cv"`, laneCount =
-   *  `sampleCount`. The tuning (`processNoise` / `meas*Noise` / `initialVariance`)
-   *  is captured at construction from the first call's opts. Heap-only. */
-  private _kalmanPredictors: Map<string, StatePredictor> | null = null;
-  /** The resolved `initialVariance` used to build the filters above — also the
-   *  default `varianceFloor` for the confidence curve. */
-  private _kalmanInitialVariance: number = DEFAULT_KALMAN_INITIAL_VARIANCE;
-  /** Per-trajectory-field f64 scratch for `pullKalmanPredictedLatest`: deinterleaved
-   *  position/velocity/acceleration measurement lanes + the predicted-value and
-   *  predicted-variance output lanes, each sized to the field's `sampleCount`.
-   *  Reused across calls — the predicted hot loop allocates nothing. */
-  private _kalmanScratch: Record<
-    string,
-    { pos: Float64Array; vel: Float64Array; acc: Float64Array; pred: Float64Array; varr: Float64Array }
-  > | null = null;
-
-  /** Two-frame ping-pong cache for `pullHermiteLatest` (0.9.84). Hermite
-   *  reconstruction needs the PREVIOUS + CURRENT frame pair; the single
-   *  `cachedRawFrame` above is insufficient. `_hermiteA` / `_hermiteB` are the
-   *  two reusable scratch frames; `_hermiteCurr` points at whichever holds the
-   *  newest pulled frame and `_hermitePrev` at the one before it (null until a
-   *  second distinct frame arrives). Each fresh pull rotates the references and
-   *  the timestamp pair rather than copying. Lazily allocated. */
-  private _hermiteA: FrameFor<S> | null = null;
-  private _hermiteB: FrameFor<S> | null = null;
-  private _hermitePrev: FrameFor<S> | null = null;
-  private _hermiteCurr: FrameFor<S> | null = null;
-  /** Producer timestamps (ns) of `_hermitePrev` / `_hermiteCurr`. */
-  private _hermitePrevTsNs: number = 0;
-  private _hermiteCurrTsNs: number = 0;
-
-  /** Rolling window of recent readback-latency samples (ms) backing
-   *  `lastReadbackMedianMs()` (0.9.71). A fixed-size circular buffer; `_count`
-   *  saturates at the window length and `_head` is the next write slot. Fed by
-   *  `recordReadbackLatency(ms)` and by `pullPredictedLatest`'s warm path
-   *  (observed frame staleness). Heap-side, per-instance. */
-  private readonly _readbackSamples = new Float64Array(READBACK_SAMPLE_WINDOW);
-  private _readbackHead = 0;
-  private _readbackCount = 0;
-  /** Reused scratch for the median computation so `lastReadbackMedianMs()`
-   *  sorts in place without allocating. */
-  private readonly _readbackSortScratch = new Float64Array(READBACK_SAMPLE_WINDOW);
+  /** Trajectory-evaluation engine + the shared eval cache (0.9.949
+   *  extract). See `./BridgeEvaluation.ts`. */
+  private readonly evaluation: BridgeEvaluation<S>;
+  /** Predictive-pull engine — readback-latency median, Taylor + Kalman
+   *  predicted pulls (0.9.949 extract). See `./BridgePrediction.ts`. */
+  private readonly prediction: BridgePrediction<S>;
 
   /** Lower floor on the classifier's OK band — `_classifyInvariant` uses
    *  `max(invariantAbsoluteEpsilon, INVARIANT_OK_THRESHOLD · |stored|)`. Set
@@ -857,17 +573,6 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
   /** Publish PLL state to SAB lanes 4-7 after every PLL state change.
    *  See `BridgeOptions.publishPllToSab` for the contract. (0.6.16) */
   private readonly publishPllToSab: boolean;
-  private readonly _kalmanWasmConsumer: WorkletConsumer | null;
-  private readonly _kalmanWasmScratchBuffer: SharedArrayBuffer | null;
-  private readonly _kalmanWasmScratchOffset: number;
-  private readonly _kalmanWasmScratchLimit: number;
-  private _kalmanWasmPlans: Map<string, BridgeKalmanWasmPlan> | null = null;
-  private _kalmanWasmHasLastProducerNs = false;
-  private _kalmanWasmLastProducerNs = 0;
-  private _kalmanProcessNoise = DEFAULT_KALMAN_PROCESS_NOISE;
-  private _kalmanMeasPosNoise = DEFAULT_KALMAN_MEAS_POS_NOISE;
-  private _kalmanMeasVelNoise = DEFAULT_KALMAN_MEAS_VEL_NOISE;
-  private _kalmanMeasAccNoise = DEFAULT_KALMAN_MEAS_ACC_NOISE;
 
   constructor(
     sab: SharedArrayBuffer,
@@ -888,27 +593,6 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     // process visibility. Callers who don't need cross-process readers
     // can pass `publishPllToSab: false` to save the ~100 ns/observe.
     this.publishPllToSab = opts.publishPllToSab !== false;
-    const kcfg = opts.kalmanWasm;
-    this._kalmanWasmConsumer = kcfg?.consumer ?? null;
-    this._kalmanWasmScratchBuffer = kcfg?.scratchBuffer ?? null;
-    const rawOffset = kcfg?.scratchByteOffset;
-    const offset = typeof rawOffset === "number" && Number.isFinite(rawOffset) ? rawOffset : 0;
-    this._kalmanWasmScratchOffset = offset >= 0 ? offset : 0;
-    const wBuffer = this._kalmanWasmScratchBuffer;
-    if (wBuffer === null) {
-      this._kalmanWasmScratchLimit = 0;
-    } else if (
-      kcfg && Number.isFinite(kcfg.scratchByteLength) && (kcfg.scratchByteLength as number) > 0
-    ) {
-      const rawLen = kcfg.scratchByteLength as number;
-      const limit = this._kalmanWasmScratchOffset + rawLen;
-      this._kalmanWasmScratchLimit = Math.min(wBuffer.byteLength, limit);
-    } else {
-      this._kalmanWasmScratchLimit = wBuffer.byteLength;
-    }
-    if (this._kalmanWasmScratchLimit < this._kalmanWasmScratchOffset) {
-      this._kalmanWasmScratchLimit = 0;
-    }
 
     // FrameSmoother owns the consumer-side prev buffer + classification
     // tables + the trajectory-aware blender. Pass `scratchFrame` as the
@@ -916,6 +600,18 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     // single allocation path (scratchFrame is the canonical heap-side
     // frame allocator).
     this.smoother = new FrameSmoother<S>(schema, () => this.scratchFrame());
+
+    // Evaluation + prediction engines (0.9.949 extract). They reach the ring
+    // and PLL only through this host facade, so Bridge's state stays private.
+    const host: BridgeReadHost<S> = {
+      schema: this.schema,
+      pll: this.pll,
+      pullLatest: (out) => this.pullLatest(out),
+      scratchFrame: () => this.scratchFrame(),
+      observeConsumerTime: (c, p) => this.observeConsumerTime(c, p),
+    };
+    this.evaluation = new BridgeEvaluation<S>(host);
+    this.prediction = new BridgePrediction<S>(host, this.evaluation, opts.kalmanWasm);
   }
 
   /** Byte size needed for a ring of `(capacity, schema)`. Pass the same
@@ -1253,49 +949,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * only — no SAB access, no internal state.
    */
   evaluateInto(srcFrame: FrameFor<S>, dt: number, outFrame: FrameFor<S>): void {
-    if (!Number.isFinite(dt)) {
-      throw new Error(`evaluateInto: dt must be finite, got ${dt}`);
-    }
-    const src = srcFrame as unknown as Record<string, unknown>;
-    const out = outFrame as unknown as Record<string, unknown>;
-    const fields = this.schema.compiled.fields;
-    for (let i = 0; i < fields.length; i++) {
-      const field = fields[i]!;
-      const name = field.name;
-      if (field.trajectory) {
-        // Trajectory field. evaluateTrajectoryInto throws on length
-        // mismatch — we don't pre-validate, the helper's message is clearer.
-        if (field.kind === "f64") {
-          evaluateTrajectoryInto(
-            src[name] as Float64Array,
-            field.trajectory,
-            dt,
-            out[name] as Float64Array,
-          );
-        } else if (field.kind === "f32") {
-          evaluateTrajectoryInto(
-            src[name] as Float32Array,
-            field.trajectory,
-            dt,
-            out[name] as Float32Array,
-          );
-        } else {
-          // Defensive — the DSL only allows trajectory tags on f64/f32.
-          throw new Error(
-            `evaluateInto: trajectory field '${name}' has unexpected kind '${field.kind}'`,
-          );
-        }
-      } else if (field.isArray) {
-        // Non-trajectory array — verbatim .set(). TypedArray.set throws
-        // RangeError if out is shorter than src; we let that surface.
-        (out[name] as { set(s: ArrayLike<unknown>): void }).set(
-          src[name] as ArrayLike<unknown>,
-        );
-      } else {
-        // Scalar (number or BigInt) — direct copy.
-        out[name] = src[name];
-      }
-    }
+    return this.evaluation.evaluateInto(srcFrame, dt, outFrame);
   }
 
   /**
@@ -1331,65 +985,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     segmentSeconds: number,
     outFrame: FrameFor<S>,
   ): void {
-    if (!Number.isFinite(t)) {
-      throw new Error(`evaluateHermiteInto: t must be finite, got ${t}`);
-    }
-    if (!Number.isFinite(segmentSeconds)) {
-      throw new Error(
-        `evaluateHermiteInto: segmentSeconds must be finite, got ${segmentSeconds}`,
-      );
-    }
-    const prev = prevFrame as unknown as Record<string, unknown>;
-    const curr = currFrame as unknown as Record<string, unknown>;
-    const out = outFrame as unknown as Record<string, unknown>;
-    const fields = this.schema.compiled.fields;
-    for (let i = 0; i < fields.length; i++) {
-      const field = fields[i]!;
-      const name = field.name;
-      if (field.trajectory) {
-        // Trajectory field. Both prev and curr must carry the same flat
-        // payload shape (the schema enforces this at construction). The
-        // per-field interpolationMode selects the spline degree: cubic (C¹,
-        // default), quintic (C², 0.9.80), or septic (C³, 0.9.81).
-        const mode = field.trajectory.interpolationMode;
-        if (field.kind === "f64") {
-          const p = prev[name] as Float64Array;
-          const c = curr[name] as Float64Array;
-          const o = out[name] as Float64Array;
-          if (mode === "quintic-hermite") {
-            evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          } else if (mode === "septic-hermite") {
-            evaluateSepticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          } else {
-            evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          }
-        } else if (field.kind === "f32") {
-          const p = prev[name] as Float32Array;
-          const c = curr[name] as Float32Array;
-          const o = out[name] as Float32Array;
-          if (mode === "quintic-hermite") {
-            evaluateQuinticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          } else if (mode === "septic-hermite") {
-            evaluateSepticHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          } else {
-            evaluateHermiteTrajectoryInto(p, c, field.trajectory, t, segmentSeconds, o);
-          }
-        } else {
-          // Defensive — the DSL only tags trajectory on f64/f32.
-          throw new Error(
-            `evaluateHermiteInto: trajectory field '${name}' has unexpected kind '${field.kind}'`,
-          );
-        }
-      } else if (field.isArray) {
-        // Non-trajectory array — pass through the LATEST (curr) state.
-        (out[name] as { set(s: ArrayLike<unknown>): void }).set(
-          curr[name] as ArrayLike<unknown>,
-        );
-      } else {
-        // Scalar — pass through curr.
-        out[name] = curr[name];
-      }
-    }
+    return this.evaluation.evaluateHermiteInto(prevFrame, currFrame, t, segmentSeconds, outFrame);
   }
 
   /**
@@ -1399,21 +995,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * their full length, scalars zero-initialized.
    */
   scratchEvaluatedFrame(): FrameFor<S> {
-    const out: Record<string, unknown> = {};
-    for (const field of this.schema.compiled.fields) {
-      if (field.trajectory) {
-        // Post-evaluation: extrapolated positions only, length = sampleCount.
-        out[field.name] = newHeapTypedArray(
-          field.kind,
-          field.trajectory.sampleCount,
-        );
-      } else if (field.isArray) {
-        out[field.name] = newHeapTypedArray(field.kind, field.length);
-      } else {
-        out[field.name] = kindTsType(field.kind) === "bigint" ? 0n : 0;
-      }
-    }
-    return out as FrameFor<S>;
+    return this.evaluation.scratchEvaluatedFrame();
   }
 
   /**
@@ -1422,12 +1004,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * argument. (0.6.5)
    */
   setSampleRate(rate: number): void {
-    if (!Number.isFinite(rate) || rate <= 0) {
-      throw new Error(
-        `setSampleRate: rate must be a positive finite number, got ${rate}`,
-      );
-    }
-    this.defaultSampleRate = rate;
+    return this.evaluation.setSampleRate(rate);
   }
 
   /**
@@ -1444,55 +1021,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     sampleRate?: number,
     opts?: { timestamp?: TimestampRoleOf<S> },
   ): number {
-    if (!Number.isFinite(baseConsumerNs)) {
-      throw new Error(
-        `pullEvaluatedLatest: baseConsumerNs must be finite, got ${baseConsumerNs}`,
-      );
-    }
-    const sr = sampleRate ?? this.defaultSampleRate;
-    if (!Number.isFinite(sr) || sr <= 0) {
-      throw new Error(
-        `pullEvaluatedLatest: sampleRate not provided and no default set via setSampleRate(rate)`,
-      );
-    }
-    if (this.schema.timestamps === null) {
-      throw new Error(
-        `pullEvaluatedLatest: schema has no .withTimestamps(...) attached`,
-      );
-    }
-    const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
-    const role = this.schema.timestamps.roles[roleName];
-    if (!role) {
-      throw new Error(
-        `pullEvaluatedLatest: unknown timestamp role '${String(roleName)}'`,
-      );
-    }
-    if (this.cachedRawFrame === null) {
-      this.cachedRawFrame = this.scratchFrame();
-    }
-    const skipped = this.pullLatest(this.cachedRawFrame);
-    if (skipped >= 0) {
-      // Fresh frame — update timestamp cache and drive the PLL. Observing
-      // is gated on a fresh pull because feeding the PLL a repeated
-      // producer stamp at increasing consumer times would poison the
-      // residual (the producer's true clock is advancing, it just hasn't
-      // pushed yet).
-      const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
-      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
-      this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
-      this.observeConsumerTime(baseConsumerNs, this.cachedTimestampNs);
-      this.cachedEvalValid = true;
-    } else if (!this.cachedEvalValid) {
-      // Ring is empty and we've never pulled a frame — nothing to evaluate.
-      return -1;
-    }
-    // Either case (fresh-pull or cache-only): update the quantum context
-    // so sample-offset arithmetic uses this quantum's base/rate, then
-    // evaluate sample 0 into `out`.
-    this.cachedBaseConsumerNs = baseConsumerNs;
-    this.cachedSampleRate = sr;
-    this.evaluateAtSampleOffset(out, 0);
-    return skipped;
+    return this.evaluation.pullEvaluatedLatest(out, baseConsumerNs, sampleRate, opts);
   }
 
   /**
@@ -1504,21 +1033,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * the cached raw frame. Heap-only — never touches the SAB. (0.6.5)
    */
   evaluateAtSampleOffset(out: FrameFor<S>, sampleOffset: number): void {
-    if (!this.cachedEvalValid) {
-      throw new Error(
-        `evaluateAtSampleOffset: no cached frame; call pullEvaluatedLatest first`,
-      );
-    }
-    if (!Number.isFinite(sampleOffset)) {
-      throw new Error(
-        `evaluateAtSampleOffset: sampleOffset must be finite, got ${sampleOffset}`,
-      );
-    }
-    const consumerNs =
-      this.cachedBaseConsumerNs + (sampleOffset / this.cachedSampleRate) * 1e9;
-    const producerNs = this.phaseLockedTime(consumerNs);
-    const dt_s = (producerNs - this.cachedTimestampNs) * 1e-9;
-    this.evaluateInto(this.cachedRawFrame as FrameFor<S>, dt_s, out);
+    return this.evaluation.evaluateAtSampleOffset(out, sampleOffset);
   }
 
   /**
@@ -1556,69 +1071,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     sampleRate?: number,
     opts?: { timestamp?: TimestampRoleOf<S> },
   ): number {
-    if (!Number.isFinite(baseConsumerNs)) {
-      throw new Error(
-        `pullHermiteLatest: baseConsumerNs must be finite, got ${baseConsumerNs}`,
-      );
-    }
-    if (this.schema.timestamps === null) {
-      throw new Error(
-        `pullHermiteLatest: schema has no .withTimestamps(...) attached`,
-      );
-    }
-    const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
-    const role = this.schema.timestamps.roles[roleName];
-    if (!role) {
-      throw new Error(
-        `pullHermiteLatest: unknown timestamp role '${String(roleName)}'`,
-      );
-    }
-    const sr = sampleRate ?? this.defaultSampleRate;
-    if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
-      throw new Error(
-        `pullHermiteLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
-      );
-    }
-    if (this._hermiteA === null || this._hermiteB === null) {
-      this._hermiteA = this.scratchFrame();
-      this._hermiteB = this.scratchFrame();
-    }
-    // Pull into whichever buffer is NOT the current one (the old prev, whose
-    // contents are now discardable). On a fresh pull, rotate references.
-    const pullTarget = this._hermiteCurr === this._hermiteA ? this._hermiteB : this._hermiteA;
-    const skipped = this.pullLatest(pullTarget);
-    if (skipped >= 0) {
-      const rawValue = (pullTarget as unknown as Record<string, unknown>)[role.field];
-      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
-      const tsNs = this._timestampToNs(numericRaw, role.unit, sr);
-      // Rotate: old curr becomes prev; the freshly-pulled buffer becomes curr.
-      this._hermitePrev = this._hermiteCurr;
-      this._hermitePrevTsNs = this._hermiteCurrTsNs;
-      this._hermiteCurr = pullTarget;
-      this._hermiteCurrTsNs = tsNs;
-      // Drive the PLL once, gated on the fresh pull (same rationale as
-      // pullEvaluatedLatest: re-feeding a stale stamp poisons the residual).
-      this.observeConsumerTime(baseConsumerNs, tsNs);
-    } else if (this._hermiteCurr === null) {
-      // Ring empty and we've never pulled a frame — nothing to reconstruct.
-      return -1;
-    }
-
-    const curr = this._hermiteCurr as FrameFor<S>;
-    const seg = this._hermiteCurrTsNs - this._hermitePrevTsNs;
-    if (this._hermitePrev === null || !(seg > 0)) {
-      // Only one frame seen, or non-monotonic/duplicate stamps — Hermite needs
-      // two distinct endpoints, so hold the current frame's positions
-      // (evaluateInto at dt=0 yields the position lane + passes scalars through).
-      this.evaluateInto(curr, 0, out);
-      return skipped;
-    }
-    const producerNs = this.phaseLockedTime(baseConsumerNs);
-    let t = (producerNs - this._hermitePrevTsNs) / seg;
-    if (t < 0) t = 0;
-    else if (t > 1) t = 1;
-    this.evaluateHermiteInto(this._hermitePrev, curr, t, seg * 1e-9, out);
-    return skipped;
+    return this.evaluation.pullHermiteLatest(out, baseConsumerNs, sampleRate, opts);
   }
 
   /**
@@ -1663,37 +1116,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
     sampleCount: number,
     callback: (sampleIdx: number, frame: FrameFor<S>) => void,
   ): void {
-    if (!this.cachedEvalValid) {
-      throw new Error(
-        `forEachSampleInQuantum: no cached frame; call pullEvaluatedLatest first`,
-      );
-    }
-    if (
-      !Number.isFinite(sampleCount) ||
-      sampleCount < 0 ||
-      sampleCount !== Math.floor(sampleCount)
-    ) {
-      throw new Error(
-        `forEachSampleInQuantum: sampleCount must be a non-negative integer, got ${sampleCount}`,
-      );
-    }
-    if (sampleCount === 0) return;
-    // Hoist all cached state into locals so the inner loop's reads
-    // are register-sourced. The per-sample dt arithmetic uses the
-    // PLL via `phaseLockedTime` so drift-mode extrapolation works
-    // identically to evaluateAtSampleOffset; the explicit base + rate
-    // factor avoids a redundant divide inside the loop.
-    const base = this.cachedBaseConsumerNs;
-    const cachedTs = this.cachedTimestampNs;
-    const nsPerSample = 1e9 / this.cachedSampleRate;
-    const src = this.cachedRawFrame as FrameFor<S>;
-    for (let i = 0; i < sampleCount; i++) {
-      const consumerNs = base + i * nsPerSample;
-      const producerNs = this.pll.phaseLockedTime(consumerNs);
-      const dt_s = (producerNs - cachedTs) * 1e-9;
-      this.evaluateInto(src, dt_s, evalFrame);
-      callback(i, evalFrame);
-    }
+    return this.evaluation.forEachSampleInQuantum(evalFrame, sampleCount, callback);
   }
 
   /**
@@ -1701,7 +1124,7 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * `evaluateAtSampleOffset` / `forEachSampleInQuantum`. (0.6.5)
    */
   resetEvalCache(): void {
-    this.cachedEvalValid = false;
+    return this.evaluation.resetEvalCache();
   }
 
   /**
@@ -1721,12 +1144,16 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * Non-finite or negative samples are ignored (defensive — a bad clock read
    * shouldn't poison the median). Allocation-free; safe from a `process()`
    * loop.
+   *
+   * **Frontier API** — listed under `frontierMembers` in
+   * docs/stable-api-manifest.json: shipped on the root for 0.9.x but OUTSIDE
+   * the 1.0 stability contract until deliberately promoted (or moved behind
+   * `/experimental`). Implemented in `./BridgePrediction.ts`.
+   *
+   * @experimental
    */
   recordReadbackLatency(ms: number): void {
-    if (!Number.isFinite(ms) || ms < 0) return;
-    this._readbackSamples[this._readbackHead] = ms;
-    this._readbackHead = (this._readbackHead + 1) % READBACK_SAMPLE_WINDOW;
-    if (this._readbackCount < READBACK_SAMPLE_WINDOW) this._readbackCount++;
+    return this.prediction.recordReadbackLatency(ms);
   }
 
   /**
@@ -1744,20 +1171,16 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *
    * Median (not mean) so a single stalled readback doesn't yank the lead.
    * Sorts a reused scratch buffer in place — allocation-free.
+   *
+   * **Frontier API** — listed under `frontierMembers` in
+   * docs/stable-api-manifest.json: shipped on the root for 0.9.x but OUTSIDE
+   * the 1.0 stability contract until deliberately promoted (or moved behind
+   * `/experimental`). Implemented in `./BridgePrediction.ts`.
+   *
+   * @experimental
    */
   lastReadbackMedianMs(): number {
-    const n = this._readbackCount;
-    if (n === 0) return 0;
-    const scratch = this._readbackSortScratch;
-    for (let i = 0; i < n; i++) scratch[i] = this._readbackSamples[i]!;
-    // Sort only the populated prefix. Sorting the whole window would drag
-    // unwritten zeros into the low half and bias the median down while the
-    // buffer is still filling.
-    const view = scratch.subarray(0, n);
-    view.sort();
-    const mid = n >> 1;
-    // Odd n → middle element; even n → mean of the two central elements.
-    return (n & 1) === 1 ? view[mid]! : (view[mid - 1]! + view[mid]!) / 2;
+    return this.prediction.lastReadbackMedianMs();
   }
 
   /**
@@ -1790,149 +1213,19 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    * `out` must be a `scratchEvaluatedFrame()` (trajectory fields sized to
    * `sampleCount`). Returns a `PredictedPullResult` with the applied weight +
    * effective horizon for observability.
+   *
+   * **Frontier API** — listed under `frontierMembers` in
+   * docs/stable-api-manifest.json: shipped on the root for 0.9.x but OUTSIDE
+   * the 1.0 stability contract until deliberately promoted (or moved behind
+   * `/experimental`). Implemented in `./BridgePrediction.ts`.
+   *
+   * @experimental
    */
   pullPredictedLatest(
     out: FrameFor<S>,
     opts?: PredictedPullOptions<S>,
   ): PredictedPullResult {
-    const leadMsRaw = opts?.leadMs ?? 0;
-    const maxLeadMs = opts?.maxLeadMs ?? DEFAULT_MAX_LEAD_MS;
-    if (!Number.isFinite(leadMsRaw) || leadMsRaw < 0) {
-      throw new Error(
-        `pullPredictedLatest: leadMs must be a non-negative finite number, got ${leadMsRaw}`,
-      );
-    }
-    if (!Number.isFinite(maxLeadMs) || maxLeadMs < 0) {
-      throw new Error(
-        `pullPredictedLatest: maxLeadMs must be a non-negative finite number, got ${maxLeadMs}`,
-      );
-    }
-    const leadMs = leadMsRaw > maxLeadMs ? maxLeadMs : leadMsRaw;
-    const leadSeconds = leadMs * 1e-3;
-
-    if (this.cachedRawFrame === null) {
-      this.cachedRawFrame = this.scratchFrame();
-    }
-    const skipped = this.pullLatest(this.cachedRawFrame);
-    if (skipped >= 0) {
-      // Fresh frame — warm the PLL + record staleness when the caller supplied
-      // a consumer clock and the schema carries timestamps. Same observe
-      // gating as pullEvaluatedLatest: only on a fresh pull (repeating a stale
-      // producer stamp at advancing consumer times would poison the residual).
-      const consumerNs = opts?.consumerNs;
-      if (this.schema.timestamps !== null && consumerNs !== undefined) {
-        if (!Number.isFinite(consumerNs)) {
-          throw new Error(
-            `pullPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
-          );
-        }
-        const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
-        const role = this.schema.timestamps.roles[roleName];
-        if (!role) {
-          throw new Error(
-            `pullPredictedLatest: unknown timestamp role '${String(roleName)}'`,
-          );
-        }
-        let sr = opts?.sampleRate ?? this.defaultSampleRate;
-        if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
-          throw new Error(
-            `pullPredictedLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
-          );
-        }
-        const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
-        const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
-        this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
-        this.observeConsumerTime(consumerNs, this.cachedTimestampNs);
-      }
-      this.cachedEvalValid = true;
-    } else if (!this.cachedEvalValid) {
-      // Ring empty and nothing cached — nothing to predict from.
-      return {
-        skipped: -1,
-        predicted: false,
-        confidenceWeight: 0,
-        dtEffectiveSeconds: 0,
-        leadSecondsRequested: leadSeconds,
-        valueUncertainty: 0,
-      };
-    }
-
-    // Build the decoupled PLL uncertainty snapshot once (shared across fields).
-    const pllSnap: PllUncertainty = {
-      sigmaEstimateNs: this.pll.sigmaEstimateNs,
-      driftPpm: this.pll.driftPpm,
-      driftEstimatorEnabled: this.pll.driftEstimatorEnabled,
-      locked: this.pll.locked,
-    };
-    const config = {
-      maxHorizonSeconds: maxLeadMs * 1e-3,
-      trustedHorizonSeconds: (opts?.trustedLeadMs ?? 0) * 1e-3,
-      sigmaFloorNs: opts?.sigmaFloorNs,
-      confidenceFloor: opts?.confidenceFloor,
-    };
-
-    if (this._predictHoldScratch === null) {
-      this._predictHoldScratch = this._buildPredictHoldScratch();
-    }
-    const holdScratch = this._predictHoldScratch;
-    const src = this.cachedRawFrame as unknown as Record<string, unknown>;
-    const dst = out as unknown as Record<string, unknown>;
-    const fields = this.schema.compiled.fields;
-
-    let confidenceWeight = 0;
-    let dtEffectiveSeconds = 0;
-    let valueUncertainty = 0;
-    for (let i = 0; i < fields.length; i++) {
-      const field = fields[i]!;
-      const name = field.name;
-      if (field.trajectory) {
-        // Confidence-bounded forward extrapolation. The weight + effective
-        // horizon are identical across trajectory fields (they depend only on
-        // the clock + horizon, not on field values), so capturing the last
-        // field's result is representative; valueUncertainty is per-field, so
-        // take the max.
-        const r =
-          field.kind === "f32"
-            ? predictiveExtrapolateInto(
-                src[name] as Float32Array,
-                field.trajectory,
-                leadSeconds,
-                pllSnap,
-                dst[name] as Float32Array,
-                holdScratch[name] as Float32Array,
-                config,
-              )
-            : predictiveExtrapolateInto(
-                src[name] as Float64Array,
-                field.trajectory,
-                leadSeconds,
-                pllSnap,
-                dst[name] as Float64Array,
-                holdScratch[name] as Float64Array,
-                config,
-              );
-        confidenceWeight = r.confidenceWeight;
-        dtEffectiveSeconds = r.dtEffectiveSeconds;
-        if (r.valueUncertainty > valueUncertainty) valueUncertainty = r.valueUncertainty;
-      } else if (field.isArray) {
-        // Non-trajectory array — pass through the latest known state verbatim.
-        (dst[name] as { set(s: ArrayLike<unknown>): void }).set(
-          src[name] as ArrayLike<unknown>,
-        );
-      } else {
-        // Scalar — pass through.
-        dst[name] = src[name];
-      }
-    }
-
-    return {
-      skipped,
-      predicted: dtEffectiveSeconds > 0,
-      confidenceWeight,
-      dtEffectiveSeconds,
-      leadSecondsRequested: leadSeconds,
-      valueUncertainty,
-    };
+    return this.prediction.pullPredictedLatest(out, opts);
   }
 
   /**
@@ -1968,463 +1261,21 @@ export class BridgeImpl<S extends Schema<FieldsObject, any>> {
    *
    * `out` must be a `scratchEvaluatedFrame()`. Returns a `KalmanPredictedPullResult`.
    * Use only for **smooth** macro fields, never discontinuous events.
+   *
+   * **Frontier API** — listed under `frontierMembers` in
+   * docs/stable-api-manifest.json: shipped on the root for 0.9.x but OUTSIDE
+   * the 1.0 stability contract until deliberately promoted (or moved behind
+   * `/experimental`). Implemented in `./BridgePrediction.ts`.
+   *
+   * @experimental
    */
   pullKalmanPredictedLatest(
     out: FrameFor<S>,
     opts?: KalmanPredictedPullOptions<S>,
   ): KalmanPredictedPullResult {
-    if (this.schema.timestamps === null) {
-      throw new Error(
-        "pullKalmanPredictedLatest: schema must declare .withTimestamps(...) — the predictor needs a producer timestamp per frame to compute the inter-frame dt",
-      );
-    }
-    const leadMsRaw = opts?.leadMs ?? 0;
-    const maxLeadMs = opts?.maxLeadMs ?? DEFAULT_MAX_LEAD_MS;
-    if (!Number.isFinite(leadMsRaw) || leadMsRaw < 0) {
-      throw new Error(
-        `pullKalmanPredictedLatest: leadMs must be a non-negative finite number, got ${leadMsRaw}`,
-      );
-    }
-    if (!Number.isFinite(maxLeadMs) || maxLeadMs < 0) {
-      throw new Error(
-        `pullKalmanPredictedLatest: maxLeadMs must be a non-negative finite number, got ${maxLeadMs}`,
-      );
-    }
-    const leadMs = leadMsRaw > maxLeadMs ? maxLeadMs : leadMsRaw;
-    const leadSeconds = leadMs * 1e-3;
-    const trustedLeadMs = opts?.trustedLeadMs ?? 0;
-    const confidenceFloor = opts?.confidenceFloor ?? 0;
-    const famineAwareHorizon = opts?.famineAwareHorizon ?? false;
-
-    // Read + validate `consumerNs` ONCE, before the fresh/famine branch — the
-    // famine path needs it for the advancing target, but it's only OBSERVED on a
-    // fresh pull (observing a stale stamp at an advancing consumer time would
-    // poison the PLL residual). (0.9.905)
-    const consumerNs = opts?.consumerNs;
-    if (consumerNs !== undefined && !Number.isFinite(consumerNs)) {
-      throw new Error(
-        `pullKalmanPredictedLatest: consumerNs must be finite, got ${consumerNs}`,
-      );
-    }
-
-    // Lazily build the per-field filters + scratch (tuning captured here, once).
-    if (this._kalmanPredictors === null) this._buildKalmanPredictors(opts);
-    const predictors = this._kalmanPredictors!;
-    const scratch = this._kalmanScratch!;
-    const wasmPlans = this._kalmanWasmPlans;
-    const varianceFloor = opts?.varianceFloor ?? this._kalmanInitialVariance;
-
-    if (this.cachedRawFrame === null) {
-      this.cachedRawFrame = this.scratchFrame();
-    }
-    const skipped = this.pullLatest(this.cachedRawFrame);
-    let fresh = false;
-    if (skipped >= 0) {
-      // Fresh frame — extract the producer timestamp (always; timestamps are
-      // required here) and optionally warm the PLL for telemetry.
-      const roleName = opts?.timestamp ?? this.schema.timestamps.defaultRole;
-      const role = this.schema.timestamps.roles[roleName];
-      if (!role) {
-        throw new Error(
-          `pullKalmanPredictedLatest: unknown timestamp role '${String(roleName)}'`,
-        );
-      }
-      let sr = opts?.sampleRate ?? this.defaultSampleRate;
-      if (role.unit === "samples" && (!Number.isFinite(sr) || sr <= 0)) {
-        throw new Error(
-          `pullKalmanPredictedLatest: timestamp role '${String(roleName)}' is in 'samples' but no sampleRate provided and no default set via setSampleRate(rate)`,
-        );
-      }
-      const rawValue = (this.cachedRawFrame as unknown as Record<string, unknown>)[role.field];
-      const numericRaw = role.isBigInt ? Number(rawValue as bigint) : (rawValue as number);
-      this.cachedTimestampNs = this._timestampToNs(numericRaw, role.unit, sr);
-      // Observe ONLY on a fresh pull (validated up top). The famine path must not
-      // feed a stale producer stamp at an advancing consumer time.
-      if (consumerNs !== undefined) {
-        this.observeConsumerTime(consumerNs, this.cachedTimestampNs);
-      }
-      this.cachedEvalValid = true;
-      fresh = true;
-    } else if (!this.cachedEvalValid) {
-      // Ring empty and nothing cached — nothing to predict from.
-      return {
-        skipped: -1,
-        predicted: false,
-        confidenceWeight: 0,
-        dtEffectiveSeconds: 0,
-        leadSecondsRequested: leadSeconds,
-        valueUncertainty: 0,
-        maxVariance: 0,
-        forwardDistanceSeconds: 0,
-      };
-    }
-
-    // Horizon confidence taper (clock-independent; matches the Taylor curve).
-    let cHorizon: number;
-    if (leadMs <= trustedLeadMs) cHorizon = 1;
-    else if (leadMs >= maxLeadMs) cHorizon = 0;
-    else {
-      const span = maxLeadMs - trustedLeadMs;
-      cHorizon = span > 0 ? 1 - (leadMs - trustedLeadMs) / span : 0;
-    }
-    if (cHorizon < 0) cHorizon = 0;
-    else if (cHorizon > 1) cHorizon = 1;
-
-    // Advancing target (0.9.905): under `famineAwareHorizon`, predict at the
-    // PLL-mapped consumer time + lead. During a famine `cachedTimestampNs` is
-    // frozen but the consumer clock advances, so `dt` (and the covariance) grow
-    // → the variance gate fades `w` → an exact hold. Forward-only: never predict
-    // BEHIND the freshest stamp (a backward dt makes the variance formula's
-    // odd-power process-noise terms ill-defined; clamping keeps `dt ≥ lead`).
-    let baseNs = this.cachedTimestampNs;
-    if (famineAwareHorizon && consumerNs !== undefined && this.pll.locked) {
-      const mapped = this.pll.phaseLockedTime(consumerNs);
-      if (mapped > baseNs) baseNs = mapped;
-    }
-    const targetNs = baseNs + leadSeconds * 1e9;
-    const src = this.cachedRawFrame as unknown as Record<string, unknown>;
-    const dst = out as unknown as Record<string, unknown>;
-    const fields = this.schema.compiled.fields;
-    const useWasm = wasmPlans !== null && this._kalmanWasmConsumer !== null && wasmPlans.size > 0;
-    let wasmDt = 0;
-    if (fresh && useWasm) {
-      if (this._kalmanWasmHasLastProducerNs) {
-        wasmDt = (this.cachedTimestampNs - this._kalmanWasmLastProducerNs) * 1e-9;
-        if (!Number.isFinite(wasmDt) || wasmDt < 0) wasmDt = 0;
-      }
-      this._kalmanWasmLastProducerNs = this.cachedTimestampNs;
-      this._kalmanWasmHasLastProducerNs = true;
-    }
-
-    let resultMaxVar = 0;
-    let headlineWeight = 0;
-    let predictedAny = false;
-    let sawTrajectory = false;
-    for (let fi = 0; fi < fields.length; fi++) {
-      const field = fields[fi]!;
-      const name = field.name;
-      if (field.trajectory) {
-        sawTrajectory = true;
-        const order = field.trajectory.order;
-        const sc = field.trajectory.sampleCount;
-        const plan = useWasm ? wasmPlans!.get(name) : null;
-        if (plan !== null && plan !== undefined) {
-          const isPlanar = field.trajectory.layout === "planar";
-          const flat = src[name] as Float32Array;
-          for (let i = 0; i < sc; i++) {
-            const posIdx = isPlanar ? i : i * order;
-            plan.pos[i] = flat[posIdx]!;
-            if (order >= 2) plan.vel[i] = flat[isPlanar ? sc + i : posIdx + 1]!;
-            if (order >= 3 && plan.acc !== null) plan.acc[i] = flat[isPlanar ? 2 * sc + i : posIdx + 2]!;
-          }
-          if (fresh) {
-            const useVel = order >= 2 ? 1 : 0;
-            const useAcc = order >= 3 ? 1 : 0;
-            if (plan.model === "cv") {
-              this._kalmanWasmConsumer!.kalmanIngestCvF32x4SoaSimd(
-                plan.xOff,
-                plan.pOff,
-                plan.posOff,
-                plan.velOff,
-                sc,
-                wasmDt,
-                this._kalmanProcessNoise,
-                this._kalmanMeasPosNoise,
-                this._kalmanMeasVelNoise,
-                useVel,
-                plan.vScratchOff,
-              );
-            } else {
-              this._kalmanWasmConsumer!.kalmanIngestCaF32x4SoaSimd(
-                plan.xOff,
-                plan.pOff,
-                plan.posOff,
-                plan.velOff,
-                plan.accOff,
-                sc,
-                wasmDt,
-                this._kalmanProcessNoise,
-                this._kalmanMeasPosNoise,
-                this._kalmanMeasVelNoise,
-                this._kalmanMeasAccNoise,
-                useVel,
-                useAcc,
-                plan.vScratchOff,
-              );
-            }
-          }
-          if (plan.model === "cv") {
-            this._kalmanWasmConsumer!.kalmanPredictCvF32x4SoaSimd(
-              plan.xOff,
-              plan.pOff,
-              plan.predOff,
-              plan.varOff,
-              sc,
-              leadSeconds,
-              this._kalmanProcessNoise,
-            );
-          } else {
-            this._kalmanWasmConsumer!.kalmanPredictCaF32x4SoaSimd(
-              plan.xOff,
-              plan.pOff,
-              plan.predOff,
-              plan.varOff,
-              sc,
-              leadSeconds,
-              this._kalmanProcessNoise,
-            );
-          }
-          let maxVar = 0;
-          for (let i = 0; i < sc; i++) if (plan.varr[i]! > maxVar) maxVar = plan.varr[i]!;
-          let cVar = varianceFloor > 0 ? 1 - maxVar / varianceFloor : 0;
-          if (cVar < 0) cVar = 0;
-          else if (cVar > 1) cVar = 1;
-          let w = cHorizon * cVar;
-          if (w < confidenceFloor) w = 0;
-          const dstField = dst[name] as Float32Array;
-          const oneMinusW = 1 - w;
-          for (let i = 0; i < sc; i++) {
-            dstField[i] = w * plan.pred[i]! + oneMinusW * plan.pos[i]!;
-          }
-          if (w > 0) predictedAny = true;
-          if (maxVar >= resultMaxVar) {
-            resultMaxVar = maxVar;
-            headlineWeight = w;
-          }
-          continue;
-        }
-
-        const predictor = predictors.get(name)!;
-        const sb = scratch[name]!;
-        const flat = src[name] as Float64Array | Float32Array;
-        // Deinterleave the stamped (p[,v[,a]]) lanes from the flat trajectory.
-        // Layout-aware: planar layout stores each derivative lane contiguously.
-        const isPlanar = field.trajectory.layout === "planar";
-        for (let i = 0; i < sc; i++) {
-          const posIdx = isPlanar ? i : i * order;
-          sb.pos[i] = flat[posIdx]!;
-          if (order >= 2) sb.vel[i] = flat[isPlanar ? sc + i : posIdx + 1]!;
-          if (order >= 3) sb.acc[i] = flat[isPlanar ? 2 * sc + i : posIdx + 2]!;
-        }
-        // Fuse only on a fresh pull (re-feeding a stale stamp would corrupt dt).
-        if (fresh) {
-          const v = order >= 2 ? sb.vel : undefined;
-          const a = order >= 3 ? sb.acc : undefined;
-          predictor.ingest(this.cachedTimestampNs, sb.pos, v, a);
-        }
-        predictor.predictInto(targetNs, sb.pred, sb.varr);
-        // Field variance = the worst lane (conservative).
-        let maxVar = 0;
-        for (let i = 0; i < sc; i++) if (sb.varr[i]! > maxVar) maxVar = sb.varr[i]!;
-        let cVar = varianceFloor > 0 ? 1 - maxVar / varianceFloor : 0;
-        if (cVar < 0) cVar = 0;
-        else if (cVar > 1) cVar = 1;
-        let w = cHorizon * cVar;
-        if (w < confidenceFloor) w = 0;
-        // Blend predicted → hold (position lane). w=0 ⇒ exact latest-frame hold.
-        const dstField = dst[name] as Float64Array | Float32Array;
-        const oneMinusW = 1 - w;
-        for (let i = 0; i < sc; i++) {
-          dstField[i] = w * sb.pred[i]! + oneMinusW * sb.pos[i]!;
-        }
-        if (w > 0) predictedAny = true;
-        // The headline reflects the MOST uncertain field (most conservative).
-        if (maxVar >= resultMaxVar) {
-          resultMaxVar = maxVar;
-          headlineWeight = w;
-        }
-      } else if (field.isArray) {
-        (dst[name] as { set(s: ArrayLike<unknown>): void }).set(
-          src[name] as ArrayLike<unknown>,
-        );
-      } else {
-        dst[name] = src[name];
-      }
-    }
-
-    const dtEffectiveSeconds = headlineWeight * leadSeconds;
-    return {
-      skipped,
-      predicted: predictedAny && dtEffectiveSeconds > 0,
-      confidenceWeight: sawTrajectory ? headlineWeight : 0,
-      dtEffectiveSeconds,
-      leadSecondsRequested: leadSeconds,
-      valueUncertainty: resultMaxVar > 0 ? Math.sqrt(resultMaxVar) : 0,
-      maxVariance: resultMaxVar,
-      forwardDistanceSeconds: (targetNs - this.cachedTimestampNs) * 1e-9,
-    };
+    return this.prediction.pullKalmanPredictedLatest(out, opts);
   }
 
-  /** Build one `StatePredictor` + deinterleave/output scratch per trajectory
-   *  field. Called lazily on the first `pullKalmanPredictedLatest`; the tuning
-   *  is captured from that first call's opts. (0.9.902) */
-  private _buildKalmanPredictors(opts?: KalmanPredictedPullOptions<S>): void {
-    const q = opts?.processNoise ?? DEFAULT_KALMAN_PROCESS_NOISE;
-    const rp = opts?.measPosNoise ?? DEFAULT_KALMAN_MEAS_POS_NOISE;
-    const p0 = opts?.initialVariance ?? DEFAULT_KALMAN_INITIAL_VARIANCE;
-    const rv = opts?.measVelNoise ?? DEFAULT_KALMAN_MEAS_VEL_NOISE;
-    const ra = opts?.measAccNoise ?? DEFAULT_KALMAN_MEAS_ACC_NOISE;
-    this._kalmanInitialVariance = p0;
-    this._kalmanProcessNoise = q;
-    this._kalmanMeasPosNoise = rp;
-    this._kalmanMeasVelNoise = rv;
-    this._kalmanMeasAccNoise = ra;
-    const preds = new Map<string, StatePredictor>();
-    const scratch: Record<
-      string,
-      { pos: Float64Array; vel: Float64Array; acc: Float64Array; pred: Float64Array; varr: Float64Array }
-    > = {};
-    for (const field of this.schema.compiled.fields) {
-      if (!field.trajectory) continue;
-      const order = field.trajectory.order;
-      const sc = field.trajectory.sampleCount;
-      const model: StatePredictorModel = order >= 3 ? "ca" : "cv";
-      preds.set(
-        field.name,
-        new StatePredictor({
-          laneCount: sc,
-          model,
-          processNoise: q,
-          measPosNoise: rp,
-          measVelNoise: rv,
-          measAccNoise: ra,
-          initialVariance: p0,
-        }),
-      );
-      scratch[field.name] = {
-        pos: new Float64Array(sc),
-        vel: new Float64Array(sc),
-        acc: new Float64Array(sc),
-        pred: new Float64Array(sc),
-        varr: new Float64Array(sc),
-      };
-    }
-    this._kalmanPredictors = preds;
-    this._kalmanScratch = scratch;
-    this._buildKalmanWasmPredictors();
-  }
-
-  /** Build one f32x4 Wasm plan per eligible trajectory field. If a field fails
-   * any gate, it stays on the JS path. */
-  private _buildKalmanWasmPredictors(): void {
-    const consumer = this._kalmanWasmConsumer;
-    const scratchBuffer = this._kalmanWasmScratchBuffer;
-    if (consumer === null || scratchBuffer === null) {
-      this._kalmanWasmPlans = new Map();
-      return;
-    }
-    if (!(scratchBuffer instanceof SharedArrayBuffer)) {
-      this._kalmanWasmPlans = new Map();
-      return;
-    }
-    const cAny = consumer as unknown as Record<string, unknown>;
-    const hasExports = [
-      "kalmanIngestCvF32x4SoaSimd",
-      "kalmanPredictCvF32x4SoaSimd",
-      "kalmanIngestCaF32x4SoaSimd",
-      "kalmanPredictCaF32x4SoaSimd",
-    ].every((name) => typeof cAny[name] === "function");
-    if (!hasExports) {
-      this._kalmanWasmPlans = new Map();
-      return;
-    }
-    const start = this._kalmanWasmScratchOffset;
-    const end = this._kalmanWasmScratchLimit > start ? this._kalmanWasmScratchLimit : 0;
-    if (end <= start) {
-      this._kalmanWasmPlans = new Map();
-      return;
-    }
-
-    let cursor = start;
-    const align16 = (x: number): number => (x + 15) & ~15;
-    const plans = new Map<string, BridgeKalmanWasmPlan>();
-    for (const field of this.schema.compiled.fields) {
-      if (!field.trajectory || field.kind !== "f32") continue;
-      const sc = field.trajectory.sampleCount;
-      if (!Number.isInteger(sc) || sc <= 0 || sc % 4 !== 0) continue;
-
-      const order = field.trajectory.order;
-      const model: StatePredictorModel = order >= 3 ? "ca" : "cv";
-      const m = model === "ca" ? 3 : 2;
-      const bytesX = sc * m * 4;
-      const bytesP = sc * m * m * 4;
-      const bytesPos = sc * 4;
-      const bytesVel = sc * 4;
-      const bytesAcc = sc * 4;
-      const bytesPred = sc * 4;
-      const bytesVar = sc * 4;
-      const bytesScratch = 2 * m * 16;
-      const used = bytesX + bytesP + bytesPos + bytesVel + bytesAcc + bytesPred + bytesVar + bytesScratch;
-      const xOff = align16(cursor);
-      if (xOff + used > end) {
-        break;
-      }
-      const pOff = xOff + bytesX;
-      const posOff = pOff + bytesP;
-      const velOff = posOff + bytesPos;
-      const accOff = velOff + bytesVel;
-      const predOff = accOff + bytesAcc;
-      const varOff = predOff + bytesPred;
-      const vScratchOff = align16(varOff + bytesVar);
-      const next = vScratchOff + bytesScratch;
-      if (next > end) break;
-
-      const useAcc = model === "ca";
-      plans.set(field.name, {
-        model,
-        sampleCount: sc,
-        xOff,
-        pOff,
-        posOff,
-        velOff,
-        accOff: useAcc ? accOff : 0,
-        predOff,
-        varOff,
-        vScratchOff,
-        pos: new Float32Array(scratchBuffer, posOff, sc),
-        vel: new Float32Array(scratchBuffer, velOff, sc),
-        acc: useAcc ? new Float32Array(scratchBuffer, accOff, sc) : null,
-        pred: new Float32Array(scratchBuffer, predOff, sc),
-        varr: new Float32Array(scratchBuffer, varOff, sc),
-      });
-      cursor = next;
-    }
-    this._kalmanWasmPlans = plans;
-  }
-
-  /** Build one hold-scratch buffer per trajectory field, sized to its
-   *  `sampleCount` and matching its kind. Called lazily on the first
-   *  `pullPredictedLatest`. (0.9.71) */
-  private _buildPredictHoldScratch(): Record<string, Float64Array | Float32Array> {
-    const scratch: Record<string, Float64Array | Float32Array> = {};
-    for (const field of this.schema.compiled.fields) {
-      if (field.trajectory) {
-        scratch[field.name] = newHeapTypedArray(
-          field.kind,
-          field.trajectory.sampleCount,
-        ) as Float64Array | Float32Array;
-      }
-    }
-    return scratch;
-  }
-
-  /**
-   * Convert a timestamp value (read from the schema's role field, in the
-   * role's declared unit) into nanoseconds.
-   */
-  private _timestampToNs(
-    value: number,
-    unit: TimestampUnit,
-    sampleRate: number,
-  ): number {
-    switch (unit) {
-      case "ns":      return value;
-      case "us":      return value * 1e3;
-      case "ms":      return value * 1e6;
-      case "s":       return value * 1e9;
-      case "samples": return (value / sampleRate) * 1e9;
-    }
-  }
 
   /**
    * Classify a stored vs computed invariant ratio into ok / soft / hard +

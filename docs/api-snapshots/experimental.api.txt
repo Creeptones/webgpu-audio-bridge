@@ -938,8 +938,6 @@ function voiceParamLayout
 
 # ── Internal declarations reachable from the public surface ──
 
-type AnyTypedArray (internal, src/SpscRing.ts) = Float64Array | Float32Array | Uint32Array | Int32Array | Uint16Array | Int16Array | Uint8Array | Int8Array | BigInt64Array | BigUint64Array
-
 interface AudioContextLike (internal, src/experimental/renderQuantum.ts)
   close() => Promise<void>
   readonly baseLatency?: number | undefined
@@ -1038,10 +1036,16 @@ class BridgeImpl<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
   waitForData(timeoutMs?: number | undefined) => 'ok' | 'not-equal' | 'timed-out'
   waitForSpace(timeoutMs?: number | undefined) => 'ok' | 'not-equal' | 'timed-out'
 
+interface BridgeKalmanWasmOptions (internal, src/BridgePrediction.ts)
+  readonly consumer: WorkletConsumer
+  readonly scratchBuffer: SharedArrayBuffer
+  readonly scratchByteLength?: number | undefined
+  readonly scratchByteOffset?: number | undefined
+
 interface BridgeOptions (internal, src/Bridge.ts)
   readonly blockTimeoutMs?: number | undefined
   readonly flowController?: boolean | undefined
-  readonly kalmanWasm?: { readonly consumer: WorkletConsumer; readonly scratchBuffer: SharedArrayBuffer; readonly scratchByteOffset?: number | undefined; readonly scratchByteLength?: number | undefined; } | undefined
+  readonly kalmanWasm?: BridgeKalmanWasmOptions | undefined
   readonly notify?: 'always' | 'waiter-flag' | undefined
   readonly policy?: BackpressurePolicy | undefined
   readonly publishPllToSab?: boolean | undefined
@@ -1108,17 +1112,6 @@ interface ConsumerClockRecoveryOptions (internal, src/ConsumerClockRecovery.ts)
   readonly outlierEwmaAlpha?: number | undefined
   readonly outlierSigmaMultiplier?: number | undefined
   readonly outlierWarmupObservations?: number | undefined
-
-interface Ctx (internal, src/jit/lower.ts)
-  readonly inputs: Set<string>
-  readonly lengthName: string | null
-  readonly loopVar: string
-  readonly outputs: Set<string>
-  readonly scalars: Set<string>
-  readonly sig: KernelSignature
-  readonly states: Set<string>
-  readonly temps: Map<string, IrNode>
-  readonly writtenStates: Set<string>
 
 type DefaultRole (internal, src/Bridge.ts) = "worker"
 
@@ -1199,7 +1192,7 @@ type InvariantFailurePolicy (internal, src/BridgeConsumer.ts) = "fallback-to-pre
 
 type InvariantFn<F extends FieldsObject> (internal, src/schema.ts) = (frame: { -readonly [K in keyof F]: F[K] extends FieldSpec<infer T> ? T : never; }) => number
 
-interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
+interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>> (internal, src/BridgePrediction.ts)
   readonly confidenceFloor?: number | undefined
   readonly consumerNs?: number | undefined
   readonly famineAwareHorizon?: boolean | undefined
@@ -1215,7 +1208,7 @@ interface KalmanPredictedPullOptions<S extends Schema<FieldsObject, any>> (inter
   readonly trustedLeadMs?: number | undefined
   readonly varianceFloor?: number | undefined
 
-interface KalmanPredictedPullResult (internal, src/Bridge.ts)
+interface KalmanPredictedPullResult (internal, src/BridgePrediction.ts)
   readonly confidenceWeight: number
   readonly dtEffectiveSeconds: number
   readonly forwardDistanceSeconds: number
@@ -1236,28 +1229,11 @@ type LatencyHint (internal, src/connect.ts) = "tracking" | "balanced" | "through
 
 type LoopBound (internal, src/jit/ir.ts) = { readonly kind: "param"; readonly name: string; } | { readonly kind: "const"; readonly value: number; }
 
-interface NormalizedEdge (internal, src/connectGraph.ts)
-  readonly backend?: WorkQueueBackend | undefined
-  readonly capacity?: number | undefined
-  readonly from: readonly string[]
-  readonly id: string
-  readonly kind: GraphEdgeKind
-  readonly latencyHint: LatencyHint
-  readonly policy?: GraphSpscPolicy | undefined
-  readonly schema: Schema<FieldsObject, any>
-  readonly to: readonly string[]
-
 interface PlanArrayRef (internal, src/jit/vectorize.ts)
   readonly name: string
   readonly role: 'input' | 'output'
 
-interface PllUncertainty (internal, src/predictiveExtrapolation.ts)
-  readonly driftEstimatorEnabled: boolean
-  readonly driftPpm: number
-  readonly locked: boolean
-  readonly sigmaEstimateNs: number
-
-interface PredictedPullOptions<S extends Schema<FieldsObject, any>> (internal, src/Bridge.ts)
+interface PredictedPullOptions<S extends Schema<FieldsObject, any>> (internal, src/BridgePrediction.ts)
   readonly confidenceFloor?: number | undefined
   readonly consumerNs?: number | undefined
   readonly leadMs?: number | undefined
@@ -1267,7 +1243,7 @@ interface PredictedPullOptions<S extends Schema<FieldsObject, any>> (internal, s
   readonly timestamp?: TimestampRoleOf<S> | undefined
   readonly trustedLeadMs?: number | undefined
 
-interface PredictedPullResult (internal, src/Bridge.ts)
+interface PredictedPullResult (internal, src/BridgePrediction.ts)
   readonly confidenceWeight: number
   readonly dtEffectiveSeconds: number
   readonly leadSecondsRequested: number
@@ -1282,8 +1258,6 @@ interface PublishedPllState (internal, src/SpscRing.ts)
   offsetNs: number
 
 type RejectVerdict (internal, src/jit/kernelCache.ts) = { readonly status: "rejected-acoustic"; readonly profile: AcousticProfile; readonly reason: string; } | Exclude<CompileResult, { readonly status: "accepted"; }>
-
-type ScalarOp (internal, src/SpscRing.ts) = (slot: number, frame: Record<string, unknown>) => void
 
 interface Schema<F extends FieldsObject = FieldsObject, T extends TimestampsConfig<F> | null = null> (internal, src/schema.ts)
   readonly _brand: 'wab/Schema'

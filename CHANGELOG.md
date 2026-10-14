@@ -4,6 +4,39 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.949] - 2026-10-14
+
+### Changed - frontier work moved out of `Bridge.ts` (no public-API change)
+
+- **`src/Bridge.ts`: about 2,930 → about 1,800 lines.** The two engines that had grown inside it are now internal modules composed by `Bridge`, the same pattern as the 0.6.8–0.6.9 `SpscRing` / `FrameSmoother` / `ConsumerClockRecovery` extracts:
+  - **`src/BridgeEvaluation.ts`** (`BridgeEvaluation<S>`) owns the shared eval cache (newest raw frame, its producer timestamp, quantum base and sample rate) and the two-frame Hermite pair. It implements `evaluateInto`, `evaluateHermiteInto`, `scratchEvaluatedFrame`, `setSampleRate`, `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `pullHermiteLatest`, `forEachSampleInQuantum` and `resetEvalCache`. `_timestampToNs` is now the module function `timestampToNs`.
+  - **`src/BridgePrediction.ts`** (`BridgePrediction<S>`) owns the readback-latency rolling median, `pullPredictedLatest`, `pullKalmanPredictedLatest`, the per-field `StatePredictor`s and the f32x4 `kalmanWasm` plans. The `Predicted*` / `KalmanPredicted*` option/result types and the `DEFAULT_MAX_LEAD_MS` / `DEFAULT_KALMAN_*` constants are declared there and re-exported from `Bridge.ts` and the root unchanged.
+  - Every public `Bridge` method keeps its signature and full JSDoc and becomes a one-line delegator. The engines reach the ring and PLL only through a `BridgeReadHost` closure facade, so no `Bridge` private state became public. Method bodies were moved verbatim; only member references were re-pointed.
+- **Frontier members made explicit.** `pullPredictedLatest`, `pullKalmanPredictedLatest`, `recordReadbackLatency`, `lastReadbackMedianMs` and `BridgeOptions.kalmanWasm` now carry `@experimental` with a note that they are outside the 1.0 contract until promoted. `docs/stable-api-manifest.json` gains **`frontierMembers`**, which lists these plus `SpscRingOptions.notify` (`'waiter-flag'`) and `BridgeGPUSourceOptions.writeTarget` (`'shared'` is reserved and throws). `check:api-boundary` verifies each entry still exists in the member-level surface.
+- `BridgeOptions.kalmanWasm`'s inline object type is now the named `BridgeKalmanWasmOptions` (identical shape).
+
+### Fixed
+
+- **API-surface extractor walked method bodies** (0.9.948 tooling). The internal-declaration closure descended into function, constructor and accessor bodies and property initializers, so a type used only for a local variable inside a method (for example `PllUncertainty` in `pullPredictedLatest`) was reported as public surface. It now visits only declared signatures, parameter types and declared property types.
+
+### Why
+
+The audit found `Bridge.ts` at roughly 2.6× its documented size. Most of the growth was frontier prediction code (the Kalman runtime and its WASM plan builder) living on the class that 1.0 has to freeze. Splitting it out lets the 1.0 decision for those members be made separately from the stable core, and keeps `Bridge.ts` an orchestration layer.
+
+### Wire compatibility
+
+None. No SAB, behavior or public-API change. The member-level API snapshot diff for this release is exactly: `kalmanWasm`'s type is now named (same shape), and the five moved interfaces report `src/BridgePrediction.ts` as their declaring file.
+
+### Tests
+
+- The full suite passes unchanged, including all predict, Kalman, Hermite, timeline, crossfade and hot-swap pins.
+- `tests/apiSurface.test.ts` pin 6: types used only inside method bodies are not in the surface, and Bridge's private engines (`BridgeReadHost`, `BridgeEvaluation`, `BridgePrediction`) do not leak into the root snapshot.
+- Bench is unchanged within noise (push/pull/pullLatest about 0.8–1.0 µs; `pullKalmanPredict` 16-lane median 4.25 µs, budget 10 µs).
+
+### Documentation
+
+CLAUDE.md §What lives where (Bridge composition), `docs/api-boundary.md` (`frontierMembers`).
+
 ## [0.9.948] - 2026-10-14
 
 ### Changed - the API freeze gate now sees member-level changes

@@ -1,9 +1,10 @@
 // Fixture for tests/apiSurface.test.ts — version 2 (renamed read → readInto) of a tiny public surface.
+interface BodyOnly { readonly n: number }
 class Impl<T> {
   private secret = 1;
   protected guarded(): void {}
   constructor(public readonly name: string, private readonly t: T) { void this.secret; void this.t; }
-  readInto(out: T[]): number { return out.length; }
+  readInto(out: T[]): number { const local: BodyOnly = { n: out.length }; return local.n; }
   /** @deprecated use read */
   legacy(): void {}
 }

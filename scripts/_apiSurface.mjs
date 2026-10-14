@@ -182,13 +182,29 @@ function internalClosure(checker, exportedSymbols) {
     }
     ts.forEachChild(node, visitNode);
   };
+  // Visit only the DECLARED shape — never function/constructor/accessor
+  // bodies or property initializers (a local variable's type inside a method
+  // body is not public surface).
+  const visitSignature = (node) => {
+    node.typeParameters?.forEach(visitNode);
+    node.parameters?.forEach((p) => { if (p.type) visitNode(p.type); });
+    if (node.type) visitNode(node.type);
+  };
   while (queue.length) {
     const sym = queue.shift();
     for (const decl of sym.declarations ?? []) {
       if (ts.isClassDeclaration(decl)) {
         decl.typeParameters?.forEach(visitNode);
         decl.heritageClauses?.forEach(visitNode);
-        for (const m of decl.members) if (isPublicMember(m)) visitNode(m);
+        for (const m of decl.members) {
+          if (!isPublicMember(m)) continue;
+          if (ts.isPropertyDeclaration(m)) { if (m.type) visitNode(m.type); }
+          else visitSignature(m);
+        }
+      } else if (ts.isFunctionDeclaration(decl)) {
+        visitSignature(decl);
+      } else if (ts.isVariableDeclaration(decl)) {
+        if (decl.type) visitNode(decl.type);
       } else {
         visitNode(decl);
       }

@@ -42,6 +42,15 @@ stays behind `webgpu-audio-bridge/experimental` until promotion is deliberate.
 - `deprecatedShims` — `@deprecated` re-exports scheduled for removal at 0.10.0.
 
 `workletExports` lists the `/worklet` subpath the same way.
+
+`frontierMembers` (0.9.949) names frontier-grade MEMBERS of otherwise-stable
+declarations as `Owner.member`: `BridgeImpl.pullPredictedLatest`,
+`BridgeImpl.pullKalmanPredictedLatest`, `BridgeImpl.recordReadbackLatency`,
+`BridgeImpl.lastReadbackMedianMs`, `BridgeOptions.kalmanWasm`,
+`SpscRingOptions.notify` (`'waiter-flag'`), and `BridgeGPUSourceOptions.writeTarget`
+(`'shared'` is reserved and throws). They carry `@experimental` in their JSDoc
+and sit outside the 1.0 contract until promoted. The boundary check verifies
+that each entry still exists in the member-level root surface.
 `npm run check:api-boundary` fails when a root or worklet export is not
 classified, when a listed name is no longer exported, when a name sits in two
 buckets, and when root `src/index.ts` contains known experimental markers outside
