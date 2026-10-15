@@ -14,6 +14,8 @@ All notable changes to this project will be documented here. This project adhere
 
 - **`tests/browser/jit-vectorize.spec.ts` explains its timeouts.** The "AudioContext reaching `running`" and "SIMD upgrade reaching `complete`" waits now fail with a snapshot of the page's `#status` panel (the only place a `start()` failure is reported), the AudioContext state, `__jit.diag()`, and every page and console error seen. The Firefox job on `main` has timed out on the first wait with only "Timeout 5000ms exceeded". No Firefox binary or CI artifact is reachable from the dev environment, so the next CI run needs to carry the cause. The test's assertions are unchanged.
 
+- **Firefox CI: a virtual audio sink.** With the timeout snapshot above, the Firefox failure turned out to be the environment. The jit-vectorize timeout reported `ctxState: suspended` with `#status` stuck at "starting…" and no errors: `await ctx.resume()` never settles. The hosted runner has no sound server, so headless Firefox cannot open an output stream and no AudioContext ever runs. That is also why the latency bench produced no report on Firefox. Chromium and WebKit use built-in fake sinks when headless. `.github/workflows/browser.yml` now starts PulseAudio with a null sink for the Firefox job. (`minimal.spec` kept passing only because its `seq` counter comes from the producer worker, so it never proved the worklet runs.)
+
 ### Why
 
 The `browser` workflow has failed on every push to `main` since at least 0.9.921, so it gated nothing.
