@@ -4,6 +4,29 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.952] - 2026-10-15
+
+### Fixed - browser smoke CI
+
+- **`bench/e2e-latency/` page crashed at load, failing `tests/browser/latency.spec.ts` on every engine.** Since `f0f76f2` / `2291613` / `47c0f54`, `main.js` looks up 19 controls that `index.html` never had (`notifyMode`, `producerPushMode`, `producerTickHz`, `consumerMode`, `sweep`, `copySweep`, and the `sweep*` inputs). The first `addEventListener` on a `null` element threw, so `window.__bench` was never set and the spec read no report. The controls are added, with defaults matching `readUI()` / `readSweep()` (a single run behaves exactly as `main.js` already assumed), and the matrix-sweep inputs sit in a collapsed `<details>` section. Verified locally on Chromium: the CPU-stub run produces its report again and every numeric assertion in the spec passes.
+
+### Changed
+
+- **`tests/browser/jit-vectorize.spec.ts` explains its timeouts.** The "AudioContext reaching `running`" and "SIMD upgrade reaching `complete`" waits now fail with a snapshot of the page's `#status` panel (the only place a `start()` failure is reported), the AudioContext state, `__jit.diag()`, and every page and console error seen. The Firefox job on `main` has timed out on the first wait with only "Timeout 5000ms exceeded". No Firefox binary or CI artifact is reachable from the dev environment, so the next CI run needs to carry the cause. The test's assertions are unchanged.
+
+### Why
+
+The `browser` workflow has failed on every push to `main` since at least 0.9.921, so it gated nothing.
+
+### Wire compatibility
+
+None. Bench page and browser test only; no `src/` change.
+
+### Tests
+
+- `latency.spec.ts` should pass on all three engines.
+- The Firefox `jit-vectorize` failure is expected to persist until its cause (now reported in the failure message) is fixed.
+
 ## [0.9.951] - 2026-10-14
 
 ### Changed - duplicated logic removed, type ergonomics

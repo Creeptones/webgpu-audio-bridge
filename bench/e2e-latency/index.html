@@ -51,11 +51,59 @@
           <option value="main">layout thrash on main thread</option>
         </select>
       </label>
+      <label>notify
+        <select id="notifyMode">
+          <option value="always" selected>always</option>
+          <option value="waiter-flag">waiter-flag (experimental)</option>
+        </select>
+      </label>
+      <label>producer push
+        <select id="producerPushMode">
+          <option value="push" selected>push</option>
+          <option value="beginCommit">beginPush/commitPush</option>
+          <option value="pushRaw">pushRaw</option>
+        </select>
+      </label>
+      <label>producer Hz
+        <input id="producerTickHz" type="number" value="60" min="1" max="2000" step="1" />
+      </label>
+      <label>consumer
+        <select id="consumerMode">
+          <option value="rawPullLatest" selected>raw pullLatest (notify)</option>
+          <option value="rawPullLatestNoNotify">raw pullLatest (no notify)</option>
+          <option value="rawPull">raw pull (FIFO)</option>
+          <option value="bridgePullLatestNoNotify">Bridge.pullLatest (no notify)</option>
+          <option value="bridgePullLatest">Bridge.pullLatest</option>
+          <option value="bridgePull">Bridge.pull</option>
+        </select>
+      </label>
     </div>
 
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
     <button id="copy">Copy report to clipboard</button>
+
+    <details>
+      <summary>Matrix sweep</summary>
+      <div class="controls">
+        <!-- Comma-separated lists; empty = use the single-run value above. -->
+        <label>consumer modes <input id="sweepModes" type="text" placeholder="rawPullLatest,bridgePullLatest" /></label>
+        <label>n values <input id="sweepNValues" type="text" placeholder="1000" /></label>
+        <label>capacities <input id="sweepCapacities" type="text" placeholder="16,64" /></label>
+        <label>backends <input id="sweepBackends" type="text" placeholder="cpu" /></label>
+        <label>loads <input id="sweepLoads" type="text" placeholder="idle,main" /></label>
+        <label>notify modes <input id="sweepNotifyModes" type="text" placeholder="always,waiter-flag" /></label>
+        <label>push modes <input id="sweepProducerPushModes" type="text" placeholder="push,pushRaw" /></label>
+        <label>producer Hz <input id="sweepProducerTickHz" type="text" placeholder="60" /></label>
+        <label>ms / cell <input id="sweepMs" type="number" value="5000" min="500" max="30000" step="100" /></label>
+        <label>rounds <input id="sweepRounds" type="number" value="1" min="1" max="10" step="1" /></label>
+        <label>warm-up ms <input id="sweepWarmupMs" type="number" value="500" min="0" max="10000" step="100" /></label>
+        <label>min samples <input id="sweepMinSamples" type="number" value="40" min="1" max="10000" step="1" /></label>
+        <label><input id="sweepRandomize" type="checkbox" /> randomize order</label>
+      </div>
+      <button id="sweep">Run sweep</button>
+      <button id="copySweep">Copy sweep results</button>
+    </details>
 
     <h2>Live report</h2>
     <pre id="report">(not running)</pre>
