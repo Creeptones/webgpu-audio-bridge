@@ -17,9 +17,11 @@
 //     same absolute space:
 //        nowEpochNs = audioStartPerfNs + currentTime * 1e9
 //        latencyNs  = nowEpochNs - tMacroNs
-//     The remaining sub-ms slop is the constructor-execution time between
-//     `new AudioContext()` returning and currentTime being clocked from 0;
-//     well below audio-quantum scale.
+//     The remaining slop is the gap between `new AudioContext()` returning
+//     and currentTime being clocked from 0: sub-ms on Chromium/WebKit, but
+//     ~1 s on Firefox, which opens the device asynchronously. Main re-anchors
+//     once the context runs and posts {type:"clock"} when the two disagree;
+//     this processor then swaps the anchor and drops the stale samples.
 //
 // performance.now() is not exposed on AudioWorkletGlobalScope reliably across
 // browsers, which is why we go through the AudioContext alignment instead of
@@ -76,6 +78,35 @@ class BridgeLatencyConsumer extends AudioWorkletProcessor {
 
     // Sliding window — we keep the cumulative hist and snapshot/reset every
     // report. Avoids unbounded memory growth across long runs.
+
+    // Main → worklet control: `clock` replaces the alignment anchor once the
+    // context is really running (Firefox starts its device asynchronously, so
+    // the construction-time anchor can be ~1 s stale) and drops the samples
+    // measured against the stale anchor; `reset` (sent by the matrix sweep
+    // after warm-up) clears the measurement window.
+    this.port.onmessage = (e) => {
+      const msg = e.data;
+      if (msg?.type === "clock") {
+        this.audioStartPerfNs = msg.audioStartPerfMs * 1e6;
+        this.resetStats();
+      } else if (msg?.type === "command" && msg.command === "reset") {
+        this.resetStats();
+      }
+    };
+  }
+
+  resetStats() {
+    this.hist.fill(0);
+    this.maxNsObserved = 0;
+    this.samples = 0;
+    this.samplesDelta = 0;
+    this.pulls = 0;
+    this.skippedTotal = 0;
+    this.workletQuanta = 0;
+    this.workletMisses = 0;
+    this.consecutiveMisses = 0;
+    this.underrunEvents = 0;
+    this.maxMissStreak = 0;
   }
 
   pullLatest() {

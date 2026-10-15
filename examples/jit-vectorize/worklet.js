@@ -20,7 +20,7 @@
 // synchronous `new WebAssembly.Instance` is microseconds, but an async
 // compile/instantiate on the audio thread could blow a render quantum.
 
-import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/index.js";
+import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/core.js";
 
 const AMP = 0.22; // output gain (kept OUTSIDE the timed region — we time the kernel only)
 

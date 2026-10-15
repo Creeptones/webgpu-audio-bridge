@@ -395,7 +395,7 @@ const noopEncoder: GpuCommandEncoderLike = {
   copyBufferToBuffer(_s, _so, _d, _do, _size) { /* no-op */ },
 };
 
-// ── 0.9.946 latest-only coalescing ─────────────────────────────────────────
+// ── 0.9.945 latest-only coalescing ─────────────────────────────────────────
 function testLatestOnlyCoalescesScheduledSlots(): void {
   const device = makeMockDevice();
   const bridge = makeBridge();

@@ -30,6 +30,11 @@
  *       [DAG_FLOW_SCALE_MIN, 2.0]; the side channel never tears the protocol.
  *       The multi-consumer last-writer-wins property is sanity-checked in the
  *       concurrent test (this pin drives the REAL single-consumer pull path).
+ *  11.  2^31 ticket wrap (0.9.947 regression): starting 5 tickets below the
+ *       Int32 wrap, 4×capacity push/pull pairs all deliver FIFO with zero drops
+ *       and dequeueTicket ends NEGATIVE. Pre-0.9.947 `pull` treated a negative
+ *       claim as "empty" → the first post-wrap frame was orphaned + the queue
+ *       wedged into drop-newest.
  */
 
 import { assert, assertEq } from "./_assert.js";
@@ -40,6 +45,7 @@ import {
 } from "../src/index.js";
 import { MpmcWorkQueue, MPMC_WQ_HEADER_BYTES } from "../src/MpmcWorkQueue.js";
 import { DAG_FLOW_SCALE_MIN } from "../src/AdaptiveFlowController.js";
+import { driveAcrossTicketWrap } from "./_mpmcWqWrap.js";
 
 // Silence (and capture) the one-shot experimental warning so it doesn't pollute
 // the suite output, while still pinning that it fires.
@@ -400,6 +406,19 @@ function pin10_flowScale(): void {
   pass("pin10: flow_scale lane (seed 1.0, widened clamp < 0.5, bounds, side-channel)");
 }
 
+// Pin 11 — 2^31 ticket wrap (0.9.947 regression; see tests/_mpmcWqWrap.ts).
+function pin11_ticketWrap(): void {
+  const cap = 8;
+  const { queue, sab } = MpmcWorkQueue.create(allKinds, cap, { producerCount: 1 });
+  const frame = queue.createFrame() as unknown as Record<string, unknown>;
+  const out = queue.createFrame() as unknown as Record<string, unknown>;
+  driveAcrossTicketWrap(
+    queue as unknown as Parameters<typeof driveAcrossTicketWrap>[0],
+    sab, MPMC_WQ_HEADER_BYTES, frame, out, "a_u32", "js",
+  );
+  pass("pin11: 2^31 ticket wrap — every frame delivered FIFO, zero drops, negative tickets claimed");
+}
+
 function main(): void {
   console.log("MpmcWorkQueue — single-thread API pins");
   pin1_layout();
@@ -412,6 +431,7 @@ function main(): void {
   pin8_slackReserve();
   pin9_endOfStream();
   pin10_flowScale();
+  pin11_ticketWrap();
   console.warn = realWarn;
   console.log(`\nMpmcWorkQueue: ${passed} pins passed.`);
 }

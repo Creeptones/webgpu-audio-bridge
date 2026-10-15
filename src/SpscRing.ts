@@ -35,7 +35,7 @@
  *     - α-smoother dispatch (`pullSmoothed` / `pullLatestSmoothed`,
  *       `resetSmoother`) and the named skip policies. The blend itself
  *       lives on the composed `FrameSmoother` (0.6.9).
- *     - Schema-invariant classifier (`_classifyInvariant` + epsilon floor).
+ *     - Schema-invariant classifier (`classifyInvariant` in `./_invariant.ts` + epsilon floor).
  *     - PLL dispatch (`observeConsumerTime`, `phaseLockedTime`,
  *       `resetPll`). The PI loop + offset state live on the composed
  *       `ConsumerClockRecovery` (0.6.9).
@@ -260,7 +260,8 @@ import {
 import { AdaptiveFlowController } from "./AdaptiveFlowController.js";
 import { buildScratchFrame } from "./_heap.js";
 
-export const RING_HEADER_BYTES = 32;
+import { RING_HEADER_BYTES } from "./_ringHeader.js";
+export { RING_HEADER_BYTES };
 /** Active SPSC counter lanes: write_index (Int32 lane 0), read_index (Int32
  *  lane 1). Other active control lanes (flow_scale on lane 2, torn_frame on
  *  lane 3) are accounted for separately — this constant counts only SPSC
@@ -276,7 +277,9 @@ export const RING_HEADER_INT32_LANES = 8;
 //   lane 3:    torn_frame_counter — Int32 monotonic wrap-counter (0.6.0)
 //   lanes 4-5: PLL offset (Int64 ns, atomic via aliased BigInt64Array; 0.6.16)
 //   lane 6:    PLL drift (Q16.16 ppm signed Int32; 0.6.16)
-//   lane 7:    PLL status word (bit 0 = locked, bits 1-31 reserved; 0.6.16)
+//   lane 7:    PLL status word (bit 0 = locked; 0.6.16). Bits 1-30 carry the
+//              PLL publish SEQLOCK counter (0.9.947; previously reserved, so a
+//              pre-0.9.947 writer leaves them 0 and readers stay compatible).
 export const WRITE_IDX_LANE = 0;
 export const READ_IDX_LANE = 1;
 export const FLOW_SCALE_LANE = 2;
@@ -287,6 +290,27 @@ export const PLL_DRIFT_LANE = 6;
 export const PLL_STATUS_LANE = 7;
 // PLL status word bit positions.
 const PLL_STATUS_LOCKED_BIT = 1; // bit 0
+// Seqlock counter in status bits 1-30 (0.9.947). Odd = a publish is in
+// progress; even = quiescent. 30 bits, wraps; only equality + parity matter.
+const PLL_STATUS_SEQ_SHIFT = 1;
+const PLL_STATUS_SEQ_MASK = 0x3fffffff;
+// Bounded retry for the seqlock reader — keeps readPublishedPllState
+// wait-free. A publish is ~6 stores, so one retry virtually always suffices;
+// the bound only matters if the publishing thread is descheduled mid-publish.
+const PLL_READ_MAX_ATTEMPTS = 16;
+
+/** Snapshot returned by `readPublishedPllState` (0.9.947: named + reusable
+ *  as an out-param for an allocation-free read). */
+export interface PublishedPllState {
+  locked: boolean;
+  offsetNs: number;
+  driftPpm: number;
+  /** `true` when the snapshot came from a single publish (seqlock-verified).
+   *  `false` only if the bounded retry was exhausted while a publish stayed in
+   *  progress (publisher descheduled mid-write) — the fields may then mix two
+   *  publishes. Always `true` against a pre-0.9.947 writer (seq stays 0). */
+  consistent: boolean;
+}
 // Q16.16 conversion factor for drift ppm publication. Drift range is
 // effectively ±32768 ppm, which dwarfs any realistic clock drift (≤ 200 ppm).
 const PLL_DRIFT_Q16_16 = 65536;
@@ -1337,43 +1361,9 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * the classifier; SpscRing itself never inspects the value.
    */
   pull(out: FrameFor<S>): SpscPullResult {
-    if (this._needsOverrunAware) return this._pullOverrunAware(out);
-    const r = this.pullResult;
-    const readIdx = this.indices[READ_IDX_LANE]!;
-    const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
-    if (writeIdx === readIdx) {
-      r.ok = false; // empty — exact i32 equality is wrap-correct
-      return r;
-    }
-    const slot = (readIdx >>> 0) & this.mask;
-    const frame = out as unknown as Record<string, unknown>;
-    const sr = this.scalarReaders;
-    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-    const al = this.arrayLayout;
-    const av = this.arrayViews;
-    for (let i = 0; i < al.length; i++) {
-      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-      dst.set(av[i]![slot]!);
-    }
-    // Read stored invariant BEFORE release-store so the slot bytes are still
-    // ours. The classifier on Bridge only touches heap state so it can
-    // safely run AFTER release.
-    const invariantStored = this.invariantView !== null
-      ? this.invariantView[
-          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-        ]!
-      : 0;
-    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
-    this._notifyLane(READ_IDX_LANE);
-    this._updateFlowScale(writeIdx, readIdx);
-    this._recordOccupancy((writeIdx - readIdx) | 0);
-    this.pulledFrames = (this.pulledFrames + 1) | 0;
-    r.ok = true;
-    r.skipped = 0;
-    r.invariantStored = invariantStored;
-    r.preWriteIdx = writeIdx;
-    r.preReadIdx = readIdx;
-    return r;
+    return this._needsOverrunAware
+      ? this._pullOverrunAware(out, true)
+      : this._pullReject(out, true);
   }
 
   /**
@@ -1403,7 +1393,7 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * miss the wake. Use `pull` (which bundles the notify) for everything
    * else.
    *
-   * Dispatches to `_pullOverrunAwareNoNotify` when `_needsOverrunAware`
+   * Dispatches to `_pullOverrunAware(out, false)` when `_needsOverrunAware`
    * is true (drop-oldest policy) so the no-notify primitive remains
    * correct under every overflow policy. Mirrors the dispatch shape of
    * `pull`.
@@ -1412,15 +1402,39 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * helper in 0.8.2 when `BridgeInputLane.pullAll` adopted it.
    */
   _pullNoNotify(out: FrameFor<S>): SpscPullResult {
-    if (this._needsOverrunAware) return this._pullOverrunAwareNoNotify(out);
-    const r = this.pullResult;
+    return this._needsOverrunAware
+      ? this._pullOverrunAware(out, false)
+      : this._pullReject(out, false);
+  }
+
+  /**
+   * Single-frame pull for the reject / block policies (strict SPSC: only the
+   * consumer writes `read_index`, so a plain index read + release-store
+   * suffice). `notify` is a constant at each call site (`pull` → true,
+   * `_pullNoNotify` → false), so after inlining the branch folds away
+   * (0.9.951 merge of two previously duplicated bodies).
+   */
+  private _pullReject(out: FrameFor<S>, notify: boolean): SpscPullResult {
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
     if (writeIdx === readIdx) {
-      r.ok = false;
-      return r;
+      this.pullResult.ok = false; // empty — exact i32 equality is wrap-correct
+      return this.pullResult;
     }
-    const slot = (readIdx >>> 0) & this.mask;
+    // Decode (incl. the stored invariant) BEFORE the release-store so the
+    // slot bytes are still ours. The Bridge-side classifier only touches heap
+    // state, so it can safely run after release.
+    this._decodeSlot((readIdx >>> 0) & this.mask, out);
+    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
+    if (notify) this._notifyLane(READ_IDX_LANE);
+    return this._finishPull(writeIdx, readIdx, 0);
+  }
+
+  /** Decode slot `slot` into `out` (scalars via the precompiled readers,
+   *  arrays via `.set()` from the cached slot views) and stash the slot's
+   *  stored invariant in `pullResult.invariantStored`. Shared by every pull
+   *  variant (0.9.951); must run BEFORE the commit that releases the slot. */
+  private _decodeSlot(slot: number, out: FrameFor<S>): void {
     const frame = out as unknown as Record<string, unknown>;
     const sr = this.scalarReaders;
     for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
@@ -1430,23 +1444,24 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
       dst.set(av[i]![slot]!);
     }
-    const invariantStored = this.invariantView !== null
+    this.pullResult.invariantStored = this.invariantView !== null
       ? this.invariantView[
           slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
         ]!
       : 0;
-    Atomics.store(this.indices, READ_IDX_LANE, (readIdx + 1) | 0); // release
-    // NB: Atomics.notify deliberately omitted — that's the whole point of
-    // this shim. Flow-scale tick still runs so the bench compares like for
-    // like on the post-release work; the occupancy + pulled counters also
-    // stay in sync with the public `pull` path so the bench's stats
-    // surface matches.
+  }
+
+  /** Post-commit bookkeeping shared by every successful pull (0.9.951):
+   *  flow-scale PI tick, occupancy high-water mark, pulled/skipped counters,
+   *  and the reused `pullResult` fields. */
+  private _finishPull(writeIdx: number, readIdx: number, skipped: number): SpscPullResult {
     this._updateFlowScale(writeIdx, readIdx);
     this._recordOccupancy((writeIdx - readIdx) | 0);
     this.pulledFrames = (this.pulledFrames + 1) | 0;
+    if (skipped !== 0) this.skippedFrames = (this.skippedFrames + skipped) | 0;
+    const r = this.pullResult;
     r.ok = true;
-    r.skipped = 0;
-    r.invariantStored = invariantStored;
+    r.skipped = skipped;
     r.preWriteIdx = writeIdx;
     r.preReadIdx = readIdx;
     return r;
@@ -1463,42 +1478,18 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    */
   pullLatest(out: FrameFor<S>): SpscPullResult {
     if (this._needsOverrunAware) return this._pullLatestOverrunAware(out);
-    const r = this.pullResult;
     const readIdx = this.indices[READ_IDX_LANE]!;
     const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
     if (writeIdx === readIdx) {
-      r.ok = false;
-      return r;
+      this.pullResult.ok = false;
+      return this.pullResult;
     }
     const newestIdx = (writeIdx - 1) | 0;
     const skipped = ((newestIdx - readIdx) | 0); // ≥ 0 by the empty-check above
-    const slot = (newestIdx >>> 0) & this.mask;
-    const frame = out as unknown as Record<string, unknown>;
-    const sr = this.scalarReaders;
-    for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-    const al = this.arrayLayout;
-    const av = this.arrayViews;
-    for (let i = 0; i < al.length; i++) {
-      const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-      dst.set(av[i]![slot]!);
-    }
-    const invariantStored = this.invariantView !== null
-      ? this.invariantView[
-          slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-        ]!
-      : 0;
+    this._decodeSlot((newestIdx >>> 0) & this.mask, out);
     Atomics.store(this.indices, READ_IDX_LANE, writeIdx | 0); // consume everything up to writeIdx
     this._notifyLane(READ_IDX_LANE);
-    this._updateFlowScale(writeIdx, readIdx);
-    this._recordOccupancy((writeIdx - readIdx) | 0);
-    this.pulledFrames = (this.pulledFrames + 1) | 0;
-    this.skippedFrames = (this.skippedFrames + skipped) | 0;
-    r.ok = true;
-    r.skipped = skipped;
-    r.invariantStored = invariantStored;
-    r.preWriteIdx = writeIdx;
-    r.preReadIdx = readIdx;
-    return r;
+    return this._finishPull(writeIdx, readIdx, skipped);
   }
 
   /**
@@ -1546,32 +1537,20 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * Atomics.store becomes a compareExchange). The bench separates
    * this in its 0.7.2 per-policy section.
    */
-  private _pullOverrunAware(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
+  private _pullOverrunAware(out: FrameFor<S>, notify: boolean): SpscPullResult {
     // Bounded retry — see method header. capacity + 1 is the worst-case
     // bound under SPSC; in practice the loop body runs once per pull.
+    // `notify` is constant per call site (0.9.951: `_pullOverrunAwareNoNotify`
+    // folded in — `_pullNoNotify` passes false and its caller issues ONE
+    // trailing `_notifyReadAdvance()` per burst).
     for (let attempt = 0; attempt <= this.capacity; attempt++) {
       const readIdx = Atomics.load(this.indices, READ_IDX_LANE);  // acquire
       const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE); // acquire
       if (writeIdx === readIdx) {
-        r.ok = false; // empty
-        return r;
+        this.pullResult.ok = false; // empty
+        return this.pullResult;
       }
-      const slot = (readIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
+      this._decodeSlot((readIdx >>> 0) & this.mask, out);
       // CAS-commit: claim slot `readIdx` only if no one (i.e. the
       // producer's `_dropOldest`) advanced READ_IDX past us mid-read.
       const prev = Atomics.compareExchange(
@@ -1581,24 +1560,15 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
         (readIdx + 1) | 0,
       );
       if (prev !== readIdx) continue; // producer overran — retry whole pull
-      this._notifyLane(READ_IDX_LANE);
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      r.ok = true;
-      r.skipped = 0;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
+      if (notify) this._notifyLane(READ_IDX_LANE);
+      return this._finishPull(writeIdx, readIdx, 0);
     }
     // Unreachable under SPSC for the same reason as `_dropOldest`'s
     // defensive return: the producer cannot infinitely advance
     // `read_index` without the consumer also advancing it. Defensive
     // return surfaces any future protocol change as `ok = false`.
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
+    this.pullResult.ok = false;
+    return this.pullResult;
   }
 
   /**
@@ -1614,31 +1584,16 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * against the new snapshot.
    */
   private _pullLatestOverrunAware(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
     for (let attempt = 0; attempt <= this.capacity; attempt++) {
       const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
       const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
       if (writeIdx === readIdx) {
-        r.ok = false;
-        return r;
+        this.pullResult.ok = false;
+        return this.pullResult;
       }
       const newestIdx = (writeIdx - 1) | 0;
       const skipped = ((newestIdx - readIdx) | 0);
-      const slot = (newestIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
+      this._decodeSlot((newestIdx >>> 0) & this.mask, out);
       // CAS-commit advances READ_IDX from `readIdx` straight to
       // `writeIdx` — drains everything older than the newest in one
       // atomic step, matching the reject-path semantics. On CAS
@@ -1651,86 +1606,10 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
       );
       if (prev !== readIdx) continue;
       this._notifyLane(READ_IDX_LANE);
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      this.skippedFrames = (this.skippedFrames + skipped) | 0;
-      r.ok = true;
-      r.skipped = skipped;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
+      return this._finishPull(writeIdx, readIdx, skipped);
     }
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
-  }
-
-  /**
-   * `_pullNoNotify` variant for the drop-oldest CAS-commit path (0.8.2).
-   * Selected at construction when `policy === 'drop-oldest'` via the same
-   * `_needsOverrunAware` flag that gates `_pullOverrunAware` / `_pullLatestOverrunAware`.
-   *
-   * Identical to `_pullOverrunAware` minus the trailing
-   * `Atomics.notify(READ_IDX_LANE, 1)` — caller (`BridgeInputLane.pullAll`)
-   * issues ONE notify at burst end via `_notifyReadAdvance()` on the
-   * success branch. The CAS-commit retry loop is preserved verbatim from
-   * `_pullOverrunAware`; only the per-frame notify is elided.
-   *
-   * Same correctness pin applies: the concurrent stress test under
-   * drop-oldest (`tests/Bridge.concurrent.test.ts`) asserts every consumed
-   * frame is bit-exact against the producer's recipe. The retry-on-CAS-
-   * failure shape protects against the producer racing the same
-   * `read_index` lane while the consumer is mid-read; the omitted notify
-   * doesn't widen that window — it just defers the wake-up signal.
-   */
-  private _pullOverrunAwareNoNotify(out: FrameFor<S>): SpscPullResult {
-    const r = this.pullResult;
-    for (let attempt = 0; attempt <= this.capacity; attempt++) {
-      const readIdx = Atomics.load(this.indices, READ_IDX_LANE);
-      const writeIdx = Atomics.load(this.indices, WRITE_IDX_LANE);
-      if (writeIdx === readIdx) {
-        r.ok = false;
-        return r;
-      }
-      const slot = (readIdx >>> 0) & this.mask;
-      const frame = out as unknown as Record<string, unknown>;
-      const sr = this.scalarReaders;
-      for (let i = 0; i < sr.length; i++) sr[i]!(slot, frame);
-      const al = this.arrayLayout;
-      const av = this.arrayViews;
-      for (let i = 0; i < al.length; i++) {
-        const dst = frame[al[i]!.name] as { set: (src: AnyTypedArray) => void };
-        dst.set(av[i]![slot]!);
-      }
-      const invariantStored = this.invariantView !== null
-        ? this.invariantView[
-            slot * this.invariantSlotStrideF64 + this.invariantElemOffsetF64
-          ]!
-        : 0;
-      const prev = Atomics.compareExchange(
-        this.indices,
-        READ_IDX_LANE,
-        readIdx,
-        (readIdx + 1) | 0,
-      );
-      if (prev !== readIdx) continue;
-      // Notify deliberately omitted — caller pairs N pulls with one
-      // `_notifyReadAdvance()` on the success branch.
-      this._updateFlowScale(writeIdx, readIdx);
-      this._recordOccupancy((writeIdx - readIdx) | 0);
-      this.pulledFrames = (this.pulledFrames + 1) | 0;
-      r.ok = true;
-      r.skipped = 0;
-      r.invariantStored = invariantStored;
-      r.preWriteIdx = writeIdx;
-      r.preReadIdx = readIdx;
-      return r;
-    }
-    const r2 = this.pullResult;
-    r2.ok = false;
-    return r2;
+    this.pullResult.ok = false;
+    return this.pullResult;
   }
 
   /**
@@ -2124,6 +2003,19 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     // ±2^53 ns (≈ 104 days).
     const hi = Math.floor(offsetRounded / 0x100000000);
     const lo = (offsetRounded - hi * 0x100000000) | 0;
+    // Seqlock open (0.9.947): bump the status-lane sequence to ODD before
+    // touching the payload lanes, keeping the previous locked bit so a
+    // pre-0.9.947 reader (which masks bit 0 only) still sees a valid status.
+    // The offset spans two Int32 lanes; without this a reader could pair the
+    // new low word with the old high word across a 2^32-ns carry (≈ 4.29 s
+    // error). Single writer (the consumer Bridge), so no CAS is needed.
+    const prevStatus = Atomics.load(this.indices, PLL_STATUS_LANE);
+    const busySeq = ((prevStatus >>> PLL_STATUS_SEQ_SHIFT) & PLL_STATUS_SEQ_MASK) | 1;
+    Atomics.store(
+      this.indices,
+      PLL_STATUS_LANE,
+      (busySeq << PLL_STATUS_SEQ_SHIFT) | (prevStatus & PLL_STATUS_LOCKED_BIT),
+    );
     Atomics.store(this.indices, PLL_OFFSET_LANE_LOW, lo);
     Atomics.store(this.indices, PLL_OFFSET_LANE_HIGH, hi | 0);
     // Drift as signed Q16.16 ppm. Range ±32768 ppm clamped — any
@@ -2135,10 +2027,13 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
     if (driftQ > MAX_Q) driftQ = MAX_Q;
     else if (driftQ < MIN_Q) driftQ = MIN_Q;
     Atomics.store(this.indices, PLL_DRIFT_LANE, driftQ);
+    // Seqlock close: EVEN sequence + the new locked bit, stored last (the
+    // status-last order the one-bit lock gate already relied on).
+    const doneSeq = (busySeq + 1) & PLL_STATUS_SEQ_MASK;
     Atomics.store(
       this.indices,
       PLL_STATUS_LANE,
-      locked ? PLL_STATUS_LOCKED_BIT : 0,
+      (doneSeq << PLL_STATUS_SEQ_SHIFT) | (locked ? PLL_STATUS_LOCKED_BIT : 0),
     );
   }
 
@@ -2153,49 +2048,62 @@ export class SpscRing<S extends Schema<FieldsObject, any>> {
    * consumer Bridge is using, and calls this method to inspect the
    * consumer's PLL state without postMessage or other IPC.
    *
-   * ─── Read order contract (0.8.1) ──────────────────────────────────────
+   * ─── Seqlock contract (0.9.947; supersedes the 0.8.1 read order) ──────
    *
-   * The status lane is read FIRST, then offset, then drift. This pairs
-   * with `publishPllState`'s status-last write order to form a one-bit
-   * gate: a reader that observes `locked === false` knows the
-   * offset/drift fields may be stale or zero (no PLL has published yet,
-   * or the producer just reset) and should ignore them; a reader that
-   * observes `locked === true` knows the offset/drift fields belong to a
-   * publish point where the producer had locked. The protocol does NOT
-   * implement a full seqlock — concurrent publish/read interleaving can
-   * still produce a snapshot stitched across two publishes — but the
-   * documented invariants (status changes only on lock/unlock
-   * transitions; offset/drift change every observe) ensure the stitched
-   * snapshot is a valid publish point in practice, not a synthesis of
-   * incompatible halves.
+   * `publishPllState` brackets its payload stores with the status lane's
+   * sequence counter (bits 1-30): ODD before the offset/drift stores, EVEN
+   * (plus the new locked bit) after. This method loads status, the three
+   * payload lanes, then status again, and accepts the snapshot only when both
+   * status loads are identical and even — i.e. no publish overlapped the read.
+   * The tuple (locked, offsetNs, driftPpm) therefore always comes from ONE
+   * publish. Before 0.9.947 there was no sequence: a read overlapping a
+   * publish could pair the new low offset word with the old high word, and
+   * across a 2^32-ns carry that is a ≈ 4.29 s error.
    *
-   * The four lanes (status / offset-low / offset-high / drift) are
-   * individually atomic; the tuple is not mutually atomic. Live observer
-   * activity that needs sample-accurate coherence should instead call
-   * `bridge.telemetry()` on the consumer Bridge directly (same-thread
-   * loads, gated against the heap state). The published-lane path exists
-   * for the cross-thread / cross-process case where direct Bridge access
-   * isn't available.
+   * Wait-free: at most `PLL_READ_MAX_ATTEMPTS` (16) attempts. If every
+   * attempt overlaps a publish (only possible when the publishing thread is
+   * descheduled mid-publish), the last attempt's values are returned with
+   * `consistent: false`.
    *
-   * Four atomic loads + one ppm decode + one offset reconstruction.
-   * Allocation-free (no BigInt boxing; see `publishPllState` for the
-   * 0.8.2 BigInt-free encoding).
+   * Compatibility: a pre-0.9.947 writer never sets the sequence bits, so its
+   * snapshots read as `consistent: true` with the old (unguarded) semantics;
+   * a pre-0.9.947 reader masks bit 0 only and ignores the sequence.
+   *
+   * ─── Allocation ───────────────────────────────────────────────────────
+   *
+   * Pass `out` (a reused `PublishedPllState`) for an allocation-free read;
+   * without it, one result object is allocated per call. No BigInt boxing
+   * either way (see `publishPllState` for the 0.8.2 BigInt-free encoding).
    */
-  readPublishedPllState(): { locked: boolean; offsetNs: number; driftPpm: number } {
-    const status = Atomics.load(this.indices, PLL_STATUS_LANE);
-    const locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
-    // Two Int32 loads + Number reconstruction (0.8.2). Bit-equivalent to
-    // reading the same 8 bytes as a BigInt64 then converting to Number,
-    // but allocation-free on the hot reader path. `(lo >>> 0)` casts the
-    // low half from signed Int32 to its unsigned interpretation; the
-    // signed high half multiplies by 2^32 to reconstruct the full Int64
-    // as a JavaScript Number. Within ±2^53 ns this is exact.
-    const lo = Atomics.load(this.indices, PLL_OFFSET_LANE_LOW);
-    const hi = Atomics.load(this.indices, PLL_OFFSET_LANE_HIGH);
-    const offsetNs = hi * 0x100000000 + (lo >>> 0);
-    const driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
-    const driftPpm = driftQ / PLL_DRIFT_Q16_16;
-    return { locked, offsetNs, driftPpm };
+  readPublishedPllState(out?: PublishedPllState): PublishedPllState {
+    // Seqlock read (0.9.947): status → payload → status; accept when the two
+    // status loads match and the sequence is even (no publish in progress).
+    // Bounded retry keeps this wait-free.
+    let status = 0;
+    let lo = 0;
+    let hi = 0;
+    let driftQ = 0;
+    let consistent = false;
+    for (let attempt = 0; attempt < PLL_READ_MAX_ATTEMPTS; attempt++) {
+      status = Atomics.load(this.indices, PLL_STATUS_LANE);
+      lo = Atomics.load(this.indices, PLL_OFFSET_LANE_LOW);
+      hi = Atomics.load(this.indices, PLL_OFFSET_LANE_HIGH);
+      driftQ = Atomics.load(this.indices, PLL_DRIFT_LANE);
+      const status2 = Atomics.load(this.indices, PLL_STATUS_LANE);
+      if (status === status2 && ((status >>> PLL_STATUS_SEQ_SHIFT) & 1) === 0) {
+        consistent = true;
+        break;
+      }
+    }
+    // Two Int32 halves + Number reconstruction (0.8.2, BigInt-free).
+    // `(lo >>> 0)` reads the low half unsigned; the signed high half scales
+    // by 2^32. Exact within ±2^53 ns.
+    const o = out ?? { locked: false, offsetNs: 0, driftPpm: 0, consistent: false };
+    o.locked = (status & PLL_STATUS_LOCKED_BIT) !== 0;
+    o.offsetNs = hi * 0x100000000 + (lo >>> 0);
+    o.driftPpm = driftQ / PLL_DRIFT_Q16_16;
+    o.consistent = consistent;
+    return o;
   }
 
   /** Current producer counter (unsigned-decoded for telemetry). */

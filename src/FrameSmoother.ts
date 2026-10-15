@@ -46,7 +46,7 @@
  *       helpers. Both touch only the heap-side prev buffer.
  *
  *   Bridge<S>  (./Bridge.ts):
- *     - The invariant classifier (`_classifyInvariant` + epsilon floor) and
+ *     - The invariant classifier (`classifyInvariant` in `./_invariant.ts` + epsilon floor) and
  *       the `ok` / `soft` / `hard` dispatch. The classifier decides which of
  *       `seedFrom` / `observe` / `fallbackInto` to call on FrameSmoother; the
  *       smoother itself does not know about invariants.
@@ -438,12 +438,18 @@ export class FrameSmoother<S extends Schema<FieldsObject, any>> {
    *  happens at the runtime layer (`dst` is always a freshly-allocated
    *  frame from `allocateFrame()`). */
   private _copyFrameInto(src: FrameRecord, dst: FrameRecord): void {
-    for (const f of this.scalarLayout) {
-      dst[f.name] = src[f.name];
+    // Indexed loops (0.9.950): `for…of` allocated an iterator per call on
+    // this per-pull path (seedFrom runs on every OK-band invariant pull).
+    const scalars = this.scalarLayout;
+    for (let i = 0; i < scalars.length; i++) {
+      const name = scalars[i]!.name;
+      dst[name] = src[name];
     }
-    for (const f of this.arrayLayout) {
-      (dst[f.name] as { set: (s: ArrayLike<number> | ArrayLike<bigint>) => void }).set(
-        src[f.name] as ArrayLike<number> | ArrayLike<bigint>,
+    const arrays = this.arrayLayout;
+    for (let i = 0; i < arrays.length; i++) {
+      const name = arrays[i]!.name;
+      (dst[name] as { set: (s: ArrayLike<number> | ArrayLike<bigint>) => void }).set(
+        src[name] as ArrayLike<number> | ArrayLike<bigint>,
       );
     }
   }

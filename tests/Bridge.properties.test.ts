@@ -219,8 +219,13 @@ function pinSmootherMonotonicConvergence(): void {
           // FP epsilon. The blend `α·curr + (1−α)·prev` is computed in f64;
           // a single ulp rounding step is allowed at each iteration.
           // Distance is at most `(1-α)^k · initial`, which decays
-          // monotonically; allow `1e-9 · initial + 1e-12` slack.
-          const allowedSlack = 1e-9 * Math.abs(currX - prevX) + 1e-12;
+          // monotonically; allow `1e-9 · initial + 1e-12` slack PLUS a few
+          // ulps of the operands' MAGNITUDE: rounding error scales with
+          // |x|, not with |curr − prev| (0.9.945 fix — near |x| ≈ 1e6 one
+          // rounding step is ≈ 1.2e-10, far above the old 1e-12 floor, and
+          // fast-check's random seed occasionally found it).
+          const magnitudeUlps = 4 * Number.EPSILON * Math.max(Math.abs(currX), Math.abs(prevX));
+          const allowedSlack = 1e-9 * Math.abs(currX - prevX) + 1e-12 + magnitudeUlps;
           assert(
             distance <= lastDistance + allowedSlack,
             `P2: distance grew at iter ${i}: was ${lastDistance}, now ${distance} (α=${alpha}, prev=${prevX}, curr=${currX})`,

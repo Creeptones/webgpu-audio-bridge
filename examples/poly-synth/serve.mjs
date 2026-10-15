@@ -7,7 +7,7 @@
 // wabt load same-origin under require-corp.
 //
 // Like the other Frontier-6/7 demos, the library's experimental barrel transitively
-// imports `acorn` (the JIT compiler's parser) via dist/jit/parse.js — a BARE
+// imports `acorn` (the JIT compiler's parser) via dist/jit/acornParser.js — a BARE
 // specifier raw browser ESM cannot resolve, and import maps are unavailable in module
 // WORKERS, so the page AND the compile worker would both fail to load it. We vendor
 // acorn's ESM build (./vendor/acorn.mjs) and rewrite the single bare `from "acorn"`

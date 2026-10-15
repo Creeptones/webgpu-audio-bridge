@@ -163,9 +163,6 @@ export class StatePredictor {
   /** State dimension: 2 (CV) or 3 (CA). */
   private readonly _m: number;
   private readonly _q: number;
-  private readonly _rp: number;
-  private readonly _rv: number;
-  private readonly _ra: number;
   private readonly _p0: number;
 
   /** Flat per-lane state: lane `i` occupies `[i*m, i*m + m)`. */
@@ -177,6 +174,12 @@ export class StatePredictor {
    *  Preallocated so the hot path allocates nothing. */
   private readonly _K: Float64Array;
   private readonly _row: Float64Array;
+  /** Per-ingest `dt` handed to `_propagateCA/CV`, and the diagonal R by state
+   *  index (0.9.950). Passing doubles as arguments to non-inlined helpers
+   *  boxed a HeapNumber per argument per lane (~7 per lane per ingest for CA);
+   *  the helpers now read them from typed storage. Arithmetic is unchanged. */
+  private readonly _dtCell = new Float64Array(1);
+  private readonly _rByIdx = new Float64Array(3);
 
   private _seeded = false;
   private _lastProducerNs = 0;
@@ -218,9 +221,9 @@ export class StatePredictor {
     this._model = model;
     this._m = model === "ca" ? 3 : 2;
     this._q = opts.processNoise;
-    this._rp = opts.measPosNoise;
-    this._rv = rv;
-    this._ra = ra;
+    this._rByIdx[0] = opts.measPosNoise;
+    this._rByIdx[1] = rv;
+    this._rByIdx[2] = ra;
     this._p0 = p0;
 
     const m = this._m;
@@ -319,15 +322,17 @@ export class StatePredictor {
     this._lastProducerNs = producerNs;
     const useV = velocity !== undefined;
     const useA = acceleration !== undefined && m === 3;
+    this._dtCell[0] = dt;
     for (let i = 0; i < n; i++) {
       if (dt > 0) {
-        if (m === 3) this._propagateCA(i, dt);
-        else this._propagateCV(i, dt);
+        if (m === 3) this._propagateCA(i);
+        else this._propagateCV(i);
       }
-      // Sequential scalar measurement updates (diagonal R).
-      this._updateScalar(i, 0, position[i]!, this._rp);
-      if (useV) this._updateScalar(i, 1, velocity![i]!, this._rv);
-      if (useA) this._updateScalar(i, 2, acceleration![i]!, this._ra);
+      // Sequential scalar measurement updates (diagonal R). The measurement is
+      // read inside `_updateScalar` from the array (no boxed double argument).
+      this._updateScalar(i, 0, position);
+      if (useV) this._updateScalar(i, 1, velocity!);
+      if (useA) this._updateScalar(i, 2, acceleration!);
     }
   }
 
@@ -482,7 +487,8 @@ export class StatePredictor {
   // an explicit FP intermediate held in locals; Q is added componentwise.
 
   /** CV: F = [[1,dt],[0,1]], Q = q·[[dt³/3, dt²/2],[dt²/2, dt]]. */
-  private _propagateCV(lane: number, dt: number): void {
+  private _propagateCV(lane: number): void {
+    const dt = this._dtCell[0]!;
     const xb = lane * 2;
     // State: x0 += dt·x1; x1 unchanged.
     this._x[xb] = this._x[xb]! + dt * this._x[xb + 1]!;
@@ -510,7 +516,8 @@ export class StatePredictor {
 
   /** CA: F = [[1,dt,½dt²],[0,1,dt],[0,0,1]],
    *  Q = q·[[dt⁵/20,dt⁴/8,dt³/6],[dt⁴/8,dt³/3,dt²/2],[dt³/6,dt²/2,dt]]. */
-  private _propagateCA(lane: number, dt: number): void {
+  private _propagateCA(lane: number): void {
+    const dt = this._dtCell[0]!;
     const xb = lane * 3;
     const h = 0.5 * dt * dt; // ½dt²
     const x0 = this._x[xb]!;
@@ -565,7 +572,9 @@ export class StatePredictor {
    *  (diagonal R): innovation y = z − x[idx]; S = P[idx][idx] + r; gain
    *  K = P[:,idx]/S; x += K·y; P −= K · P[idx,:]. No matrix inverse — one
    *  scalar divide. Order fixed for the bit-exact WASM ports. */
-  private _updateScalar(lane: number, idx: number, z: number, r: number): void {
+  private _updateScalar(lane: number, idx: number, measurement: Float64Array): void {
+    const z = measurement[lane]!;
+    const r = this._rByIdx[idx]!;
     const m = this._m;
     const xb = lane * m;
     const pb = lane * m * m;

@@ -23,3 +23,16 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # Release gates (previously only run by `prepublishOnly`, so a README
+  # rewrite silently broke `npm publish`). One cell is enough: these are
+  # deterministic text/manifest checks, not platform-sensitive.
+  release-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check:release

@@ -15,7 +15,7 @@
 // synchronous `new WebAssembly.Instance`/bytes-compile is microseconds, but an async
 // compile on the audio thread could blow a render quantum.
 
-import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/index.js";
+import { createJitConsumer, handleJitInstallMessage } from "../../dist/experimental/core.js";
 
 const AMP = 0.25; // master output gain (kept OUTSIDE the timed region)
 const TWO_PI = Math.PI * 2;

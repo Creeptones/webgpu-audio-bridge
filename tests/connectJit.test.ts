@@ -162,6 +162,15 @@ class FakePort implements JitPostTarget {
 }
 
 function flush(): Promise<void> { return new Promise((r) => setTimeout(r, 0)); }
+/** Wait until the fake compile round-trip has delivered (an install message
+ *  reached the port, or a fallback fired). A single `flush()` tick raced the
+ *  async compile under a loaded `npm test` run (pin H flaked once at 0.9.945);
+ *  this polls macrotasks with a generous cap instead of assuming one tick. */
+async function flushUntil(done: () => boolean, maxMs = 10_000): Promise<void> {
+  const t0 = Date.now();
+  await flush();
+  while (!done() && Date.now() - t0 < maxMs) await flush();
+}
 
 // ── A: connectJit() shape ─────────────────────────────────────────────────────
 function testShape(): void {
@@ -288,7 +297,7 @@ async function testEndToEnd(): Promise<void> {
     },
   });
   c.requestCompile();
-  await flush();
+  await flushUntil(() => port.posted.length > 0 || fellBack);
 
   assertEq(fellBack, false, "E: no fallback for a compilable kernel");
   assertEq(upgradeTransport, "bytes", "E: onUpgrade fired with the default bytes transport");
@@ -393,7 +402,7 @@ async function testTokenEndToEnd(): Promise<void> {
   let fellBack = false;
   c.bind({ worker, workletPort: port, callbacks: { onUpgrade: (t) => { upgradeTransport = t; }, onFallback: () => { fellBack = true; } } });
   c.requestCompile();
-  await flush();
+  await flushUntil(() => port.posted.length > 0 || fellBack);
 
   assertEq(fellBack, false, "G: a compilable token kernel does not fall back");
   assertEq(upgradeTransport, "bytes", "G: onUpgrade fired (bytes transport)");
@@ -447,7 +456,7 @@ async function testVoiceTokenEndToEnd(): Promise<void> {
   let upgraded = false;
   c.bind({ worker, workletPort: port, callbacks: { onUpgrade: () => { upgraded = true; } } });
   c.requestCompile();
-  await flush();
+  await flushUntil(() => port.posted.length > 0);
 
   assert(upgraded, "H: a compilable voice token kernel upgrades (no fallback)");
   assertEq(port.posted.length, 1, "H: one install message reached the port");

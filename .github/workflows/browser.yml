@@ -29,6 +29,20 @@ jobs:
       - run: npm run build
       - name: Install Playwright (${{ matrix.browser }})
         run: npx playwright install --with-deps ${{ matrix.browser }}
+      # Headless Firefox on Linux renders Web Audio through PulseAudio; the
+      # hosted runner has no sound server, so every AudioContext stays
+      # 'suspended' forever (resume() never settles, worklets never run).
+      # Chromium/WebKit use built-in fake sinks headless. A null sink gives
+      # Firefox a real (silent) output device. Diagnosed via the
+      # jit-vectorize spec's timeout snapshot (ctxState: suspended).
+      - name: Virtual audio sink (Firefox)
+        if: matrix.browser == 'firefox'
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci_null
+          pactl set-default-sink ci_null
+          pactl info | grep -E 'Server Name|Default Sink'
       - name: Browser smoke
         run: npm run test:browser -- --project=${{ matrix.browser }}
       - name: Upload Playwright report on failure

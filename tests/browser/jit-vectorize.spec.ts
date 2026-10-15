@@ -41,6 +41,32 @@ declare global {
 test("jit-vectorize: naive JS kernel silently upgrades to WASM SIMD", async ({ page }) => {
   const pageErrors: string[] = [];
   page.on("pageerror", (err) => pageErrors.push(`pageerror: ${err.message}`));
+  // Console errors are collected for DIAGNOSIS only (a favicon 404 is noise);
+  // the final assertion still checks pageErrors alone.
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => { if (msg.type() === "error") consoleErrors.push(msg.text()); });
+
+  // On a timed-out wait, report WHY: the page's own status panel (start()
+  // failures land there and nowhere else), the AudioContext state, and every
+  // page/console error seen so far. Without this a failure on a CI-only engine
+  // (no local Firefox, artifacts not always reachable) is just "Timeout 5000ms".
+  async function waitOrExplain(label: string, fn: () => boolean, timeout: number): Promise<void> {
+    try {
+      await page.waitForFunction(fn, undefined, { timeout });
+    } catch (err) {
+      const snapshot = await page.evaluate(() => ({
+        status: document.getElementById("status")?.textContent?.trim() ?? "(no #status)",
+        ctxState: (window as any).__jit?.ctxState?.() ?? "(no __jit)",
+        diag: JSON.stringify((window as any).__jit?.diag?.() ?? null),
+      })).catch((e: unknown) => ({ status: `(evaluate failed: ${String(e)})`, ctxState: "?", diag: "?" }));
+      throw new Error(
+        `${label} timed out after ${timeout} ms\n` +
+          `  ctxState: ${snapshot.ctxState}\n  #status: ${snapshot.status}\n  diag: ${snapshot.diag}\n` +
+          `  pageErrors: ${JSON.stringify(pageErrors)}\n  consoleErrors: ${JSON.stringify(consoleErrors)}\n` +
+          `  (${(err as Error).message.split("\n")[0]})`,
+      );
+    }
+  }
 
   await page.goto("/");
 
@@ -52,16 +78,16 @@ test("jit-vectorize: naive JS kernel silently upgrades to WASM SIMD", async ({ p
   await page.waitForFunction(() => !!(window as any).__jit, undefined, { timeout: 5_000 });
 
   // (b) the context resumes (audio runs).
-  await page.waitForFunction(() => (window as any).__jit.ctxState() === "running", undefined, { timeout: 5_000 });
+  await waitOrExplain("AudioContext reaching 'running'", () => (window as any).__jit.ctxState() === "running", 5_000);
 
   // jitEnabled in an isolated context.
   expect(await page.evaluate(() => (window as any).__jit.state.jit.jitEnabled)).toBe(true);
 
   // (c) the worklet reaches `complete` on the SIMD kernel within a few seconds.
-  await page.waitForFunction(() => {
+  await waitOrExplain("SIMD upgrade reaching 'complete'", () => {
     const d = (window as any).__jit.diag();
     return d && d.phase === "complete" && d.ranSimd === true && d.upgraded === true;
-  }, undefined, { timeout: 15_000 });
+  }, 15_000);
 
   // (d) the gate verified it bit-exact before shipping.
   const gate = await page.evaluate(() => (window as any).__jit.upgrade()?.gate ?? null);

@@ -83,14 +83,14 @@ import {
 import { SpscRing } from "./SpscRing.js";
 import { FrameSmoother } from "./FrameSmoother.js";
 import { ConsumerClockRecovery } from "./ConsumerClockRecovery.js";
+import type { SmoothedPullOptions, TelemetrySnapshot } from "./Bridge.js";
 import {
-  INVARIANT_OK_THRESHOLD,
-  INVARIANT_SOFT_THRESHOLD,
-  INVARIANT_SOFT_ALPHA_BASE,
-  type SmoothedPullOptions,
-  type TelemetrySnapshot,
-} from "./Bridge.js";
+  INVARIANT_CLASS_OK,
+  INVARIANT_CLASS_HARD,
+  classifyInvariant,
+} from "./_invariant.js";
 import { buildScratchFrame } from "./_heap.js";
+import { buildTelemetrySnapshot } from "./_telemetry.js";
 
 export type { SmoothedPullOptions };
 
@@ -346,62 +346,11 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
    * dashboard use only.
    */
   telemetry(): TelemetrySnapshot {
-    return Object.freeze({
-      tornFrames: this.ring.tornFrameCount(),
-      softFrames: this._softFrames,
-      stallRecoveries: this.pll === null ? 0 : this.pll.stallRecoveries,
-      // 0.9.935 — angular monodromy counter; 0 when the smoother is opted out.
-      cycleSlips: this.smoother === null ? 0 : this.smoother.cycleSlips,
-      flowScale: this.ring.flowScaleHint(),
-      available: this.ring.available(),
-      capacity: this.capacity,
-      writeIndex: this.ring.writeIndexUnsigned(),
-      readIndex: this.ring.readIndexUnsigned(),
-      pllLocked: this.pll === null ? false : this.pll.locked,
-      pllOffsetNs: this.pll === null ? 0 : this.pll.offsetNs,
-      pllOutliersRejected: this.pll === null ? 0 : this.pll.outliersRejected,
-      pllDriftPpm: this.pll === null ? 0 : this.pll.driftPpm,
-      policy: this.ring.policy,
-      droppedFrames: this.ring.droppedCount(),
-      pushedFrames: this.ring.pushedCount(),
-      pulledFrames: this.ring.pulledCount(),
-      skippedFrames: this.ring.skippedCount(),
-      lastFullWaitNs: this.ring.lastFullWaitNanos(),
-      lastEmptyWaitNs: this.ring.lastEmptyWaitNanos(),
-      maxOccupancyEverSeen: this.ring.maxOccupancy(),
-    });
+    // Shared builder (0.9.951) — see src/_telemetry.ts for field semantics.
+    return buildTelemetrySnapshot(this.ring, this._softFrames, this.pll, this.smoother);
   }
 
   // ── Invariant classifier + dispatch (mirrors Bridge<S>) ──────────────────
-
-  private _classifyInvariant(
-    computed: number,
-    stored: number,
-  ): { kind: "ok" | "soft" | "hard"; alpha: number } {
-    if (!Number.isFinite(computed) || !Number.isFinite(stored)) {
-      return { kind: "hard", alpha: 0 };
-    }
-    const absErr = Math.abs(computed - stored);
-    if (absErr === 0) return { kind: "ok", alpha: 1 };
-    const eps = this.invariantAbsoluteEpsilon;
-    const absStored = Math.abs(stored);
-    const okBand = eps > INVARIANT_OK_THRESHOLD * absStored
-      ? eps
-      : INVARIANT_OK_THRESHOLD * absStored;
-    if (absErr < okBand) return { kind: "ok", alpha: 1 };
-    if (stored === 0) {
-      return { kind: "hard", alpha: 0 };
-    }
-    const delta = absErr / absStored;
-    if (delta < INVARIANT_SOFT_THRESHOLD) {
-      const alpha = Math.min(
-        1,
-        Math.max(0, INVARIANT_SOFT_ALPHA_BASE / delta),
-      );
-      return { kind: "soft", alpha };
-    }
-    return { kind: "hard", alpha: 0 };
-  }
 
   private _invariantHandleRaw(
     out: Record<string, unknown>,
@@ -410,16 +359,17 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
     const inv = this.schema.invariant;
     if (inv === null) return;
     const computed = inv.compute(out);
-    const { kind, alpha } = this._classifyInvariant(computed, invariantStored);
-    if (kind === "ok") {
+    // Shared allocation-free classifier (0.9.950): OK / HARD sentinels, else α.
+    const cls = classifyInvariant(computed, invariantStored, this.invariantAbsoluteEpsilon);
+    if (cls === INVARIANT_CLASS_OK) {
       if (this.smoother !== null) this.smoother.seedFrom(out);
-    } else if (kind === "soft") {
+    } else if (cls !== INVARIANT_CLASS_HARD) {
       // 0.9.35: count the soft branch (parity with Bridge<S>._softFrames).
       // Exposed via telemetry().softFrames so a Bridge Inspector visualises
       // soft "ride-over" events distinctly from hard fallbacks
       // (telemetry().tornFrames).
       this._softFrames = (this._softFrames + 1) | 0;
-      if (this.smoother !== null) this.smoother.observe(out, alpha);
+      if (this.smoother !== null) this.smoother.observe(out, cls);
     } else {
       this.ring.incrementTornFrameCount();
       this._invokeHardPolicy(out, computed, invariantStored);
@@ -437,13 +387,13 @@ export class BridgeConsumer<S extends Schema<FieldsObject, any>> {
       return;
     }
     const computed = this.schema.invariant.compute(out);
-    const { kind } = this._classifyInvariant(computed, invariantStored);
-    if (kind === "hard") {
+    const cls = classifyInvariant(computed, invariantStored, this.invariantAbsoluteEpsilon);
+    if (cls === INVARIANT_CLASS_HARD) {
       this.ring.incrementTornFrameCount();
       this._invokeHardPolicy(out, computed, invariantStored);
       return;
     }
-    if (kind === "soft") {
+    if (cls !== INVARIANT_CLASS_OK) {
       // 0.9.35: count the soft branch on the smoothed path too, matching
       // Bridge<S>'s unified counter across raw + smoothed pulls.
       this._softFrames = (this._softFrames + 1) | 0;

@@ -4,6 +4,320 @@ All notable changes to this project will be documented here. This project adhere
 
 > **Versioning policy (post-0.6.0)**: future improvements default to **patch bumps** (`0.6.x`) rather than minor bumps. Many additional improvements are planned before 1.0; we want the version number to reflect actual maturity, not feature count. Minor bumps (`0.7.0` etc.) are reserved for wire-format changes, breaking public-API changes, or batched-patch promotion. The 0.7.x cohort (and every subsequent minor) is expected to go deep — `0.7.0 → 0.7.99` is the planned patch envelope before `0.8.0` is considered. See [`CLAUDE.md`](./CLAUDE.md) for the full policy.
 
+## [0.9.952] - 2026-10-15
+
+### Fixed - browser smoke CI
+
+- **`bench/e2e-latency/` page crashed at load, failing `tests/browser/latency.spec.ts` on every engine.** Since `f0f76f2` / `2291613` / `47c0f54`, `main.js` looks up 19 controls that `index.html` never had (`notifyMode`, `producerPushMode`, `producerTickHz`, `consumerMode`, `sweep`, `copySweep`, and the `sweep*` inputs). The first `addEventListener` on a `null` element threw, so `window.__bench` was never set and the spec read no report. The controls are added, with defaults matching `readUI()` / `readSweep()` (a single run behaves exactly as `main.js` already assumed), and the matrix-sweep inputs sit in a collapsed `<details>` section. Verified locally on Chromium: the CPU-stub run produces its report again and every numeric assertion in the spec passes.
+
+### Changed
+
+- **`tests/browser/jit-vectorize.spec.ts` explains its timeouts.** The "AudioContext reaching `running`" and "SIMD upgrade reaching `complete`" waits now fail with a snapshot of the page's `#status` panel (the only place a `start()` failure is reported), the AudioContext state, `__jit.diag()`, and every page and console error seen. The Firefox job on `main` has timed out on the first wait with only "Timeout 5000ms exceeded". No Firefox binary or CI artifact is reachable from the dev environment, so the next CI run needs to carry the cause. The test's assertions are unchanged.
+
+- **Firefox CI: a virtual audio sink.** With the timeout snapshot above, the Firefox failure turned out to be the environment. The jit-vectorize timeout reported `ctxState: suspended` with `#status` stuck at "starting…" and no errors: `await ctx.resume()` never settles. The hosted runner has no sound server, so headless Firefox cannot open an output stream and no AudioContext ever runs. That is also why the latency bench produced no report on Firefox. Chromium and WebKit use built-in fake sinks when headless. `.github/workflows/browser.yml` now starts PulseAudio with a null sink for the Firefox job. (`minimal.spec` kept passing only because its `seq` counter comes from the producer worker, so it never proved the worklet runs.)
+- **e2e-latency bench: re-anchor the clock once the AudioContext runs.** With audio working, Firefox reported p99 ≈ 992 ms. That was a measurement artifact, not latency. The bench anchored worklet `currentTime` to wall-clock right after `new AudioContext()` returned, assuming `currentTime` starts at 0 at that moment. Firefox opens the device asynchronously (~1 s headless with PulseAudio), so every sample carried that startup gap. `main.js` now pairs the epoch clock with `ctx.currentTime` once the context is running. If the two anchors differ by more than 20 ms it posts `{type:"clock"}`, and the worklet swaps the anchor and drops the stale samples. Chromium with a 1 s forced late start reproduces the 992.16 ms bin on the old code and reads ~9 ms p99 on the new one; normal starts send no re-anchor. The worklet also now handles the `reset` command the matrix sweep already sent after warm-up (previously a no-op, so sweep cells included warm-up samples).
+
+### Why
+
+The `browser` workflow has failed on every push to `main` since at least 0.9.921, so it gated nothing.
+
+### Wire compatibility
+
+None. Bench page and browser test only; no `src/` change.
+
+### Tests
+
+- `latency.spec.ts` should pass on all three engines.
+- The Firefox `jit-vectorize` failure is expected to persist until its cause (now reported in the failure message) is fixed.
+
+## [0.9.951] - 2026-10-14
+
+### Changed - duplicated logic removed, type ergonomics
+
+- **SpscRing pull variants deduplicated.** `pull`, `_pullNoNotify`, `pullLatest` and the drop-oldest CAS variants repeated the same slot-decode and post-commit bookkeeping blocks. They now share two helpers, `_decodeSlot` (scalars + arrays + the stored invariant, before the commit) and `_finishPull` (flow-scale tick, occupancy, counters, the reused result). `pull`/`_pullNoNotify` and their CAS forms are each one body with a constant `notify` flag; `_pullOverrunAwareNoNotify` is gone. `SpscRing.ts` shrank by about 145 lines. The memory ordering is unchanged: still decode → release-store/CAS → notify. Performance is unchanged within noise (8 interleaved A/B rounds of 2M push+pull: median `pull` 481 → 474 ns, `pullLatest` 491 → 518 ns, per-variant minimums improved).
+- **One telemetry builder.** `Bridge.telemetry()` and `BridgeConsumer.telemetry()` built the same 21-field frozen literal by hand. Both now call `buildTelemetrySnapshot` in the new `src/_telemetry.ts`, which keeps the key order and values identical.
+- **One `RING_HEADER_BYTES`.** `SpscRing.ts` and `worklet/index.ts` each declared their own `32`. Both now re-export it from the dependency-free leaf `src/_ringHeader.ts`, so the worklet entry still does not import SpscRing.
+- **`MountResult` is discriminated on `role` AND `mode`.** Checking `mode === "turbo"` now narrows `macro` to `BridgeConsumer`/`BridgeProducer` and `input` to `BridgeInputLane` with no cast; `"standard"` narrows both to `MessageChannelBridge`. Previously `macro` stayed a facade-or-MessageChannelBridge union whatever `mode` said. Reading code is unaffected; only hand-constructing a `MountResult` with a non-literal `mode` stops compiling.
+
+### Deprecated (removal at 0.10.0)
+
+- `BridgeGPUSource.inFlightCount()` and `BridgeBlockProducer.inFlightCount()`: pure aliases of `inFlight()`, which is the name `BridgeBlockProducer` and the examples use.
+- `Bridge._updateFlowScale()`: an underscore test seam that sat on the public type surface. It becomes non-public at 0.10.0.
+- These are tracked in the new `deprecatedMembers` list in `docs/stable-api-manifest.json`. `check:api-boundary` requires each entry to exist and be `@deprecated`.
+
+### Why
+
+Duplicated copies drift: the `BridgeFacades` symmetry pin was the only guard on the telemetry literal, and the two header constants had no guard at all. The `MountResult` union made every Turbo-mode caller cast.
+
+### Wire compatibility
+
+None. Public API: `MountResult` narrowed (see above); everything else is additive or a deprecation.
+
+### Tests
+
+- New `tests/surfaceHygiene.test.ts` (4 pins), in `npm test` / `test:unit`:
+  - `RING_HEADER_BYTES`: root ≡ SpscRing ≡ worklet ≡ `layout.headerBytes`.
+  - `MountResult` narrowing: a compile-time no-cast assignment plus runtime `instanceof`, and the standard arm's `macro` is `MessageChannelBridge`.
+  - `Bridge` and `BridgeConsumer` `telemetry()` agree on key order and SAB-backed fields over one SAB.
+  - The deprecated alias returns the same value as `inFlight()`.
+- The full suite passes unchanged, including the SPSC interleaving fuzzer, the 1M-frame concurrent stress, the waiter-flag pins and `BridgeInputLane.pullAll`.
+- `tests/browser/webgpu-readback.spec.ts` now reads `inFlight()`.
+
+## [0.9.950] - 2026-10-14
+
+### Changed - per-call garbage removed from the audio-thread pull paths
+
+Measured with the new `npm run bench:alloc` (minor GCs over 400k calls after warm-up; Node 22; the plain-`pullLatest` harness floor is about 2–3):
+
+| path | before | after |
+|---|---|---|
+| `pullPredictedLatest` | ≈ 45 | ≈ 8 |
+| `pullKalmanPredictedLatest` (order-3 CA) | ≈ 50 | ≈ 8 |
+| `pull` on an invariant schema | ≈ 46 | ≈ 12 |
+
+- **Shared, allocation-free invariant classifier.** `classifyInvariant` in the new `src/_invariant.ts` replaces the two byte-identical `_classifyInvariant` copies in `Bridge` and `BridgeConsumer`. Each copy returned a fresh `{ kind, alpha }` object on every pull of an invariant schema. The new function returns a number: the `INVARIANT_CLASS_OK` (2) or `INVARIANT_CLASS_HARD` (−1) sentinel, or the soft α ∈ (0, 1]. `INVARIANT_OK_THRESHOLD` / `INVARIANT_SOFT_THRESHOLD` / `INVARIANT_SOFT_ALPHA_BASE` moved there too and are re-exported from `Bridge.ts` and the root unchanged.
+- **`FrameSmoother.seedFrom` / `fallbackInto`** (run on every OK-band invariant pull) now copy with indexed loops. The `for…of` loops allocated per call (29 → 0 GCs in isolation).
+- **`pullPredictedLatest`** reuses its PLL-uncertainty snapshot, horizon-config and per-field extrapolation-result objects instead of building three objects per call plus one per trajectory field.
+- **`StatePredictor.ingest`** (behind `pullKalmanPredictedLatest`) no longer passes doubles into its non-inlined per-lane helpers. `dt` and the diagonal R are read from typed storage, and the measurement from its array. V8 had been boxing about 7 HeapNumbers per lane per ingest for the CA model (56 → 6 GCs in isolation). The arithmetic and evaluation order are unchanged; the bit-exact StatePredictor WASM-equivalence pins pass. Side effect: the `npm run bench` `pullKalmanPredict` cell (16-lane, order-3 CA) dropped from a ≈ 4.3 µs to a ≈ 3.2 µs median.
+
+### Added
+
+- Optional caller-owned result objects, filled in place and returned, for a fully allocation-free call:
+  - `Bridge.pullPredictedLatest(out, opts?, result?)`
+  - `Bridge.pullKalmanPredictedLatest(out, opts?, result?)`
+  - `predictiveExtrapolateInto(..., config?, result?)`
+
+  Without the argument, each call returns a fresh object, exactly as before.
+- `npm run bench:alloc` (`bench/allocation.bench.ts`) is the GC-count probe used for the table above.
+- Guidance: README §Use (audio-thread allocation), `u64()` / `i64()` JSDoc, QUICKSTART. `u64`/`i64` scalars decode to a new `BigInt` on every read, so keep them off per-quantum worklet paths. The README's main example now uses `u32()` for `seq`.
+
+### Not changed (by design)
+
+- `BridgeBlockConsumer.process*` still throws on a channel-count or `count` misuse. These are deterministic programmer errors that fire on the first call, and failing fast beats rendering wrong audio.
+- `telemetry()` still returns a fresh frozen snapshot (a documented allocating helper).
+- The residual GCs above the floor come from V8 boxing double arguments into large non-inlined helpers, a few 16-byte HeapNumbers per call.
+
+### Wire compatibility
+
+None. Public API is additive (optional trailing parameters). Behavior is bit-identical.
+
+### Tests
+
+- New `tests/Bridge.allocationFree.test.ts` (5 pins): the out-param variants of `pullPredictedLatest` / `pullKalmanPredictedLatest` / `predictiveExtrapolateInto` fill and return the caller's object, bit-identical to the allocating call on a twin Bridge over 40 frames (results and `out` payloads). `classifyInvariant` matches the pre-0.9.950 object-returning classifier over an edge-case grid (±0, subnormals, ±Infinity, NaN, `stored = 0`, eps floors) plus 20k random inputs. `readPublishedPllState(out)` returns `out`.
+
+## [0.9.949] - 2026-10-14
+
+### Changed - frontier work moved out of `Bridge.ts` (no public-API change)
+
+- **`src/Bridge.ts`: about 2,930 → about 1,800 lines.** The two engines that had grown inside it are now internal modules composed by `Bridge`, the same pattern as the 0.6.8–0.6.9 `SpscRing` / `FrameSmoother` / `ConsumerClockRecovery` extracts:
+  - **`src/BridgeEvaluation.ts`** (`BridgeEvaluation<S>`) owns the shared eval cache (newest raw frame, its producer timestamp, quantum base and sample rate) and the two-frame Hermite pair. It implements `evaluateInto`, `evaluateHermiteInto`, `scratchEvaluatedFrame`, `setSampleRate`, `pullEvaluatedLatest`, `evaluateAtSampleOffset`, `pullHermiteLatest`, `forEachSampleInQuantum` and `resetEvalCache`. `_timestampToNs` is now the module function `timestampToNs`.
+  - **`src/BridgePrediction.ts`** (`BridgePrediction<S>`) owns the readback-latency rolling median, `pullPredictedLatest`, `pullKalmanPredictedLatest`, the per-field `StatePredictor`s and the f32x4 `kalmanWasm` plans. The `Predicted*` / `KalmanPredicted*` option/result types and the `DEFAULT_MAX_LEAD_MS` / `DEFAULT_KALMAN_*` constants are declared there and re-exported from `Bridge.ts` and the root unchanged.
+  - Every public `Bridge` method keeps its signature and full JSDoc and becomes a one-line delegator. The engines reach the ring and PLL only through a `BridgeReadHost` closure facade, so no `Bridge` private state became public. Method bodies were moved verbatim; only member references were re-pointed.
+- **Frontier members made explicit.** `pullPredictedLatest`, `pullKalmanPredictedLatest`, `recordReadbackLatency`, `lastReadbackMedianMs` and `BridgeOptions.kalmanWasm` now carry `@experimental` with a note that they are outside the 1.0 contract until promoted. `docs/stable-api-manifest.json` gains **`frontierMembers`**, which lists these plus `SpscRingOptions.notify` (`'waiter-flag'`) and `BridgeGPUSourceOptions.writeTarget` (`'shared'` is reserved and throws). `check:api-boundary` verifies each entry still exists in the member-level surface.
+- `BridgeOptions.kalmanWasm`'s inline object type is now the named `BridgeKalmanWasmOptions` (identical shape).
+
+### Fixed
+
+- **API-surface extractor walked method bodies** (0.9.948 tooling). The internal-declaration closure descended into function, constructor and accessor bodies and property initializers, so a type used only for a local variable inside a method (for example `PllUncertainty` in `pullPredictedLatest`) was reported as public surface. It now visits only declared signatures, parameter types and declared property types.
+
+### Why
+
+The audit found `Bridge.ts` at roughly 2.6× its documented size. Most of the growth was frontier prediction code (the Kalman runtime and its WASM plan builder) living on the class that 1.0 has to freeze. Splitting it out lets the 1.0 decision for those members be made separately from the stable core, and keeps `Bridge.ts` an orchestration layer.
+
+### Wire compatibility
+
+None. No SAB, behavior or public-API change. The member-level API snapshot diff for this release is exactly: `kalmanWasm`'s type is now named (same shape), and the five moved interfaces report `src/BridgePrediction.ts` as their declaring file.
+
+### Tests
+
+- The full suite passes unchanged, including all predict, Kalman, Hermite, timeline, crossfade and hot-swap pins.
+- `tests/apiSurface.test.ts` pin 6: types used only inside method bodies are not in the surface, and Bridge's private engines (`BridgeReadHost`, `BridgeEvaluation`, `BridgePrediction`) do not leak into the root snapshot.
+- Bench is unchanged within noise (push/pull/pullLatest about 0.8–1.0 µs; `pullKalmanPredict` 16-lane median 4.25 µs, budget 10 µs).
+
+### Documentation
+
+CLAUDE.md §What lives where (Bridge composition), `docs/api-boundary.md` (`frontierMembers`).
+
+## [0.9.948] - 2026-10-14
+
+### Changed - the API freeze gate now sees member-level changes
+
+- **Member-level API snapshots.** `docs/api-snapshots/{root,worklet,experimental}.api.txt` replace the old `*.dts.snapshot.txt` files. The new `scripts/_apiSurface.mjs` generates them from the SOURCES with the TypeScript compiler API, so no build is needed. Each snapshot lists every export with its full public shape: class constructors, every public static and instance member with its signature, interface members and index/call signatures, type-alias bodies (comments stripped), function overloads, and `@deprecated` markers. It also covers the **non-exported declarations the public surface reaches**; for example, `Bridge` is a conditional alias over the internal `BridgeImpl`, whose 40+ methods are now snapshotted. Previously the snapshot held only the `export { … } from` lines of `dist/index.d.ts`, so renaming or retyping a `Bridge` method did not change it.
+- **`check:api-snapshot`** reports a stale snapshot with a `-`/`+` member-line diff (multiset-aware, because identical member lines legitimately recur across classes).
+- **Exact root-export accounting.** `docs/stable-api-manifest.json` (format v2) now lists **every** root export by name, values and types alike, in exactly one `rootBuckets` list: `primary` (101), `gpuWorklet` (41), `advanced` (39), `frontierOnRoot` (15) and `deprecatedShims` (16). It also lists the `/worklet` subpath in `workletExports` (23). `check:api-boundary` fails when an export is unclassified, a listed name is no longer exported, a name is in two buckets, or a `deprecatedShims` entry is not a `@deprecated` export. Previously it only checked that a free-text summary list was non-empty.
+- **`frontierOnRoot`** names the frontier-grade APIs that currently ship on the stable root: `StatePredictor*`, `predictiveExtrapolateInto` + `Pll*`/`PredictiveExtrapolation*`, the `DEFAULT_KALMAN_*` constants, `DEFAULT_MAX_LEAD_MS`, and the `Predicted*`/`KalmanPredicted*` pull option/result types. Each must be promoted deliberately or moved behind `/experimental` before 1.0.
+- `npm run check:release` no longer needs `dist/` for the snapshot step (order: metadata → boundary → snapshot → build).
+
+### Why
+
+1.0 is a promise not to break the public surface without a 2.0. The previous gate could not see the change it exists to catch: a renamed method passed silently, and an export could appear on the root without anyone classifying it.
+
+### Wire compatibility
+
+None. Tooling, snapshots and manifest only. No `src/` change.
+
+### Tests
+
+- New `tests/apiSurface.test.ts` (in `npm test` / `test:unit`). It runs the extractor on two fixtures (`tests/fixtures/apiSurface/v1.ts`, `v2.ts`) that differ by one method renamed on a class reachable only through an exported type alias, and pins: (1) the rename changes the snapshot; (2) the internal class behind the alias is captured; (3) private/protected members are excluded and public readonly kept; (4) `@deprecated` members are marked; (5) the real root snapshot lists `BridgeImpl`'s instance methods.
+- Verified by mutation while developing: renaming `Bridge.pullLatestSmoothed` makes `check:api-snapshot` fail with the exact `-`/`+` lines, and adding an unclassified root export makes `check:api-boundary` fail.
+
+### Documentation
+
+`docs/api-boundary.md` (buckets + snapshot semantics), README §API boundary, CLAUDE.md (release gates now include `check:release` and the version-bump checklist).
+
+## [0.9.947] - 2026-10-14
+
+### Fixed - three concurrency bugs
+
+- **Torn PLL offset read (`readPublishedPllState`)** — the Int64 PLL offset spans two Int32 header lanes (4 = low, 5 = high) and was read with no sequence check, so a read overlapping a publish could pair the new low word with the old high word. Across a 2^32-ns carry that is a ≈ 4.29 s error. The method's doc claimed this could not produce "a synthesis of incompatible halves"; it could. `publishPllState` now brackets its payload stores with a **seqlock counter in status-lane bits 1–30** (previously documented as reserved): odd before the payload stores, even (+ the new locked bit) after. `readPublishedPllState` loads status → payload → status and accepts only an unchanged, even sequence, retrying at most 16 times (wait-free). The cross-thread stress reproduces the tear on the old reader (≈ 9 % of reads torn under a carry-crossing writer) and shows zero on the new one.
+- **One dead `SpmcRing` consumer could pin the producer at 0.05× forever** — `flowScaleHint()` min-reduces every consumer's `flowScale[c]` cell, and only the cell's owner updates it, on `pull`. A crashed or wedged consumer never pulls again, so its last value (possibly the floor) stayed in the min indefinitely, contradicting the "decoupled producer" design. The hint now skips a consumer whose cursor has not moved while the producer wrote more than **`staleAfterFrames`** frames (new `SpmcRingOptions` field, default `capacity`) and that still has a backlog; it rejoins as soon as its cursor moves. If every consumer is stalled the hint returns 1.0. Producer-local heap bookkeeping only, preallocated (the hint stays allocation-free and O(consumerCount)).
+- **`MpmcWorkQueue` / `WasmMpmcWorkQueue` wedged after 2^31 claims** — the `claimTicket()` hook added in `1ca422a` returned `-1` for "empty" and `pull` treated **any negative** return as empty. Tickets are Int32 and go negative after 2^31 claims, so from then on every claim advanced `dequeueTicket` and was dropped: the frame was orphaned, the delivered frontier stalled, and the queue fell into permanent drop-newest. This affected the plain JS queue too, not only the WASM variant. The emptiness pre-check moved into `pull`; the hook is now an **unconditional fetch-add** in both backends (`emitWasmMpmc` / `emitWasmMpmcBytes` emit a single `i32.atomic.rmw.add`), so every Int32 it returns is a real ticket.
+
+### Added
+
+- `readPublishedPllState(out?)` on `SpscRing` and `Bridge` takes an optional reusable **out-param** (allocation-free read), and returns the named type **`PublishedPllState`** (`{ locked, offsetNs, driftPpm, consistent }`, new root type export). `consistent` is `false` only if the bounded retry was exhausted while a publish stayed in progress; it is always `true` against a pre-0.9.947 writer.
+- `SpmcRingOptions.staleAfterFrames` (experimental).
+
+### Why
+
+All three were found in the pre-1.0 audit. The PLL tear is rare but silent and large. The SpmcRing pin and the 2^31 wedge are permanent once triggered, and the wedge is guaranteed for any long-running work queue.
+
+### Wire compatibility
+
+- **PLL status lane:** uses bits 1–30 that were documented as reserved; no layout change. A pre-0.9.947 **reader** masks bit 0 only, so it reads a new writer correctly (without tear protection). A pre-0.9.947 **writer** never sets the sequence bits, so a new reader treats its snapshots as consistent, with the old semantics.
+- **`SpmcRing`:** no SAB change.
+- **`MpmcWorkQueue`:** no SAB change. **WASM claim module contract changed:** a module emitted before 0.9.947 can return `-1` without claiming, so it must not be paired with this release's `WasmMpmcWorkQueue`. `connectWorkQueue` / `connectGraph` emit the module at allocation time and always match. The protected `claimTicket()` override hook no longer returns a sentinel (experimental surface).
+- Public API: additive (`PublishedPllState` type; optional `out` param; `consistent` field on the returned snapshot).
+
+### Tests
+
+- New `tests/Bridge.pllSeqlock.concurrent.test.ts` (in `npm test` + `test:concurrent`): a worker runs the REAL compiled `publishPllState` body (injected via `toString()`, because tsx cannot load the TS sources inside `worker_threads`) and publishes offsets alternating across the 2^32 carry while the main thread reads. SATURATED phase (back-to-back publishes): zero torn among consistent reads, with exhausted reads flagged rather than torn. PACED phase: zero torn and ≥ 99 % consistent (observed ≥ 99.87 %). `PLL_SEQLOCK_LEGACY=1` runs the pre-fix reader and asserts it DOES tear.
+- `tests/Bridge.pll.test.ts` pin 92b: sequence parity per publish, mid-publish → `consistent: false` with no hang, recovery, pre-0.9.947-writer compatibility, out-param identity.
+- `tests/SpmcRing.test.ts` pin 12: stalled consumer excluded after `staleAfterFrames`, re-admitted on progress, 1.0 when all are stalled, option validation. Pin 11(c)'s white-box min-reduce moved to a fresh ring, because its consumer 1 is now (correctly) a stalled consumer.
+- `tests/MpmcWorkQueue.test.ts` pin 11 + `tests/WasmMpmcWorkQueue.test.ts` (shared driver `tests/_mpmcWqWrap.ts`): real push/pull traffic starting 5 tickets below the Int32 wrap: 4×capacity frames FIFO, zero drops, `dequeueTicket` ends negative. Both FAIL on the pre-fix code at ticket −2147483648.
+- `tests/emitWasmMpmc.test.ts`: pins the unconditional-claim contract, including negative tickets and `-1` as a real claim.
+- Benches `bench:wasm-mpmc-wq` / `bench:wasm-mpmc-ticket-storm` moved their emptiness checks into JS to match.
+
+## [0.9.946] - 2026-10-14
+
+### Added - acorn-free `webgpu-audio-bridge/experimental/core` subpath
+
+- **New package export `./experimental/core`** (`src/experimental/core.ts`): the full experimental surface (fan rings, `connectGraph`, hot-swap, WebNN, renderQuantum, the JIT runtime, the token-path compiler, grammar, masks, cache) WITHOUT importing the optional `acorn` peer. AudioWorklets, no-bundler module workers and bundled apps that never compile JS-source kernels can now use the experimental surface without `acorn` installed or resolvable.
+- **JS-parser injection**: `registerJsParser(parse: JsParseFn)` / `hasJsParser()` (exported from both experimental paths). `src/jit/parse.ts` no longer imports `acorn`; the single `acorn` import moved to `src/jit/acornParser.ts`, a side-effect module that registers `acorn.parse`.
+- `webgpu-audio-bridge/experimental` is now `import "../jit/acornParser.js"` + `export * from "./core.js"` — **unchanged behavior** for every existing import (JS-source `compileKernel` / `connectJit({ kernel })` still work out of the box).
+
+### Fixed
+
+- **`examples/mpmc-fan-in` and `examples/god-node-hotswap` did not load in a browser**: their page, workers and worklet imported the experimental barrel, which pulled a bare `acorn` specifier that browser ESM cannot resolve (the same failure `59986ef` worked around for liquid-control only). They now import `dist/experimental/core.js`; verified in headless Chromium (fan-in: three producers delivering, `tornFrameCount() = 0`; hot-swap: Start → Morph to B completes with the plan applied, no page errors).
+- The JIT demos' AudioWorklets (`jit-vectorize`, `kernel-palette`, `kernel-generative`, `poly-synth`) also import `/experimental/core` now, so the worklet realm no longer depends on each demo server's bare-specifier rewrite.
+
+### Why
+
+`acorn` is an optional peer used only to parse JS-source kernels, but every `/experimental` import loaded it statically, so a fan-ring or hot-swap user paid for (and could be broken by) a dependency they never used. Parser injection keeps the quarantine at exactly one file and makes the acorn-free surface a first-class import path instead of a per-demo workaround.
+
+### Wire compatibility
+
+No SAB/wire change. Public surface: additive (`./experimental/core` export; `registerJsParser`, `hasJsParser`, `JsParseFn` on the experimental paths). Behavior from `webgpu-audio-bridge/experimental` is unchanged. From `/experimental/core`, a JS-source compile without a registered parser returns `rejected-source` with `E_PARSE` (a value, never a throw) whose message names both fixes.
+
+### Tests
+
+- New `tests/jitParserInjection.test.ts` (3 pins, in `npm test` / `test:unit`): the core subpath loads and compiles a token kernel with no parser registered; JS-source without a parser → `rejected-source` `E_PARSE` naming `registerJsParser` + the full barrel; after `registerJsParser(acorn.parse)` the core subpath's compile is byte-identical to the full barrel's.
+- `tests/JitCompiler.test.ts` pin 10 now also asserts `src/experimental/core.ts` never reaches `acorn` and that `src/jit/acornParser.ts` is the only file importing it. Its import crawler now follows bare side-effect imports (`import "./x.js"`).
+- `scripts/check-api-boundary.mjs` expects the `./experimental/core` export and reads markers from `src/experimental/core.ts`; the experimental API snapshot is taken from `dist/experimental/core.d.ts`.
+
+### Documentation
+
+README §API boundary, `docs/api-boundary.md` and CLAUDE.md describe the two experimental paths and the single-file acorn quarantine.
+
+## [0.9.945] - 2026-10-14
+
+### Added - consolidated catch-up (GPU readback, perf, API boundary, WASM work queue)
+
+**GPU readback (`BridgeGPUSource`)**
+- **Readback latency stats** (`f0f76f2`): `readbackLatencyStats(): ReadbackLatencyStats` (rolling `samples`/`minUs`/`maxUs`/`meanUs` + p50/p95/p99) with the `readbackLatencySampleCount` option.
+- **Coalescing policy** (`a1b6d62`): new `backpressureMode?: ReadbackBackpressureMode` (`"reject"` default = historical behavior; `"latest-only"` re-encodes a burst into the newest still-`scheduled` slot and never touches in-flight slots). Accessors `backpressureMode()` and `coalescedCount()`.
+- **Adaptive pacing + dirty-region readback** (`a937bf6`): `pacing?: ReadbackPacingMode` (`"manual"` default | `"adaptive"`) with `readbackBudgetMs` (default 8 ms). Adaptive mode declines `scheduleReadback()` before the staging ring saturates. New methods: `recommendedReadbackAction(): ReadbackAction` (`"dispatch" | "skip-readback" | "reduce-quality"`), `shouldScheduleReadback()`, `readbackPressure(): ReadbackPressureSnapshot` and `pacingDeclinedCount()`. `scheduleReadback(src, enc, srcOffset?, byteLength?, dstOffset?)` gains the optional `byteLength`/`dstOffset` params: a partial copy is merged into a retained full-frame image before it is published (`initialFrameBytes?: PartialReadbackInitialFrame`, `partialReadbackCount()`, `partialBytesCopied()`). New static helpers `BridgeGPUSource.rawCompatibility(schema, opts?)` → `RawReadbackCompatibility` (reasons `compatible` / `invariant-lane` / `wgsl-layout-error` / `struct-size-mismatch`) and `BridgeGPUSource.rawIfCompatible(...)`, which picks the `"raw"` fast path only when it is byte-safe.
+- **Field-level helpers** (`f266728`): `fieldReadbackRange(fields)` → `FieldReadbackRange` (smallest contiguous span), plus `scheduleFieldReadback(field, src, enc, opts?)` and `scheduleFieldsReadback(fields, src, enc, opts?)`. These take their offsets from the schema layout, and `FieldReadbackOptions.srcOffset` can override them.
+- **WASM decoder adapter** (`65efe8d`): `BridgeGPUSource.wasmDecoder(schema, opts: WasmReadbackDecoderOptions)` wraps an `emitWasmDecoder(schema)` export (`memory`, `decodeFrame`, `srcByteOffset`/`dstByteOffset`, optional `plan`) as a readback decoder closure.
+- Benches `npm run bench:gpu-readback-pacing` and `npm run bench:gpu-readback-decoder-path` (mock device, bridge-side cost only). Opt-in real-GPU probe `npm run test:browser:webgpu` with the weekly/manual `.github/workflows/webgpu-readback.yml`.
+
+**Trajectory / WASM performance**
+- **Septic f32 fast path** (`7e4995f`): when prev, curr and out are all `Float32Array`, `evaluateSepticHermiteTrajectoryInto` uses `p1 + h0·(p0−p1)` and skips one multiply per point pair. The f64 path is unchanged.
+- **Planar trajectory layout** (`e88906e`): `TrajectoryLayout = "interleaved" | "planar"` on trajectory array specs (`layout?`, default `"interleaved"`). The schema validator, every trajectory evaluator, `FrameSmoother`, `Bridge`'s Kalman ingest and `predictiveExtrapolation` all handle planar planes.
+- **JIT fast-math gating** (`e88906e`, experimental): `fastMath?: boolean` on `compileKernel`/`compileIr`/`compileTokens`, `KernelCache.getOrCompile` and `connectJit`. When true, the f32 SIMD and voice-SIMD emitters may fuse add·mul into `f32x4.relaxed_madd`, and the gate swaps strict ULP for a fast-math band (maxAbs ≤ 1e-3, RMS ≤ 1e-4). The default stays strict and non-fused. Scalar-only (stateful) kernels always gate strict.
+- **f32x4 Kalman WASM path** (`bd59a1a`): `BridgeOptions.kalmanWasm?: { consumer, scratchBuffer, scratchByteOffset?, scratchByteLength? }` routes `pullKalmanPredictedLatest` through four new `wasm/decoder.wat` exports (`kalman_{ingest,predict}_{cv,ca}_f32x4_soa_simd`). They surface on `WorkletConsumer` as `kalmanIngestCvF32x4SoaSimd` / `kalmanPredictCvF32x4SoaSimd` / `kalmanIngestCaF32x4SoaSimd` / `kalmanPredictCaF32x4SoaSimd`. Omitting the option keeps the JS path. `bench:kalman-simd` was extended to cover it.
+
+**CI release gates** (this release)
+- New `release-gates` job in `.github/workflows/test.yml` runs `npm run check:release` on every push/PR. The metadata, boundary and snapshot checks previously ran only inside `prepublishOnly`, which is how the README regression above went unnoticed.
+
+**API boundary guard + snapshots** (`3697864`, `3de1ef5`)
+- `npm run check:api-boundary` (`scripts/check-api-boundary.mjs`) enforces the package `exports` map, a list of markers that must stay out of the root, and the `acorn` dependency split. The machine-readable split lives in `docs/stable-api-manifest.json`.
+- `npm run api:snapshot` / `npm run check:api-snapshot` (`scripts/generate-api-snapshot.mjs`) diff `dist/index.d.ts` and `dist/experimental/index.d.ts` against `docs/api-snapshots/{root,experimental}.dts.snapshot.txt`.
+- `npm run check:release-metadata` (`scripts/check-release-metadata.mjs`, `f0f76f2`) checks that the README status version and `CITATION.cff` match `package.json`.
+
+**Standard fallback / worklet pull hardening** (`cfdfc4c`)
+- `emitWorkletProcessorModule` processors expose a commit-aware `pullLatest(target?)` helper. It acquire-loads `write_index`, decodes the newest frame, release-stores `read_index` (a CAS commit/retry when `processorOptions.policy === "drop-oldest"`), notifies a parked producer and returns the skipped count (`-1` when empty).
+- `connect()` in Standard mode now throws `ConnectUnsupportedError` when the macro or input ring requests a non-`drop-oldest` policy. Previously it degraded silently.
+
+**WASM backend for the MPMC work queue** (`1ca422a`, experimental — previously undocumented)
+- `WasmMpmcWorkQueue` (subclass of `MpmcWorkQueue`) replaces only the contended dequeue claim with a WASM `i32.atomic.rmw.add` kernel through a new protected `MpmcWorkQueue.claimTicket()` hook. The held-claim, generation and teardown protocol is unchanged.
+- `emitWasmMpmc()` / `emitWasmMpmcBytes()` emit the `claim_ticket` module. `allocateWasmSharedMemory(byteLength)` page-rounds a shared `WebAssembly.Memory`.
+- `connectWorkQueue({ backend: "js" | "wasm" })`, `mountWorkQueue(handle, { backend? })`, a per-edge `backend` on `connectGraph` mpmc-wq edges, and `MountGraphOptions.backend`. `"wasm"` is best-effort and falls back to `"js"` when WASM threads are unavailable. `WorkQueueHandle` gains `backend` plus optional `wasmMemory`/`wasmModule`.
+- `npm run test:wasm-mpmc-wq`, `npm run bench:wasm-mpmc-wq` and `npm run bench:wasm-mpmc-ticket-storm`.
+
+**Benchmarks and examples**
+- **SpmcRing Stage 4.2 bench** (`06feea3`): `npm run bench:spmc` (`bench/spmc.bench.ts`). It measures push/pull latency against `consumerCount`, the per-consumer slow-consumer drop curve and broadcast cost against SPSC, with a 10 µs hard budget.
+- **E2E latency sweep** (`2291613`, `47c0f54`, `a6e12ab`, `cc282b2`): `bench/e2e-latency` gains `notifyMode` (`always`/`waiter-flag`), producer push-mode and tick-rate knobs, no-notify pull modes and a matrix sweep. The headless runner is `node tmp/run-e2e-latency-bench.mjs` (Playwright + Chromium, `BENCH_PORT`). It prints `BEST_CONFIG_BY_AREA`, global median deltas and per-axis 95 % CI blocks (`AREA_P99_CI_*`).
+- **`examples/liquid-control/`** (`baa890a`): an untrained Liquid Time-Constant network running on CPU in a Worker drives an AudioWorklet synth through `BridgeWebNNSource.pushFromTypedArray()`. Run it with `npm run dev:liquid-control` (port 5190); `npm run selftest:liquid-control` is a headless bounded/alive/liquid check.
+
+### Fixed
+- **E2E latency notify-mode mismatch** (`2291613`, `47c0f54`): the consumer page now builds its `Bridge` with the same `notify` mode as the producer worker. The worker echoes its mode at startup, and the run reports `FAIL: benchmark ring config mismatch` when the two disagree.
+- **liquid-control worker load** (`59986ef`): `BridgeWebNNSource` is now imported from `dist/experimental/BridgeWebNNSource.js` instead of the experimental barrel. The barrel pulls the JIT's bare `acorn` import, which a browser module worker cannot resolve.
+- **`npm publish` was blocked** (this release): the `3de1ef5` README rewrite changed the status-block wording, so `check:release-metadata` (run by `prepublishOnly`) failed on every commit since. The check now matches the README's current `- Version: \`x.y.z\`` line and its two dependency claims, and the README's duplicate `npm run build` validation line and UTF-8 BOM are gone.
+- **UTF-8 mojibake** (this release): `3de1ef5`/`e88906e` round-tripped files through a non-UTF-8 editor ("—" → "â€”", a BOM on two barrels). Repaired in `src/index.ts`, `src/experimental/index.ts`, `src/jit/compileKernel.ts`, `src/jit/emitKernelWat.ts` (including the emitted WAT header comment strings), the API-boundary docs/scripts/manifest, and the `god-node-hotswap` HUD strings.
+- **`examples/god-node-hotswap` page failed to load** (this release): `main.js` imported `migratePlan` from `dist/index.js`, which `3de1ef5` had stopped exporting. It now imports it from the experimental subpath.
+- **Release metadata drift** (`f0f76f2`): `CITATION.cff` moved from stale `0.9.70` to the current version. The `src/index.ts` Standard-mode marker was corrected from `0.10.0` to `0.9.40`.
+
+### Changed
+- **Root → experimental move, made non-breaking** (`3de1ef5` + this release): `crossfadeWeight`, `crossfadeInto`, `HotSwapConsumer`, `migratePlan` and their types (`Crossfade*`, `HotSwap*`, `Migrate*`) now live on `webgpu-audio-bridge/experimental`. `3de1ef5` had simply deleted them from the root, a breaking public-API change the versioning policy reserves for a minor bump. This release restores them on the root as **`@deprecated` shims** (`src/_deprecatedRootShims.ts`; the very same objects as the experimental exports) so 0.9.x root imports keep compiling. **The shims are removed at 0.10.0** — migrate imports to the experimental subpath.
+- **`acorn` packaging** (`3de1ef5`): `acorn` moved from `dependencies` to an optional `peerDependency` (also kept in `devDependencies`). Users of the experimental JIT's JS-source path must install `acorn` themselves.
+- **`prepublishOnly` order**: now `typecheck → test → check:release`, where the new `npm run check:release` = `check:release-metadata → check:api-boundary → build → check:api-snapshot`. Previously `check:api-snapshot` ran before `build`, so it diffed a stale `dist/` (or failed on a clean checkout).
+
+### Why
+
+These commits shipped to `main` after `0.9.944` (and `1ca422a` just before it) with no per-patch version bump or CHANGELOG entry. This release documents all of them in one entry rather than minting about ten versions after the fact. Source comments that already said `0.9.946` for the readback coalescing work were corrected to `0.9.945`.
+
+### Wire compatibility
+
+- **No SPSC/`Bridge` SAB change.** Ring header lanes, frame layout and `RING_HEADER_BYTES` are unchanged. `MpmcWorkQueue`'s layout is unchanged too: `WasmMpmcWorkQueue` uses the same layout inside a page-padded `WebAssembly.Memory`.
+- **Planar trajectories are opt-in.** Interleaved (the default) frames are byte-identical. A planar field changes the byte order inside that array field only, and `describeSchemaLayout` carries `trajectory.layout`, so full-shape layout matches catch a mismatch between peers.
+- **`decoder.wasm` export contract grew.** `instantiateConsumer` validates every expected export, so a `decoder.wasm` built before this release no longer instantiates against these JS sources. Rebuild with `npm run build:wasm`.
+- **Root API: additive.**
+  - New types: `ReadbackLatencyStats`, `ReadbackBackpressureMode`, `ReadbackPacingMode`, `ReadbackAction`, `ReadbackPressureSnapshot`, `RawReadbackCompatibility`, `RawReadbackCompatibilityOptions`, `RawReadbackCompatibilityReason`, `PartialReadbackInitialFrame`, `FieldReadbackOptions`, `FieldReadbackRange`, `WasmReadbackDecoderOptions`, `TrajectoryLayout`.
+  - New `BridgeGPUSource` statics and methods (listed above) and `BridgeOptions.kalmanWasm`.
+  - `crossfadeWeight` / `crossfadeInto` / `HotSwapConsumer` / `migratePlan` (+ types): moved to `/experimental`, kept on the root as `@deprecated` shims until 0.10.0 — **net: no root removal in this release.**
+- **Experimental subpath:** adds `WasmMpmcWorkQueue`, `emitWasmMpmc`, `emitWasmMpmcBytes`, `allocateWasmSharedMemory` and the types `WasmMpmcClaimSource`, `WasmMpmcClaimTicket`, `EmitWasmMpmcOptions`, `WasmMpmcClaimOffsets`, `WasmSharedMemoryAllocation`, `WorkQueueBackend`, plus the moved hot-swap and migration APIs.
+- **Behavior changes:** Standard-mode `connect()` now throws on a non-`drop-oldest` policy. `WorkletConsumer` has four new required members.
+
+### Tests
+- `tests/BridgeGPUSource.raw.test.ts` 6–10: rawCompatibility/rawIfCompatible, partial raw and closure merge, field helpers, wasmDecoder.
+- `tests/BridgeGPUSource.writeTarget.test.ts`: latest-only coalescing and adaptive pacing.
+- `tests/BridgeGPUSource.autoPoll.test.ts`: latency stats.
+- `tests/browser/webgpu-readback.spec.ts` (new): a real-WebGPU latency histogram. It skips when no adapter is exposed; set `REQUIRE_WEBGPU_READBACK=1` to make that a failure.
+- `tests/browser/latency.spec.ts`: asserts the new e2e worklet miss/underrun counters (`workletMisses`, `underrunEvents`, `maxMissStreak`, `missRate`).
+- `tests/Bridge.codegen.test.ts` 9: the generated `pullLatest` commits `read_index`.
+- `tests/connect.test.ts` 110: Standard mode rejects unsupported policies.
+- `tests/WasmMpmcWorkQueue.test.ts` and `tests/emitWasmMpmc.test.ts` (new in `1ca422a`). **This release registers both in `npm test` / `test:unit`**, so CI now runs them.
+- `tests/connectJit.test.ts` pins E/G/H: replaced the single `setTimeout(0)` wait for the async compile round-trip with a bounded `flushUntil(...)` poll. Pin H flaked once under a full `npm test` run while this release was being validated.
+- `tests/Bridge.properties.test.ts` P2: the convergence slack gains a magnitude-scaled term (`4·ε·max(|curr|,|prev|)`). The old slack scaled only with `|curr − prev|`, so fast-check's random seed occasionally found a legitimate one-ulp rounding step near `|x| ≈ 1e6` and failed the suite.
+- `tests/typecheck-deprecations.test.ts` pin 4: the deprecated root shims are identical (`===`) to the experimental exports, and the generic `HotSwapConsumer<S>` shim is usable as a type. Pin 11 in both `tests/connectWorkQueue.test.ts` and `tests/connectGraph.test.ts` covers the `backend:"wasm"` opt-in and its fallback.
+- No new pins cover planar layout, `fastMath`, the septic f32 path or `kalmanWasm`.
+
+### Documentation
+- `README.md` rewritten from about 2,450 to 259 lines: a status block, the stable/experimental split and dependency claims.
+- New: `docs/api-boundary.md`, `docs/stable-api-manifest.json`, `docs/api-snapshots/*`, `docs/integration-recipes.md`, `docs/gpu-readback-measurement.md`, `docs/gpu-readback-baselines.json`, `website/plans/gpu-readback-hardware-validation.md`, `examples/liquid-control/README.md`.
+- Updated: `docs/standard-mode-design.md`, `docs/emit-worklet-reader-design.md`, `docs/frontier2-classical-predictive-extrapolation-handoff.md`, `bench/e2e-latency/README.md`.
+
 ## [0.9.944] - 2026-06-01
 
 ### Added - Apollo Frontier 7, JS-source stateful kernel authoring

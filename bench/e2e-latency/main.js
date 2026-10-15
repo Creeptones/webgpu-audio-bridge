@@ -206,6 +206,22 @@ function shuffleInPlace(arr) {
   }
 }
 
+const CLOCK_REANCHOR_MS = 20;
+
+async function reanchorWhenRunning(ctx, node, constructionAnchorMs) {
+  const deadline = performance.now() + 10_000;
+  while (ctx.state !== "closed" && performance.now() < deadline) {
+    if (ctx.state === "running" && ctx.currentTime > 0) {
+      const anchorMs = performance.timeOrigin + performance.now() - ctx.currentTime * 1000;
+      if (Math.abs(anchorMs - constructionAnchorMs) > CLOCK_REANCHOR_MS) {
+        node.port.postMessage({ type: "clock", audioStartPerfMs: anchorMs });
+      }
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 async function start(override = null) {
   if (state) return;
   const opts = { ...readUI(), ...(override ?? {}) };
@@ -269,6 +285,15 @@ async function start(override = null) {
   const silentGain = ctx.createGain();
   silentGain.gain.value = 0;
   node.connect(silentGain).connect(ctx.destination);
+  // Re-anchor once the context is actually running. `audioStartPerfMs` above
+  // assumes currentTime starts counting at 0 the moment the constructor
+  // returns; Chromium/WebKit honor that within ~1 ms, but Firefox opens the
+  // audio device asynchronously (headless + PulseAudio: ~1 s), and every
+  // sample would carry that startup gap as a constant bias. Pair the main
+  // thread's epoch clock with ctx.currentTime once it advances; if the two
+  // anchors disagree by more than CLOCK_REANCHOR_MS, send the corrected one
+  // and the worklet discards the samples taken under the stale anchor.
+  void reanchorWhenRunning(ctx, node, audioStartPerfMs);
   node.port.onmessage = (e) => {
     if (e.data.type === "report") {
       // Worklet doesn't know which backend the worker is running, or output

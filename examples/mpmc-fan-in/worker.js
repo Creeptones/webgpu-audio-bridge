@@ -11,7 +11,7 @@
 // MP→SC wire format soaks + promotes). Imports `../../dist/...` — run
 // `npm run build` (or `tsc -p tsconfig.build.json`) once so dist is fresh.
 
-import { mountFanIn } from "../../dist/experimental/index.js";
+import { mountFanIn } from "../../dist/experimental/core.js";
 import { makeFanInSchema } from "./schema.js";
 
 let ring = null;

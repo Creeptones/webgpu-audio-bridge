@@ -270,9 +270,11 @@ export class BridgeBlockProducer<S extends Schema<FieldsObject, any>> {
     return this.source.inFlight();
   }
 
-  /** Alias for `inFlight()`. */
+  /** Alias for `inFlight()`.
+   *  @deprecated Use `inFlight()` (identical result). Removed at 0.10.0. (0.9.951)
+   */
   inFlightCount(): number {
-    return this.source.inFlightCount();
+    return this.source.inFlight();
   }
 
   /** Total staging-buffer count from construction. */

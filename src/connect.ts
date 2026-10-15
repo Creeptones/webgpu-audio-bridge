@@ -231,17 +231,34 @@ export type MountResult<
   Macro extends Schema<FieldsObject, any>,
   Input extends Schema<FieldsObject, any> = never,
 > =
+  // Discriminated on BOTH `role` and `mode` (0.9.951): checking
+  // `mode === "turbo"` narrows `macro` to the SAB facade and `input` to
+  // `BridgeInputLane` with no cast; `"standard"` narrows both to
+  // `MessageChannelBridge`. (Before 0.9.951 `macro` stayed the
+  // `Facade | MessageChannelBridge` union whatever `mode` said.)
   | {
       readonly role: "producer";
-      readonly mode: ConnectMode;
-      readonly macro: BridgeProducer<Macro> | MessageChannelBridge<Macro>;
-      readonly input?: BridgeInputLane<Input> | MessageChannelBridge<Input>;
+      readonly mode: "turbo";
+      readonly macro: BridgeProducer<Macro>;
+      readonly input?: BridgeInputLane<Input>;
+    }
+  | {
+      readonly role: "producer";
+      readonly mode: "standard";
+      readonly macro: MessageChannelBridge<Macro>;
+      readonly input?: MessageChannelBridge<Input>;
     }
   | {
       readonly role: "consumer";
-      readonly mode: ConnectMode;
-      readonly macro: BridgeConsumer<Macro> | MessageChannelBridge<Macro>;
-      readonly input?: BridgeInputLane<Input> | MessageChannelBridge<Input>;
+      readonly mode: "turbo";
+      readonly macro: BridgeConsumer<Macro>;
+      readonly input?: BridgeInputLane<Input>;
+    }
+  | {
+      readonly role: "consumer";
+      readonly mode: "standard";
+      readonly macro: MessageChannelBridge<Macro>;
+      readonly input?: MessageChannelBridge<Input>;
     };
 
 /** Returned by `connect()` on the allocating thread. Frozen. */
@@ -763,20 +780,16 @@ function mountFromHandle<
       | MessageChannelBridge<Schema<FieldsObject, any>>;
   }
 
-  if (opts.role === "producer") {
-    return {
-      role: "producer",
-      mode: handle.mode,
-      macro: macro as BridgeProducer<Macro> | MessageChannelBridge<Macro>,
-      input: input as BridgeInputLane<Input> | MessageChannelBridge<Input> | undefined,
-    };
+  // `mountRing` returns the SAB facade for Turbo and a MessageChannelBridge for
+  // Standard, so each (role, mode) arm below is exact.
+  if (handle.mode === "turbo") {
+    return opts.role === "producer"
+      ? { role: "producer", mode: "turbo", macro: macro as BridgeProducer<Macro>, input: input as BridgeInputLane<Input> | undefined }
+      : { role: "consumer", mode: "turbo", macro: macro as BridgeConsumer<Macro>, input: input as BridgeInputLane<Input> | undefined };
   }
-  return {
-    role: "consumer",
-    mode: handle.mode,
-    macro: macro as BridgeConsumer<Macro> | MessageChannelBridge<Macro>,
-    input: input as BridgeInputLane<Input> | MessageChannelBridge<Input> | undefined,
-  };
+  return opts.role === "producer"
+    ? { role: "producer", mode: "standard", macro: macro as MessageChannelBridge<Macro>, input: input as MessageChannelBridge<Input> | undefined }
+    : { role: "consumer", mode: "standard", macro: macro as MessageChannelBridge<Macro>, input: input as MessageChannelBridge<Input> | undefined };
 }
 
 /** Free-function form of `topology.mount` for the PEER thread, which only ever

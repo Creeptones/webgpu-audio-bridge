@@ -1,4 +1,4 @@
-﻿# webgpu-audio-bridge
+# webgpu-audio-bridge
 
 [![test](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/Creeptones/webgpu-audio-bridge/actions/workflows/test.yml)
 [![DOI](https://zenodo.org/badge/1249253281.svg)](https://doi.org/10.5281/zenodo.20380886)
@@ -15,7 +15,7 @@ This is not GPU audio-rate synthesis. It is the practical browser split: GPU for
 
 ## Status
 
-- Version: `0.9.944`
+- Version: `0.9.952`
 - License: MIT
 - Maturity: pre-1.0 by policy. `1.0` means API stability.
 - Stable core: no direct runtime dependencies
@@ -48,14 +48,16 @@ npm install webgpu-audio-bridge
 Requires cross-origin isolation.
 
 ```ts
-import { Bridge, defineSchema, u64, f64 } from "webgpu-audio-bridge";
+import { Bridge, defineSchema, u32, f64 } from "webgpu-audio-bridge";
 
-const Schema = defineSchema({ seq: u64(), cutoffHz: f64() });
+// Prefer number kinds (u32/f64/…) for fields the AudioWorklet reads every
+// quantum: u64/i64 decode to a BigInt, which allocates on every pull.
+const Schema = defineSchema({ seq: u32(), cutoffHz: f64() });
 const { sab, capacity } = Bridge.allocate(64, Schema);
 
 const producer = new Bridge(sab, capacity, Schema);
 const frame = producer.scratchFrame();
-frame.seq = 1n;
+frame.seq = 1;
 frame.cutoffHz = 1200;
 producer.push(frame);
 
@@ -67,6 +69,8 @@ if (consumer.pullLatest(out) >= 0) {
 ```
 
 In an `AudioWorkletProcessor`, poll with `pullLatest()` or a generated reader. Do not call blocking methods such as `waitForData()` from the audio thread.
+
+Audio-thread allocation: `pull`, `pullLatest`, the smoothed pulls and the invariant classifier allocate nothing per call for number-kind fields. For the predicted pulls, pass a reused result object (`pullPredictedLatest(out, opts, result)`, `pullKalmanPredictedLatest(out, opts, result)`); for PLL observability, `readPublishedPllState(out)`. `u64`/`i64` scalars decode to a fresh `BigInt` on every read; keep them off per-quantum worklet paths (`npm run bench:alloc` measures the hot paths).
 
 Generated worklet modules should use `emitWorkletProcessorModule()` when they
 need fresh-latest reads. Its generated `pullLatest(target?)` helper decodes the
@@ -175,12 +179,17 @@ import { connectJit } from "webgpu-audio-bridge/experimental";
 
 Experimental includes WebNN, render quantum probes, God-node hot-swap and migration helpers, MPMC/SPMC/work queues, DAG topology, and JIT/kernel grammar.
 
+`webgpu-audio-bridge/experimental` loads the optional `acorn` peer for JS-source JIT compiles. If you do not compile JS-source kernels — fan rings, `connectGraph`, hot-swap, the token-path JIT, or anything inside an `AudioWorklet` / no-bundler module worker — import the same surface from the acorn-free subpath instead:
+
+```ts
+import { mountFanIn } from "webgpu-audio-bridge/experimental/core";
+```
+
 Boundary checks:
 
 ```bash
-npm run check:api-boundary
-npm run build
-npm run check:api-snapshot
+npm run check:api-boundary   # every root export classified in docs/stable-api-manifest.json
+npm run check:api-snapshot   # member-level public API snapshot (docs/api-snapshots/*.api.txt)
 ```
 
 Docs:
@@ -199,7 +208,6 @@ npm test
 npm run test:browser
 npm run check:release-metadata
 npm run check:api-boundary
-npm run build
 npm run check:api-snapshot
 ```
 

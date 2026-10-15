@@ -20,18 +20,21 @@ async function main(): Promise<void> {
   const claim = instance.exports.claim_ticket;
   assert(typeof claim === "function", "claim_ticket export present");
 
+  // 0.9.947 contract: an UNCONDITIONAL fetch-add — no "-1 = empty" sentinel
+  // (the emptiness pre-check lives in MpmcWorkQueue.pull). Every i32 is a
+  // valid ticket, including negative ones past the 2^31 wrap.
   const header = new Int32Array(memory.buffer, 0, 8);
-  assertEq((claim as () => number)(), -1, "empty queue returns -1");
-  Atomics.store(header, 0, 2);
   assertEq((claim as () => number)(), 0, "first claim returns old dequeue ticket");
   assertEq((claim as () => number)(), 1, "second claim returns next ticket");
-  assertEq((claim as () => number)(), -1, "claim stops at enqueue frontier");
-  assertEq(Atomics.load(header, 1), 2, "dequeue ticket advanced only for claims");
+  assertEq(Atomics.load(header, 0), 0, "enqueue lane untouched");
+  assertEq(Atomics.load(header, 1), 2, "dequeue ticket advanced once per claim");
 
-  Atomics.store(header, 0, -2_147_483_648);
   Atomics.store(header, 1, 2_147_483_647);
-  assertEq((claim as () => number)(), 2_147_483_647, "signed diff wraps like JS Int32");
-  assertEq(Atomics.load(header, 1), -2_147_483_648, "fetch-add wraps Int32");
+  assertEq((claim as () => number)(), 2_147_483_647, "claims ticket 2^31 − 1");
+  assertEq((claim as () => number)(), -2_147_483_648, "next claim is the wrapped NEGATIVE ticket (a real claim, not 'empty')");
+  Atomics.store(header, 1, -1);
+  assertEq((claim as () => number)(), -1, "ticket -1 is a real claim too");
+  assertEq(Atomics.load(header, 1), 0, "fetch-add wraps Int32");
 
   const paddedBytes = await compileWat(emitWasmMpmc({
     memoryPages: { min: 1, max: 1 },
@@ -41,7 +44,6 @@ async function main(): Promise<void> {
   const padded = await WebAssembly.instantiate(paddedBytes, { env: { memory: paddedMemory } });
   const paddedClaim = padded.instance.exports.claim_ticket as () => number;
   const paddedHeader = new Int32Array(paddedMemory.buffer, 0, 32);
-  Atomics.store(paddedHeader, 0, 1);
   assertEq(paddedClaim(), 0, "padded dequeue offset claims ticket 0");
   assertEq(Atomics.load(paddedHeader, 16), 1, "padded dequeue lane advanced at byte 64");
 
@@ -50,8 +52,9 @@ async function main(): Promise<void> {
     headerOffsets: { enqueueTicket: 0, dequeueTicket: 64 },
   }), { env: { memory: paddedMemory } });
   const binaryClaim = binary.instance.exports.claim_ticket as () => number;
-  Atomics.store(paddedHeader, 0, 2);
   assertEq(binaryClaim(), 1, "binary emitter matches padded WAT semantics");
+  Atomics.store(paddedHeader, 16, -2);
+  assertEq(binaryClaim(), -2, "binary emitter: negative tickets are real claims");
 
   assert(/i32\.atomic\.rmw\.add/.test(emitWasmMpmc()), "emitted WAT contains atomic add");
   ok("emitWasmMpmc emitted atomic add");
